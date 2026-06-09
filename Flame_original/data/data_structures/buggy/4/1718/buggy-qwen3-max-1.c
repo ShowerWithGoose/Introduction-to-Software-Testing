@@ -1,0 +1,100 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+struct words{
+    char word[20];
+    int time;
+    struct words *next;
+};
+typedef struct words *list;
+list insert(list head,char *tmp){
+    list r=head;
+    list p=(list)malloc(sizeof(struct words));
+    strcpy(p->word,tmp);
+    p->time=1;
+    p->next=NULL;
+    if(head==NULL){
+        return p;
+    }
+    if(strcmp(head->word,p->word)>0){
+        p->next=head;
+        return p;
+    }
+    while(r->next!=NULL){
+        int op=strcmp(r->word,p->word);
+        if(op==0){
+            r->time++;
+            free(p); // @@ [Memory leak: allocated node 'p' is not freed when duplicate word is found]
+            return head;
+        }else if(op<0){
+            r=r->next;
+        }else{
+            list check=head;
+            while(check->next!=r){
+                check=check->next;
+            }
+            p->next=r;
+            check->next=p;
+            return head;
+        }
+    }
+    if(strcmp(r->word,p->word)==0){
+        r->time++;
+        free(p); // @@ [Memory leak: allocated node 'p' is not freed when duplicate word is found at last node]
+        return head;
+    }else if(strcmp(r->word,p->word)<0){
+        r->next=p;
+        return head;
+    }else{
+        list check=head;
+        while(check->next!=r){
+            check=check->next;
+        }
+        p->next=r;
+        check->next=p;
+        return head;
+    }
+}
+int main()
+{
+    FILE *in;
+    in=fopen("article.txt","r");
+    if (in == NULL) { // @@ [Potential runtime error: file opening failure not handled, may cause segmentation fault]
+        return 1;
+    }
+    char sent[1024];
+    list head=NULL;
+    while(fgets(sent,1024,in)!=NULL){
+        char tmp[20];
+        int tmplong=0;
+        for(int i=0;sent[i]!='\0';i++){
+            if((sent[i]<='z'&&sent[i]>='a')||(sent[i]>='A'&&sent[i]<='Z')){
+                if(tmplong >= 19) { // @@ [Buffer overflow risk: tmp array size is 20, but no bounds check before writing]
+                    break;
+                }
+                if(sent[i]>='A'&&sent[i]<='Z'){
+                    tmp[tmplong++]=sent[i]+'a'-'A';
+                } else {
+                    tmp[tmplong++]=sent[i];
+                }
+            }else if(tmplong>0){
+                    tmp[tmplong]='\0';
+                    head=insert(head,tmp);
+                    tmplong=0;
+            }
+        }
+        if(tmplong>0){ // @@ [Missing handling of last word in line if line doesn't end with non-letter]
+            tmp[tmplong]='\0';
+            head=insert(head,tmp);
+        }
+    }
+    fclose(in);
+    // @@ [Output not in lexicographical order due to flawed insertion logic in 'insert' function]
+    while(head!=NULL){
+        printf("%s %d\n",head->word,head->time);
+        list temp = head;
+        head=head->next;
+        free(temp); // @@ [Memory leak: nodes are not freed in original code]
+    }
+    return 0;
+}

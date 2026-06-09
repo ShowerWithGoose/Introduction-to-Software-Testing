@@ -1,0 +1,29 @@
+package src.AST.STMT;
+
+import src.AST.LVal;
+import src.ErrorHandle.Errortype;
+import src.fronted.LexicAnalysis.Word;
+
+import static src.fronted.SyntaxAnalysis.SyntaxAnalysis.utils;
+
+public class StmtLValGetchar {
+    private LVal lVal;
+    private Word assign;
+    private Word wordGetchar;
+    private Word lParent;
+    private Word rParent;
+    private Word semicolon;
+
+    public StmtLValGetchar() {
+    }
+
+    public StmtLValGetchar analyse() {
+        this.lVal = new LVal().analyse();
+        this.assign = utils.read("=");
+        this.wordGetchar = utils.read("getchar");
+        this.lParent = utils.read("(");
+        this.rParent = utils.tryReadnext(1, ")", Errortype.j);
+        this.semicolon = utils.tryReadnext(1, ";", Errortype.i);
+        return this;
+    }
+}

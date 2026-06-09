@@ -1,0 +1,69 @@
+#include<stdio.h>
+#include<string.h>
+int main()
+{
+	char a[100];
+	int d,i,z,w;
+	gets(a);
+	for(i=0;a[i]!='\0';i++)
+	{
+		if(a[i]=='.')
+		{
+			d=i;
+		}
+	}
+	if(d==1)
+	{
+		if(a[0]-'0'==0)
+		{
+			for(i=2;i<strlen(a);i++)
+			{
+				if(a[i]!='0')
+				{
+					z=-(i-1);
+					w=i;
+					break;
+				}
+			}
+			printf("%c",a[w]);
+			if(w+1==strlen(a))
+			{
+				printf("e%d",z);
+			}
+			else
+			{
+				printf(".");
+			for(i=w+1;i<strlen(a);i++)
+			{
+				printf("%c",a[i]); 
+			}
+			printf("e%d",z);
+			}
+		}
+		else 
+		{
+			for(i=0;i<strlen(a);i++)
+			{
+				printf("%c",a[i]);
+			}
+			printf("e0");
+		}
+	}
+	else 
+	{
+		z=d-1;
+		printf("%c",a[0]);
+		printf(".");
+		for(i=1;i<strlen(a);i++)
+		{
+			if(a[i]!='.')
+			{
+				printf("%c",a[i]);
+			}
+		}
+		printf("e%d",z);
+	}
+	return 0;
+}
+
+

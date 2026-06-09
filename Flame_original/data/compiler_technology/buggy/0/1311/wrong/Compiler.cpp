@@ -1,0 +1,168 @@
+#include<bits/stdc++.h>
+using namespace std;
+
+
+unordered_map<string,string> Word2Type;
+vector<pair<string,string>> word;// 存储分解后的所有单词及类型
+unordered_set<char> sym={'!','&','|','+','-','*','/','%','<','>','=',' ',',',';','(',')','[',']','{','}'};
+bool haveError = 0;
+bool isAnnot = 0; //是否处于多行注释状态（单行注释直接跳过该行）
+string token;//单个单词
+
+void check();//本地检查文件输出
+void init_Word2Type();//初始化单词对应类别码
+void Read(string buf);//读取一行
+string getLexType(string word);//获得读取的单词类型
+void pushWord();//单词入栈
+bool isNum(string token);
+bool isIdent(string token);
+int main() {
+    init_Word2Type();
+    ifstream input;
+    input.open("testfile.txt",ios::in);
+    if(!input.is_open()) cout<<"打开文件失败"<<"\n";
+    else{
+        string buf;
+        while(getline(input,buf)){
+            Read(buf);
+        }
+        input.close();
+    }
+    
+    if(!haveError){
+        ofstream output("lexer.txt");
+        for(auto e : word) output<<e.first<<" "<<e.second<<"\n";
+        output.close();
+    }
+    else{
+        ofstream output("error.txt");
+    }
+    //check();
+    return 0;
+}
+
+void init_Word2Type(){
+    vector<string>key={"main","const","int","char","break","continue","if","else","!","&&","||","for","getint","getchar","printf","return","+","-","void","*","/","%","<","<=",">",">=","==","!=","=",";",",","(",")","[","]","{","}"};
+    vector<string>value={"MAINTK","CONSTTK","INTTK","CHARTK","BREAKTK","CONTINUETK","IFTK","ELSETK","NOT","AND","OR","FORTK","GETINTTK","GETCHARTK","PRINTFTK","RETURNTK","PLUS","MINU","VOIDTK","MULT","DIV","MOD","LSS","LEQ","GRE","GEQ","EQL","NEQ","ASSIGN","SEMICN","COMMA","LPARENT","RPARENT","LBRACK","RBRACK","LBRACE","RBRACE"};
+    while(!key.empty()){
+        Word2Type.emplace(key.back(),value.back());
+        key.pop_back();
+        value.pop_back();
+    }
+}
+void Read(string buf){
+    int l = buf.length();
+    for(int i=0;i<l;i++){
+        if(isAnnot){
+            if(buf[i]!='*') continue;
+            else if(i+1<=l-1&&buf[i+1]=='/'){
+                i++;
+                isAnnot = 0;
+                continue;
+            }
+            else continue;         
+        }
+        if(buf[i]=='"'){
+            token+='"';
+            while(buf[++i]!='"'){
+                token+=buf[i];
+            }
+            token+='"';
+            pushWord();
+        }
+        else if(buf[i]=='\''){
+            token+='\'';     
+            if(buf[i+3]=='\''){
+                token+=buf[i+1];
+                token+=buf[i+2];
+                token+='\'';
+                i+=3;
+            }
+            else if(buf[i+2]=='\''){
+                token+=buf[i+1];
+                token+='\'';
+                i+=2;
+            }
+            pushWord();
+        }
+        else if(sym.find(buf[i])!=sym.end()){
+            pushWord();
+            if(buf[i]!=' ') token+=buf[i];
+            
+            if(buf[i]=='&'||buf[i]=='|') {
+                token+=buf[++i];
+                pushWord();
+            }
+            else if(buf[i]=='!'||buf[i]=='<'||buf[i]=='='||buf[i]=='>'){
+                if(buf[i+1]=='=') token+=buf[++i];
+                pushWord();
+            }
+            else if(buf[i]=='/'&&buf[i+1]=='*'){
+                isAnnot = 1;
+                token = "";
+            }
+            else if(buf[i]=='/'&&buf[i+1]=='/'){
+                token = "";
+                break;
+            }
+            else if(buf[i]!=' ') pushWord();
+        }
+        else if(buf[i]>=32&&buf[i]<=126) token+=buf[i];
+    }
+    pushWord();
+}
+string getLexType(string word){
+    auto it = Word2Type.find(word);
+    if(it!=Word2Type.end()) return it->second;
+    else if(isNum(word)) return "INTCON";
+    else if(word[0]=='"') return "STRCON";
+    else if(word[0]=='\'') return "CHRCON";
+    else if(isIdent(word)) return "IDENFR";
+}
+void pushWord(){
+    if(token == "") return;
+    word.push_back({getLexType(token),token});
+    token = "";
+}
+bool isNum(string token){
+    int l = token.length();
+    for(int i=0;i<l;i++){
+        if(!isdigit(token[i])) return 0;
+        }
+    return 1;
+}
+
+void check() {
+    ifstream lexerFile("lexer.txt");
+    ifstream ansFile("ans.txt");
+    if (!lexerFile.is_open() || !ansFile.is_open()) {
+        cerr << "无法打开文件。" << endl;
+    }
+    string lexerLine, ansLine;
+    int lineNumber = 1;
+    bool foundDifference = false;
+
+    while (getline(lexerFile, lexerLine) && getline(ansFile, ansLine)) {
+        if (lexerLine != ansLine) {
+            cout <<  lineNumber << endl;
+            cout << "lexer.txt: " << lexerLine << endl;
+            cout << "ans.txt: " << ansLine << endl;
+            foundDifference = true;
+        }
+        lineNumber++;
+    }
+    if (!foundDifference) {
+        cout << "666" << endl;
+    }
+    lexerFile.close();
+    ansFile.close();
+}
+bool isIdent(string token){
+    int l = token.length();
+    if(token[0]!='_'&&!isalpha(token[0])) return 0;
+    for(int i=1;i<l;i++){
+        char ch = token[i];
+        if((!isalpha(ch))&&(!isdigit(ch))&&(ch!='_')) return 0;
+    }
+    return 1;
+}

@@ -1,0 +1,52 @@
+#include<stdio.h>
+int main()
+{
+    char s[110];
+    scanf("%s",s);
+    int i,flot=0,num1=0,num2=0;
+    if(s[0]=='0')
+    {
+        i=2;
+        while(s[i]=='0')
+        {
+            i++;
+            num1++;
+        }
+        printf("%c",s[i]);
+        if(s[i+1]!='\0')
+        {
+            printf(".");
+        }
+        for(i=i+1;s[i]!='\0';i++)
+        {
+            printf("%c",s[i]);
+        }
+        printf("e-%d",num1+1);
+    }
+    else
+    {
+        for(i=0;;i++)
+        {
+            if(s[i]=='.')
+            break;
+            else
+            {
+                num2++;
+            }
+        }
+        printf("%c.",s[0]);
+        for(i=1;s[i]!='\0';i++)
+        {
+            if(s[i]=='.')
+            {
+                continue;
+            }
+            else
+            {
+                printf("%c",s[i]);
+            }
+        }
+        printf("e%d",num2-1);
+    }
+    return 0;
+}

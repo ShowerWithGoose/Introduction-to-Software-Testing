@@ -1,0 +1,60 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
+#include <ctype.h>
+#define MAXSIZE 1024
+
+int stack[MAXSIZE];
+int top=-1;//≥ı ºªØ 
+
+void push(int stack[], int item)
+{
+    if(top==MAXSIZE-1)
+    {
+        printf("error"); // @@ Missing space after "error" and missing newline/exit; should print "error " to match expected output format
+    }
+    else
+    {
+        top++;
+        stack[top]=item;
+    }
+}
+
+void pop(int stack[])
+{
+    if(top==-1)
+    {
+        printf("error"); // @@ Missing space after "error"; should print "error " to match expected output format
+    }
+    else
+    {
+        printf("%d", stack[top]); // @@ Missing space after the popped element; should print "%d " to match expected output format
+        top--;
+    }
+}
+
+int main(int argc, const char * argv[])
+{
+    int action, item;
+    
+    while(1)
+    {
+        scanf("%d", &action);
+        if(action==1)//push
+        {
+            scanf("%d", &item);
+            push(stack, item);
+        }
+        else if(action==0)//pop
+        {
+            pop(stack);
+        }
+        else if(action==-1)
+        {
+            break;
+        }
+    }
+    
+    return 0;
+}
