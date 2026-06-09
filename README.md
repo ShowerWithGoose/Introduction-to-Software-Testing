@@ -1,2 +1,5 @@
 # ---
+Flame——original文件夹中是论文里Flame的实现代码。
+Flame_project文件夹中是我们的方法，加上了变量对齐与错误信息结构化两个创新点。
+Flame_Qwen是在原始Flame上加入单模型单次与多次投票的代码，主要改动在qwen_experiments.py
 所有代码实现部分
