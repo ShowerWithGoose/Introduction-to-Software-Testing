@@ -1,0 +1,275 @@
+Based on the problem description and test case, the program is missing error detection for invalid single '&' and '|' operators (error type 'a'). The test case shows that line 18 contains `if (f2() & f1())` which should trigger error 'a', but it's not being detected.
+
+Looking at the code, the lexer correctly identifies single '&' and '|' as errors during lexical analysis, but the syntax analyzer doesn't check for these operators in the conditional expressions. The issue is in the `LOrExp` and `LAndExp` classes which only handle '||' and '&&' operators respectively, but don't validate against single '&' or '|' tokens.
+
+However, examining the lexer more closely, I see that when it encounters a single '&', it adds an AND token ("&&") anyway and sets the flag, but this might not be properly handled. But the main issue appears to be in the syntax analysis phase.
+
+Looking at the grammar, the `Cond` → `LOrExp` production should only accept logical OR expressions with '||', but the current implementation doesn't validate that single '&' or '|' aren't used.
+
+Actually, reviewing the lexer code more carefully, I can see the issue:
+
+<frontend/Lexer.java>
+...
+            if (c == '&') {
+                if (posWord < getLine(posLine).length() - 1 && getLine(posLine).charAt(posWord + 1) == '&') {
+                    words.add(new Token("AND", "&&", posLine));
+                    len = 2;
+                } else {
+                    Wrong wrong = new Wrong("WRONGAND", posLine, "a");
+                    wrongs.put(posLine + 1, wrong);
+                    len = 1;
+                    words.add(new Token("AND", "&&", posLine));  // This is incorrect!
+                    flag = true;
+                }
+            } else if (c == '|') {
+                if (posWord < getLine(posLine).length() - 1 && getLine(posLine).charAt(posWord + 1) == '|') {
+                    words.add(new Token("OR", "||", posLine));
+                    len = 1;
+                } else {
+                    Wrong wrong = new Wrong("WRONGOR", posLine, "a");
+                    wrongs.put(posLine + 1, wrong);
+                    len = 1;
+                    words.add(new Token("OR", "||", posLine));  // This is incorrect!
+                    flag = true;
+                }
+            }
+...
+
+The lexer is incorrectly adding an AND/OR token even when it encounters a single '&' or '|', which means the parser will see "&&" or "||" tokens instead of the actual single characters. This prevents the syntax analyzer from detecting the error properly.
+
+But wait, looking at the expected output, the error should be detected at line 18, which corresponds to the '&' in `if (f2() & f1())`. The lexer should detect this as error 'a', but the current implementation has a bug in the '|' case where it sets `len = 1` but should set `len = 2` for the double character case.
+
+Actually, looking more carefully at the '|' handling:
+
+```java
+else if (c == '|') {
+    if (posWord < getLine(posLine).length() - 1 && getLine(posLine).charAt(posWord + 1) == '|') {
+        words.add(new Token("OR", "||", posLine));
+        len = 1;  // BUG: should be len = 2
+    } else {
+        Wrong wrong = new Wrong("WRONGOR", posLine, "a");
+        wrongs.put(posLine + 1, wrong);
+        len = 1;
+        words.add(new Token("OR", "||", posLine));
+        flag = true;
+    }
+}
+```
+
+There's a bug in the correct case handling for "||" - it sets `len = 1` instead of `len = 2`, which would cause parsing issues.
+
+However, the main issue for the missing error 'a' detection is that the lexer is adding fake AND/OR tokens even for single characters, which masks the error from the parser.
+
+But looking at the test case again, the input has `&` (single ampersand), which should be caught by the lexer. The lexer does create a Wrong object with type "a", but then it also adds a fake "AND" token. The problem might be that the WrongFile singleton isn't properly collecting this error.
+
+Wait, looking at the Lexer's addWords method for '&':
+
+```java
+if (c == '&') {
+    if (posWord < getLine(posLine).length() - 1 && getLine(posLine).charAt(posWord + 1) == '&') {
+        words.add(new Token("AND", "&&", posLine));
+        len = 2;
+    } else {
+        Wrong wrong = new Wrong("WRONGAND", posLine, "a");
+        wrongs.put(posLine + 1, wrong);
+        len = 1;
+        words.add(new Token("AND", "&&", posLine));  // This line is problematic
+        flag = true;
+    }
+}
+```
+
+The issue is that it's adding a fake "AND" token even for single '&', which means the parser will process it as if it were "&&", so no syntax error will be detected. But the Wrong object is created and should be output.
+
+However, looking at the Lexer's printWords method:
+
+```java
+public void printWords() {
+    String outputFileName;
+    if (!flag) {
+        // output lexer.txt
+    } else {
+        outputFileName = "error.txt";
+        try {
+            OutputStream outputStream = new FileOutputStream(outputFileName);
+            PrintStream ps = new PrintStream(outputStream);
+            for (int i : wrongs.keySet()) {
+                ps.println(i + " a");
+            }
+        } catch (FileNotFoundException e) {
+            System.err.println("Can not open " + outputFileName);
+        }
+    }
+}
+```
+
+But in the Compiler main method, it calls `lexer.recognize()` and then creates a CompUnit with `lexer.getWords()`, which returns the words list that includes the fake tokens. The CompUnit then does syntax analysis, and if syntax errors are found, it outputs to error.txt via WrongFile.
+
+The problem is that the lexer's own error detection (for single '&' and '|') is separate from the syntax analyzer's error detection. The lexer sets its own `flag` and `wrongs`, but the Compiler class doesn't use the lexer's error output - it only uses the tokens and relies on the syntax analyzer's WrongFile.
+
+So the single '&' error should actually be caught during syntax analysis, not lexical analysis. Looking at the grammar, the `LOrExp` and `LAndExp` productions only allow '||' and '&&', so if a single '&' token appears, it should cause a syntax error.
+
+But wait, in the lexical analysis, a single '&' should NOT be tokenized as AND - it should either be an error or some other token. Looking at the token category codes, there's no token for single '&', so it should be an error.
+
+The real issue is in the Lexer.java file where it handles single '&' and '|'. It should NOT add any token to the words list when it encounters a single '&' or '|', because these are invalid tokens. Instead, it should just record the error and skip the character.
+
+But looking at the current implementation, it adds a fake AND/OR token, which allows the parser to continue incorrectly.
+
+However, the expected behavior according to the problem is that error 'a' should be detected for single '&' and '|', and this should be done during syntax analysis according to the error description.
+
+Looking more carefully at the grammar productions:
+- LAndExp → EqExp | LAndExp '&&' EqExp  
+- LOrExp → LAndExp | LOrExp '||' LAndExp
+
+So the parser expects only '&&' and '||' tokens. If it encounters a single '&' token (which shouldn't exist if lexical analysis is correct), it would be a syntax error.
+
+But the lexical analyzer should have already caught the single '&' as an invalid token. However, the problem states that error 'a' is a syntax analysis error, not lexical.
+
+Re-reading the error description: "The symbols "&" and "|" appearing individually" - this suggests that during syntax analysis, if the parser encounters these symbols in contexts where '&&' or '||' are expected, it should report error 'a'.
+
+But in the current lexer implementation, single '&' and '|' are being converted to AND/OR tokens, which masks the error.
+
+Actually, looking at the token category codes table, there are no entries for single '&' or '|', which means they are invalid tokens and should be caught during lexical analysis.
+
+The bug is in Lexer.java - when it encounters a single '&', it should not add any token to the words list, or it should add an invalid token that the parser can recognize as error 'a'.
+
+But the current approach of adding a fake AND token is wrong.
+
+However, looking at the test case output, the program is expected to output error 'a' at line 18, which means the error detection mechanism should be working.
+
+Let me trace through what happens:
+
+1. Input: `if (f2() & f1())`
+2. Lexer encounters '&'
+3. Since next char is not '&', it creates Wrong("WRONGAND", posLine, "a") and adds it to `wrongs` with key `posLine + 1`
+4. It also adds a fake Token("AND", "&&", posLine) to `words`
+5. The `flag` is set to true
+6. In Compiler.main(), it calls `lexer.recognize()` then creates CompUnit with `lexer.getWords()`
+7. CompUnit does syntax analysis using the fake AND token, so no syntax error is detected
+8. Finally, `compUnit.printWords()` is called
+9. Since `WrongFile.getInstance().getFlag()` is false (because syntax analysis didn't find errors), it calls `file.printWords()` which outputs to parser.txt
+10. But the lexer's own errors in `lexer.wrongs` are never output because the Compiler class doesn't call `lexer.printWords()`
+
+Ah! That's the key issue. The Compiler class completely ignores the lexer's error detection. It only relies on the syntax analyzer's WrongFile.
+
+So the single '&' error should actually be detected during syntax analysis, not lexical analysis.
+
+Looking at the grammar again, the `Cond` → `LOrExp` production. The `LOrExp` class parses LOrExp → LAndExp | LOrExp '||' LAndExp.
+
+If there's a single '&' in the input, what token would it be? According to the lexical specification, single '&' is not a valid token, so it should have been caught by the lexer.
+
+But the problem description says error 'a' is for "The symbols "&" and "|" appearing individually", which suggests that these symbols can appear in the input but are syntactically invalid.
+
+This implies that the lexer should tokenize single '&' as some token (maybe as a generic symbol), and then the syntax analyzer should detect that it's invalid in boolean contexts.
+
+However, looking at the provided token category codes, there's no token for single '&' or '|', which means they are lexical errors.
+
+Given the confusion, let me look at the actual expected behavior from the test case:
+
+Input line 18: `if (f2() & f1()) {`
+Expected output: `18 a`
+
+This means that at line 18, error type 'a' should be reported.
+
+In the current implementation, the Lexer does detect this and creates a Wrong object, but the Compiler class doesn't output the lexer's errors.
+
+The Compiler class should check if the lexer found any errors and output those, but it doesn't.
+
+However, looking at the Compiler code:
+
+```java
+public class Compiler {
+    public static void main(String[] argv) throws IOException {
+        Lexer lexer = new Lexer();
+        lexer.getFile();
+        lexer.recognize();
+        CompUnit compUnit = new CompUnit(lexer.getWords());
+        compUnit.parseCompUnit();
+        compUnit.printWords();
+    }
+}
+```
+
+It never checks `lexer.flag` or outputs `lexer.wrongs`.
+
+But wait, in the Lexer's recognize method, when it finds a single '&', it sets `flag = true` and adds to `wrongs`, but the Compiler ignores this.
+
+However, the problem states that for erroneous source programs, output should go to error.txt with line number and error code.
+
+The design seems to be that all error detection should happen in the syntax analyzer, not the lexer.
+
+Looking back at the Lexer code, I see that for single '&' and '|', it adds fake AND/OR tokens. This is likely the root cause - it's masking the error from the syntax analyzer.
+
+But the syntax analyzer should be able to detect when single '&' or '|' are used inappropriately.
+
+Actually, re-examining the grammar, there's no production that allows single '&' or '|', so if the lexer properly tokenized them as invalid tokens, the syntax analyzer would fail.
+
+But the token category codes don't include single '&' or '|', so they should be lexical errors.
+
+Given the expected output includes error 'a', and the problem description lists it as a syntax analysis error, I think the intended design is:
+
+1. The lexer should tokenize single '&' as a generic symbol or keep it as is
+2. The syntax analyzer, when parsing boolean expressions, should check for single '&' or '|' and report error 'a'
+
+But in the current lexer implementation, single '&' is being converted to AND token, which is wrong.
+
+Looking at the Lexer.addWords() method again:
+
+For '&':
+- If "&&", add AND token with len=2
+- Else, add Wrong with type "a", add fake AND token, set flag=true, len=1
+
+For '|':
+- If "||", add OR token with len=1 (BUG: should be len=2)
+- Else, add Wrong with type "a", add fake OR token, set flag=true, len=1
+
+The bugs are:
+1. For "||" case, len should be 2, not 1
+2. For single '&' and '|', it shouldn't add fake AND/OR tokens
+
+But since the Compiler class doesn't use the lexer's error output, the fake tokens cause the syntax analyzer to miss the error.
+
+However, looking at the test case, the program does output some errors ('j' errors), which come from the syntax analyzer's WrongFile.
+
+This suggests that the single '&' error should be detected by the syntax analyzer, not the lexer.
+
+Let me check how the syntax analyzer would encounter a single '&' token.
+
+If the lexer properly tokenized single '&' as an invalid token, the syntax analyzer would fail. But since there's no token category for it, it should be a lexical error.
+
+I think the issue is in the Lexer.java file where it handles single '&' and '|'. It should not add any token to the words list, which would cause the syntax analyzer to fail when it can't match the expected tokens.
+
+But the current implementation adds fake tokens, allowing the syntax analysis to proceed incorrectly.
+
+However, the expected behavior is that error 'a' is reported, which means the error detection logic needs to be in the syntax analyzer.
+
+Looking at the Cond/LOrExp/LAndExp classes, they don't have any logic to detect single '&' or '|'.
+
+Given the time, I believe the most likely location of the error is in the Lexer.java file, specifically in how it handles single '&' and '|' characters.
+
+<frontend/Lexer.java>
+...
+            if (c == '&') {
+                if (posWord < getLine(posLine).length() - 1 && getLine(posLine).charAt(posWord + 1) == '&') {
+                    words.add(new Token("AND", "&&", posLine));
+                    len = 2;
+                } else {
+                    Wrong wrong = new Wrong("WRONGAND", posLine, "a");
+                    wrongs.put(posLine + 1, wrong);
+                    len = 1;
+                    words.add(new Token("AND", "&&", posLine));
+                    flag = true;
+                }
+            } else if (c == '|') {
+                if (posWord < getLine(posLine).length() - 1 && getLine(posLine).charAt(posWord + 1) == '|') {
+                    words.add(new Token("OR", "||", posLine));
+                    len = 1;
+                } else {
+                    Wrong wrong = new Wrong("WRONGOR", posLine, "a");
+                    wrongs.put(posLine + 1, wrong);
+                    len = 1;
+                    words.add(new Token("OR", "||", posLine));
+                    flag = true;
+                }
+            }
+...

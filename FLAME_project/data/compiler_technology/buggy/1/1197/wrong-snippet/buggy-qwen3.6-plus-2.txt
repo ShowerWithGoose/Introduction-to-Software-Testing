@@ -1,0 +1,807 @@
+Based on the problem description and the test case analysis:
+
+1.  **Test Case Input**:
+    ```text
+    void f(int a {} // error 1 (Missing ')')
+    
+    int main( { // error 2 (Missing ')')
+        int a = 10;
+        f(a + 10; // error 3 (Missing ')')
+        return 0;
+    }
+    ```
+
+2.  **Expected Output**:
+    ```text
+    1 j
+    3 j
+    5 j
+    ```
+    Note: Line 3 in the input file corresponds to `int main( {`. The error is detected when parsing `MainFuncDef` or `FuncDef`. However, looking at the line numbers in Expected Output:
+    - Error 1 is at line 1 (`void f(int a {}`). The missing `)` is expected after `a`.
+    - Error 2 is at line 3 (`int main( {`). The missing `)` is expected after `(`.
+    - Error 3 is at line 5 (`f(a + 10;`). The missing `)` is expected after `10`.
+
+    Wait, let's re-read the input carefully.
+    Line 1: `void f(int a {}`
+    Line 2: (empty)
+    Line 3: `int main( {`
+    Line 4: `    int a = 10;`
+    Line 5: `    f(a + 10;`
+    Line 6: `    return 0;`
+    Line 7: `}`
+
+    The expected output says errors are at lines 1, 3, and 5.
+    The buggy output says errors are at lines 1, 1, 3, and 5. Specifically, it outputs `1 NONE` and `1 j`.
+
+    The `1 NONE` suggests that an error of type `NONE` is being logged at line 1. Looking at the code, `ErrorType.NONE` is used in `BType.java`:
+    ```java
+    } else {
+        processError(ErrorType.NONE);
+    }
+    ```
+    And potentially elsewhere if `terminalCheck` is called with `ErrorType.NONE` (which is the default for some overloads).
+
+    However, the main issue is likely in how `CompUnit` distinguishes between `Decl` and `FuncDef`.
+    In `CompUnit.java`:
+    ```java
+    while (Stream.of(LexType.CONSTTK, LexType.INTTK, LexType.CHARTK)
+            .anyMatch((o) -> o == Lexer.INSTANCE.getLexType())) {
+        if (Lexer.INSTANCE.getLexType() != LexType.CONSTTK) {
+            Lexer.INSTANCE.next();
+            Lexer.INSTANCE.next();
+            if (Lexer.INSTANCE.getLexType() != LexType.LPARENT) {
+                Lexer.INSTANCE.back(2);
+                compUnit.parseAndAdd(NodeRegistry.DECL);
+            } else {
+                Lexer.INSTANCE.back(2);
+                break;
+            }
+        } else {
+            compUnit.parseAndAdd(NodeRegistry.DECL);
+        }
+    }
+    ```
+    When parsing `void f(...)`, `void` is `VOIDTK`. The loop condition checks for `CONSTTK`, `INTTK`, `CHARTK`. `VOIDTK` is NOT in this list. So the first loop skips `void f`.
+    Then the second loop:
+    ```java
+    while (Stream.of(LexType.VOIDTK, LexType.INTTK, LexType.CHARTK)
+            .anyMatch((o) -> o == Lexer.INSTANCE.getLexType())) {
+        if (Lexer.INSTANCE.getLexType() != LexType.INTTK) {
+            compUnit.parseAndAdd(NodeRegistry.FUNC_DEF);
+        } else {
+             // ... handles int main vs int func
+        }
+    }
+    ```
+    Here, `VOIDTK` matches. It calls `NodeRegistry.FUNC_DEF`.
+    Inside `FuncDef.parse()`:
+    ```java
+    funcDef.parseAndAdd(NodeRegistry.FUNC_TYPE); // Consumes 'void'
+    funcDef.terminalCheck(LexType.IDENFR);       // Consumes 'f'
+    funcDef.terminalCheck(LexType.LPARENT);      // Consumes '('
+    switch (Lexer.INSTANCE.getLexType()) {
+        case INTTK, CHARTK -> {
+            funcDef.parseAndAdd(NodeRegistry.TERMINAL); // Consumes 'int'
+            funcDef.parseAndAdd(NodeRegistry.FUNC_F_PARAMS); // Parses 'a'
+            funcDef.terminalCheck(LexType.RPARENT, ErrorType.j); // Expects ')' but finds '{'
+        }
+        // ...
+    }
+    ```
+    When `terminalCheck(LexType.RPARENT, ErrorType.j)` fails, it calls `processError(ErrorType.j)`. This should log `1 j`.
+
+    Why is `1 NONE` appearing?
+    Let's look at `BType.java` again.
+    ```java
+    public static Node parse() {
+        BType bType = new BType();
+        if (Lexer.INSTANCE.getLexType() == LexType.INTTK ||
+            Lexer.INSTANCE.getLexType() == LexType.CHARTK) {
+            bType.parseAndAdd(NodeRegistry.TERMINAL);
+        } else {
+            processError(ErrorType.NONE);
+        }
+        return bType;
+    }
+    ```
+    `FuncFParam` calls `NodeRegistry.B_TYPE`.
+    ```java
+    public static Node parse() {
+        FuncFParam funcFParam = new FuncFParam();
+        funcFParam.parseAndAdd(NodeRegistry.B_TYPE); // <--- Here
+        funcFParam.terminalCheck(LexType.IDENFR);
+        // ...
+    }
+    ```
+    In `void f(int a {})`, inside `FuncFParams`, it parses `FuncFParam`.
+    `FuncFParam` calls `BType.parse()`. The current token is `int` (`INTTK`). So `BType` consumes `int`. No error.
+    Then `FuncFParam` expects `IDENFR`. It finds `a`. Consumes `a`.
+    Then `FuncFParam` checks for `[`. It finds `{`. So it returns.
+    Back in `FuncDef`, it expects `RPARENT`. It finds `{`. Error `j` at line 1.
+
+    So where does `NONE` come from?
+    Maybe the issue is in `CompUnit` logic for `int main`.
+    Line 3: `int main( {`.
+    Second loop in `CompUnit`:
+    Token is `INTTK`.
+    `if (Lexer.INSTANCE.getLexType() != LexType.INTTK)` is false.
+    Else block:
+    ```java
+    Lexer.INSTANCE.next(); // Consumes 'int'
+    if (Lexer.INSTANCE.getLexType() == LexType.MAINTK) {
+        Lexer.INSTANCE.back();
+        break; // Breaks out of loop, goes to MainFuncDef
+    } else {
+        Lexer.INSTANCE.back();
+        compUnit.parseAndAdd(NodeRegistry.FUNC_DEF);
+    }
+    ```
+    Token is `MAINTK`. So it breaks.
+    Then `compUnit.parseAndAdd(NodeRegistry.MAIN_FUNC_DEF);`.
+    `MainFuncDef.parse()`:
+    ```java
+    mainFuncDef.terminalCheck(LexType.INTTK); // Consumes 'int'
+    mainFuncDef.terminalCheck(LexType.MAINTK); // Consumes 'main'
+    mainFuncDef.terminalCheck(LexType.LPARENT); // Consumes '('
+    mainFuncDef.terminalCheck(LexType.RPARENT, ErrorType.j); // Expects ')', finds '{'. Error j at line 3.
+    ```
+    This seems correct for line 3.
+
+    What about Line 5: `f(a + 10;`.
+    This is inside `main`'s block.
+    `Stmt` parsing.
+    `default` case in `Stmt`:
+    ```java
+    PRINT = false;
+    stmt.parseAndAdd(NodeRegistry.EXP); // Parses 'f' as PrimaryExp/LVal?
+    PRINT = true;
+    if (Lexer.INSTANCE.getLexType() == LexType.ASSIGN) {
+       // ...
+    } else {
+       stmt.get(0).print();
+    }
+    stmt.terminalCheck(LexType.SEMICN, ErrorType.i);
+    ```
+    Wait, `f(a+10` is a function call statement.
+    Grammar: `Stmt → ... | [Exp] ';' | ...`
+    Also `UnaryExp → Ident '(' [FuncRParams] ')'`.
+    
+    If `Stmt` parses `Exp`, `Exp` -> `AddExp` -> ... -> `UnaryExp`.
+    `UnaryExp` sees `IDENFR` ('f').
+    ```java
+    case IDENFR -> {
+        Lexer.INSTANCE.next(); // Consumes 'f'
+        if (Lexer.INSTANCE.getLexType() == LexType.LPARENT) {
+            Lexer.INSTANCE.back(); // Backs up to 'f'
+            unaryExp.parseAndAdd(NodeRegistry.TERMINAL); // Consumes 'f'
+            unaryExp.terminalCheck(LexType.LPARENT); // Consumes '('
+            if (Lexer.INSTANCE.getLexType() != LexType.RPARENT) {
+                unaryExp.parseAndAdd(NodeRegistry.FUNC_R_PARAMS); // Parses 'a+10'
+            }
+            unaryExp.terminalCheck(LexType.RPARENT, ErrorType.j); // Expects ')', finds ';'. Error j at line 5.
+        } 
+        // ...
+    }
+    ```
+    This also seems to produce `5 j`.
+
+    So why `1 NONE`?
+    Let's look at `CompUnit` again.
+    The first loop:
+    ```java
+    while (Stream.of(LexType.CONSTTK, LexType.INTTK, LexType.CHARTK)
+            .anyMatch((o) -> o == Lexer.INSTANCE.getLexType())) {
+    ```
+    Input starts with `void`. `VOIDTK` is not in the list. Loop doesn't run.
+    
+    Is it possible `BType` is called incorrectly somewhere?
+    
+    Let's look at `VarDecl`.
+    `VarDecl` calls `BType`.
+    If the parser mistakenly tries to parse `void f...` as a `Decl`?
+    No, `Decl` checks for `CONSTTK`. If not, it assumes `VarDecl`.
+    `VarDecl` calls `BType`.
+    `BType` expects `INTTK` or `CHARTK`.
+    If `CompUnit` incorrectly identified `void f` as a `Decl`, then `VarDecl` would be called.
+    `VarDecl` calls `BType`. Current token is `void` (`VOIDTK`).
+    `BType` checks `INTTK`/`CHARTK`. Fails.
+    `BType` executes `processError(ErrorType.NONE)`.
+    This would generate `1 NONE`.
+    
+    So the bug is in `CompUnit.java`. It fails to skip `void` functions correctly in the first loop or incorrectly enters the `Decl` path.
+    
+    Let's trace `CompUnit` with `void f(int a {}`.
+    1. First `while` loop: Checks `CONSTTK`, `INTTK`, `CHARTK`. Current is `VOIDTK`. Condition false. Loop skipped.
+    2. Second `while` loop: Checks `VOIDTK`, `INTTK`, `CHARTK`. Current is `VOIDTK`. Condition true.
+       Inside: `if (Lexer.INSTANCE.getLexType() != LexType.INTTK)` -> True (`VOIDTK` != `INTTK`).
+       Executes: `compUnit.parseAndAdd(NodeRegistry.FUNC_DEF);`.
+       
+    This path seems correct. It calls `FuncDef`. `FuncDef` handles `void`.
+    
+    Is there another place?
+    What if the input was `int a = 10;`?
+    
+    Let's look at the Buggy Output again:
+    `1 NONE`
+    `1 j`
+    `3 j`
+    `5 j`
+    
+    The `1 NONE` appears before `1 j`.
+    
+    Could it be that `CompUnit` is trying to parse `void` as a `BType`?
+    
+    Look at `CompUnit` first loop again.
+    ```java
+    while (Stream.of(LexType.CONSTTK, LexType.INTTK, LexType.CHARTK)
+            .anyMatch((o) -> o == Lexer.INSTANCE.getLexType())) {
+        if (Lexer.INSTANCE.getLexType() != LexType.CONSTTK) {
+            Lexer.INSTANCE.next();
+            Lexer.INSTANCE.next();
+            if (Lexer.INSTANCE.getLexType() != LexType.LPARENT) {
+                Lexer.INSTANCE.back(2);
+                compUnit.parseAndAdd(NodeRegistry.DECL);
+            } else {
+                Lexer.INSTANCE.back(2);
+                break;
+            }
+        } else {
+            compUnit.parseAndAdd(NodeRegistry.DECL);
+        }
+    }
+    ```
+    This loop only handles `const`, `int`, `char`.
+    
+    What if the error is in `FuncDef`?
+    `FuncDef` calls `FuncType`.
+    `FuncType`:
+    ```java
+    public static Node parse() {
+        FuncType funcType = new FuncType();
+        switch (Lexer.INSTANCE.getLexType()) {
+            case VOIDTK, INTTK, CHARTK -> funcType.parseAndAdd(NodeRegistry.TERMINAL);
+        }
+        return funcType;
+    }
+    ```
+    This consumes `void`.
+    
+    Then `FuncDef` expects `IDENFR`.
+    
+    Is it possible the parser is entering `Decl` for `void f`?
+    Only if `CompUnit` logic is flawed.
+    
+    Wait, look at `Decl.java`:
+    ```java
+    public static Node parse() {
+        Decl decl = new Decl();
+        if (Objects.requireNonNull(Lexer.INSTANCE.getLexType()) == LexType.CONSTTK) {
+            decl.parseAndAdd(NodeRegistry.CONST_DECL);
+        } else {
+            decl.parseAndAdd(NodeRegistry.VAR_DECL);
+        }
+        return decl;
+    }
+    ```
+    If `Decl` is called when token is `VOIDTK`, it goes to `VAR_DECL`.
+    `VarDecl` calls `BType`.
+    `BType` sees `VOIDTK`. Fails check. Logs `NONE`.
+    
+    So, `Decl` IS being called for `void f`.
+    Why?
+    
+    Let's re-read `CompUnit`.
+    ```java
+    while (Stream.of(LexType.CONSTTK, LexType.INTTK, LexType.CHARTK)
+            .anyMatch((o) -> o == Lexer.INSTANCE.getLexType())) {
+         // ...
+    }
+    while (Stream.of(LexType.VOIDTK, LexType.INTTK, LexType.CHARTK)
+            .anyMatch((o) -> o == Lexer.INSTANCE.getLexType())) {
+         // ...
+    }
+    ```
+    
+    If the first loop consumes something, it might advance the pointer.
+    But `VOIDTK` doesn't enter the first loop.
+    
+    Is it possible that `FuncDef` parsing fails, backtracks (if it did), and then tries `Decl`? No, this is a recursive descent parser without backtracking at the `CompUnit` level for `FuncDef` vs `Decl` once inside the loop.
+    
+    However, look at the second loop in `CompUnit`:
+    ```java
+    while (Stream.of(LexType.VOIDTK, LexType.INTTK, LexType.CHARTK)
+            .anyMatch((o) -> o == Lexer.INSTANCE.getLexType())) {
+        if (Lexer.INSTANCE.getLexType() != LexType.INTTK) {
+            compUnit.parseAndAdd(NodeRegistry.FUNC_DEF);
+        } else {
+             // ...
+        }
+    }
+    ```
+    If `FuncDef` is called, it parses `void f(int a {}`.
+    It logs `1 j`.
+    It does NOT log `1 NONE`.
+    
+    Where does `1 NONE` come from?
+    
+    Maybe `BType` is called inside `FuncFParam`?
+    `FuncFParam` -> `BType`.
+    Token is `int`. `BType` succeeds.
+    
+    Maybe `VarDef`?
+    
+    Let's look at `CompUnit` again. Is it possible that `void` is handled by the FIRST loop?
+    No.
+    
+    Is it possible the order of loops is wrong or they overlap incorrectly?
+    
+    Actually, look at `CompUnit` first loop logic for `INTTK`.
+    If token is `INTTK`:
+    1. `next()` -> `f` (IDENFR) ? No, `next()` gets next token.
+    If input is `int a = 10;`, token is `INTTK`.
+    `next()` -> `a`.
+    `next()` -> `=`.
+    Check if `=` is `LPARENT`. No.
+    `back(2)`. Token is `INTTK`.
+    `parseAndAdd(DECL)`.
+    `Decl` -> `VarDecl`.
+    `VarDecl` -> `BType`.
+    `BType` sees `INTTK`. OK.
+    
+    If input is `int main()`.
+    Token `INTTK`.
+    `next()` -> `main`.
+    `next()` -> `(`.
+    Check if `(` is `LPARENT`. Yes.
+    `back(2)`. Token is `INTTK`.
+    `break`.
+    
+    Then second loop.
+    Token `INTTK`.
+    Enters `else`.
+    `next()` -> `main`.
+    Check `MAINTK`. Yes.
+    `back()`. Token is `INTTK`.
+    `break`.
+    
+    Then `MainFuncDef`.
+    
+    This logic seems fine for `int`.
+    
+    What if there is a `void` declaration? Not allowed in grammar.
+    
+    Let's look at the `1 NONE` again.
+    `ErrorType.NONE` is ONLY used in `BType.java` in the provided code snippets.
+    
+    ```java
+    // BType.java
+    } else {
+        processError(ErrorType.NONE);
+    }
+    ```
+    
+    So `BType.parse()` is being called when the current token is NOT `INTTK` or `CHARTK`.
+    And it's happening at Line 1.
+    Line 1 starts with `void`.
+    
+    So `BType` is being called when token is `VOIDTK`.
+    Who calls `BType`?
+    1. `ConstDecl`
+    2. `VarDecl`
+    3. `FuncFParam`
+    
+    `FuncFParam` is called from `FuncFParams` from `FuncDef`.
+    In `FuncDef`, `FuncType` consumes `void`. Then `IDENFR` (`f`) is consumed. Then `LPARENT` (`(`) is consumed.
+    Then `FuncFParams` is called.
+    Inside `FuncFParams`, `FuncFParam` is called.
+    `FuncFParam` calls `BType`.
+    Current token is `int`.
+    So `BType` should succeed.
+    
+    UNLESS `FuncDef` didn't consume `void`?
+    `FuncType` consumes `void`.
+    
+    Is it possible `CompUnit` called `Decl` instead of `FuncDef`?
+    If `CompUnit` called `Decl` on `void f...`:
+    `Decl` -> `VarDecl` (since not `CONSTTK`).
+    `VarDecl` -> `BType`.
+    `BType` sees `VOIDTK`.
+    `BType` logs `NONE`.
+    
+    So the question is: Why did `CompUnit` call `Decl` for `void f`?
+    
+    Look at `CompUnit` first loop:
+    ```java
+    while (Stream.of(LexType.CONSTTK, LexType.INTTK, LexType.CHARTK)
+            .anyMatch((o) -> o == Lexer.INSTANCE.getLexType())) {
+    ```
+    `VOIDTK` is not in this list.
+    
+    Look at `CompUnit` second loop:
+    ```java
+    while (Stream.of(LexType.VOIDTK, LexType.INTTK, LexType.CHARTK)
+            .anyMatch((o) -> o == Lexer.INSTANCE.getLexType())) {
+        if (Lexer.INSTANCE.getLexType() != LexType.INTTK) {
+            compUnit.parseAndAdd(NodeRegistry.FUNC_DEF);
+        } 
+        // ...
+    }
+    ```
+    This SHOULD call `FuncDef`.
+    
+    Is it possible that `FuncDef` parsing failed, and the parser continued in a way that re-analyzed? No, standard recursive descent doesn't backtrack like that unless explicitly coded.
+    
+    Wait! Look at `CompUnit` first loop again.
+    
+    ```java
+    while (Stream.of(LexType.CONSTTK, LexType.INTTK, LexType.CHARTK)
+            .anyMatch((o) -> o == Lexer.INSTANCE.getLexType())) {
+        if (Lexer.INSTANCE.getLexType() != LexType.CONSTTK) {
+            Lexer.INSTANCE.next();
+            Lexer.INSTANCE.next();
+            if (Lexer.INSTANCE.getLexType() != LexType.LPARENT) {
+                Lexer.INSTANCE.back(2);
+                compUnit.parseAndAdd(NodeRegistry.DECL);
+            } else {
+                Lexer.INSTANCE.back(2);
+                break;
+            }
+        } else {
+            compUnit.parseAndAdd(NodeRegistry.DECL);
+        }
+    }
+    ```
+    
+    If the input was `int f() {}`, it would break.
+    
+    There is no obvious path for `VOIDTK` to enter `Decl`.
+    
+    However, notice `1 NONE` and `1 j`.
+    `1 j` is correct for `void f(int a {}`.
+    `1 NONE` is spurious.
+    
+    Is it possible `BType` is called TWICE?
+    
+    Let's check `FuncFParam` again.
+    ```java
+    public static Node parse() {
+        FuncFParam funcFParam = new FuncFParam();
+        funcFParam.parseAndAdd(NodeRegistry.B_TYPE);
+        // ...
+    }
+    ```
+    
+    Let's check `VarDecl` again.
+    ```java
+    public static Node parse() {
+        VarDecl varDecl = new VarDecl();
+        varDecl.parseAndAdd(NodeRegistry.B_TYPE);
+        // ...
+    }
+    ```
+    
+    If `CompUnit` correctly calls `FuncDef`, `BType` is called once with `INTTK`.
+    
+    Is it possible the error is in `CompUnit`'s handling of the transition between loops?
+    
+    Actually, look at `CompUnit` first loop.
+    If the source code has `void` at the beginning, the first loop is skipped.
+    
+    What if the `Lexer` is at the wrong position?
+    
+    Let's look at `Compiler.java`.
+    It reads the whole file.
+    
+    There is one subtle thing.
+    In `CompUnit`, the second loop:
+    ```java
+    while (Stream.of(LexType.VOIDTK, LexType.INTTK, LexType.CHARTK)
+            .anyMatch((o) -> o == Lexer.INSTANCE.getLexType())) {
+        if (Lexer.INSTANCE.getLexType() != LexType.INTTK) {
+            compUnit.parseAndAdd(NodeRegistry.FUNC_DEF);
+        } else {
+            Lexer.INSTANCE.next();
+            if (Lexer.INSTANCE.getLexType() == LexType.MAINTK) {
+                Lexer.INSTANCE.back();
+                break;
+            } else {
+                Lexer.INSTANCE.back();
+                compUnit.parseAndAdd(NodeRegistry.FUNC_DEF);
+            }
+        }
+    }
+    ```
+    
+    If `FuncDef` is called, it parses the function.
+    After `FuncDef` returns, the loop continues.
+    
+    If `FuncDef` encounters an error, it still returns.
+    
+    I suspect the issue might be related to `BType` being called in a context where it shouldn't, or `CompUnit` misidentifying `void` as start of a `Decl`.
+    
+    But `VOIDTK` is not in the first loop's check.
+    
+    Wait, look at `Decl` again.
+    ```java
+    if (Objects.requireNonNull(Lexer.INSTANCE.getLexType()) == LexType.CONSTTK) {
+        decl.parseAndAdd(NodeRegistry.CONST_DECL);
+    } else {
+        decl.parseAndAdd(NodeRegistry.VAR_DECL);
+    }
+    ```
+    
+    If `Decl` is called with `VOIDTK`, it calls `VarDecl`.
+    `VarDecl` calls `BType`.
+    `BType` fails with `NONE`.
+    
+    So `Decl` IS being called.
+    
+    Why?
+    
+    Maybe the first loop in `CompUnit` is NOT skipping `VOIDTK`?
+    
+    ```java
+    Stream.of(LexType.CONSTTK, LexType.INTTK, LexType.CHARTK)
+            .anyMatch((o) -> o == Lexer.INSTANCE.getLexType())
+    ```
+    
+    If `Lexer.INSTANCE.getLexType()` is `VOIDTK`, this is false.
+    
+    Is it possible `VOIDTK` is being mapped to something else?
+    `reserveWords.add("void");`
+    `LexType.VOIDTK` exists.
+    
+    Let's look at `CompUnit` again.
+    
+    Is it possible that the `break` in the first loop for `int main` case leaves the token stream in a state where the second loop doesn't run correctly?
+    
+    No, `break` exits the first loop. Second loop starts.
+    
+    There is a possibility that `CompUnit` is structured such that it tries to parse `Decl` BEFORE checking for `FuncDef` in some ambiguous cases? No, the loops are sequential.
+    
+    However, consider the input `void f(int a {}`.
+    
+    If I assume the code is correct, `1 NONE` shouldn't happen.
+    
+    Let's look at `BType` again.
+    
+    ```java
+    public static Node parse() {
+        BType bType = new BType();
+        if (Lexer.INSTANCE.getLexType() == LexType.INTTK ||
+            Lexer.INSTANCE.getLexType() == LexType.CHARTK) {
+            bType.parseAndAdd(NodeRegistry.TERMINAL);
+        } else {
+            processError(ErrorType.NONE);
+        }
+        return bType;
+    }
+    ```
+    
+    The error `NONE` is definitely from here.
+    
+    The only way `BType` sees `VOIDTK` is if `VarDecl` or `ConstDecl` is called.
+    `ConstDecl` requires `CONSTTK`.
+    `VarDecl` is called by `Decl` if not `CONSTTK`.
+    
+    So `Decl` is called with `VOIDTK`.
+    
+    Why is `Decl` called?
+    
+    Because `CompUnit` called `NodeRegistry.DECL`.
+    
+    Where?
+    
+    In the first loop:
+    ```java
+    compUnit.parseAndAdd(NodeRegistry.DECL);
+    ```
+    
+    This happens if:
+    1. Token is `CONSTTK`.
+    2. Token is `INTTK`/`CHARTK` AND next-next token is NOT `LPARENT`.
+    
+    If Token is `VOIDTK`, the first loop is skipped.
+    
+    Is it possible `VOIDTK` is considered `INTTK`? No.
+    
+    Wait! Look at the imports or Enum definitions.
+    
+    `LexType.VOIDTK` is distinct.
+    
+    Is it possible the `CompUnit` code provided in the prompt is NOT the code being run? No, I must debug the provided code.
+    
+    Let's look closely at `CompUnit` first loop again.
+    
+    ```java
+    while (Stream.of(LexType.CONSTTK, LexType.INTTK, LexType.CHARTK)
+            .anyMatch((o) -> o == Lexer.INSTANCE.getLexType())) {
+    ```
+    
+    If this loop is entered, it means token is `CONSTTK`, `INTTK`, or `CHARTK`.
+    
+    If the input is `void f...`, this loop is NOT entered.
+    
+    Then the second loop:
+    ```java
+    while (Stream.of(LexType.VOIDTK, LexType.INTTK, LexType.CHARTK)
+            .anyMatch((o) -> o == Lexer.INSTANCE.getLexType())) {
+    ```
+    This IS entered.
+    `VOIDTK` != `INTTK`.
+    `compUnit.parseAndAdd(NodeRegistry.FUNC_DEF);`
+    
+    So `FuncDef` is called.
+    
+    Inside `FuncDef`:
+    `FuncType` consumes `VOIDTK`.
+    `terminalCheck(IDENFR)` consumes `f`.
+    `terminalCheck(LPARENT)` consumes `(`.
+    Switch on `INTTK`.
+    `TERMINAL` consumes `INTTK`.
+    `FUNC_F_PARAMS` parses `a`.
+    `terminalCheck(RPARENT)` fails. Error `j`.
+    
+    So `1 j` is generated.
+    
+    Where is `1 NONE`?
+    
+    Is it possible `FuncFParam` calls `BType`? Yes.
+    Does `BType` fail? No, token is `INTTK`.
+    
+    Is it possible `FuncDef` calls `Decl`? No.
+    
+    Is it possible `CompUnit` calls `Decl` AFTER `FuncDef`?
+    No, `FuncDef` is inside a `while` loop. After `FuncDef` returns, the loop checks the next token.
+    The next token is `{` (from `void f(int a {}`).
+    `{` is not `VOIDTK`, `INTTK`, `CHARTK`.
+    Loop ends.
+    
+    Then `MainFuncDef` is called.
+    Token is `{`.
+    `MainFuncDef` expects `INTTK`.
+    `terminalCheck(INTTK)` fails.
+    Does it log an error?
+    `terminalCheck` with default `ErrorType.NONE`?
+    
+    ```java
+    public void terminalCheck(LexType lexType) {
+        terminalCheck(lexType, (o) -> {});
+    }
+    
+    public void terminalCheck(LexType lexType, Consumer<Node> callBack) {
+        terminalCheck(lexType, callBack, ErrorType.NONE);
+    }
+    ```
+    
+    Yes! `MainFuncDef.terminalCheck(LexType.INTTK)` uses the overload that defaults to `ErrorType.NONE`.
+    
+    ```java
+    public static Node parse() {
+        MainFuncDef mainFuncDef = new MainFuncDef();
+        mainFuncDef.terminalCheck(LexType.INTTK); // <--- HERE
+        // ...
+    }
+    ```
+    
+    So, after parsing `void f...` (which failed with `j`), the parser is at `{`.
+    It proceeds to `MainFuncDef`.
+    It expects `INTTK`.
+    It finds `{`.
+    It logs `NONE` at the current line number.
+    What is the current line number?
+    The lexer is at `{`.
+    In `void f(int a {}`, the `{` is on Line 1.
+    
+    So it logs `1 NONE`.
+    
+    Then `MainFuncDef` continues?
+    `terminalCheck` just logs error and returns?
+    No, `terminalCheck` implementation:
+    
+    ```java
+    public void terminalCheck(LexType lexType, Consumer<Node> callBack, ErrorType errorType) {
+        if (Lexer.INSTANCE.getLexType() == lexType) {
+            this.parseAndAdd(NodeRegistry.TERMINAL);
+            callBack.accept(this);
+        } else {
+            processError(errorType);
+        }
+    }
+    ```
+    
+    It does NOT consume the token if it fails.
+    So `MainFuncDef` continues.
+    `mainFuncDef.terminalCheck(LexType.MAINTK);`
+    Token is `{`. Fails. Logs `NONE` again?
+    
+    Wait, `MainFuncDef` calls `terminalCheck(INTTK)`. Fails. Logs `NONE`.
+    Then `terminalCheck(MAINTK)`. Fails. Logs `NONE`.
+    Then `terminalCheck(LPARENT)`. Fails. Logs `NONE`.
+    Then `terminalCheck(RPARENT, ErrorType.j)`. Fails. Logs `j`.
+    
+    So we would expect multiple `NONE`s.
+    
+    But the buggy output is `1 NONE`, `1 j`, `3 j`, `5 j`.
+    
+    Why only one `NONE`?
+    
+    Maybe `Config.DEBUG` or `PRINT` settings suppress some?
+    No, errors are printed immediately in `processError`.
+    
+    ```java
+    public void processError(ErrorType errorType) {
+        error = true;
+        errorList.add(new ErrorLog(lineNum, errorType));
+        if (Config.DEBUG) {
+            Config.ERR.println(new ErrorLog(lineNum, errorType));
+        }
+    }
+    ```
+    
+    If `MainFuncDef` fails 4 times, we should see 4 errors.
+    
+    However, the Expected Output is `1 j`, `3 j`, `5 j`.
+    This implies that for `void f(int a {}`, the parser should detect `1 j` and then STOP or SKIP to the next valid construct?
+    
+    Or, more likely, the parser should NOT proceed to `MainFuncDef` if `FuncDef` failed?
+    
+    But standard recursive descent doesn't stop.
+    
+    The key is that `MainFuncDef` is called UNCONDITIONALLY at the end of `CompUnit`.
+    
+    ```java
+    compUnit.parseAndAdd(NodeRegistry.MAIN_FUNC_DEF);
+    ```
+    
+    If the previous parsing left the token at `{` (Line 1), `MainFuncDef` will try to parse `{` as `int main...`.
+    It will fail.
+    
+    The error `1 NONE` comes from `MainFuncDef` failing to find `INTTK` at Line 1.
+    
+    To fix this, `CompUnit` should probably ensure that `MainFuncDef` is only parsed if the token is appropriate, OR `MainFuncDef` should handle errors differently, OR the parser should synchronize.
+    
+    But the specific request is to identify the location of the errors.
+    
+    The spurious `1 NONE` is caused by `MainFuncDef` being called when the current token is not `INTTK`.
+    
+    The code snippet where the error is likely located is `CompUnit.java` calling `MainFuncDef` unconditionally, or `MainFuncDef.java` not handling the error context correctly.
+    
+    However, the most direct cause of the `NONE` error is in `MainFuncDef.java` using `terminalCheck` which defaults to `NONE`.
+    
+    But the structural error is in `CompUnit.java` assuming the next thing is `MainFuncDef`.
+    
+    Given the format, I should output the code snippet.
+    
+    The `1 NONE` is generated in `MainFuncDef.parse()` at the first `terminalCheck`.
+    
+    <frontend/nodes/MainFuncDef.java>
+    ...
+    public static Node parse() {
+        MainFuncDef mainFuncDef = new MainFuncDef();
+        mainFuncDef.terminalCheck(LexType.INTTK);
+        mainFuncDef.terminalCheck(LexType.MAINTK);
+        mainFuncDef.terminalCheck(LexType.LPARENT);
+        mainFuncDef.terminalCheck(LexType.RPARENT, ErrorType.j);
+        mainFuncDef.parseAndAdd(NodeRegistry.BLOCK);
+        return mainFuncDef;
+    }
+    ...
+
+    And potentially `CompUnit.java` for calling it unconditionally.
+
+    <frontend/nodes/CompUnit.java>
+    ...
+        }
+        compUnit.parseAndAdd(NodeRegistry.MAIN_FUNC_DEF);
+        return compUnit;
+    }
+    ...
+
+    I will provide `MainFuncDef.java` as the primary source of the `NONE` error type usage, and `CompUnit.java` as the logical flow error. The prompt asks for "the code snippet where the error is likely to be located".
+
+    The `1 NONE` is specifically because `MainFuncDef` is invoked on invalid input.
+
+<frontend/nodes/MainFuncDef.java>
+package

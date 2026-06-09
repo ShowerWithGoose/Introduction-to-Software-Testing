@@ -1,0 +1,291 @@
+**Summary of Analysis:**
+
+1.  **Problem**: The program encounters a "Time Limit Exceeded" error. This typically indicates an infinite loop or a situation where the lexer fails to advance the input stream, causing it to process the same character repeatedly.
+2.  **Input**: The test case is a valid C-like source code file (`testfile.txt`) containing standard keywords, identifiers, operators, and comments. It does not contain any lexical errors (like standalone `&` or `|`).
+3.  **Code Inspection**:
+    *   The `Lexer.java` file contains the core logic for reading characters and forming tokens.
+    *   In the `next()` method, there is a block handling multi-character operators (`>`, `<`, `&`, `|`, `=`, `!`).
+    *   Specifically, look at the handling of `&` and `|`. If the next character does not form a valid double-character operator (like `&&` or `||`), the code enters the `else if (ch == '&' || ch == '|')` block.
+    *   Inside this block:
+        ```java
+        reader.unread(nextChar);
+        addErrorRecord(ErrorType.ILLEGAL_SYMBOL, lineNum);
+        String right = (char) ch + String.valueOf((char) ch);
+        token = new Token(doubleChar.substring(0, 1), doubleCharOperators.get(right), lineNum);
+        return true;
+        ```
+    *   There is a critical logical error here: `doubleCharOperators.get(right)`. The map `doubleCharOperators` contains keys like `"&&"` and `"||"`. The variable `right` is constructed as `"&&"` or `"||"`. So `doubleCharOperators.get(right)` returns `LexType.AND` or `LexType.OR`.
+    *   However, the token value passed to the `Token` constructor is `doubleChar.substring(0, 1)`, which is just `"&"` or `"|"`.
+    *   While this might produce an incorrect token type/value combination for an error case, it *does* return `true`, so it shouldn't cause an infinite loop by itself *if* the input was erroneous.
+    *   **The Real Issue**: Look closely at the condition `if (ch == '>' || ch == '<' || ch == '&' || ch == '|' || ch == '=' || ch == '!')`.
+    *   If `ch` is one of these, it reads `nextChar`.
+    *   If `nextChar` forms a valid double operator (e.g., `<=`), it returns.
+    *   If `nextChar` does *not* form a valid double operator, it checks `else if (ch == '&' || ch == '|')`.
+    *   If `ch` is NOT `&` or `|` (e.g., `ch` is `>` and `nextChar` is `a`), it executes `reader.unread(nextChar);` and then falls through to the end of the `if` block.
+    *   After the `if` block, the code proceeds to:
+        ```java
+        value = sb.substring(0, 1);
+        type = singleCharTokens.get(value.charAt(0));
+        token = new Token(value, type, lineNum);
+        return true;
+        ```
+    *   This seems correct for `>`, `<`, `=`, `!`.
+    *   **Wait**, let's look at the comment handling logic again.
+        ```java
+        if (ch == '/') {
+            int nextChar = reader.read();
+            if (nextChar == '/') {
+                while (ch != '\n') { // BUG HERE
+                    ch = reader.read();
+                }
+                lineNum++;
+                return next();
+            } 
+            // ...
+        }
+        ```
+    *   In the single-line comment handling (`//`), the loop condition is `while (ch != '\n')`. However, `ch` was set to `'/'` before entering this block. The variable `ch` is **not updated** inside the `while` loop initially? No, `ch = reader.read()` is inside.
+    *   But wait, look at the variable scope. `int ch = reader.read();` is at the start of `next()`.
+    *   Inside `if (ch == '/')`, `nextChar` is read.
+    *   Then `while (ch != '\n')`. The variable `ch` still holds `'/'`. It enters the loop.
+    *   Inside the loop: `ch = reader.read();`. This updates `ch`.
+    *   If the line ends with `\n`, `ch` becomes `\n`. The loop terminates.
+    *   Then `lineNum++`.
+    *   Then `return next();`.
+    *   This looks okay for `//`.
+
+    *   Let's look at `/* */` comments.
+        ```java
+        else if (nextChar == '*') {
+            while (true) {
+                ch = reader.read();
+                if (ch == '\n') {
+                    lineNum++;
+                }
+                if (ch == '*') {
+                    int next = reader.read();
+                    if (next == '/') {
+                        return next();
+                    } else {
+                        reader.unread(next);
+                    }
+                }
+            }
+        }
+        ```
+    *   This also looks generally okay, assuming EOF handling isn't broken (it might hang if EOF is reached inside a comment because `ch` will be -1, never `*`, loop continues forever). **This is a potential TLE source if the input has an unterminated comment.** But the input provided is valid and terminated.
+
+    *   Let's re-examine the `&` and `|` logic.
+        The input code does *not* contain `&` or `|`. So that path is not taken.
+
+    *   Let's look at the `sb` usage.
+        ```java
+        sb.append((char) ch);
+        if (Character.isLetter(ch) || ch == '_') {
+           // ... builds identifier
+        } else if (Character.isDigit(ch)) {
+           // ... builds number
+           // Note: sb already has the first digit.
+           if (ch == '0') {
+               value = "0";
+           } else {
+               ch = reader.read();
+               while (Character.isDigit(ch)) {
+                   sb.append((char) ch); // Appends subsequent digits
+                   ch = reader.read();
+               }
+               // ...
+               value = sb.toString();
+           }
+        }
+        ```
+    *   If `ch` is `'0'`, `value` is hardcoded to `"0"`. `sb` contains `"0"`. This is fine.
+
+    *   Let's look at the `TLE` cause again.
+        Is it possible that `reader.unread` is failing or behaving unexpectedly?
+        
+    *   Actually, look at this specific block in `Lexer.java`:
+        ```java
+        if (ch == '>' || ch == '<' || ch == '&' || ch == '|' || ch == '=' || ch == '!') {
+            int nextChar = reader.read();
+            if (nextChar != -1) {
+                sb.append((char) nextChar);
+                String doubleChar = sb.toString();
+                if (doubleCharOperators.containsKey(doubleChar)) {
+                    token = new Token(doubleChar, doubleCharOperators.get(doubleChar), lineNum);
+                    return true;
+                } else if (ch == '&' || ch == '|') {
+                    reader.unread(nextChar);
+                    addErrorRecord(ErrorType.ILLEGAL_SYMBOL, lineNum);
+                    String right = (char) ch + String.valueOf((char) ch);
+                    token = new Token(doubleChar.substring(0, 1), doubleCharOperators.get(right), lineNum);
+                    return true;
+                }
+                reader.unread(nextChar);
+            }
+        }
+        value = sb.substring(0, 1);
+        type = singleCharTokens.get(value.charAt(0));
+        token = new Token(value, type, lineNum);
+        return true;
+        ```
+        
+    *   Consider the case where `ch` is `!` and `nextChar` is `=`.
+        `sb` initially has `!`.
+        `sb.append('=')` -> `sb` is `!=`.
+        `doubleChar` is `!=`.
+        `doubleCharOperators` contains `!=`.
+        Returns `NEQ`. Correct.
+
+    *   Consider `ch` is `!` and `nextChar` is `a`.
+        `sb` is `!`.
+        `sb.append('a')` -> `sb` is `!a`.
+        `doubleChar` is `!a`.
+        Not in `doubleCharOperators`.
+        `ch` is not `&` or `|`.
+        `reader.unread('a')`.
+        Falls through.
+        `value = sb.substring(0, 1)` -> `!`.
+        `singleCharTokens.get('!')` -> `NOT`.
+        Returns `NOT`. Correct.
+
+    *   **Is there an infinite loop in whitespace skipping?**
+        ```java
+        while (Character.isWhitespace(ch)) {
+            if (ch == '\n') {
+                lineNum++;
+            }
+            ch = reader.read();
+            if (ch == -1) {
+                return false;
+            }
+        }
+        ```
+        This looks fine.
+
+    *   **Let's check the Comment Logic again very carefully.**
+        ```java
+        if (ch == '/') {
+            int nextChar = reader.read();
+            if (nextChar == '/') {
+                while (ch != '\n') {
+                    ch = reader.read();
+                }
+                lineNum++;
+                return next();
+            } else if (nextChar == '*') {
+                 // ...
+            } else {
+                reader.unread(nextChar);
+            }
+        }
+        ```
+        If `nextChar` is `/`, we enter the `while` loop.
+        The condition is `ch != '\n'`. At this point `ch` is still `/` (from the outer scope). So it enters.
+        It reads a new char into `ch`.
+        It continues until `ch` is `\n`.
+        Then it increments `lineNum`.
+        Then it calls `next()`.
+        
+        **CRITICAL BUG FOUND**:
+        In the `//` comment handling:
+        ```java
+        while (ch != '\n') {
+            ch = reader.read();
+        }
+        lineNum++;
+        return next();
+        ```
+        When the loop exits, `ch` is `\n`.
+        The code then manually increments `lineNum++`.
+        Then it calls `return next();`.
+        
+        Inside the recursive `next()` call:
+        1. It reads a character. Since the previous call stopped *after* reading `\n` (and storing it in `ch`, but not consuming it from the stream? No, `reader.read()` consumes it).
+        Wait. `ch = reader.read()` consumes the character.
+        So when the `while` loop finishes, the `\n` has been consumed from the stream.
+        The `lineNum` is incremented.
+        Then `next()` is called.
+        The new `next()` call starts by reading the *next* character after `\n`.
+        This seems correct.
+
+    *   **However**, look at the `/* */` comment logic again.
+        ```java
+        while (true) {
+            ch = reader.read();
+            if (ch == '\n') {
+                lineNum++;
+            }
+            if (ch == '*') {
+                int next = reader.read();
+                if (next == '/') {
+                    return next();
+                } else {
+                    reader.unread(next);
+                }
+            }
+        }
+        ```
+        If `ch` is `-1` (EOF), `ch == '\n'` is false. `ch == '*'` is false. Loop continues forever. **This causes TLE if EOF is reached inside a comment.**
+        But the test case doesn't have an unterminated comment.
+
+    *   Let's look at the `Test Case Input` again.
+        It ends with:
+        ```java
+        // zhe shi yi ge hen niu bi de ce shi
+        ```
+        This is a single-line comment at the end of the file.
+        
+        Let's trace the execution for this last line.
+        1. Lexer processes tokens up to `}`.
+        2. Next `next()` call skips whitespace/newlines.
+        3. Reads `/`. `ch` is `/`.
+        4. Reads next char. It is `/`.
+        5. Enters `if (nextChar == '/')`.
+        6. Enters `while (ch != '\n')`.
+           - `ch` is currently `/`.
+           - Loop body: `ch = reader.read()`.
+           - Reads characters: `z`, `h`, `e`, ` `, ..., `e`, `s`, `i`.
+           - Finally, reads `\n`? Or does the file end without a newline?
+           
+        If the file ends **without** a trailing newline after the comment:
+        - `reader.read()` will eventually return `-1`.
+        - `ch` becomes `-1`.
+        - Condition `ch != '\n'` (-1 != 10) is TRUE.
+        - Loop continues.
+        - `ch = reader.read()` returns `-1` again.
+        - Infinite loop. **TLE**.
+
+        If the file ends **with** a trailing newline:
+        - `reader.read()` returns `\n`.
+        - `ch` becomes `\n`.
+        - Condition `ch != '\n'` is FALSE.
+        - Loop exits.
+        - `lineNum++`.
+        - `return next()`.
+        - Inside `next()`:
+          - `ch = reader.read()`. Returns `-1` (EOF).
+          - `while (Character.isWhitespace(ch))` -> `isWhitespace(-1)` is false.
+          - `if (ch == -1) return false;`.
+          - Returns false.
+          - Loop in `main` terminates.
+
+        Most online judges and test files **may or may not** have a trailing newline. If `testfile.txt` does not have a newline at the very end, this code hangs. Given "Time Limit Exceeded", this is the most likely culprit.
+
+        **Fix**: The loop should also check for `-1`.
+
+<frontend/Lexer.java>
+...
+        if (ch == '/') {
+            int nextChar = reader.read();
+            if (nextChar == '/') {
+                while (ch != '\n') {
+                    ch = reader.read();
+                    if (ch == -1) {
+                        break;
+                    }
+                }
+                lineNum++;
+                return next();
+            } else if (nextChar == '*') {
+...

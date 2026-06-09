@@ -1,0 +1,258 @@
+Looking at the test case input and the expected vs actual output, I can see that the program is missing error detection for line 3.
+
+Test Case Input:
+```
+void f(int a {} // error 1 (missing closing parenthesis)
+int main( { // error 2 (missing closing parenthesis)  
+    int a = 10;
+    f(a + 10; // error 3 (missing closing parenthesis)
+    return 0;
+}
+```
+
+Expected Output: `1 j`, `3 j`, `5 j`
+Actual Output: `1 j`, `5 j`
+
+The issue is that the parser is not detecting the missing closing parenthesis on line 3 in the function call `f(a + 10;`.
+
+Looking at the code, the problem appears to be in the `parseStmt()` method in `Parser.java`. When parsing a function call like `f(a + 10;`, the parser should detect that there's no closing parenthesis before the semicolon.
+
+In the `parseStmt()` method, there's a section that handles assignment statements with function calls:
+
+```java
+if (tokens.get().isOf(TokenType.GETINTTK, TokenType.GETCHARTK)) {
+    Token get = tokens.consume();
+    tokens.consumeExpect(TokenType.LPARENT);
+    Logger.logger.check(tokens.consumeExpect(TokenType.RPARENT), new ErrorItem(tokens.getBefore().getLineNum(), "j", "Stmt中缺少)"));
+    Logger.logger.check(tokens.consumeExpect(TokenType.SEMICN), new ErrorItem(tokens.getBefore().getLineNum(), "i", "Stmt中缺少;"));
+    return new GetStmt(lVal, get);
+}
+```
+
+However, this only handles `getint()` and `getchar()` calls. For general function calls like `f(a + 10)`, the parser treats it as an `AssignStmt` where the right-hand side is an expression. The function call `f(a + 10` would be parsed as part of the expression, but the missing closing parenthesis isn't being detected properly.
+
+Looking more closely at the `parseUnaryExp()` method, which handles function calls:
+
+```java
+// UnaryExp → PrimaryExp | Ident '(' [FuncRParams] ')' | UnaryOp UnaryExp // j
+private UnaryExp parseUnaryExp() {
+    if (tokens.get().isOf(TokenType.IDENFR)) {
+        if (tokens.ahead(1).isOf(TokenType.LPARENT)) {
+            Token ident = tokens.consumeExpect(TokenType.IDENFR);
+            tokens.consumeExpect(TokenType.LPARENT);
+
+            if (tokens.get().isOf(TokenType.RPARENT)) {
+                tokens.consume();
+                return new UnaryExp(ident);
+            } else {
+                int index = tokens.getIndex();
+                Exp exp = tryParser.tryParseExp();
+                if (exp == null) {
+                    Logger.logger.error(new ErrorItem(tokens.getBefore().getLineNum(), "j", "UnaryExp中缺少)"));
+                    return new UnaryExp(ident);
+                } else {
+                    if (tokens.get().isOf(TokenType.ASSIGN)) {
+                        tokens.setIndex(index);
+                        Logger.logger.error(new ErrorItem(tokens.getBefore().getLineNum(), "j", "UnaryExp中缺少)"));
+                        return new UnaryExp(ident);
+                    } else {
+                        tokens.setIndex(index);
+                        FuncRParams funcRParams = parseFuncRParams();
+                        Logger.logger.check(tokens.consumeExpect(TokenType.RPARENT), new ErrorItem(tokens.getBefore().getLineNum(), "j", "UnaryExp中缺少)"));
+                        return new UnaryExp(ident, funcRParams);
+                    }
+                }
+            }
+        } else {
+            return new UnaryExp(parsePrimaryExp());
+        }
+    } else if (tokens.get().isOf(TokenType.LPARENT, TokenType.INTCON, TokenType.CHRCON)) {
+        return new UnaryExp(parsePrimaryExp());
+    } else {
+        UnaryOp unaryOp = parseUnaryOp();
+        UnaryExp unaryExp = parseUnaryExp();
+        return new UnaryExp(unaryOp, unaryExp);
+    }
+}
+```
+
+The issue is in the logic that checks for `TokenType.ASSIGN`. In the test case `f(a + 10;`, after parsing the expression `a + 10`, the next token is `SEMICN` (semicolon), not `ASSIGN`. So the condition `if (tokens.get().isOf(TokenType.ASSIGN))` is false, and it goes to the else branch where it tries to parse `FuncRParams` and then expects a closing parenthesis.
+
+However, the problem is that when `parseFuncRParams()` is called, it will consume tokens until it can't form a valid parameter list, but it doesn't handle the case where the closing parenthesis is missing and instead encounters a semicolon.
+
+Looking at the `parseFuncRParams()` method:
+
+```java
+// FuncRParams → Exp { ',' Exp }
+private FuncRParams parseFuncRParams() {
+    ArrayList<Exp> exps = new ArrayList<>();
+    do {
+        exps.add(parseExp());
+    } while (tokens.consumeExpect(TokenType.COMMA) != null);
+    return new FuncRParams(exps);
+}
+```
+
+This method doesn't check for the closing parenthesis - it just keeps parsing expressions separated by commas until it can't. Then back in `parseUnaryExp()`, it tries to consume the closing parenthesis with `Logger.logger.check(tokens.consumeExpect(TokenType.RPARENT), ...)`, which should detect the missing parenthesis.
+
+But wait, let me trace through what happens with `f(a + 10;`:
+
+1. `parseStmt()` sees `f` (IDENFR) followed by `(`, so it parses `LVal` as just `f`
+2. Then it sees `=`? No, there's no `=` in `f(a + 10;` - this is actually a function call statement, not an assignment!
+
+Ah, that's the real issue! The input `f(a + 10;` is a function call statement, not an assignment. But the grammar shows that function calls can only appear as part of expressions, and standalone function calls should be parsed as `ExpStmt` (expression statements).
+
+So `f(a + 10;` should be parsed as an `ExpStmt` containing an expression that is a function call.
+
+In `parseStmt()`, the default case handles this:
+
+```java
+default:
+    int index = tokens.getIndex();
+    Exp exp = tryParser.tryParseExp();
+    if (tokens.get().isOf(TokenType.ASSIGN)) {
+        // handle assignment
+    } else if (exp != null) {
+        tokens.setIndex(index);
+        exp = parseExp();
+        Logger.logger.check(tokens.consumeExpect(TokenType.SEMICN), new ErrorItem(tokens.getBefore().getLineNum(), "i", "Stmt中缺少;"));
+        return new ExpStmt(exp);
+    } else {
+        // handle empty statement
+    }
+```
+
+So `tryParser.tryParseExp()` should successfully parse `f(a + 10` as an expression (function call), then it calls `parseExp()` which calls `parseAddExp()`, etc., eventually calling `parseUnaryExp()` for the function call.
+
+In `parseUnaryExp()`, when it tries to parse `f(a + 10`, it will:
+1. Consume `f` and `(`
+2. Parse `FuncRParams` which parses `a + 10` as an expression
+3. Then try to consume `)` but finds `;` instead
+4. This should trigger the error check: `Logger.logger.check(tokens.consumeExpect(TokenType.RPARENT), new ErrorItem(tokens.getBefore().getLineNum(), "j", "UnaryExp中缺少)"));`
+
+The `tokens.getBefore().getLineNum()` should give the line number of the last consumed token, which would be the `10` token on line 3.
+
+But why isn't this error being reported? Let me check the `consumeExpect` method in `TokenList.java`:
+
+```java
+public Token consumeExpect(TokenType... types) {
+    Token token = tokenLists.get(index);
+    if (!token.isOf(types)) {
+        return null;
+//            TODO:
+//            throw new SyntaxException("Expected " + types + " but got " + token.type);
+    }
+    index++;
+    return token;
+}
+```
+
+And the `Logger.check()` method:
+
+```java
+public <T> T check(T obj, ErrorItem error) {
+    if (obj == null) {
+        error(error);
+    }
+    return obj;
+}
+```
+
+So when `tokens.consumeExpect(TokenType.RPARENT)` returns `null` (because it found `SEMICN` instead of `RPARENT`), the `Logger.check()` should log the error.
+
+The issue might be with `tokens.getBefore().getLineNum()`. Let's see what `getBefore()` returns:
+
+```java
+public Token getBefore() {
+    return index > 0 ? tokenLists.get(index - 1) : null;
+}
+```
+
+When we're at the point where we expect `)`, the `index` points to the `SEMICN` token. So `getBefore()` returns the token before `SEMICN`, which should be the `10` token, which is on line 3.
+
+This should work correctly. But looking more carefully at the test case:
+
+The third error is on line 5 in the expected output, not line 3. Wait, let me recount:
+
+```
+1: void f(int a {} // error 1
+2: 
+3: int main( { // error 2  
+4:     int a = 10;
+5:     f(a + 10; // error 3
+6:     return 0;
+7: }
+```
+
+Actually, line 5 contains `f(a + 10;`, so the expected output shows error on line 5, which matches. The actual output shows `5 j`, so that error IS being detected.
+
+Wait, I misread the outputs:
+- Expected: `1 j`, `3 j`, `5 j`  
+- Actual: `1 j`, `5 j`
+
+So the missing error is on line 3, not line 5. Line 3 is `int main( {`.
+
+Looking at line 3: `int main( {`
+This should be `int main() {`, so it's missing the closing parenthesis after `(`.
+
+In `parseMainFuncDef()`:
+
+```java
+//MainFuncDef → 'int' 'main' '(' ')' Block // j
+private MainFuncDef parseMainFuncDef() {
+    tokens.consumeExpect(TokenType.INTTK);
+    tokens.consumeExpect(TokenType.MAINTK);
+    tokens.consumeExpect(TokenType.LPARENT);
+    tokens.consumeExpect(TokenType.RPARENT);
+    Block body = parseBlock();
+    return new MainFuncDef(body);
+}
+```
+
+Here, `tokens.consumeExpect(TokenType.RPARENT)` will fail because after `(`, the next token is `{`, not `)`. So it should return `null`, but there's no error checking here!
+
+That's the bug! In `parseMainFuncDef()`, the call to `tokens.consumeExpect(TokenType.RPARENT)` is not wrapped with `Logger.logger.check()`, so when it fails (returns `null`), no error is reported.
+
+Similarly, looking at `parseFuncDef()`:
+
+```java
+//FuncDef → FuncType Ident '(' [FuncFParams] ')' Block // j
+private FuncDef parseFuncDef() {
+    FuncType funcType = parseFuncType();
+    Token ident = tokens.consumeExpect(TokenType.IDENFR);
+    tokens.consumeExpect(TokenType.LPARENT);
+    if (tokens.get().isOf(TokenType.RPARENT)) {
+        tokens.consume();
+        Block body = parseBlock();
+        return new FuncDef(funcType, ident, body);
+    } else {
+        if (tokens.get().isOf(TokenType.LBRACE)) {
+            Logger.logger.error(new ErrorItem(tokens.getBefore().getLineNum(), "j", "FuncDef中缺少)"));
+            Block body = parseBlock();
+            return new FuncDef(funcType, ident, body);
+        } else {
+            FuncFParams funcFParams = parseFuncFParams();
+            Logger.logger.check(tokens.consumeExpect(TokenType.RPARENT), new ErrorItem(tokens.getBefore().getLineNum(), "j", "FuncDef中缺少)"));
+            Block body = parseBlock();
+            return new FuncDef(funcType, ident, funcFParams, body);
+        }
+    }
+}
+```
+
+In `parseFuncDef()`, there IS error checking for the missing parenthesis, which is why line 1 error is detected.
+
+But in `parseMainFuncDef()`, there's NO error checking.
+
+<frontend/Parser.java>
+...
+    //MainFuncDef → 'int' 'main' '(' ')' Block // j
+    private MainFuncDef parseMainFuncDef() {
+        tokens.consumeExpect(TokenType.INTTK);
+        tokens.consumeExpect(TokenType.MAINTK);
+        tokens.consumeExpect(TokenType.LPARENT);
+        tokens.consumeExpect(TokenType.RPARENT);
+        Block body = parseBlock();
+        return new MainFuncDef(body);
+    }
+...

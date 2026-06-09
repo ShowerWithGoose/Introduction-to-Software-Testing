@@ -1,0 +1,304 @@
+Based on the problem description and the provided code, the issue is that the program produces **no output file** (`parser.txt` or `error.txt`).
+
+Looking at `Compiler.java`:
+1. It reads `testfile.txt`.
+2. It runs the Lexer.
+3. It runs the Parser.
+4. It checks `tokenErrors.isEmpty()`.
+5. If empty, it writes to `parser.txt`. If not, it writes to `error.txt`.
+
+The fact that there is **no output file** suggests that an exception occurred during execution before the file writing logic completed, or the program crashed. However, a more subtle logical error often leads to "Wrong Answer" or empty/incorrect output in these types of assignments.
+
+Let's look closely at `Parser.java`. The `parseCompUnit` method calls `parseDecl`, `parseFuncDef`, and `parseMainFuncDef`.
+
+In `parseMainFuncDef`:
+```java
+public TreeNode parseMainFuncDef(Token token) {
+    ArrayList<TreeNode> nodes = new ArrayList<>();
+    nodes.add(token);
+    nodes.add(tokens.getNext()); // 'main'
+    nodes.add(tokens.getNext()); // '('
+    Token token1 = tokens.getNext();
+    if (token1.getTokenType() != TokenType.RPARENT) {
+        tokens.backLast();
+        tokenErrors.add(new tokenError(getErrorLine('j',nodes),"j"));
+    }
+    nodes.add(token1);
+    nodes.add(parseBlock(tokens.getNext())); // '{'
+    return new MainFuncDefNode(nodes);
+}
+```
+
+In `parseFuncDef`:
+```java
+public TreeNode parseFuncDef(Token token) {
+    ArrayList<TreeNode> nodes = new ArrayList<>();
+    nodes.add(parseFuncType(token));
+    nodes.add(tokens.getNext()); // ident
+    nodes.add(tokens.getNext()); // '('
+    Token t = tokens.getNext();
+    if (t.getTokenType() != TokenType.RPARENT && t.getTokenType() != TokenType.LBRACE) {
+        nodes.add(parseFuncFParams(t));
+        t = tokens.getNext();
+    }
+    if (t.getTokenType() != TokenType.RPARENT) {
+        tokens.backLast();
+        tokenErrors.add(new tokenError(getErrorLine('j',nodes),"j"));
+    } else {
+        nodes.add(t); // ')'
+    }
+
+    nodes.add(parseBlock(tokens.getNext()));
+    return new FuncDefNode(nodes);
+}
+```
+
+The critical issue lies in how `parseCompUnit` determines when to stop parsing declarations and start parsing function definitions, and specifically how it identifies the `main` function.
+
+```java
+public TreeNode parseCompUnit() {
+    ArrayList<TreeNode> nodes = new ArrayList<>();
+    Token token = tokens.getNext();
+    while (isDecl(token)) {
+        nodes.add(parseDecl(token));
+        token = tokens.getNext();
+    }
+    while (!isMain(token)) {
+        nodes.add(parseFuncDef(token));
+        token = tokens.getNext();
+    }
+    nodes.add(parseMainFuncDef(token));
+    return new CompUnitNode(nodes);
+}
+```
+
+The `isMain` method looks ahead:
+```java
+public boolean isMain(Token token) {
+    Token t = tokens.getNext();
+    if (token.getTokenType() == TokenType.INTTK && t.getTokenType() == TokenType.MAINTK) {
+        tokens.backLast();
+        return true;
+    }
+    tokens.backLast();
+    return false;
+}
+```
+
+If the input is valid, this logic seems okay. However, let's look at `isDecl`.
+```java
+public boolean isDecl(Token token) {
+    if (token.getTokenType() == TokenType.CONSTTK) {
+        return true;
+    }
+    Token token1 = tokens.getNext();
+    Token token2 = tokens.getNext();
+    if (token2.getTokenType() == TokenType.LPARENT) {
+        tokens.backLast();
+        tokens.backLast();
+        return false;
+    }
+    /*
+    if (token1.getTokenType() == TokenType.MAINTK) {
+        tokens.backLast();
+        tokens.backLast();
+        return false;
+    }*/
+    tokens.backLast();
+    tokens.backLast();
+    return true;
+}
+```
+
+There is a commented-out check for `MAINTK` in `isDecl`. If `isDecl` encounters `int main`, it sees `int` (token), then `main` (token1), then `(` (token2). Since `token2` is `LPARENT`, it returns `false`. This correctly stops the decl loop.
+
+Then `parseCompUnit` enters the `while (!isMain(token))` loop.
+The current `token` is `int`. `isMain(int)` checks next token `main`. It matches. So `isMain` returns `true`.
+The loop `while (!isMain(token))` does **not** execute.
+Then `parseMainFuncDef(token)` is called with `token` being `int`.
+
+This logic seems correct for the happy path.
+
+However, consider the case where there are **no** declarations and **no** function definitions before main, or just function definitions.
+
+Let's look at the `Lexer` again.
+In `Symbol` method, handling comments:
+```java
+            case '/':
+                if (content.charAt(index + 1) == '/') {
+                    // ... skip line comment
+                } else if (content.charAt(index + 1) == '*'){
+                    index++;
+                    index++;
+                    int pre_index3 = index;
+                    index++;
+                    while (content.charAt(index) != '/'  || content.charAt(pre_index3) != '*') {
+                        if (content.charAt(pre_index3) == '\n') {
+                            numLine++;
+                        }
+                        pre_index3 = index;
+                        index++;
+                    }
+                    index++;
+                }
+                else {
+                    index++;
+                    tokens.add(new Token("/",TokenType.DIV,numLine));
+
+                }
+                break;
+```
+There is a potential **IndexOutOfBoundsException** in the comment skipping logic if the file ends abruptly inside a comment, or if `index` goes out of bounds in the `while` loop condition `content.charAt(index)`. The loop condition checks `content.charAt(index)` without verifying `index < content.length()`. If the comment is not closed properly at the end of the file, this will crash.
+
+Similarly in `catchIdent` and `catchIntConst`, there are no bounds checks inside the `while` loops:
+```java
+    public void catchIntConst(String content) {
+        StringBuilder temp = new StringBuilder();
+        while (content.charAt(index) >= '0' && content.charAt(index) <= '9') {
+            temp.append(content.charAt(index));
+            index++;
+        }
+        // ...
+    }
+```
+If the file ends with a digit, `index` increments, and the next `while` condition check `content.charAt(index)` will throw an exception because `index == content.length()`.
+
+The same applies to `catchIdent`:
+```java
+    public void catchIdent(String content) {
+        StringBuilder temp = new StringBuilder();
+        temp.append(content.charAt(index));
+        index++;
+        while (classifier(content.charAt(index))) { // No bounds check!
+            temp.append(content.charAt(index));
+            index++;
+        }
+        // ...
+    }
+```
+
+And in `tokenize`:
+```java
+        while (index < content.length()) {
+            while (index < content.length() && (content.charAt(index) == '\n' || content.charAt(index) == ' ' )) {
+                // ...
+            }
+            if (index >= content.length()) {
+                break;
+            }
+            // ...
+            if (classifier(content.charAt(index))) {
+                notSymbol(content);
+            } else {
+                Symbol(content);
+            }
+        }
+```
+Inside `notSymbol` or `Symbol`, if we enter `catchIdent` or `catchIntConst`, the internal `while` loops do not check `index < content.length()`.
+
+For example, if the last character of the file is `a` (part of an identifier), `catchIdent` is called.
+1. `temp.append('a')`, `index++`.
+2. `while (classifier(content.charAt(index)))` -> `index` is now `length`. `content.charAt(index)` throws `StringIndexOutOfBoundsException`.
+
+This crash explains why there is **no output file**. The program terminates due to an unhandled exception during Lexical Analysis.
+
+<Lexer.java>
+...
+    public void catchIntConst(String content) {
+        StringBuilder temp = new StringBuilder();
+        while (index < content.length() && content.charAt(index) >= '0' && content.charAt(index) <= '9') {
+            temp.append(content.charAt(index));
+            index++;
+        }
+        //index --;
+        tokens.add(new Token(temp.toString(),TokenType.INTCON,numLine));
+    }
+    public void catchIdent(String content) {
+        StringBuilder temp = new StringBuilder();
+        temp.append(content.charAt(index));
+        index++;
+        while (index < content.length() && classifier(content.charAt(index))) {
+            temp.append(content.charAt(index));
+            index++;
+        }
+        tokens.add(new Token(temp.toString(),TokenType.IDENFR,numLine));
+    }
+
+    public void Symbol(String content) {
+...
+            case '/':
+                if (content.charAt(index + 1) == '/') {
+                    index++;
+                    index++;
+                    while (index < content.length() && content.charAt(index) != '\n') {
+                        index++;
+                    }
+                    if (index < content.length()) {
+                        numLine++;
+                        index++;
+                    }
+                } else if (content.charAt(index + 1) == '*'){
+                    index++;
+                    index++;
+                    int pre_index3 = index;
+                    index++;
+                    while (index < content.length() && (content.charAt(index) != '/'  || content.charAt(pre_index3) != '*')) {
+                        if (content.charAt(pre_index3) == '\n') {
+                            numLine++;
+                        }
+                        pre_index3 = index;
+                        index++;
+                    }
+                    if (index < content.length()) {
+                        index++;
+                    }
+                }
+                else {
+                    index++;
+                    tokens.add(new Token("/",TokenType.DIV,numLine));
+
+                }
+                break;
+...
+            case '\'':
+                StringBuilder temp = new StringBuilder();
+                int pre_index = index;
+                temp.append(content.charAt(index));
+                index++;
+                int check = 0;
+                while (index < content.length() && (content.charAt(index) != '\'' || (content.charAt(pre_index) == '\\' && check == 0))) {
+                    temp.append(content.charAt(index));
+                    if ((content.charAt(pre_index) == '\\' && content.charAt(index) == '\\')) {
+                        check = 1;
+                    }
+                    pre_index = index;
+                    index++;
+                }
+                if (index < content.length()) {
+                    temp.append(content.charAt(index));
+                    index++;
+                }
+                tokens.add(new Token(temp.toString(),TokenType.CHRCON,numLine));
+                break;
+
+            case '\"':
+                StringBuilder temp2 = new StringBuilder();
+                int pre_index2 = index;
+                temp2.append(content.charAt(index));
+                index++;
+                int check1 = 0;
+                while (index < content.length() && (content.charAt(index) != '\"' || content.charAt(pre_index2) == '\\' && check1 == 0)) {
+                    temp2.append(content.charAt(index));
+                    if ((content.charAt(pre_index2) == '\\' && content.charAt(index) == '\\')) {
+                        check1 = 1;
+                    }
+                    pre_index2 = index;
+                    index++;
+                }
+                if (index < content.length()) {
+                    temp2.append(content.charAt(index));
+                    index++;
+                }
+                tokens.add(new Token(temp2.toString(),TokenType.STRCON,numLine));
+                break;
+...

@@ -1,0 +1,181 @@
+Based on the problem description and test case input, the compilation error occurs because `g++` is not found, but that's just the environment issue. The actual **lexical analysis logic error** relevant to the assignment is in handling **error type 'a'**, which corresponds to standalone `&` or `|` symbols.
+
+Looking at the provided code, in `<lexer.cpp>`, the handling of `&` and `|` correctly detects the error and adds an error entry. However, **after detecting the error, it still pushes a dummy token ("HELL") into the token list**, and later during output, tokens with type `Null` are skipped — so the error reporting itself seems okay.
+
+But there's a **critical flaw**: when an error is detected (like a single `&`), the lexer should **not continue producing tokens normally afterward**, or more importantly, **the program must output only to `error.txt` and not to `lexer.txt`** if any lexical error exists.
+
+However, in the `run()` function in `<lexer.cpp>`, **both files may be written**: it always writes valid tokens to `lexer.txt`, and if there are errors, it also writes to `error.txt`. According to the problem statement:
+
+> For an erroneous source program, output the line number [...] into **error.txt**.
+
+This implies: **if there is any lexical error, only `error.txt` should be produced; `lexer.txt` should not be output at all.**
+
+But the current code outputs `lexer.txt` regardless, and then appends `error.txt` if errors exist. That violates the spec.
+
+However, the test case says: "Each erroneous example will have exactly one error", and expected behavior is to output **only** to `error.txt`.
+
+But wait — the **immediate cause** of failure in many automated judges is often **incorrect handling of the error condition during scanning**, especially **not stopping or misreporting**.
+
+Yet looking more closely at the **character constant parsing (`chrcon`)** in `<lexer.cpp>`, there is a **clear bug**:
+
+### In `chrcon()`:
+```cpp
+void Lexer::chrcon() {
+    std::string chr = "";
+    pos++;
+    // 需要考虑转义字符
+    if (source[pos] == '\\') {
+        std::string chr1 = "";
+        chr1.push_back(source[pos++]);
+        chr1 = "\'" + chr1 + "\'";
+        tokens.push_back(Token{chr1, Token::TokenType::CHRCON, line_number}); // '\''
+        chr.push_back(source[pos]);
+        pos +=2;
+        tokens.push_back(Token{chr, Token::TokenType::CHRCON, line_number});
+    } else {
+        chr.push_back(source[pos]);
+        pos +=2;
+        chr = "\'" + chr + "\'";
+        tokens.push_back(Token{chr, Token::TokenType::CHRCON, line_number});
+    }
+}
+```
+
+This logic is **fundamentally broken**:
+
+- If it sees `'\\'`, it:
+  1. Pushes a token for `'\'` (which is incomplete — it should include the next char like `\n`, `\\`, etc.)
+  2. Then reads `source[pos]` (now after `\`) and pushes **another** character as a separate char const.
+  3. Does `pos += 2` after already incrementing `pos` once → **over-skipping**
+- In the `else` branch: it does `pos += 2`, assuming the next char is the closing `'`, but **does not check** if `source[pos + 1]` is actually `'`.
+
+Moreover, **it never validates that the character constant is properly closed**. For example, input like `'a` (missing closing quote) should be an error, but this code assumes it's always followed by a `'` and blindly does `pos += 2`.
+
+But the problem states: **"Each erroneous example will contain only lexical analysis errors"** and **only error type 'a' is defined** in the table. So perhaps char/str errors are not tested? However, the presence of malformed logic here could cause crashes or wrong tokenization.
+
+But the **most likely location of the error** that matches **error type 'a'** is actually handled correctly in the `&` and `|` cases.
+
+Wait — the **real issue** is subtler.
+
+Look at this part in `next()`:
+
+```cpp
+else if (ch == '\n') {
+    line_number++;
+    pos++;
+    tokens.push_back({"HELL", Token::TokenType::Null, line_number});
+}
+```
+
+And also the final `else`:
+
+```cpp
+else {
+    pos++;
+    tokens.push_back({"HELL", Token::TokenType::Null, line_number});
+}
+```
+
+These push `Null` tokens, which are later skipped. That’s fine.
+
+But now consider: what if the input contains a single `&`?
+
+Example test input (implied by error type 'a'):  
+`if(1 & 2)`
+
+The lexer should:
+- Detect `&` is not followed by `&`
+- Report error 'a' at correct line
+- **Not produce any token output file (`lexer.txt`)**, only `error.txt`
+
+But the current `run()` function **always writes `lexer.txt`**, even if there are errors.
+
+According to the problem:
+> For a correct source program, output [...] into **lexer.txt**  
+> For an erroneous source program, output [...] into **error.txt**
+
+So **mutually exclusive output files**.
+
+Thus, the bug is in `run()`: it should **not write `lexer.txt` if there are any errors**.
+
+But the problem also says: "each erroneous example will have exactly one error", so we can check `!errors.empty()` and **skip writing `lexer.txt`**.
+
+However, the **test case input shown is**:
+```
+/bin/sh: 1: g++: not found
+```
+
+That suggests the program didn't even compile. But that’s environment.
+
+But the **actual logical error in code** that would cause **wrong output format** is in the **error reporting logic**.
+
+Yet, looking back, the **most concrete bug** is in **`chrcon()`**, because:
+
+- It **always assumes** that after the opening `'`, there is exactly one character and then a closing `'`.
+- It does `pos += 2` in the `else` branch, meaning: read one char, then skip next two positions — but if the input is `'a'`, then:
+  - pos at `'`
+  - pos++ → at `a`
+  - chr = "a"
+  - pos += 2 → now at position after `'` (good)
+- But if input is `'ab'`, it will treat `a` as the char, skip `b` and whatever is after.
+- Worse: if input is `'`, then `source[pos]` is beyond string → **undefined behavior**.
+
+But again, the problem says only error type 'a' exists in tests.
+
+So perhaps the real issue is elsewhere.
+
+Wait! Look at the **handling of `&`**:
+
+```cpp
+else if (ch == '&') {
+    if (source[pos + 1] == '&') {
+        pos += 2;
+        tokens.push_back(Token{"&&", Token::AND, line_number});
+    } else { // Error! type: a
+        pos++;
+        errors.push_back(Error(line_number, 'a'));
+        tokens.push_back(Token{"HELL", Token::TokenType::Null, line_number});
+    }
+}
+```
+
+What if `&` is the **last character** in the file? Then `source[pos + 1]` is out of bounds → **undefined behavior (possibly crash or wrong read)**.
+
+Same for `|`, `!`, `<`, `>`, `=`, etc.
+
+So the code **does not check bounds** before accessing `source[pos + 1]`.
+
+This is a **critical error**.
+
+For example, if input ends with `&`, then `source[pos + 1]` is invalid.
+
+Thus, **all lookaheads must check `pos + 1 < source.length()`**.
+
+This is likely the source of runtime error or incorrect behavior.
+
+Given that, the **error is in multiple places**, but most relevant to error type 'a' is in the `&` and `|` handling.
+
+So the **code snippet with error** is in `<lexer.cpp>` in the `next()` function, specifically the parts handling `&` and `|` without bounds checking.
+
+<lexer.cpp>
+...
+    else if (ch == '&') {
+        if (source[pos + 1] == '&') {
+            pos += 2;
+            tokens.push_back(Token{"&&", Token::AND, line_number});
+        } else { // Error! type: a
+            pos++;
+            errors.push_back(Error(line_number, 'a'));
+            tokens.push_back(Token{"HELL", Token::TokenType::Null, line_number});
+        }
+    } else if (ch == '|') {
+        if (source[pos + 1] == '|') {
+            pos += 2;
+            tokens.push_back(Token{"||", Token::OR, line_number});
+        } else { // Error! type: a
+            pos++;
+            errors.push_back(Error(line_number, 'a'));
+            tokens.push_back(Token{"HELL", Token::TokenType::Null, line_number});
+        }
+    }
+...

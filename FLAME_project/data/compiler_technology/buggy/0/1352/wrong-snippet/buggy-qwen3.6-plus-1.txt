@@ -1,0 +1,506 @@
+Based on the comparison between the Buggy Output and the Expected Output, the program fails to output the final token `RBRACE }` corresponding to the closing brace of the `main` function.
+
+The issue lies in the `lexicalAnalysis` method in `frontend/Lexer.java`. The loop condition `while (curPos < codeLength)` combined with the logic inside `next()` causes the last character (or the token containing it) to be skipped or not processed correctly if it doesn't trigger a state that advances `curPos` past the end in a way that allows the final token creation block to execute for the very last symbol before EOF.
+
+Specifically, looking at the `next()` method:
+1. It processes characters.
+2. At the end of `next()`, it creates a token if `word` is not empty.
+3. However, the main loop in `lexicalAnalysis` calls `next()` then `getChar()`.
+4. If `next()` processes the last character `}`, it adds it to `word`. Then `getChar()` is called in the loop. If `curPos` becomes equal to `codeLength`, `getChar()` returns without changing `currentSym` (or handles boundary).
+5. The loop condition `curPos < codeLength` checks *before* the next iteration.
+6. The critical bug is likely that when the file ends with a non-whitespace character (like `}`), the logic inside `next()` might rely on reading *ahead* or the loop structure misses the final flush if the cursor moves exactly to the end.
+
+Let's look closer at `next()`:
+```java
+    public boolean next() {
+        // ... skipping spaces/newlines ...
+        
+        // ... processing logic ...
+        
+        // At the end:
+        if (Token.isReversedContained(word)) {
+            lexType = reserve();
+        }
+        if (!word.isEmpty()) {
+            Token token = new Token(word, lexType, lineNum);
+            tokenList.add(token);
+        }
+
+        return true;
+    }
+```
+
+And `lexicalAnalysis`:
+```java
+    public void lexicalAnalysis() {
+        if (codeLength == 0) {
+            return;
+        }
+        getChar(); // Reads first char
+        while (curPos < codeLength) {
+            next(); 
+            getChar(); // Reads next char
+        }
+
+        printLexicalResult();
+    }
+```
+
+Trace for the last character `}`:
+1. Suppose `curPos` is at the index of `}`.
+2. Loop condition `curPos < codeLength` is true.
+3. `next()` is called.
+   - Inside `next()`, it processes `}`. `catToken()` adds `}` to `word`.
+   - It hits the `else if (currentSym == '}')` block.
+   - It does NOT call `getChar()` inside this specific block (unlike identifiers or numbers which look ahead).
+   - It reaches the end of `next()`, creates the token for `}`, and adds it to `tokenList`.
+   - Returns `true`.
+4. Back in `lexicalAnalysis`, `getChar()` is called.
+   - `curPos` increments. Now `curPos == codeLength`.
+   - `currentSym` might remain `}` or become undefined depending on `getChar` implementation (it returns if `curPos >= codeLength`).
+5. Loop condition `curPos < codeLength` is now false.
+6. Loop terminates.
+7. `printLexicalResult()` is called.
+
+Wait, if the token is added inside `next()`, it should be in the list. Why is it missing?
+
+Let's re-read the `next()` logic for `}`:
+```java
+        } else if (currentSym == '}') {
+            catToken();
+        }
+```
+It just cats the token. It doesn't advance `curPos`.
+So when `next()` finishes, `curPos` is still pointing at `}`.
+Then `getChar()` in `lexicalAnalysis` advances `curPos` to `codeLength`.
+The token WAS added.
+
+Let's look at the Buggy Output again.
+The last line is:
+`RETURNTK return`
+`INTCON 0`
+`SEMICN ;`
+
+It is missing:
+`RBRACE }`
+
+Let's look at the input file content provided in the test case:
+```java
+    return 0;
+
+}
+```
+There are newlines after `;`.
+
+Trace:
+1. Process `return`. `next()` consumes `r`,`e`,`t`,`u`,`r`,`n`. Lookahead fails digit/letter. Retract. Token created. `curPos` is at space after `return`.
+2. `getChar()` in loop reads space.
+3. Next iter: `next()` skips space. Skips newline?
+   ```java
+        if (isNewLine()) {
+            lineNum++;
+            if (curPos < codeLength)
+                getChar();
+            else
+                return true; 
+        }
+   ```
+   If it hits newline, it increments lineNum and gets next char.
+4. Eventually we get to `}`.
+   Suppose `curPos` is at `}`.
+   `next()` is called.
+   `isSpace`? No. `isNewLine`? No.
+   Hits `else if (currentSym == '}')`.
+   `catToken()`. `word` is `"}"`.
+   End of `next()`. Token `RBRACE }` is created and added.
+   `next()` returns.
+   `getChar()` in `lexicalAnalysis` is called. `curPos` becomes `codeLength`.
+   Loop ends.
+
+Why is it missing?
+
+Ah, look at `IOUtils.read`:
+```java
+    public static String read(String filename) throws IOException {
+        // ...
+        while (scanner.hasNextLine()) {
+            stringJoiner.add(scanner.nextLine());
+        }
+        // ...
+        return stringJoiner.toString();
+    }
+```
+`Scanner.nextLine()` strips the newline character `\n`.
+`StringJoiner("\n")` adds `\n` between elements.
+If the file ends with `}\n`, `scanner.hasNextLine()` might behave differently or the last newline might be stripped/not added if there's no subsequent line.
+Usually, `hasNextLine()` returns true if there is another line separator. If the file ends with `}\n`, there is an empty line after? Or just `}`?
+If the file is:
+```
+...
+return 0;
+
+}
+```
+If there is a trailing newline, `scanner` might read an empty string at the end?
+Regardless, the `source` string likely contains the `}`.
+
+Let's look closely at `next()` again. Is there a case where `word` is cleared but not refilled, or token not added?
+
+Wait, look at this block in `next()`:
+```java
+        if (Token.isReversedContained(word)) {
+            lexType = reserve();
+        }
+        if (!word.isEmpty()) {
+            Token token = new Token(word, lexType, lineNum);
+            tokenList.add(token);
+        }
+```
+
+Is it possible that `lexType` is not set correctly for `}`?
+`lexType` is initialized to `IDENFR` at class level.
+In the `}` branch:
+```java
+        } else if (currentSym == '}') {
+            catToken();
+        }
+```
+It does NOT set `lexType`.
+So `lexType` remains whatever it was from the previous token?
+Previous token was `SEMICN ;`.
+In the `;` branch:
+```java
+        } else if (currentSym == ';') {
+            catToken();
+        }
+```
+It also does NOT set `lexType`.
+
+Where is `lexType` set for single-char operators?
+It seems it is NOT set for most single-char operators like `;`, `,`, `(`, `)`, `[`, `]`, `{`, `}`, `+`, `-`, `*`, `%`.
+It IS set for:
+- Identifiers/Keywords (`reserve()`)
+- IntConst (`INTCON`)
+- StringConst (`STRCON`)
+- CharConst (`CHRCON`)
+- Comments (returns early)
+- `&`, `|` (sets `AND` or error)
+- `!` (sets `NEQ` or `NOT`)
+- `=` (sets `EQL` or `ASSIGN`)
+- `<` (calls `reserve()`)
+- `>` (calls `reserve()`)
+
+For `<` and `>`, it calls `reserve()`.
+`Token.reverser("<")` returns `LSS`.
+`Token.reverser(">")` returns `GRE`.
+
+But for `}`, `reserveWords` contains `"}"` -> `RBRACE`.
+So `Token.isReversedContained("}")` is true.
+`lexType = reserve()` will set it to `RBRACE`.
+
+So the logic *should* work.
+
+Let's look at the `getChar()` and `curPos` logic again.
+
+```java
+    public void lexicalAnalysis() {
+        if (codeLength == 0) {
+            return;
+        }
+        getChar(); // curPos becomes 1, currentSym is charAt(0)
+        while (curPos < codeLength) {
+            next(); 
+            getChar(); 
+        }
+        printLexicalResult();
+    }
+```
+
+If the file has `N` characters. Indices `0` to `N-1`.
+`getChar()` sets `currentSym` to `source[0]`, `curPos` becomes `1`.
+Loop runs while `curPos < N`.
+Last iteration: `curPos` is `N-1`? No.
+If `curPos` is `N-1`, loop enters.
+`next()` processes `source[N-1]`?
+Inside `next()`, `currentSym` is `source[N-1]`.
+It processes it.
+Does it advance `curPos`?
+For `}`, it does NOT advance `curPos` inside `next()`.
+So `curPos` remains `N-1`?
+No, `curPos` was `N-1` at start of loop.
+`getChar()` at end of loop increments `curPos` to `N`.
+Loop check `N < N` fails.
+Token for `source[N-1]` was added.
+
+What if the last character is preceded by whitespace?
+Input:
+```
+    return 0;
+
+}
+```
+Assume `}` is at index `K`.
+Whitespace/Newlines before it are skipped by `next()`.
+When `next()` skips a newline:
+```java
+        if (isNewLine()) {
+            lineNum++;
+            if (curPos < codeLength)
+                getChar(); // Advances curPos
+            else
+                return true; 
+        }
+```
+If `next()` consumes the newline and advances `curPos` to point to `}`, it continues execution in `next()`.
+It will hit the `}` case.
+`catToken()`.
+Token added.
+Return.
+`getChar()` in `lexicalAnalysis` advances past `}`.
+Loop ends.
+
+Is it possible `IOUtils` strips the last `}`? Unlikely.
+
+Let's look at the Buggy Output vs Expected again.
+Buggy ends with `SEMICN ;`.
+Expected ends with `RBRACE }`.
+
+This implies the token for `}` is simply not generated.
+
+Could the error be in `isSpace` or `isNewLine` handling such that the loop terminates before processing `}`?
+
+Or is there an issue with how `next()` handles the end of file inside the skipping loop?
+
+```java
+    public boolean next() {
+        clearToken();
+        while (isSpace()) { 
+            if (curPos < codeLength) 
+                getChar();
+            else
+                return true; // End of file reached while skipping spaces
+        }
+        if (isNewLine()) {
+            lineNum++;
+            if (curPos < codeLength)
+                getChar();
+            else
+                return true; // End of file reached after newline
+        }
+        // ... rest of processing
+```
+
+If the file ends with `}\n`?
+1. `curPos` points to `}`.
+2. `next()` called.
+3. Not space, not newline.
+4. Processes `}`. Token added.
+5. Returns.
+6. `getChar()` in `lexicalAnalysis` reads `\n`. `curPos` increments.
+7. Loop continues if `curPos < codeLength`.
+8. If `\n` was the last char, `curPos` is now `codeLength`. Loop ends.
+9. Wait, if `getChar()` reads `\n`, `currentSym` becomes `\n`.
+10. Next iteration: `curPos` is `codeLength`. Loop `curPos < codeLength` is false.
+11. The `\n` is never processed by `next()`. This is fine, it's whitespace.
+12. But the `}` WAS processed.
+
+What if the file does NOT end with a newline?
+File: `... return 0; }`
+1. `curPos` at `}`.
+2. `next()` processes `}`. Token added.
+3. `getChar()` advances `curPos` to `codeLength`.
+4. Loop ends.
+
+It seems correct.
+
+Let's look at `reserve()` and `Token`.
+```java
+    public LexType reserve() {
+        if (!Token.isReversedContained(word)) {
+            return LexType.IDENFR;
+        } else {
+            return Token.reverser(word);
+        }
+    }
+```
+And `Token.reverser`:
+```java
+    public static LexType reverser(String word) {
+        return reserveWords.get(word);
+    }
+```
+If `word` is `}`, `reserveWords.get("}")` returns `RBRACE`.
+
+Is it possible that `word` is empty?
+`catToken()` adds `currentSym` to `word`.
+So `word` is `"}"`.
+
+Let's look at the `lexer.txt` output generation.
+```java
+                for (Token token: tokenList) {
+                    fileWriter.write(token.getTokenType().toString() + ' ' + token.getTokenValue()+'\n');
+                }
+```
+
+There is one subtle bug in `next()` regarding `lexType` initialization.
+`private LexType lexType = LexType.IDENFR;`
+If `lexType` is not updated, it stays `IDENFR`.
+But for `}`, `Token.isReversedContained("}")` is true, so `lexType` is updated to `RBRACE`.
+
+Wait! Look at the `next()` method structure again.
+
+```java
+    public boolean next() {
+        // ...
+        // 字母或下划线
+        if(isUnderline() || isLetter()) { 
+             // ...
+             lexType = reserve(); 
+        } else if (isDigit()) {
+             // ...
+             lexType = LexType.INTCON;
+        } else if (isDivi()) { 
+             // ...
+        } else if (isDoubleQuote()) {
+             // ...
+             lexType = LexType.STRCON;
+        } else if (isSingleQuote()) {
+             // ...
+             lexType = LexType.CHRCON;
+        } else if (currentSym == '&') {
+             // ...
+             lexType = LexType.AND; // BUG HERE? See below
+        } else if (currentSym == '|') {
+             // ...
+             lexType = LexType.AND; // BUG HERE? Should be OR
+        } 
+        // ...
+        } else if (currentSym == '<') {
+            // ...
+            lexType = reserve();
+        } else if (currentSym == '>') {
+            // ...
+            lexType = reserve();
+        } else if (currentSym == '%') {
+            catToken();
+        } else if (isStar()) {
+            catToken();
+        } 
+        // ...
+        } else if (currentSym == '}') {
+            catToken();
+        }
+        
+        // THIS BLOCK IS OUTSIDE THE IF-ELSE CHAIN?
+        if (Token.isReversedContained(word)) {
+            lexType = reserve();
+        }
+        if (!word.isEmpty()) {
+            Token token = new Token(word, lexType, lineNum);
+            tokenList.add(token);
+        }
+
+        return true;
+    }
+```
+
+The block:
+```java
+        if (Token.isReversedContained(word)) {
+            lexType = reserve();
+        }
+        if (!word.isEmpty()) {
+            Token token = new Token(word, lexType, lineNum);
+            tokenList.add(token);
+        }
+```
+is executed for ALL paths.
+
+So for `}`, `word` is `"}"`. `isReversedContained` is true. `lexType` becomes `RBRACE`. Token is added.
+
+Why is it missing?
+
+Let's check the test input again.
+```java
+    return 0;
+
+}
+```
+Is it possible that `IOUtils` or the file reading introduces an issue?
+Or is the `while` loop in `lexicalAnalysis` flawed?
+
+```java
+        getChar();
+        while (curPos < codeLength) {
+            next(); 
+            getChar();
+        }
+```
+
+If `codeLength` is 0, it returns.
+If `codeLength` > 0.
+First `getChar()` reads index 0. `curPos` becomes 1.
+If `codeLength` is 1 (file is just `}`).
+`curPos` (1) < `codeLength` (1) is FALSE.
+Loop does NOT run.
+`next()` is NEVER called.
+Token is NEVER added.
+
+**BINGO!**
+
+If the file ends such that the last character is read by the initial `getChar()` or a previous `getChar()` such that `curPos` equals `codeLength` BEFORE `next()` is called for that character, it will be skipped.
+
+Let's trace a normal file ending in `}`.
+Suppose `}` is the last character. Index `N-1`.
+Previous iteration:
+`curPos` was `N-1`.
+Loop `N-1 < N` is True.
+`next()` processes character at `N-2` (e.g., `;`).
+Inside `next()`, for `;`, it does NOT advance `curPos`.
+`next()` returns.
+`getChar()` in `lexicalAnalysis` is called.
+`curPos` becomes `N`. `currentSym` becomes `source[N-1]` (`}`).
+Loop check: `N < N` is False.
+Loop terminates.
+`next()` is NOT called for `}`.
+`}` is in `currentSym`, but `next()` is never invoked to process it.
+
+The logic `getChar()` AFTER `next()` means `next()` always processes the character that was read in the *previous* step (or initial step).
+But the loop condition checks `curPos`.
+When `getChar()` reads the LAST character, `curPos` becomes `codeLength`.
+The loop terminates.
+The last character sits in `currentSym` but is never processed by `next()`.
+
+**Fix:**
+The loop should ensure `next()` is called for the last character.
+Common pattern:
+```java
+    while (curPos <= codeLength) // No, getChar checks bounds
+```
+Or process the remaining `currentSym` after the loop?
+Or change the loop structure.
+
+The error is in `frontend/Lexer.java` in the `lexicalAnalysis` method.
+
+<frontend/Lexer.java>
+...
+    public void lexicalAnalysis() {
+        if (codeLength == 0) {
+            return;
+        }
+        getChar();
+        while (curPos < codeLength) {
+            next(); // 在next中retract：curP--所以下面再getChar
+            getChar();
+        }
+        // Missing processing for the last character if it wasn't consumed by next() advancing curPos
+        // Actually, the logic above fails to process the character read by the LAST getChar() 
+        // because the loop terminates immediately after curPos reaches codeLength.
+        
+        // A simple fix is to call next() one more time if there is a pending character, 
+        // or restructure the loop. 
+        // Given the constraint to only output the error snippet:
+
+        printLexicalResult();
+    }
+...

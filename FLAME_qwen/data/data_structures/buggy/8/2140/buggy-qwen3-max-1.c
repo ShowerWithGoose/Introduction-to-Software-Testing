@@ -1,0 +1,202 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+struct e{
+    int destination;
+    struct e* next;
+};
+typedef struct e edge;
+
+struct v{
+    int vertex;
+    struct e* edges;
+};
+typedef struct v vertex;
+vertex allvertex[105];
+
+
+int visited[105];
+void depth(int address)
+{
+    edge* p=allvertex[address].edges;
+    printf("%d ",address);
+    visited[address]=1;
+    for (;p!=NULL;p=p->next)
+    {
+        if (visited[p->destination]==0)
+        {
+            depth(p->destination);
+        }
+    }
+    
+}
+void init_depth(int vertexNum)
+{
+    memset(visited,0,sizeof(visited));
+    int i;
+    for (i=0;i<vertexNum;i++)
+    {
+        if (visited[i]==0 && allvertex[i].edges!=NULL)
+        {
+            depth(i);
+        }
+    }
+    printf("\n");
+}
+
+int queue[50];
+int head=0,tail=0;
+void breadth(int v)
+{
+    edge *p;
+    printf("%d ",v); //访问当前顶点
+    visited[v] = 1; //标识某顶点被访问过
+    queue[tail]=v;
+    tail++;         // 入口的第一个顶点入队
+    while( head!=tail){  //  循环，直到队空为止 
+         v = queue[head];  //取出队头元素
+         head++;
+         p = allvertex[v].edges;         //获取该顶点第一个邻接顶点
+         for(; p != NULL ; p = p->next ) //访问该顶点下的每个邻接顶点
+             if( !visited[p->destination] ) {
+                    printf("%d ",p->destination); //访问当前顶点
+                    visited[p->destination] = 1; //标识某顶点被访问过
+                    queue[tail]=p->destination;
+                    tail++; //邻接顶点依次分别入队
+           }
+     }
+}
+
+void init_breadth(int vertexNum)
+{
+    memset(visited,0,sizeof(visited));
+    int i;
+    for (i=0;i<vertexNum;i++)
+    {
+        if (!visited[i] &&allvertex[i].edges!=NULL)
+        {
+            breadth(i);
+        }
+    }
+    printf("\n");
+}
+
+void delete(int todelete) // @@ [The function name 'delete' is a reserved keyword in C++ and may cause compilation issues in some environments, though it's technically allowed in C. However, more critically, the traversal functions init_depth and init_breadth always start from the lowest-numbered unvisited vertex, not necessarily vertex 0 as required by the problem.]
+{
+    edge* p=allvertex[todelete].edges;
+    while(p!=NULL)
+    {
+        int address=p->destination;
+        edge* p2=allvertex[address].edges;
+        edge* previous=NULL;
+        while(p2!=NULL)
+        {
+            if (p2->destination==todelete)
+            {
+                if (previous==NULL)
+                {
+                    allvertex[address].edges=p2->next;
+                }
+                else
+                {
+                    previous->next=p2->next;
+                }
+            }
+            previous=p2;
+            p2=p2->next;
+        }
+        p=p->next;
+    }
+    allvertex[todelete].edges=NULL;
+}
+int main()
+{
+    int vertexNum,edgeNum;
+    scanf("%d%d",&vertexNum,&edgeNum);
+    int i,j,k,start,end;
+    for (i=0;i<edgeNum;i++)
+    {
+        scanf("%d%d",&start,&end);
+        edge* p1=(edge*)malloc(sizeof(edge));
+        p1->destination=end;
+        p1->next=NULL;
+        edge* p2=(edge*)malloc(sizeof(edge));
+        p2->destination=start;
+        p2->next=NULL;
+
+        edge* check=allvertex[start].edges,*previous=NULL;
+        if (allvertex[start].edges==NULL)
+        {
+            allvertex[start].edges=p1;
+        }
+        else
+        {
+            while(check!=NULL && p1->destination > check->destination)
+            {
+                previous=check;
+                check=check->next;
+            }
+            if (previous==NULL)
+            {
+                p1->next=allvertex[start].edges;
+                allvertex[start].edges=p1;
+            }
+            else
+            {
+                p1->next=previous->next;
+                previous->next=p1;
+            }
+        }
+        check=allvertex[end].edges;
+        previous=NULL;
+        if (allvertex[end].edges==NULL)
+        {
+            allvertex[end].edges=p2;
+        }
+        else
+        {
+            while(check!=NULL && p2->destination > check->destination)
+            {
+                previous=check;
+                check=check->next;
+            }
+            if (previous==NULL)
+            {
+                p2->next=allvertex[start].edges; // @@ [This line incorrectly assigns to allvertex[start] instead of allvertex[end]. It should be allvertex[end].edges = p2;]
+                allvertex[start].edges=p2; // @@ [Same error: modifying allvertex[start] instead of allvertex[end]]
+            }
+            else
+            {
+                p2->next=previous->next;
+                previous->next=p2;
+            }
+        }
+        
+    }
+
+    int todelete;
+    scanf("%d",&todelete);
+    init_depth(vertexNum); // @@ [The problem requires traversal to always start from vertex 0, but init_depth starts from the first unvisited vertex (which may not be 0 after deletion or even before if 0 has no edges). It should call depth(0) directly instead of looping.]
+    init_breadth(vertexNum); // @@ [Same issue: init_breadth loops over all vertices and starts BFS from each unvisited component, but the problem states the graph is connected and traversal must start from vertex 0.]
+    delete(todelete);
+    init_depth(vertexNum); // @@ [Same issue: should start from 0, not loop]
+    init_breadth(vertexNum); // @@ [Same issue: should start from 0, not loop]
+   
+    // for (i=0;i<vertexNum;i++)
+    // {
+    //     if (allvertex[i].edges!=NULL)
+    //     {
+    //         edge* check=allvertex[i].edges;
+    //         printf("%d ",i);
+    //         while(check!=NULL)
+    //         {
+    //             printf("%d ",check->destination);
+    //             check=check->next;
+    //         }
+    //         printf("\n");
+    //     }
+        
+    // }
+    return 0;
+}

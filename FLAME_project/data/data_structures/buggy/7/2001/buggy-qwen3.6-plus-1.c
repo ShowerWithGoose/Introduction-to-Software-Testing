@@ -1,0 +1,48 @@
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <stdlib.h>
+struct BstNode{
+    int data;
+    struct BstNode *left,*right;
+};
+struct BstNode *insNode(struct BstNode *root,int data){
+    struct BstNode *p;
+    if(root == NULL){
+        p=(struct BstNode *)malloc(sizeof(struct BstNode));
+        p->data=data;
+        p->left=p->right=NULL;
+        return p; // @@ The function is missing a return statement for the newly created node when root is NULL. Without this, the caller receives an undefined value (likely NULL or garbage), causing the tree construction to fail and potentially leading to crashes or incorrect output.
+    }
+    else if(data<root->data){
+        root->left=insNode(root->left,data);
+    }
+    else {
+        root->right=insNode(root->right,data);
+    }
+    return root; // @@ The function is missing a return statement for the recursive cases. After inserting into the left or right subtree, the current root must be returned to maintain the tree structure in the caller. Without this, the parent nodes lose their children links.
+    }
+void printLeafNode(struct BstNode *root,int height){
+    if(root->left!=NULL)
+    printLeafNode(root->left,height+1);
+    if(root->right!=NULL)
+    printLeafNode(root->right,height+1);
+    if(root->left==NULL&&root->right==NULL){
+        printf("%d %d\n",root->data,height);
+    }
+}
+int main()
+{
+     struct  BstNode *root=NULL;
+     int n,data,i;
+     scanf("%d",&n);
+     for(i=0;i<n;i++){
+         scanf("%d",&data);
+         {
+             root=insNode(root,data);
+         }
+     }
+     printLeafNode(root,1);
+
+return 0;
+}

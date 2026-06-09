@@ -1,0 +1,276 @@
+Based on the test case input and expected error output, the program should detect three errors:
+1. Line 16: Missing right parenthesis ')' after `getchar(` → error "j"
+2. Line 18: Single '&' instead of '&&' → error "a"
+3. Line 19: Missing right parenthesis ')' after `printf("%c",s[0]` → error "j"
+
+The lexer correctly handles single '&' and '|' by reporting error "a", but the parser must also handle cases where expressions contain invalid operators. However, looking at the test case, the key issue is that the parser doesn't properly detect the missing right parentheses in function calls and printf statements.
+
+The main problem appears to be in the `parseStmt()` method's handling of `getchar` and `printf` statements, and in the expression parsing logic that should detect invalid operators like single '&'.
+
+However, the most critical issue is that the parser doesn't have logic to detect single '&' or '|' operators in expressions. The lexer only detects standalone '&' or '|' tokens at the top level, but when they appear inside expressions (like `f2() & f1()`), they are not caught by the lexer because they are part of a larger expression context.
+
+Looking at the grammar, the `LOrExp` and `LAndExp` rules only accept '||' and '&&' respectively. A single '&' or '|' should cause a syntax error, but the current parser doesn't validate this properly.
+
+The error detection for single '&'/'|' needs to happen during expression parsing, specifically in the `parseLOrExp()` and related methods. However, the current implementation just uses `nextmatch()` which won't catch invalid tokens.
+
+But wait - looking more carefully at the test case, the lexer should actually catch the single '&' because it processes tokens sequentially. Let me check the lexer code...
+
+In the lexer, when it encounters '&', it checks if the next character is also '&'. If not, it adds error "a". So the lexer should catch the single '&' on line 18.
+
+The real issues are:
+1. The `getchar( ;` case - missing right parenthesis
+2. The `printf("%c",s[0];` case - missing right parenthesis  
+3. The single '&' should be caught by lexer
+
+Looking at the parser's handling of getchar:
+
+In `parseStmt()`, when processing `LVal '=' 'getchar''('')'';'`, it has:
+```java
+if (nextmatch(nextIndex, TokenType.GETCHARTK)) {
+    // LVal '=' 'getchar''('')'';'
+    writeOutputWord();
+    nextIndex++;
+    if (nextmatch(nextIndex, TokenType.LPARENT)) {
+        writeOutputWord();
+        nextIndex++;
+        if (nextmatch(nextIndex, TokenType.RPARENT)) {
+            writeOutputWord();
+            nextIndex++;
+            // ... semicolon handling
+        } else {
+            addError(tokens.get(nextIndex - 1).lineNum, "j");//缺少右括号
+        }
+    }
+}
+```
+
+This should catch the missing ')' for getchar. Similarly for printf.
+
+But there's a problem in the `isLVal()` method. The current implementation looks ahead until it finds ASSIGN or SEMICN, but this can go beyond the current statement and cause incorrect behavior.
+
+However, the most likely location of the error is in the **expression parsing logic** where single '&' and '|' operators are not being properly validated as syntax errors.
+
+Actually, re-examining: the lexer should handle the single '&' case. The fact that it's not appearing in the output suggests either:
+1. The lexer isn't processing the '&' token correctly, or  
+2. The error is being suppressed or overwritten
+
+Looking at the lexer's handling of '&':
+```java
+else if (ch == '&'){
+    token.curPos++;
+    if (token.curPos < token.length && token.source.charAt(token.curPos) == '&') {
+        // valid &&
+    } else {
+        addError(token.lineNum, "a");
+    }
+}
+```
+
+This should work. But in the test case `if (f2() & f1())`, the '&' is between two identifiers, so the lexer should see it as a standalone '&' token and report error "a".
+
+The issue might be that the parser continues processing despite lexer errors, and the parser's own error handling interferes.
+
+But looking at the expected output, we need errors on lines 16, 18, and 19.
+
+The most critical issue is likely in the **parser's statement handling**, specifically in how it processes function calls and detects missing parentheses.
+
+Let me focus on the `parseStmt()` method's printf handling:
+
+```java
+if (nextmatch(nextIndex, TokenType.PRINTFTK)) {
+    // printf 语句 (Stmt → 'printf''('StringConst {','Exp}')'';')
+    writeOutputWord();
+    nextIndex++;
+    if (nextmatch(nextIndex, TokenType.LPARENT)) {
+        writeOutputWord();
+        nextIndex++;
+        if (nextmatch(nextIndex, TokenType.STRCON)) {
+            writeOutputWord();
+            nextIndex++;
+            while (nextmatch(nextIndex, TokenType.COMMA)) {
+                writeOutputWord();
+                nextIndex++;
+                parseExp();  // 解析表达式
+            }
+            if (nextmatch(nextIndex, TokenType.RPARENT)) {
+                // ...
+            } else {
+                addError(tokens.get(nextIndex - 1).lineNum, "j");//缺少右括号
+            }
+        }
+    }
+}
+```
+
+This should detect the missing ')' in printf. Similarly for getchar.
+
+But there's a potential issue: what if the parser doesn't reach these code paths because of earlier errors?
+
+The key insight is that the parser uses a `nextIndex` pointer that may skip over tokens incorrectly when errors occur.
+
+However, the most likely location of the bug is in the **expression parsing hierarchy**, where the parser doesn't properly validate that only valid operators are used.
+
+Looking at the grammar:
+- `LOrExp → LAndExp | LOrExp '||' LAndExp`
+- There's no rule for single '|'
+- Similarly, `LAndExp` only accepts '&&'
+
+So when the parser encounters a single '&' in an expression context, it should fail to match any rule and report an error.
+
+But the current parser implementation for `parseLOrExp()` and `parseLAndExp()` only checks for the valid multi-character operators:
+
+```java
+private void parseLAndExp() {
+    parseEqExp();
+    while (nextmatch(nextIndex, TokenType.AND)) {  // AND is '&&'
+        // ...
+    }
+}
+
+private void parseLOrExp() {
+    parseLAndExp();
+    while (nextmatch(nextIndex, TokenType.OR)) {   // OR is '||'
+        // ...
+    }
+}
+```
+
+This means that if there's a single '&' token (which would have type something else, maybe not recognized), it wouldn't be handled.
+
+Wait, but the lexer should convert single '&' into an error and presumably not create a valid token for it. Or does it create a token anyway?
+
+Looking at the lexer code for '&':
+- If it's single '&', it calls `addError()` but **does not create a token**
+- This means the token stream would be missing the '&' token entirely
+
+This could cause the parser to get confused about token positions.
+
+But actually, looking more carefully: in the lexer's '&' handling, when it's a single '&', it adds an error but **does not add any token to the tokens list**. This means the '&' character is effectively skipped, which would cause the parser to see `f2() f1()` instead of `f2() & f1()`, leading to different errors.
+
+This is likely the root cause! The lexer should either:
+1. Create a token for the single '&' (with some error type), or  
+2. Handle it differently
+
+But according to the problem description, error "a" should be reported for single '&' and '|'.
+
+The issue is that by not creating a token for the single '&', the parser loses synchronization.
+
+However, looking at the expected behavior, we just need to report error "a" on line 18, which the lexer should do.
+
+Given all this, the most probable location of the actual bug that prevents the expected errors from being reported is in the **parser's error handling and token consumption logic**, particularly around how it handles the `getchar` and `printf` function calls with missing closing parentheses.
+
+<Parser.java>
+...
+    private void parseStmt() {
+        ...
+        } else if (nextmatch(nextIndex, TokenType.PRINTFTK)) {
+            // printf 语句 (Stmt → 'printf''('StringConst {','Exp}')'';')
+            writeOutputWord();
+            nextIndex++;
+            if (nextmatch(nextIndex, TokenType.LPARENT)) {
+                writeOutputWord();
+                nextIndex++;
+                if (nextmatch(nextIndex, TokenType.STRCON)) {
+                    writeOutputWord();
+                    nextIndex++;
+                    while (nextmatch(nextIndex, TokenType.COMMA)) {
+                        writeOutputWord();
+                        nextIndex++;
+                        parseExp();  // 解析表达式
+                    }
+                    if (nextmatch(nextIndex, TokenType.RPARENT)) {
+                        writeOutputWord();
+                        nextIndex++;
+                        if (nextmatch(nextIndex, TokenType.SEMICN)) {
+                            writeOutputWord();
+                            nextIndex++;
+                        } else {
+                            addError(tokens.get(nextIndex - 1).lineNum, "i");//缺少分号
+                        }
+                    } else {
+                        addError(tokens.get(nextIndex - 1).lineNum, "j");//缺少右括号
+                    }
+                } else {
+                    addError(currentToken.lineNum, "j");  // 缺少字符串常量
+                }
+            } else {
+                addError(currentToken.lineNum, "j");  // 缺少左括号
+            }
+        } else {
+            // 解析 LVal '=' Exp ';' 或 [Exp] ';'
+            if (isLVal(nextIndex)) {
+                parseLVal();  // 左值表达式
+                if (nextmatch(nextIndex, TokenType.ASSIGN)) {
+                    writeOutputWord();
+                    nextIndex++;
+                    if (nextmatch(nextIndex, TokenType.GETINTTK)) {
+                        // LVal '=' 'getint''('')'';'
+                        writeOutputWord();
+                        nextIndex++;
+                        if (nextmatch(nextIndex, TokenType.LPARENT)) {
+                            writeOutputWord();
+                            nextIndex++;
+                            if (nextmatch(nextIndex, TokenType.RPARENT)) {
+                                writeOutputWord();
+                                nextIndex++;
+                                if (nextmatch(nextIndex, TokenType.SEMICN)) {
+                                    writeOutputWord();
+                                    nextIndex++;
+                                } else {
+                                    addError(tokens.get(nextIndex - 1).lineNum, "i");//缺少分号
+                                }
+                            } else {
+                                addError(tokens.get(nextIndex - 1).lineNum, "j");//缺少右括号
+                            }
+                        } else {
+                            addError(currentToken.lineNum, "j");  // 缺少左括号
+                        }
+                    } else if (nextmatch(nextIndex, TokenType.GETCHARTK)) {
+                        // LVal '=' 'getchar''('')'';'
+                        writeOutputWord();
+                        nextIndex++;
+                        if (nextmatch(nextIndex, TokenType.LPARENT)) {
+                            writeOutputWord();
+                            nextIndex++;
+                            if (nextmatch(nextIndex, TokenType.RPARENT)) {
+                                writeOutputWord();
+                                nextIndex++;
+                                if (nextmatch(nextIndex, TokenType.SEMICN)) {
+                                    writeOutputWord();
+                                    nextIndex++;
+                                } else {
+                                    addError(tokens.get(nextIndex - 1).lineNum, "i");//缺少分号
+                                }
+                            } else {
+                                addError(tokens.get(nextIndex - 1).lineNum, "j");//缺少右括号
+                            }
+                        } else {
+                            addError(currentToken.lineNum, "j");  // 缺少左括号
+                        }
+                    } else {
+                        parseExp();  // 普通赋值语句
+                        if (nextmatch(nextIndex, TokenType.SEMICN)) {
+                            writeOutputWord();
+                            nextIndex++;
+                        } else {
+                            addError(tokens.get(nextIndex - 1).lineNum, "i");//缺少分号
+                        }
+                    }
+                } else {
+                    addError(currentToken.lineNum, "i");  // 缺少等号
+                }
+            } else {
+                if (!nextmatch(nextIndex, TokenType.SEMICN)) {
+                    parseExp();  // 可选表达式
+                }
+                if (nextmatch(nextIndex, TokenType.SEMICN)) {
+                    writeOutputWord();
+                    nextIndex++;
+                } else {
+                    addError(tokens.get(nextIndex - 1).lineNum, "i");//缺少分号
+                }
+            }
+        }
+        writeOutput("Stmt");
+    }
+...

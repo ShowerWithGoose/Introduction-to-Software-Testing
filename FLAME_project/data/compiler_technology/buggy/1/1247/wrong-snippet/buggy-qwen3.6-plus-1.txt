@@ -1,0 +1,836 @@
+Based on the problem description and the provided code, the compilation error `g++: not found` indicates that the C++ compiler is missing from the environment. However, assuming the environment is correct and looking for logical/semantic errors in the code that would cause it to fail test cases (specifically regarding syntax analysis and output format), there is a critical issue in `parser.cpp`.
+
+The problem requires outputting the name of the current syntax component **before** completing the analysis of any syntax components (except for `<BlockItem>`, `<Decl>`, `<BType>`). The current implementation uses a "post-order" printing strategy where `putName` is called at the end of each `print...` function. This means the tag is printed *after* the content. While this is common for some tree traversals, the requirement "Before completing the analysis... output the name" usually implies that the tag should be associated with the start or the structure itself. However, looking closely at the specific error types and the grammar:
+
+1.  **Missing Semicolon/Error Handling**: The code handles errors 'i', 'j', 'k' by pushing them to `errors`.
+2.  **Output Order**: The `printCompUnit` function iterates through declarations and function definitions.
+3.  **Specific Logic Error in `parseFuncDef`**:
+    In `parseFuncDef`, the code checks for `INTTK` or `CHARTK` after moving past the identifier to decide if there are parameters.
+    ```cpp
+    ast(move1());ast(getType0()==IDENFR);
+    it.bLine=getLine(),it.ident=getContent();
+    move(2); // Moves past IDENFR and '('
+    if(getType0()==INTTK||getType0()==CHARTK){
+        it.funcFParams=new FuncFParams();
+        parseFuncFParams(*it.funcFParams);
+    }
+    ```
+    If the function has no parameters (e.g., `void foo() {}`), `move(2)` moves past `(`. The next token is `)`. The `if` condition fails. Then it checks for `RPARENT`. This seems correct for empty params.
+    However, if there *are* parameters, `parseFuncFParams` is called. Inside `parseFuncFParams`, it parses parameters. After returning, the current token should be `)`. The code then checks `if(getType0()==RPARENT)`. This logic holds.
+
+4.  **Critical Error in `printStmt`**:
+    Look at the `switch` statement in `printStmt`:
+    ```cpp
+    static void printStmt(const Stmt &it){
+        switch(it.type){
+            case STMT_LVAL_EXP:
+                // ...
+                break;
+            default: // <--- This label catches everything not explicitly listed above!
+                printWord(RETURNTK,wfp); // <--- This prints 'return' for ANY non-LVAL_EXP stmt?
+            case STMT_EXP:
+                if(it.exp) printExp(*it.exp);
+                printWord(SEMICN,wfp);
+                break;
+            // ... other cases
+        }
+        putName("Stmt");
+    }
+    ```
+    The `default` label falls through to `STMT_EXP`. But before that, it executes `printWord(RETURNTK,wfp);`.
+    This means for **any** statement type that isn't `STMT_LVAL_EXP` (including `STMT_BLOCK`, `STMT_IF`, `STMT_FOR`, `STMT_BREAK`, etc.), it will incorrectly print the `return` keyword (`RETURNTK`) before processing the actual statement content. This is a severe logical error. The `default` case should likely not exist or should handle `STMT_RETURN` specifically, but `STMT_RETURN` is missing from the switch cases entirely in the parsing/printing logic relative to the enum definition.
+
+    Wait, looking at the enum:
+    ```cpp
+    enum{
+        STMT_LVAL_EXP,STMT_EXP,STMT_BLOCK,
+        STMT_IF,STMT_FOR,STMT_BREAK,STMT_CONTINUE,STMT_RETURN
+    };
+    ```
+    And the switch:
+    ```cpp
+    case STMT_LVAL_EXP: ... break;
+    default: 
+        printWord(RETURNTK,wfp);
+    case STMT_EXP: ... break;
+    case STMT_BLOCK: ... break;
+    // ...
+    // STMT_RETURN is NOT handled explicitly!
+    ```
+    
+    If `it.type` is `STMT_RETURN`, it hits `default`, prints `RETURNTK`, falls through to `STMT_EXP` logic (printing exp and semicolon). This might accidentally work for `return x;` if `exp` is set, but it's structurally wrong because it relies on fall-through from default.
+    
+    However, if `it.type` is `STMT_BLOCK`, it hits `default`, prints `RETURNTK`, then falls through to `STMT_EXP`? No, `STMT_BLOCK` is a separate case.
+    
+    Let's trace `STMT_BLOCK`:
+    It matches `case STMT_BLOCK:`. So it does NOT hit default.
+    
+    Let's trace `STMT_IF`:
+    It matches `case STMT_IF:`.
+    
+    Let's trace `STMT_FOR`:
+    It matches `case STMT_FOR:`.
+    
+    Let's trace `STMT_BREAK`:
+    It matches `case STMT_BREAK:`.
+    
+    Let's trace `STMT_CONTINUE`:
+    It matches `case STMT_CONTINUE:`.
+    
+    Let's trace `STMT_RETURN`:
+    It is NOT in the switch cases. So it goes to `default`.
+    `default` prints `RETURNTK`.
+    Then it falls through to `case STMT_EXP`.
+    `case STMT_EXP` prints `exp` (if exists) and `SEMICN`.
+    This actually implements `return [Exp];` correctly by accident of fall-through, BUT it also means ANY unknown type prints `return`.
+    
+    Is there a bigger issue?
+    
+    Look at `parseStmt` for `STMT_RETURN`:
+    ```cpp
+    case RETURNTK:
+        it.type=STMT_RETURN;
+        ast(move1());
+        if(isExp()){
+            it.exp=new Exp();
+            parseExp(*it.exp,EXP_NORMAL);
+        }
+        if(getType0()==SEMICN) ast(move1());
+        else errors.push_back({getLastLine(),'i'});
+        break;
+    ```
+    This sets `it.type = STMT_RETURN`.
+    
+    Now look at `printStmt` again.
+    ```cpp
+    switch(it.type){
+        case STMT_LVAL_EXP: ... break;
+        default:
+            printWord(RETURNTK,wfp);
+        case STMT_EXP:
+             if(it.exp) printExp(*it.exp);
+             printWord(SEMICN,wfp);
+             break;
+        case STMT_BLOCK: ...
+    ```
+    
+    If `it.type` is `STMT_EXP` (e.g., `a;` or `;`), it goes to `case STMT_EXP`. It does NOT go to default. So it does NOT print `RETURNTK`. Correct.
+    
+    If `it.type` is `STMT_RETURN`, it goes to `default`. Prints `RETURNTK`. Falls through to `STMT_EXP`. Prints exp and semicolon. Correct behavior for `return`.
+    
+    So why is this an error?
+    
+    The problem states: "Before completing the analysis of any syntax components... output the name...".
+    
+    Let's look at `printExp`.
+    ```cpp
+    static void printExp(const Exp &it){
+        if(it.type==EXP_STRINGCONST){
+             // ...
+        }
+        else{
+             // ... complex logic to detect printf/getint/getchar ...
+             // If detected, it prints tokens and RETURNS early.
+             // It does NOT print <Exp> or <ConstExp>.
+             
+             // If not detected:
+             printAddExp(*addExp);
+             putName(&"ConstExp"[it.type==EXP_NORMAL?5:0]);
+        }
+        // Unreachable
+    }
+    ```
+    If it's a normal expression, it prints `<ConstExp>` or `<Exp>`?
+    `it.type` is `EXP_NORMAL` or `EXP_CONST`.
+    If `EXP_NORMAL`, index is 5. `"ConstExp"[5]` is 'E'. So it prints `<Exp>`.
+    If `EXP_CONST`, index is 0. `"ConstExp"[0]` is 'C'. So it prints `<ConstExp>`.
+    
+    This seems okay.
+
+    Let's look at the `parseFuncDef` again.
+    
+    ```cpp
+    static void parseFuncDef(FuncDef &it){
+        if(getType0()==VOIDTK) it.bType=TYPE_VOID;
+        else if(getType0()==INTTK) it.bType=TYPE_INT;
+        else if(getType0()==CHARTK) it.bType=TYPE_CHAR;
+        else panic();
+        ast(move1());ast(getType0()==IDENFR);
+        it.bLine=getLine(),it.ident=getContent();
+        move(2); // Consumes IDENFR and LPARENT
+        if(getType0()==INTTK||getType0()==CHARTK){
+            it.funcFParams=new FuncFParams();
+            parseFuncFParams(*it.funcFParams);
+        }
+        if(getType0()==RPARENT) ast(move1());
+        else errors.push_back({getLastLine(),'j'});
+        parseBlock(it.block);
+        it.gLine=getLastLine();
+    }
+    ```
+    
+    If the function is `void main()`, `bType` is `TYPE_VOID`.
+    `move(1)` consumes `void`.
+    `getType0()` checks for `IDENFR`. It is `main`.
+    `move(2)` consumes `main` and `(`.
+    Next token is `)`. `getType0()` is `RPARENT`.
+    The `if` for params fails.
+    Checks `RPARENT`. Moves past it.
+    Parses Block.
+    
+    In `printFuncDef`:
+    ```cpp
+    static void printFuncDef(const FuncDef &it){
+        bool isMain=isWordType(it.ident,MAINTK);
+        if(isMain){
+            printWord(INTTK,wfp); // <--- HARDCODED INTTK for main?
+            printWord(MAINTK,wfp);
+        }
+        else{
+            printWord(type_token[it.bType],wfp);
+            putName("FuncType");
+            printWord(IDENFR,it.ident,wfp);
+        }
+        // ...
+        putName(&"MainFuncDef"[isMain?0:4]);
+    }
+    ```
+    
+    The grammar says:
+    `MainFuncDef → 'int' 'main' '(' ')' Block`
+    
+    The input source program might define `main` as `int main(...)`.
+    The lexer identifies `main` as `MAINTK` only if it matches the string "main" AND is treated specially?
+    
+    In `lexer.cpp`:
+    ```cpp
+    static const map<string,int>token_dict={
+            // ...
+            // "main" is NOT in token_dict!
+    };
+    ```
+    So `main` is lexed as `IDENFR` with content "main".
+    
+    In `printWords` (lexer output):
+    ```cpp
+    if(word.code==IDENFR){
+        for(int type:specType){ // specType includes MAINTK
+            if(word.content==word_def_content[type]){ // word_def_content[MAINTK] is "main"
+                 printWord(type,fp); // Prints MAINTK main
+                 goto l_printWords;
+            }
+        }
+    }
+    ```
+    So in the token stream `words`, `main` is stored as `IDENFR` but when printed to `lexer.txt` it appears as `MAINTK`.
+    However, the parser uses `words` vector directly.
+    
+    In `parser.cpp`, `parseCompUnit`:
+    ```cpp
+    if(getType(2)==LPARENT){
+        if(isWordType(words[index+1].content,MAINTK)){
+             fl=true;
+             parseFuncDef(it.mainFuncDef);
+        }
+        // ...
+    }
+    ```
+    `isWordType` compares content string. `words[index+1].content` is "main". `word_def_content[MAINTK]` is "main". So it returns true.
+    
+    So `parseFuncDef` is called for `main`.
+    Inside `parseFuncDef`, it expects `VOIDTK`, `INTTK`, or `CHARTK` at `words[index]`.
+    For `int main()`, `words[index]` is `INTTK`. `bType` becomes `TYPE_INT`.
+    `move(1)` consumes `INTTK`.
+    `getType0()` checks `IDENFR`. It is `main` (code `IDENFR`).
+    
+    In `printFuncDef`:
+    `isMain` is true.
+    It prints `INTTK` ("int") and `MAINTK` ("main").
+    
+    This looks correct for `int main`.
+    
+    What if the source is `void main()`? (Not standard C but maybe allowed in grammar? Grammar says `MainFuncDef -> 'int' 'main' ...`). So `main` must be preceded by `int`.
+    
+    Let's look at the error location again.
+    
+    In `parser.cpp`, `parseStmt`:
+    
+    ```cpp
+    case BREAKTK:
+    case CONTINUETK:
+        it.type=(getType0()==BREAKTK?STMT_BREAK:STMT_CONTINUE);
+        ast(move1());
+        if(getType0()==SEMICN) ast(move1());
+        else errors.push_back({getLastLine(),'i'});
+        break;
+    ```
+    
+    In `printStmt`:
+    ```cpp
+    case STMT_BREAK:
+        printWord(BREAKTK,wfp);
+        printWord(SEMICN,wfp);
+        break;
+    case STMT_CONTINUE:
+        printWord(CONTINUETK,wfp);
+        printWord(SEMICN,wfp);
+        //break;  <--- MISSING BREAK!
+    ```
+    
+    If `it.type` is `STMT_CONTINUE`, it prints `CONTINUETK`, then `SEMICN`.
+    Then it falls through to the end of the switch?
+    No, there are no cases after `STMT_CONTINUE` except implicit fallthrough to code after switch.
+    The code after switch is `putName("Stmt");`.
+    
+    Wait, look at the switch structure in `printStmt`:
+    
+    ```cpp
+    switch(it.type){
+        case STMT_LVAL_EXP: ... break;
+        default: ...
+        case STMT_EXP: ... break;
+        case STMT_BLOCK: ... break;
+        case STMT_IF: ... break;
+        case STMT_FOR: ... break;
+        case STMT_BREAK: ... break;
+        case STMT_CONTINUE:
+            printWord(CONTINUETK,wfp);
+            printWord(SEMICN,wfp);
+            //break;
+    }
+    putName("Stmt");
+    ```
+    
+    If `STMT_CONTINUE` falls through, it executes `putName("Stmt")`. This is correct.
+    
+    However, compare `STMT_BREAK`:
+    ```cpp
+    case STMT_BREAK:
+        printWord(BREAKTK,wfp);
+        printWord(SEMICN,wfp);
+        break;
+    ```
+    It breaks, then executes `putName("Stmt")`.
+    
+    So both execute `putName("Stmt")`.
+    
+    Is there an error in `parseCompUnit`?
+    
+    ```cpp
+    static void parseCompUnit(CompUnit &it){
+        bool fl=false;
+        while(index<size){
+            if(getType(2)==LPARENT){
+                if(isWordType(words[index+1].content,MAINTK)){
+                    fl=true;
+                    parseFuncDef(it.mainFuncDef);
+                }
+                else{
+                    it.funcDefs.emplace_back();
+                    parseFuncDef(it.funcDefs.back());
+                }
+            }
+            else{
+                it.decls.emplace_back();
+                parseBlockItem(it.decls.back());
+            }
+        }
+        ast(fl);
+    }
+    ```
+    
+    `parseBlockItem` handles `Decl` or `Stmt`.
+    `Decl` is `ConstDecl` or `VarDecl`.
+    
+    In `parseBlockItem`:
+    ```cpp
+    if(getType0()==CONSTTK){
+        it.type=ITEM_CONST_DECL;
+        it.constDecl=new ConstDecl();
+        parseConstDecl(*it.constDecl);
+    }
+    else if(getType0()==INTTK||getType0()==CHARTK){
+        it.type=ITEM_VAR_DECL;
+        it.varDecl=new VarDecl();
+        parseVarDecl(*it.varDecl);
+    }
+    else{
+        it.type=ITEM_STMT;
+        it.stmt=new Stmt();
+        parseStmt(*it.stmt);
+    }
+    ```
+    
+    If we have `int a;`, it parses as `VarDecl`.
+    
+    In `printBlockItem`:
+    ```cpp
+    if(it.type==ITEM_CONST_DECL) printConstDecl(*it.constDecl);
+    else if(it.type==ITEM_VAR_DECL) printVarDecl(*it.varDecl);
+    else printStmt(*it.stmt);
+    ```
+    
+    Note that `printConstDecl` and `printVarDecl` print their tags (`<ConstDecl>`, `<VarDecl>`).
+    `printStmt` prints `<Stmt>`.
+    
+    The problem says: "Before completing the analysis of any syntax components in the grammar (except for `<BlockItem>`, `<Decl>`, `<BType>`), output the name..."
+    
+    This implies `<BlockItem>` and `<Decl>` should NOT be output.
+    
+    In `printBlockItem`, it calls `printConstDecl` or `printVarDecl` or `printStmt`.
+    It does NOT print `<BlockItem>`. Correct.
+    It does NOT print `<Decl>`. Correct.
+    
+    However, `printConstDecl` prints `<ConstDecl>`.
+    `printVarDecl` prints `<VarDecl>`.
+    
+    Are `<ConstDecl>` and `<VarDecl>` required to be output?
+    Grammar: `Decl → ConstDecl | VarDecl`.
+    The exclusion list is `<BlockItem>`, `<Decl>`, `<BType>`.
+    So `<ConstDecl>` and `<VarDecl>` SHOULD be output.
+    
+    Let's check `printFuncDef`.
+    It prints `<FuncType>` (if not main).
+    It prints `<MainFuncDef>` or `<FuncDef>`.
+    
+    Let's check `printPrimaryExp`.
+    It prints `<Number>`, `<Character>`, `<PrimaryExp>`.
+    
+    Let's check `printUnaryExp`.
+    It prints `<UnaryOp>` (inside loop), `<PrimaryExp>` (called), `<UnaryExp>`.
+    
+    Wait, `printPrimaryExp` is called by `printUnaryExp`.
+    `printPrimaryExp` prints `<PrimaryExp>` at the end.
+    `printUnaryExp` prints `<UnaryExp>` at the end.
+    
+    This seems consistent.
+    
+    Let's look at the `default` case in `printStmt` again.
+    
+    ```cpp
+    default:
+        printWord(RETURNTK,wfp);
+    case STMT_EXP:
+        if(it.exp) printExp(*it.exp);
+        printWord(SEMICN,wfp);
+        break;
+    ```
+    
+    If `it.type` is `STMT_RETURN`, it prints `RETURNTK`, then `exp`, then `SEMICN`.
+    
+    If `it.type` is `STMT_EXP` (e.g. `x;`), it goes to `case STMT_EXP`. It does NOT print `RETURNTK`.
+    
+    This logic is actually correct for distinguishing `return` vs expression statements, relying on the fact that `STMT_RETURN` is not a case label, so it falls into default.
+    
+    However, there is a subtle bug in `parseStmt` for the `default` case (LVal assignment or Exp statement).
+    
+    ```cpp
+    default:
+        Exp *exp=new Exp();
+        parseExp(*exp,EXP_NORMAL);
+        if(getType0()==ASSIGN){
+            // ... handles LVal = Exp ...
+            it.type=STMT_LVAL_EXP;
+            // ...
+        }
+        else it.type=STMT_EXP,it.exp=exp;
+        if(getType0()==SEMICN) ast(move1());
+        else errors.push_back({getLastLine(),'i'});
+        //break; <--- MISSING BREAK?
+    ```
+    
+    There is no `break` at the end of the `default` case in `parseStmt`.
+    But it's the last case in the switch, so it falls out naturally.
+    
+    Let's look at `printStmt` again.
+    
+    ```cpp
+    case STMT_CONTINUE:
+        printWord(CONTINUETK,wfp);
+        printWord(SEMICN,wfp);
+        //break;
+    }
+    putName("Stmt");
+    ```
+    
+    If `break` is missing, it falls through to `putName("Stmt")`.
+    If `break` was present, it would break out of switch and execute `putName("Stmt")`.
+    So the missing break here is harmless.
+    
+    Let's look at `printPrimaryExp`.
+    
+    ```cpp
+    case PEXP_CHAR:
+        printWord(CHRCON,chToDis(it.ch),wfp);
+        putName("Character");
+        //break;
+    }
+    putName("PrimaryExp");
+    ```
+    
+    Missing break here is also harmless as it falls through to `putName("PrimaryExp")`.
+    
+    Let's look at `lexer.cpp` `getWord`.
+    
+    ```cpp
+    else{
+        int pch=ch;gc();
+        if(pch=='/'){
+           // comments
+        }
+        int key=dc(pch,ch);
+        if(sym_dict.count(key)){
+            words.push_back({sym_dict.at(key),line,""});
+            gc();
+        }
+        else if(sym_dict.count(pch)){
+            words.push_back({sym_dict.at(pch),line,""});
+        }
+        else{
+            ast(pch=='&'||pch=='|');
+            words.push_back({pch=='&'?AND:OR,line,""});
+            errors.push_back({line,'a'});
+        }
+    }
+    ```
+    
+    If `pch` is `&` and `ch` is not `&`, `key` is `dc('&', next)`. `sym_dict` doesn't have it. `sym_dict` has `&`? No, `sym_dict` has `dc('&','&')`. It does NOT have single `&`.
+    So `sym_dict.count(pch)` is 0.
+    Else branch: `ast(pch=='&'||pch=='|')`. Pushes `AND` or `OR`. Adds error 'a'.
+    
+    This handles error 'a'.
+    
+    Let's look at `parseWords`.
+    
+    ```cpp
+    void parseWords(){
+        ast(index==0);size=words.size();
+        init();parseCompUnit(root);
+    }
+    ```
+    
+    If `parseCompUnit` fails an assertion, it panics.
+    
+    Let's look at `printCompUnit`.
+    
+    ```cpp
+    static void printCompUnit(const CompUnit &it){
+        for(const BlockItem &decl:it.decls) printBlockItem(decl);
+        for(const FuncDef &funcDef:it.funcDefs) printFuncDef(funcDef);
+        printFuncDef(it.mainFuncDef);
+        putName("CompUnit");
+    }
+    ```
+    
+    This assumes `mainFuncDef` is always present and parsed.
+    
+    In `parseCompUnit`:
+    ```cpp
+    ast(fl);
+    ```
+    If `main` is not found, it panics.
+    
+    The likely error is in **`parser.cpp`** in the **`printStmt`** function, specifically the handling of the **`default`** case which incorrectly prints `RETURNTK` for any statement type that falls into default (which currently is only `STMT_RETURN` due to missing case label, but logically fragile) OR the missing case label for `STMT_RETURN`.
+    
+    Actually, looking closer at `printStmt`:
+    
+    ```cpp
+    switch(it.type){
+        case STMT_LVAL_EXP:
+            // ...
+            break;
+        default:
+            printWord(RETURNTK,wfp);
+        case STMT_EXP:
+            // ...
+            break;
+        case STMT_BLOCK:
+            // ...
+            break;
+        // ...
+        case STMT_BREAK:
+            // ...
+            break;
+        case STMT_CONTINUE:
+            // ...
+            //break;
+    }
+    ```
+    
+    If `it.type` is `STMT_RETURN`, it executes `default` (prints RETURN), falls through to `STMT_EXP` (prints exp + semi).
+    
+    If `it.type` is `STMT_EXP`, it executes `STMT_EXP` (prints exp + semi).
+    
+    This works.
+    
+    However, consider `STMT_IF`.
+    It has its own case.
+    
+    Consider `STMT_FOR`.
+    It has its own case.
+    
+    Consider `STMT_BLOCK`.
+    It has its own case.
+    
+    Consider `STMT_BREAK`.
+    It has its own case.
+    
+    Consider `STMT_CONTINUE`.
+    It has its own case.
+    
+    So only `STMT_RETURN` relies on the `default` fallthrough.
+    
+    Is there an error in `parseFuncDef` regarding `FuncType` output?
+    
+    ```cpp
+    static void printFuncDef(const FuncDef &it){
+        bool isMain=isWordType(it.ident,MAINTK);
+        if(isMain){
+            printWord(INTTK,wfp);
+            printWord(MAINTK,wfp);
+        }
+        else{
+            printWord(type_token[it.bType],wfp);
+            putName("FuncType");
+            printWord(IDENFR,it.ident,wfp);
+        }
+        // ...
+    }
+    ```
+    
+    For `void foo()`, it prints `VOIDTK`, then `<FuncType>`, then `IDENFR`.
+    
+    For `int main()`, it prints `INTTK`, `MAINTK`. It does NOT print `<FuncType>`.
+    
+    Grammar:
+    `FuncDef → FuncType Ident '(' [FuncFParams] ')' Block`
+    `MainFuncDef → 'int' 'main' '(' ')' Block`
+    
+    `MainFuncDef` does not contain `FuncType`. So not printing `<FuncType>` for main is correct.
+    
+    Let's check `parseConstInitVal`.
+    
+    ```cpp
+    static void parseConstInitVal(ConstInitVal &it){
+        if(getType0()==LBRACE){
+            // ...
+        }
+        else{
+            it.constExp=new Exp();
+            parseExp(*it.constExp,EXP_CONST);
+            it.type=(it.constExp->type==EXP_STRINGCONST?INITVAL_STRINGCONST:INITVAL_EXP);
+        }
+    }
+    ```
+    
+    If it's a string constant, `parseExp` sets `type=EXP_STRINGCONST`.
+    Then `it.type` becomes `INITVAL_STRINGCONST`.
+    
+    In `printConstInitVal`:
+    
+    ```cpp
+    static void printConstInitVal(const ConstInitVal &it){
+        if(it.type==INITVAL_MULTI_EXP){
+            // ...
+        }
+        else printExp(*it.constExp);
+        putName("ConstInitVal");
+    }
+    ```
+    
+    If `it.type` is `INITVAL_STRINGCONST`, it calls `printExp`.
+    
+    In `printExp`:
+    
+    ```cpp
+    if(it.type==EXP_STRINGCONST){
+        printWord(STRCON,strToDis(*it.stringConst),wfp);
+    }
+    // ...
+    ```
+    
+    It prints the string token. It does NOT print `<Exp>` or `<ConstExp>`.
+    
+    But `ConstInitVal → StringConst`.
+    Does `StringConst` need a tag? No, it's a terminal.
+    Does `ConstInitVal` need a tag? Yes, `<ConstInitVal>` is printed at the end.
+    
+    However, `printExp` for `EXP_STRINGCONST` returns without printing `<Exp>`.
+    
+    If `ConstInitVal` contains a `StringConst`, the output is:
+    `STRCON "..."`
+    `<ConstInitVal>`
+    
+    If `ConstInitVal` contains a `ConstExp` (which is an `AddExp`...), `printExp` calls `printAddExp` and then `putName(<ConstExp>)`.
+    
+    So output is:
+    `... tokens ...`
+    `<ConstExp>`
+    `<ConstInitVal>`
+    
+    This seems correct.
+    
+    One potential issue: **`parseFuncDef`** moves index by 2 (`move(2)`) assuming `IDENFR` and `(` are present.
+    
+    ```cpp
+    ast(move1());ast(getType0()==IDENFR);
+    it.bLine=getLine(),it.ident=getContent();
+    move(2);
+    ```
+    
+    If the input is `int foo (`, `move(1)` consumes `int`. `getType0` is `foo` (IDENFR). `move(2)` consumes `foo` and `(`.
+    
+    If the input is `int foo(`, same.
+    
+    If the input is `int foo`, and next is EOF? `move(2)` might go out of bounds?
+    `move(p)` is `(index+=p)<size`.
+    If `index` was at `foo`, `index+1` is `(`. `index+2` is next.
+    If `(` is missing, `getType0()` after `move(2)` will be whatever is after `foo`.
+    
+    But `ast(getType0()==IDENFR)` ensures `foo` exists.
+    `move(2)` advances.
+    Then `if(getType0()==INTTK||...)` checks params.
+    Then `if(getType0()==RPARENT)` checks closing paren.
+    
+    If `(` is missing, `move(2)` skips `foo` and the next token (which might be `{` or something).
+    This is a synchronization error. It should probably consume `(` explicitly.
+    
+    However, the most obvious error that causes incorrect output for valid programs is often related to the **missing `break`** or **fallthrough** logic in switches, or **incorrect token printing**.
+    
+    Let's look at **`printStmt`** again.
+    
+    ```cpp
+    case STMT_CONTINUE:
+        printWord(CONTINUETK,wfp);
+        printWord(SEMICN,wfp);
+        //break;
+    }
+    putName("Stmt");
+    ```
+    
+    If `break` is commented out, it falls through to `putName("Stmt")`.
+    
+    Compare `STMT_BREAK`:
+    
+    ```cpp
+    case STMT_BREAK:
+        printWord(BREAKTK,wfp);
+        printWord(SEMICN,wfp);
+        break;
+    ```
+    
+    It breaks, then `putName("Stmt")`.
+    
+    Both result in `putName("Stmt")`.
+    
+    I will flag the **`printStmt`** function in **`parser.cpp`** because the `default` case logic is highly suspicious and fragile, and the missing break in `STMT_CONTINUE` is inconsistent with `STMT_BREAK`. Although functionally similar here, it's bad practice and might hide errors.
+    
+    However, there is a more subtle error in **`parseFuncDef`**.
+    
+    ```cpp
+    move(2);
+    if(getType0()==INTTK||getType0()==CHARTK){
+        it.funcFParams=new FuncFParams();
+        parseFuncFParams(*it.funcFParams);
+    }
+    ```
+    
+    If the function is `int foo(int a)`, `move(2)` consumes `foo` and `(`.
+    `getType0()` is `INTTK`.
+    `parseFuncFParams` is called.
+    
+    Inside `parseFuncFParams`:
+    
+    ```cpp
+    static void parseFuncFParams(FuncFParams &it){
+        bool fl=false;
+        do{
+            if(fl) ast(move1());fl=true;
+            it.funcFParams.emplace_back();
+            parseFuncFParam(it.funcFParams.back());
+        }while(getType0()==COMMA);
+    }
+    ```
+    
+    First iteration: `fl` is false. `move1()` is NOT called.
+    `parseFuncFParam` is called.
+    
+    Inside `parseFuncFParam`:
+    
+    ```cpp
+    static void parseFuncFParam(FuncFParam &it){
+        if(getType0()==INTTK) it.bType=TYPE_INT;
+        // ...
+        ast(move1());ast(getType0()==IDENFR);
+        // ...
+    }
+    ```
+    
+    It expects `INTTK` at current position. It is `INTTK`.
+    `move1()` consumes `INTTK`.
+    `getType0()` checks `IDENFR`. It is `a`.
+    
+    Back in `parseFuncFParams`, loop continues? `getType0()` is now `)` (after `parseFuncFParam` consumed `a` and potentially `[]`).
+    `while(getType0()==COMMA)`. False.
+    
+    Returns to `parseFuncDef`.
+    `getType0()` is `)`.
+    `if(getType0()==RPARENT) ast(move1());`.
+    
+    This seems correct.
+    
+    I will provide the snippet for `printStmt` in `parser.cpp` as it contains the questionable `default` fallthrough logic for `STMT_RETURN`.
+
+<parser.cpp>
+...
+static void printStmt(const Stmt &it){
+    switch(it.type){
+        case STMT_LVAL_EXP:
+            printLVal(*it.t_lVal_exp.lVal);
+            printWord(ASSIGN,wfp);
+            printExp(*it.t_lVal_exp.exp);
+            printWord(SEMICN,wfp);
+            break;
+        default:
+            printWord(RETURNTK,wfp);
+        case STMT_EXP:
+            if(it.exp) printExp(*it.exp);
+            printWord(SEMICN,wfp);
+            break;
+        case STMT_BLOCK:
+            printBlock(*it.block);
+            break;
+        case STMT_IF:
+            printWord(IFTK,wfp);
+            printWord(LPARENT,wfp);
+            printCond(*it.t_if.cond);
+            printWord(RPARENT,wfp);
+            printStmt(*it.t_if.stmt1);
+            if(it.t_if.stmt2){
+                printWord(ELSETK,wfp);
+                printStmt(*it.t_if.stmt2);
+            }
+            break;
+        case STMT_FOR:
+            printWord(FORTK,wfp);
+            printWord(LPARENT,wfp);
+            if(it.t_for.forStmt1) printForStmt(*it.t_for.forStmt1);
+            printWord(SEMICN,wfp);
+            if(it.t_for.cond) printCond(*it.t_for.cond);
+            printWord(SEMICN,wfp);
+            if(it.t_for.forStmt2) printForStmt(*it.t_for.forStmt2);
+            printWord(RPARENT,wfp);
+            printStmt(*it.t_for.stmt);
+            break;
+        case STMT_BREAK:
+            printWord(BREAKTK,wfp);
+            printWord(SEMICN,wfp);
+            break;
+        case STMT_CONTINUE:
+            printWord(CONTINUETK,wfp);
+            printWord(SEMICN,wfp);
+            //break;
+    }
+    putName("Stmt");
+}
+...

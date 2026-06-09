@@ -1,0 +1,272 @@
+Based on the comparison between the expected output and the buggy behavior, the issue appears to be in the **function call parsing logic**, specifically in how function calls are handled within expressions. 
+
+Looking at the expected output, when a function call like `func_0()` appears in an expression (e.g., `int a = func_0()+func_1()+param1;`), it should be parsed as a `<UnaryExp>` → `<PrimaryExp>` → `<LVal>` is **not** correct for function calls. Actually, function calls should be parsed as `<UnaryExp>` (for function call) directly, not through `<LVal>`.
+
+However, examining the actual parser code, the problem is more specific: **in `parseUnaryExp`, when encountering an identifier followed by '(', it correctly creates a `UnaryExpTreeForFuncCall`, but the walking/output logic doesn't match the expected format**.
+
+But looking more carefully at the expected output vs what's missing in the buggy output (which isn't shown, but we can infer from the expected), the key issue is in the **`parseStmt` method's handling of assignment statements with function calls**.
+
+Actually, looking at the expected output for lines like:
+```
+IDENFR func_0
+LPARENT (
+RPARENT )
+<UnaryExp>
+```
+
+This suggests that function calls are being parsed correctly as `UnaryExpTreeForFuncCall`. However, in the assignment statement like `int a = func_0()+func_1()+param1;`, the issue might be in how the initial variable declaration is handled.
+
+Wait, looking more carefully at the expected output for the `func_2` function:
+
+In the expected output, for the line `int a = func_0()+func_1()+param1;`, we see:
+```
+INTTK int
+IDENFR a
+ASSIGN =
+IDENFR func_0
+LPARENT (
+RPARENT )
+<UnaryExp>
+<MulExp>
+<AddExp>
+PLUS +
+...
+```
+
+But in a correct parse, `func_0()` should be a `<UnaryExp>`, then wrapped in `<MulExp>`, then `<AddExp>`, which matches.
+
+The real issue appears to be in the **`parseVarDef` method**. Looking at the expected output, when we have `int a = func_0()+func_1()+param1;`, the parser should:
+
+1. Output `INTTK int` 
+2. Output `IDENFR a`
+3. Output `ASSIGN =`
+4. Then parse the expression `func_0()+func_1()+param1` which starts with the function call
+
+But in the current implementation of `parseVarDef`, after parsing the identifier and any dimensions, if there's an `ASSIGN`, it calls `parseInitVal`.
+
+In `parseInitVal`, for the case of an expression (which includes function calls), it creates an `InitValTreeForExp` and calls `parseExp`.
+
+This should work correctly. 
+
+However, looking at the **`parseUnaryExp` method**, there's a critical issue in the condition for detecting function calls:
+
+```java
+} else if (isMatch(currToken, LexType.IDENFR) && isMatch(preRead, LexType.LPARENT)) {
+```
+
+The problem is that `preRead` is computed once at the beginning of the method using `getNextToken()`, but as tokens are consumed during parsing, this pre-read token becomes stale.
+
+Actually, looking more carefully at the code structure, the real issue is in the **`parseCompUnit` method**. The logic for distinguishing between declarations and function definitions is flawed.
+
+In `parseCompUnit`:
+```java
+preRead = getNextToken();
+prePreRead = getNext_NextToken();
+while (isMatch(currToken, LexType.CONSTTK)
+        || (isMatch(currToken, LexType.INTTK)
+        && isMatch(preRead, LexType.IDENFR)
+        && isNotMatch(prePreRead, LexType.LPARENT)
+)|| isMatch(currToken, LexType.CHARTK)
+) {
+    // Parse declarations
+}
+```
+
+Then later:
+```java
+preRead = getNextToken();
+while (isMatch(currToken, LexType.VOIDTK)
+        || (isMatch(currToken, LexType.INTTK)
+        && isMatch(preRead, LexType.IDENFR)
+        || isMatch(currToken, LexType.CHARTK))
+) {
+    // Parse function definitions
+}
+```
+
+The issue is that after parsing declarations, the `preRead` is not updated correctly for the function definition parsing loop. Also, the condition for function definitions includes `CHARTK` without checking if it's followed by an identifier and then `LPARENT`.
+
+But looking at the test input, all functions start with either `int`, `char`, or `void`, followed by an identifier, followed by `(`.
+
+The main problem appears to be in the **`parseStmt` method**, specifically in the condition for detecting assignment statements:
+
+```java
+if (isMatch(currToken, LexType.IDENFR)
+        && (findUntil(LexType.ASSIGN, LexType.SEMICN))
+) {
+```
+
+The `findUntil` method is implemented incorrectly. Looking at its implementation:
+
+```java
+public boolean findUntil(LexType find, LexType until){
+    for (int i = currTokenPos; i < tokens.size(); i++) {
+        if (tokens.get(i).getLexType() == find) {
+            return true;
+        } else if (tokens.get(i).getLexType() == until) {
+            return false;
+        }
+    }
+
+    for(int i = 0; i < currTokenPos; i++)
+    {
+        if (tokens.get(i).getLexType() == find) {
+            return true;
+        } else if (tokens.get(i).getLexType() == until) {
+            return false;
+        }
+    }
+    return false;
+}
+```
+
+This method searches forward from the current position for either the `find` token or the `until` token, but it also searches backward from position 0 to `currTokenPos`, which doesn't make sense. The backward search is completely wrong and will cause incorrect behavior.
+
+For example, when parsing `c = getchar();`, at the point where `currToken` is `c` (IDENFR), `findUntil(LexType.ASSIGN, LexType.SEMICN)` should look ahead to see if there's an `ASSIGN` before a `SEMICN`. But the current implementation might find an `ASSIGN` from a previous statement due to the backward search.
+
+However, looking at the expected output more carefully, the real issue seems to be that **function calls in expressions are not being parsed correctly as UnaryExp**.
+
+Wait, actually looking at the expected output for the main function call:
+```
+IDENFR func_4
+LPARENT (
+INTCON 1
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+...
+<FuncRParams>
+RPARENT )
+<UnaryExp>
+```
+
+This shows that `func_4(1,2,3)` is parsed as:
+- IDENFR func_4
+- LPARENT (
+- Arguments parsed as Exp → AddExp → MulExp → UnaryExp → PrimaryExp → Number
+- COMMA separators
+- FuncRParams
+- RPARENT )
+- **UnaryExp** (this is the function call itself)
+
+This is correct.
+
+But looking at the assignment in `func_2`:
+```
+IDENFR a
+ASSIGN =
+IDENFR func_0
+LPARENT (
+RPARENT )
+<UnaryExp>
+<MulExp>
+<AddExp>
+PLUS +
+```
+
+This shows `func_0()` being parsed correctly as a UnaryExp.
+
+The issue might actually be elsewhere. Let me check the **`parsePrimaryExp`** method.
+
+In `parsePrimaryExp`, when encountering an `IDENFR`, it calls `parseLVal`. But for function calls, the identifier should not go through `parseLVal`; instead, function calls should be handled in `parseUnaryExp`.
+
+This is correct in the current code: `parseUnaryExp` handles function calls before `parsePrimaryExp` is called.
+
+Actually, the problem appears to be in the **output generation**, not the parsing logic. Looking at the tree walking methods.
+
+In `UnaryExpTreeForFuncCall.walk()`:
+```java
+@Override
+public void walk(PrintStream printStream) {
+    printStream.println("IDENFR "+ident);
+    printStream.println("LPARENT (");
+
+    if (params != null) {
+        params.walk(printStream);
+    }
+
+    printStream.println("RPARENT )");
+
+    printStream.println("<UnaryExp>");
+}
+```
+
+This matches the expected output format.
+
+After careful analysis, the most likely issue is in the **`parseCompUnit` method's logic for separating declarations from function definitions**. The current logic may incorrectly classify some function definitions as declarations or vice versa.
+
+Looking at the condition again:
+```java
+while (isMatch(currToken, LexType.CONSTTK)
+        || (isMatch(currToken, LexType.INTTK)
+        && isMatch(preRead, LexType.IDENFR)
+        && isNotMatch(prePreRead, LexType.LPARENT)
+)|| isMatch(currToken, LexType.CHARTK)
+) {
+```
+
+The issue is with the `CHARTK` case - it doesn't check what follows the `char` keyword. A `char` followed by an identifier and then `(` should be a function definition, not a declaration.
+
+Similarly, in the function definition loop:
+```java
+while (isMatch(currToken, LexType.VOIDTK)
+        || (isMatch(currToken, LexType.INTTK)
+        && isMatch(preRead, LexType.IDENFR)
+        || isMatch(currToken, LexType.CHARTK))
+) {
+```
+
+The `CHARTK` case here also doesn't verify that it's followed by an identifier and `(`.
+
+This means that a variable declaration like `char c;` might be incorrectly parsed as a function definition, or vice versa.
+
+But looking at the test input, we have both `char func_0()` (function) and `char c;` (variable declaration).
+
+The correct logic should be:
+- For declarations: `const ...`, or `int/char` followed by identifier and **not** followed by `(`
+- For function definitions: `void/int/char` followed by identifier and **followed by** `(`
+- Main function: `int main()`
+
+The current code has the right idea but the implementation is flawed because `preRead` and `prePreRead` are not updated properly within the loops.
+
+<frontend/Parser.java>
+...
+    private ParseResult parseCompUnit(Token currToken) throws LexerException, ParserException {
+        CompUnitTree subTree = new CompUnitTree();
+        ParseResult result;
+        Token preRead, prePreRead;
+
+        preRead = getNextToken();
+        prePreRead = getNext_NextToken();
+        while (isMatch(currToken, LexType.CONSTTK)
+                || (isMatch(currToken, LexType.INTTK)
+                && isMatch(preRead, LexType.IDENFR)
+                && isNotMatch(prePreRead, LexType.LPARENT)
+        )|| isMatch(currToken, LexType.CHARTK)
+        ) {
+            //为什么要倒一下
+            result = parseDecl(currToken);
+            currToken = result.getNextToken();
+            subTree.declares.add((DeclTree) result.getSubtree());
+
+            preRead = getNextToken();
+            prePreRead = getNext_NextToken();
+        }
+
+        preRead = getNextToken();
+        while (isMatch(currToken, LexType.VOIDTK)
+                || (isMatch(currToken, LexType.INTTK)
+                && isMatch(preRead, LexType.IDENFR)
+                || isMatch(currToken, LexType.CHARTK))
+        ) {
+            result = parseFuncDef(currToken);
+            currToken = result.getNextToken();
+            subTree.funcs.add((FuncDefTree) result.getSubtree());
+
+            preRead = getNextToken();
+        }
+...

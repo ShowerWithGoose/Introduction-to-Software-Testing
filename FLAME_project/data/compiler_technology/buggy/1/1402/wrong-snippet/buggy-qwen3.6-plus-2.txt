@@ -1,0 +1,119 @@
+Based on the problem description and the test case analysis:
+
+1.  **Test Case Input**:
+    ```c
+    void f(int a {} // error 1 (Missing ')')
+    
+    int main( { // error 2 (Missing ')') - Note: The input `int main( {` implies `main` followed by `(` then `{`. The `)` is missing before `{`.
+        int a = 10;
+        f(a + 10; // error 3 (Missing ')')
+        return 0;
+    }
+    ```
+    *Note: The provided input string in the prompt is `void f(int a {} // error 1 \n\n int main( { // error 2 ...`. Let's trace the tokens.*
+    
+    The expected output is:
+    ```
+    1 j
+    3 j
+    5 j
+    ```
+    The buggy output is:
+    ```
+    1 j
+    3 j
+    5 i
+    ```
+
+2.  **Analysis of Error 3 (`f(a + 10;`)**:
+    -   Tokens: `f` (IDENFR), `(` (LPARENT), `a` (IDENFR), `+` (PLUS), `10` (INTCON), `;` (SEMICN).
+    -   The parser encounters `f`, identifies it as an identifier.
+    -   It looks ahead or enters `UnaryExp` / `PrimaryExp` logic.
+    -   In `Parser.java`, `unaryExp()` checks if `IDENFR` is followed by `LPARENT`.
+        ```java
+        if (tokens.get(token_index).type == TokenType.IDENFR && tokens.get(token_index + 1).type == TokenType.LPARENT) { 
+             identToken = tokens.get(token_index++); // consumes 'f'
+             lparentToken = tokens.get(token_index++); // consumes '('
+             if (tokens.get(token_index).type != TokenType.RPARENT) 
+                 funcRParams = funcRParams(); // Parses 'a + 10'
+             rparentToken = tokens.get(token_index++); // Expects ')' but finds ';'
+        }
+        ```
+    -   Inside `funcRParams`, it parses `Exp`. `Exp` -> `AddExp` -> ... -> `PrimaryExp`.
+    -   After parsing `10` (INTCON), the current token is `;` (SEMICN).
+    -   `funcRParams` returns.
+    -   Back in `unaryExp`, it executes `rparentToken = tokens.get(token_index++);`. This consumes the `;` token incorrectly as if it were `)`. It does **not** call `expect`.
+    -   Wait, looking at `unaryExp`:
+        ```java
+        rparentToken = tokens.get(token_index++);
+        ```
+        It just grabs the token. It doesn't validate it's `RPARENT`.
+    -   Then `unaryExp` returns.
+    -   Where is this `UnaryExp` used? It's part of `MulExp` -> `AddExp` -> `Exp`.
+    -   The call site for this expression is likely inside `Stmt`.
+    -   Let's look at `Stmt` parsing for `f(a + 10;`.
+    -   The `Stmt` method has a complex pre-read logic to distinguish between `LVal = Exp;` and `Exp;` or function calls.
+        ```java
+        } else {
+            int assign = token_index;
+            for (int i = token_index; i < tokens.size() && tokens.get(i).lineNumber == tokens.get(token_index).lineNumber; i++) {
+                if (tokens.get(i).type == TokenType.ASSIGN) 
+                    assign = i;
+            }
+            if (assign > token_index) { 
+                // ... handles assignment
+            } else {
+                if (tokens.get(token_index).type != TokenType.SEMICN) { 
+                    expList.add(exp()); // Calls exp() which calls unaryExp()
+                }
+                semiToken1 = expect(TokenType.SEMICN, tokens.get(token_index).type);
+            }
+        }
+        ```
+    -   When `exp()` is called, `token_index` is at `f`.
+    -   `unaryExp` consumes `f`, `(`, `a`, `+`, `10`.
+    -   Crucially, `unaryExp` consumes the `;` as `rparentToken` because it blindly does `tokens.get(token_index++)` expecting `)`.
+    -   So after `unaryExp` returns, `token_index` is pointing to the token *after* `;`.
+    -   Back in `Stmt`, `exp()` returns.
+    -   Then `semiToken1 = expect(TokenType.SEMICN, tokens.get(token_index).type);` is executed.
+    -   The current token is now whatever follows `;` (likely `return` or next line).
+    -   `expect` sees that the current token is NOT `SEMICN`.
+    -   It reports Error `i` (Missing semicolon) using `tokens.get(token_index - 1).lineNumber`.
+    -   `token_index - 1` is the index of the token *before* the current one. The current one is the token after `;`. So `token_index - 1` is the `;` itself.
+    -   The line number of `;` is 5.
+    -   So it outputs `5 i`.
+
+    **The Root Cause**:
+    In `unaryExp`, when parsing a function call `Ident '(' [FuncRParams] ')'`, the code blindly consumes the token expected to be `)` without verifying it. If it is not `)`, it should trigger an error (Error `j`: Missing right parenthesis) and potentially synchronize or handle the error gracefully so that subsequent parsing doesn't get confused. By consuming the `;` as the closing parenthesis, the parser loses track of the missing `)`, and the subsequent expectation of `;` fails, leading to a misleading "Missing semicolon" error.
+
+    The fix should be in `unaryExp` to use `expect` for the right parenthesis, similar to how it's done in other places like `funcDef`, `mainFuncDef`, etc.
+
+<frontend/Parser.java>
+...
+    private UnaryExp unaryExp() throws IOException {
+        PrimaryExp primaryExp = null;
+        Token identToken = null;
+        Token lparentToken = null;
+        FuncRParams funcRParams = null;
+        Token rparentToken = null;
+        UnaryOp unaryOp = null;
+        UnaryExp unaryExp = null;
+
+        System.out.println("\n在unaryExp中，当前token是" + tokens.get(token_index));
+        if (tokens.get(token_index).type == TokenType.IDENFR && tokens.get(token_index + 1).type == TokenType.LPARENT) { // Ident '(' [FuncRParams] ')'
+            identToken = tokens.get(token_index++);
+            lparentToken = tokens.get(token_index++);
+            if (tokens.get(token_index).type != TokenType.RPARENT) //存在FuncRParams
+                funcRParams = funcRParams();
+            rparentToken = tokens.get(token_index++);
+        } else if (tokens.get(token_index).type == TokenType.PLUS || tokens.get(token_index).type == TokenType.MINU ||
+                tokens.get(token_index).type == TokenType.NOT) { // UnaryOp UnaryExp
+            unaryOp = unaryOp();
+            unaryExp = unaryExp();
+        } else { // PrimaryExp
+            primaryExp = primaryExp();
+        }
+
+        return new UnaryExp("<UnaryExp>", primaryExp, identToken, lparentToken, funcRParams, rparentToken, unaryOp, unaryExp);
+    }
+...

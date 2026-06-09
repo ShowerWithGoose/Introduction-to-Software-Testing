@@ -1,0 +1,684 @@
+Based on the analysis of the problem description, test case, and source code:
+
+1.  **Problem Analysis**: The program needs to perform syntax analysis. For erroneous programs, it should output error line numbers and codes to `error.txt`. The expected output for the provided test case is three "missing semicolon" errors (code `i`) at lines 2, 9, and 13.
+2.  **Current Behavior**: The program produces "No output file". This usually implies that an exception was thrown during execution, causing the program to terminate before writing any output files, or the `main` method caught an exception and only printed to `stderr` without creating the files.
+3.  **Code Inspection**:
+    *   In `Compiler.java`, the `main` method wraps the logic in a `try-catch` block that catches `IOException`. If any other exception (like `IndexOutOfBoundsException` or `NullPointerException`) occurs, it will propagate up and crash the program, preventing file creation.
+    *   In `Parser.java`, the `compUnit` method uses `next(1)` and `next(2)` to look ahead.
+        ```java
+        while (next(1).getType() != MAINTK && next(2).getType() != LPARENT) {
+        ```
+        The `next(int n)` method accesses `tokens.get(current + n)`. If the token list is short or `current` is near the end, this will throw an `IndexOutOfBoundsException`.
+    *   More critically, looking at the `stmt` method in `Parser.java`:
+        ```java
+        } else {
+            if (next(0).getType() == SEMICN) {
+                Node semicolonNode = new Node(new Token(SEMICN, ";", next(-1).getLine()));
+                node.addChild(semicolonNode);
+                handleError(i, next(-1));
+            } else {
+                Node expNode = exp();
+                node.addChild(expNode);
+                Node semicolonNode = new Node(new Token(SEMICN, ";", next(-1).getLine()));
+                node.addChild(semicolonNode);
+                handleError(i, next(-1));
+            }
+        }
+        ```
+        When `handleError` is called for error `i` (missing semicolon), it checks `if (next(0).getType() != SEMICN)`. If true, it adds an error. It does **not** consume any token.
+        However, the code constructs a synthetic `SEMICN` node using `next(-1).getLine()`. `next(-1)` accesses `tokens.get(current - 1)`. If `current` is 0, this throws an `IndexOutOfBoundsException`.
+        
+    *   Let's look at the specific test case input:
+        ```c
+        int main() {
+            printf("Hello SysY!\n") // error 1
+        ...
+        ```
+        The parser enters `mainFuncDef`, then `block`. Inside `block`, it parses `BlockItem`. Since `printf` is not a declaration keyword, it goes to `stmt()`.
+        Inside `stmt()`, it matches `PRINTFTK`.
+        It parses arguments, then expects `)`. It finds `)`.
+        Then it expects `;`.
+        The code creates a synthetic semicolon node: `new Token(SEMICN, ";", next(-1).getLine())`. Here `next(-1)` refers to the `)` token just processed. This is safe if `current > 0`.
+        Then it calls `handleError(i, next(-1))`.
+        Inside `handleError`:
+        ```java
+        if (type == i) {
+            if (next(0).getType() != SEMICN) { // Checks if current token is NOT semicolon
+                Error error = new Error(i, token.getLine());
+                errors.add(error);
+            } else {
+                move(); // Consumes semicolon if present
+            }
+        }
+        ```
+        In the test case, after `)`, the next token is likely `}` (start of next line or same line depending on lexer, but here `printf` line ends with `)` and next line is empty/comment). The lexer skips comments and whitespace. The next significant token after `)` on line 2 is probably `if` on line 4? No, there is an empty line and comment.
+        Wait, the input is:
+        ```
+        int main() {
+            printf("Hello SysY!\n") // error 1
+
+            if (1)
+        ...
+        ```
+        After parsing `printf(...)`, `current` points to the token after `)`. The `)` was consumed by `move()` inside the `printf` branch?
+        Let's trace `stmt` for `printf`:
+        ```java
+        } else if (next(0).getType() == PRINTFTK) {
+            // ... moves through tokens ...
+            Node rparenNode = new Node(new Token(RPARENT, ")", next(-1).getLine()));
+            node.addChild(rparenNode);
+            handleError(j, next(-1)); // Checks for missing )
+            Node semicolonNode = new Node(new Token(SEMICN, ";", next(-1).getLine()));
+            node.addChild(semicolonNode);
+            handleError(i, next(-1)); // Checks for missing ;
+        }
+        ```
+        After `handleError(j, ...)`, if `)` was present, `move()` was called inside `handleError`. So `current` is now pointing to the token after `)`.
+        Then `handleError(i, ...)` is called. It checks `next(0)`. If `next(0)` is not `;` (which it isn't, it's likely `if` or `}`), it records error `i`. It does **not** call `move()`.
+        So `current` remains pointing to the token after `)`.
+        The `stmt` function returns.
+        Back in `block()`:
+        ```java
+        while (next(0).getType() != RBRACE) {
+            Node blockItemNode = blockItem();
+            node.addChild(blockItemNode);
+        }
+        ```
+        The loop continues. `next(0)` is still the token after `)` (e.g., `if`). It is not `RBRACE`. So it calls `blockItem()` again.
+        This seems correct so far.
+
+    *   Why "No output file"?
+        Look at `Lexer.java`.
+        ```java
+        case '&':
+            nextCh = reader.read();
+            if (nextCh == '&') {
+                writeToken(AND, "&&", lineNumber);
+            } else {
+                writeToken(AND, "&&", lineNumber); // Writes AND even if it's single &
+                writeError(lineNumber, a);
+                reader.unread(nextCh);
+            }
+            break;
+        ```
+        This handles error `a`.
+
+    *   Look at `Parser.java` -> `compUnit`.
+        ```java
+        while (next(1).getType() != MAINTK && next(2).getType() != LPARENT) {
+             Node declNode = decl();
+             node.addChild(declNode);
+        }
+        ```
+        If the input starts with `int main()`, `next(0)` is `int`, `next(1)` is `main` (MAINTK).
+        Condition: `MAINTK != MAINTK` is false. Loop doesn't run.
+        Next loop: `while (next(1).getType() != MAINTK)`.
+        `next(1)` is `MAINTK`. Condition false. Loop doesn't run.
+        Calls `mainFuncDef()`.
+
+    *   Let's look at `mainFuncDef`.
+        ```java
+        private Node mainFuncDef() {
+            // ...
+            Node rparentNode = new Node(new Token(RPARENT, ")", next(-1).getLine()));
+            node.addChild(rparentNode);
+            handleError(j, next(-1));
+            Node blockNode = block();
+            node.addChild(blockNode);
+            return node;
+        }
+        ```
+        
+    *   Let's look at `block`.
+        ```java
+        private Node block() {
+            // ...
+            while (next(0).getType() != RBRACE) {
+                Node blockItemNode = blockItem();
+                node.addChild(blockItemNode);
+            }
+            // ...
+        }
+        ```
+        
+    *   Let's look at the error handling in `stmt` again.
+        If an error `i` is detected, `current` is NOT advanced.
+        In the test case:
+        Line 2: `printf("...")` missing `;`.
+        Parser detects missing `;`. Adds error. `current` points to `if` (Line 4).
+        Returns from `stmt`.
+        Back in `block`. `next(0)` is `if`. Not `}`.
+        Calls `blockItem`.
+        `blockItem` sees `if` (not decl keyword). Calls `stmt`.
+        `stmt` handles `if`.
+        
+        Line 4-6: `if (1) \n \n /*********/ \n ;`
+        `if` parsed. `(1)` parsed. `Stmt` inside if is `;` (empty statement).
+        Wait, the input is:
+        ```
+            if (1)
+
+
+            /*********/
+            ;
+        ```
+        The `Stmt` after `if (1)` is `;`.
+        In `stmt`, for `if`:
+        ```java
+        Node stmtNode = stmt();
+        node.addChild(stmtNode);
+        ```
+        This recursive call to `stmt` will parse the `;`.
+        Inside that recursive `stmt`:
+        It falls into the `else` block at the end because `next(0)` is `SEMICN`.
+        ```java
+        } else {
+            if (next(0).getType() == SEMICN) {
+                Node semicolonNode = new Node(new Token(SEMICN, ";", next(-1).getLine()));
+                node.addChild(semicolonNode);
+                handleError(i, next(-1));
+            } 
+            // ...
+        }
+        ```
+        `next(0)` is `SEMICN`.
+        It creates a node.
+        Calls `handleError(i, next(-1))`.
+        Inside `handleError`: `next(0)` IS `SEMICN`. So it executes `else { move(); }`.
+        So `current` advances past `;`.
+        
+        Then back to outer `stmt` (the `if` statement).
+        It checks for `else`. `next(0)` is `int` (Line 9). No else.
+        Returns.
+        
+        Back in `block`. `next(0)` is `int`. Not `}`.
+        Calls `blockItem`.
+        `blockItem` sees `int`. Calls `decl`.
+        `decl` calls `varDecl`.
+        `varDecl` parses `int a`.
+        `varDef` parses `a`.
+        `varDecl` expects `;`.
+        ```java
+        Node semicolonNode = new Node(new Token(SEMICN, ";", next(-1).getLine()));
+        node.addChild(semicolonNode);
+        handleError(i, next(-1));
+        ```
+        `next(0)` is `for` (Line 11). Not `;`.
+        `handleError` adds error `i` at line of `a` (Line 9).
+        Does NOT move.
+        Returns `varDecl`.
+        Returns `decl`.
+        Returns `blockItem`.
+        Back in `block`. `next(0)` is still `for`.
+        Loop continues.
+        Calls `blockItem`.
+        `blockItem` sees `for`. Calls `stmt`.
+        `stmt` parses `for (;;) {}`.
+        Inside `for` parsing:
+        ```java
+        Node semicolonNode1 = new Node(new Token(SEMICN, ";", next(-1).getLine()));
+        node.addChild(semicolonNode1);
+        handleError(i, next(-1));
+        ```
+        First `;` in `for(;;)`. `next(0)` is `;`. `handleError` moves.
+        Second `;`. `next(0)` is `)`. `handleError` adds error?
+        Wait, `for (;;)`.
+        Tokens: `for`, `(`, `;`, `;`, `)`, `{`, `}`.
+        1. Parse `for`. Move.
+        2. Parse `(`. Move.
+        3. Check `next(0) != SEMICN`. It is `;`. So skip `forStmt`.
+        4. Create synch `;` node. `handleError(i, ...)`. `next(0)` is `;`. Move.
+        5. Check `next(0) != SEMICN`. It is `;`. Skip `cond`.
+        6. Create synch `;` node. `handleError(i, ...)`. `next(0)` is `;`. Move.
+        7. Check `next(0) != RPARENT`. It is `)`. Skip `forStmt`.
+        8. Create synch `)` node. `handleError(j, ...)`. `next(0)` is `)`. Move.
+        9. Parse `stmt` (the `{}`).
+        
+        So `for` parses correctly.
+        Back in `block`. `next(0)` is `return` (Line 13).
+        Calls `blockItem`.
+        `stmt` parses `return 0`.
+        Expects `;`.
+        `next(0)` is `}`.
+        `handleError(i, ...)` adds error `i` at line 13.
+        Does NOT move.
+        Returns.
+        Back in `block`. `next(0)` is `}`.
+        Loop terminates.
+        Parses `}`.
+        Returns `block`.
+        Returns `mainFuncDef`.
+        Returns `compUnit`.
+        
+        So parsing completes. Errors are collected.
+        Why no output?
+        
+        Check `Compiler.java`:
+        ```java
+        List<String> nodeList = parser.inorder(root, new ArrayList<>());
+        writeToFile("parser.txt", nodeList);
+        List<Error> errorsFromParser = parser.getErrors();
+        List<Error> errorsFromLexer = lexer.getErrors();
+        List<String> errors = mergeErrors(errorsFromParser, errorsFromLexer);
+        writeToFile("error.txt", errors);
+        ```
+        
+        If `parser.txt` is written, `error.txt` should be written too.
+        Unless `writeToFile` throws an exception?
+        
+        Or maybe `parser.inorder` crashes?
+        
+        Let's look at `Node.toString()`.
+        ```java
+        @Override
+        public String toString() {
+            return this.value;
+        }
+        ```
+        And `Node.setValueN()`:
+        ```java
+        public void setValueN() {
+            this.value = (type == NodeType.BlockItem || type == NodeType.Decl || type == NodeType.BType)
+                    ? "" : "<" + type.toString() + ">";
+        }
+        ```
+        
+        If `value` is null? No, initialized in constructor.
+        
+        Is it possible `root` is null?
+        `parse()` sets `root`.
+        
+        Let's look closely at `Lexer.java` again.
+        ```java
+        public void parse() throws IOException {
+            // ...
+            while (!isEndOfFile((ch = reader.read()))) {
+                // ...
+                case '/':
+                     // ...
+                     if (nextCh == '/') { // Single line comment
+                         while ((ch = reader.read()) != '\n' && !isEndOfFile(ch));
+                         lineNumber++;
+                         continue;
+                     }
+                     // ...
+            }
+        }
+        ```
+        If the file ends with a comment without a newline?
+        `while ((ch = reader.read()) != '\n' && !isEndOfFile(ch));`
+        If EOF is reached, `ch` is -1. Loop terminates.
+        `lineNumber++` is executed.
+        `continue`.
+        Outer loop checks `!isEndOfFile((ch = reader.read()))`.
+        `reader.read()` returns -1. `isEndOfFile` is true. Loop terminates.
+        This seems fine.
+
+    *   Wait, look at `Lexer.java` `case '/'` logic again.
+        ```java
+                    } else {
+                        reader.unread(nextCh); // If not comment, push back
+                        switch (ch) {
+                            case ';': // ch is '/' here!
+                                writeToken(SEMICN, ";", lineNumber);
+                                break;
+                            // ...
+                            case '/':
+                                writeToken(DIV, "/", lineNumber);
+                                break;
+                            // ...
+                        }
+                    }
+        ```
+        The `switch(ch)` is inside the `else` block of `if (nextCh == '/') ... else if (nextCh == '*')`.
+        So if it's not a comment, `ch` is still `/`.
+        The switch cases include `case ';'`, `case '('`, etc.
+        But `ch` is `/`.
+        So it goes to `default`?
+        No, there is `case '/': writeToken(DIV, "/", lineNumber); break;`.
+        So `/` is tokenized as DIV. Correct.
+
+    *   Let's check `mergeErrors`.
+        ```java
+        public static List<String> mergeErrors(List<Error> errors1, List<Error> errors2) {
+            List<String> list = new ArrayList<>();
+            // ... merges based on line number
+            return list;
+        }
+        ```
+        If both lists are empty, returns empty list.
+        `writeToFile` iterates. If list is empty, writes nothing?
+        ```java
+        try (PrintWriter writer = new PrintWriter(path.toFile())) {
+            for (Object node : content) {
+                if (!Objects.equals(node.toString(), "")) {
+                    writer.println(node);
+                }
+            }
+        }
+        ```
+        If `content` is empty, loop doesn't run. File is created but empty.
+        The problem says "No output file". This usually means the file doesn't exist.
+        
+        If an exception occurs in `parser.inorder`, `writeToFile("parser.txt", ...)` might fail or not be reached?
+        No, `parser.inorder` is called before `writeToFile`.
+        
+        Is it possible `parser.parse()` throws an exception?
+        
+        Let's look at `compUnit` again.
+        ```java
+        while (next(1).getType() != MAINTK && next(2).getType() != LPARENT) {
+        ```
+        If the input is just `int main() {}`.
+        Tokens: `INTTK`, `MAINTK`, `LPARENT`, `RPARENT`, `LBRACE`, `RBRACE`.
+        `current` = 0.
+        `next(1)` is `MAINTK`.
+        `next(1).getType() != MAINTK` is False.
+        Short-circuit AND. Condition is False.
+        Loop skipped.
+        
+        What if input has errors that cause `next()` to go out of bounds?
+        
+        In the test case, `printf` line.
+        `stmt` for `printf`.
+        `handleError(j, next(-1))` for `)`.
+        `next(0)` is `if` (or whatever is next). Not `)`.
+        So `handleError` adds error `j`?
+        Wait, `printf("...")` HAS `)`.
+        Lexer produces `STRCON`, `RPARENT`.
+        Parser `stmt`:
+        `move()` past `STRCON`.
+        `next(0)` is `RPARENT`.
+        `rparenNode` created.
+        `handleError(j, next(-1))`. `next(-1)` is `RPARENT`.
+        Inside `handleError`: `next(0)` is `RPARENT`.
+        So `else { move(); }` is executed.
+        `current` moves past `)`.
+        
+        Then `handleError(i, next(-1))` for `;`.
+        `next(-1)` is `RPARENT`.
+        `next(0)` is `if` (Line 4).
+        `next(0) != SEMICN`.
+        Adds error `i`.
+        
+        So far so good.
+
+    *   **Crucial Observation**:
+        In `Compiler.java`:
+        ```java
+        } catch (IOException e) {
+            System.err.println("Error reading or writing files: " + e.getMessage());
+        }
+        ```
+        If `parser.parse()` throws a `RuntimeException` (e.g., `IndexOutOfBoundsException`), it is NOT caught. The program crashes. No files are written (or partially written files might be deleted/empty depending on OS/flushing, but typically "No output file" means crash).
+        
+        Where could an `IndexOutOfBoundsException` occur?
+        
+        Look at `Parser.next(int n)`:
+        ```java
+        private Token next(int n) {
+            return tokens.get(current + n);
+        }
+        ```
+        
+        Look at `compUnit`:
+        ```java
+        while (next(1).getType() != MAINTK && next(2).getType() != LPARENT) {
+        ```
+        If `tokens.size()` is small, `current + 2` might be out of bounds.
+        Example: Empty file? No, `testfile.txt` has content.
+        
+        What about `stmt`?
+        
+        Look at `handleError` usage in `stmt` for `printf`:
+        ```java
+            Node rparenNode = new Node(new Token(RPARENT, ")", next(-1).getLine()));
+            node.addChild(rparenNode);
+            handleError(j, next(-1));
+            Node semicolonNode = new Node(new Token(SEMICN, ";", next(-1).getLine()));
+            node.addChild(semicolonNode);
+            handleError(i, next(-1));
+        ```
+        
+        Look at `handleError` implementation:
+        ```java
+    private void handleError(ErrorType type, Token token) {
+        if (type == i) {
+            if (next(0).getType() != SEMICN) {
+                Error error = new Error(i, token.getLine());
+                errors.add(error);
+            } else {
+                move();
+            }
+        } 
+        // ...
+    }
+        ```
+        
+        Is it possible `next(0)` fails?
+        If `current` is at the last token, `next(0)` is valid.
+        
+        Let's look at `Lexer` output for the test case.
+        Line 2: `printf` `(` `"..."` `)`
+        Line 4: `if` `(` `1` `)`
+        Line 9: `int` `a`
+        Line 11: `for` `(` `;` `;` `)` `{` `}`
+        Line 13: `return` `0`
+        Line 14: `}`
+        
+        Total tokens approx 20.
+        
+        Let's look at `compUnit` again.
+        ```java
+        while (next(1).getType() != MAINTK && next(2).getType() != LPARENT) {
+        ```
+        If the program starts with `int main`, `next(1)` is `main`. OK.
+        
+        What if the error is in `Lexer`?
+        
+        Actually, look at `Lexer.java` `readStringLiteral`.
+        ```java
+    private String readStringLiteral(char ch) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        while (!isEndOfFile((ch = (char) reader.read())) && !isQuote((char) ch)) {
+            sb.append((char) ch);
+            if (ch == '\\') {
+                ch = (char) reader.read();
+                sb.append(ch);
+            }
+        }
+        return sb.toString();
+    }
+        ```
+        If EOF is reached inside the string?
+        `isEndOfFile` checks `ch == -1`.
+        If `reader.read()` returns -1, `ch` becomes -1 (cast to char is 65535?).
+        `isEndOfFile((char) -1)`?
+        `isEndOfFile(int ch)` checks `ch == -1`.
+        But `readStringLiteral` casts to `char` BEFORE passing to `isEndOfFile`?
+        No: `!isEndOfFile((ch = (char) reader.read()))`
+        `reader.read()` returns `int`.
+        `(char) reader.read()` casts it to char.
+        Then `isEndOfFile` takes `int`?
+        Wait, `isEndOfFile` signature: `private boolean isEndOfFile(int ch)`.
+        Call: `isEndOfFile((ch = (char) reader.read()))`.
+        The argument is `ch` which is `char`. It is promoted to `int`.
+        If `reader.read()` returns -1.
+        `(char) -1` is `\uFFFF` (65535).
+        `isEndOfFile(65535)` returns `false`.
+        Loop continues!
+        `!isQuote((char) 65535)` is true.
+        `sb.append((char) 65535)`.
+        Next iteration: `reader.read()` returns -1 again?
+        Yes, `reader.read()` returns -1 on EOF.
+        Infinite loop in `readStringLiteral` if string is not closed and EOF is reached!
+        
+        Test case: `printf("Hello SysY!\n")`
+        The string is `"Hello SysY!\n"`. It is closed.
+        So `readStringLiteral` works fine.
+        
+        However, look at `Lexer.parse()` loop.
+        ```java
+        while (!isEndOfFile((ch = reader.read()))) {
+        ```
+        Here `ch` is `int`. `isEndOfFile` works correctly.
+        
+        But inside `readStringLiteral`, the cast to `char` breaks EOF detection.
+        Although the test case string is valid, this is a bug.
+        
+        Is there another bug?
+        
+        Look at `Parser.java` `stmt` for `if`.
+        ```java
+        } else if (next(0).getType() == IFTK) {
+            // ...
+            Node rparenNode = new Node(new Token(RPARENT, ")", next(-1).getLine()));
+            node.addChild(rparenNode);
+            handleError(j, next(-1));
+            Node stmtNode = stmt();
+            node.addChild(stmtNode);
+            if (next(0).getType() == ELSETK) {
+                // ...
+            }
+        }
+        ```
+        
+        Look at `Parser.java` `stmt` for `for`.
+        ```java
+        } else if (next(0).getType() == FORTK) {
+            // ...
+            Node rparenNode = new Node(new Token(RPARENT, ")", next(-1).getLine()));
+            node.addChild(rparenNode);
+            handleError(j, next(-1));
+            Node stmtNode = stmt();
+            node.addChild(stmtNode);
+        }
+        ```
+        
+        Everything seems to handle missing tokens by synthesizing them and NOT advancing `current` if the token is missing (except for `j` and `k` where it advances if present).
+        Wait, `handleError` for `j`:
+        ```java
+        } else if (type == j) {
+            if (next(0).getType() != RPARENT) {
+                Error error = new Error(j, token.getLine());
+                errors.add(error);
+            } else {
+                move();
+            }
+        }
+        ```
+        If `)` is missing, error added, `current` NOT moved.
+        If `)` is present, `current` moved.
+        
+        This logic allows the parser to recover?
+        If `)` is missing, `current` stays at the token that SHOULD have been after `)`.
+        The parent node assumes `)` was there (synthetic node).
+        The next part of the grammar expects what comes after `)`.
+        Since `current` is already pointing to it, it works.
+        
+        So why crash?
+        
+        Let's look at `Compiler.java` again.
+        ```java
+        Lexer lexer = new Lexer("testfile.txt", "lexer.txt");
+        lexer.parse();
+        ArrayList<Token> tokens = lexer.getTokens();
+        Parser parser = new Parser(tokens);
+        parser.parse();
+        ```
+        
+        If `lexer.txt` cannot be written? `FileNotFoundException`?
+        Caught by `IOException`.
+        
+        If `parser.txt` cannot be written?
+        
+        Maybe the issue is simpler.
+        
+        Look at `Node.java` `setValueN`.
+        ```java
+    public void setValueN() {
+        this.value = (type == NodeType.BlockItem || type == NodeType.Decl || type == NodeType.BType)
+                ? "" : "<" + type.toString() + ">";
+    }
+        ```
+        
+        Look at `NodeType.java`.
+        `Decl`, `BlockItem`, `BType` are defined.
+        
+        Look at `Parser.java` `decl`.
+        ```java
+    private Node decl() {
+        // Decl -> ConstDecl | VarDecl
+        Node node = new Node(Decl);
+        // ...
+        return node;
+    }
+        ```
+        
+        Look at `Parser.java` `blockItem`.
+        ```java
+    private Node blockItem() {
+        // BlockItem → Decl | Stmt
+        Node node = new Node(BlockItem);
+        // ...
+        return node;
+    }
+        ```
+        
+        Look at `Parser.java` `bType`.
+        ```java
+    private Node bType() {
+        // BType → 'int' | 'char'
+        Node node = new Node(BType);
+        // ...
+        return node;
+    }
+        ```
+        
+        These nodes have `value = ""`.
+        
+        In `Compiler.java`:
+        ```java
+        for (Object node : content) {
+            if (!Objects.equals(node.toString(), "")) {
+                writer.println(node);
+            }
+        }
+        ```
+        Empty strings are skipped.
+        
+        This is for `parser.txt`.
+        
+        For `error.txt`:
+        ```java
+        List<String> errors = mergeErrors(errorsFromParser, errorsFromLexer);
+        writeToFile("error.txt", errors);
+        ```
+        
+        If `errors` is empty, `error.txt` is created but empty.
+        The expected output is NOT empty.
+        
+        So errors MUST be generated.
+        
+        If the program crashes, no files.
+        
+        I suspect the crash is in `compUnit` or `next()`.
+        
+        <frontend/Parser.java>
+...
+    private Node compUnit() {
+        // CompUnit → {Decl} {FuncDef} MainFuncDef
+        Node node = new Node(CompUnit);
+        while (next(1).getType() != MAINTK && next(2).getType() != LPARENT) {
+            Node declNode = decl();
+            node.addChild(declNode);
+        }
+        while (next(1).getType() != MAINTK) {
+            Node funcNode = funcDef();
+            node.addChild(funcNode);
+        }
+        Node mainFuncNode = mainFuncDef();
+        node.addChild(mainFuncNode);
+        return node;
+    }
+...

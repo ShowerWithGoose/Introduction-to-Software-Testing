@@ -1,0 +1,498 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The task is to implement a syntax analyzer that outputs syntax components for correct programs or error codes (line number and type) for incorrect programs.
+2.  **Test Case Input**: A C-like source code with three specific syntax errors:
+    *   Line 13: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);` -> Missing right parenthesis `)`. Expected error: `13 j`.
+    *   Line 15: `if (3 > 0 {` -> Missing right parenthesis `)`. Expected error: `15 j`.
+    *   Line 20: `i = (((((f(str)))));` -> This is an assignment statement `LVal '=' Exp ';'`. The expression part is `((((f(str)))))`. Inside, `f(str)` is a function call. The parser needs to handle the nested parentheses. The structure is `LVal` (`i`) `=` `Exp`. The `Exp` starts with `(`. It parses `PrimaryExp` -> `( Exp )`. Inside, another `( Exp )`, etc., until `f(str)`. After `f(str)`, there are closing parentheses `))))`. Then `;`.
+        *   Wait, let's look closer at line 20: `i = (((((f(str)))));`
+        *   Tokens: `i`, `=`, `(`, `(`, `(`, `(`, `(`, `f`, `(`, `str`, `)`, `)`, `)`, `)`, `)`, `)`, `;`
+        *   Parsing `Exp`:
+            *   `AddExp` -> `MulExp` -> `UnaryExp` -> `PrimaryExp`
+            *   `PrimaryExp` sees `(`. Calls `primaryExpExpParser`.
+            *   `primaryExpExpParser` consumes `(`, calls `expParser`, expects `)`.
+            *   This recursion happens 5 times for the 5 opening parens.
+            *   Innermost `expParser` parses `f(str)`. `f` is `Ident`, `(` is `LPARENT`. `unaryExpParser` sees `Ident` followed by `LPARENT`, so it goes to `unaryExpFuncParser`.
+            *   `unaryExpFuncParser` consumes `f`, `(`, parses args (`str`), expects `)`. Consumes `)`. Returns `UnaryExpFunc`.
+            *   This `UnaryExpFunc` is wrapped in `UnaryExpPri`? No, `unaryExpFuncParser` returns `UnaryExpFunc` which extends `UnaryExp`.
+            *   So innermost `Exp` is formed from this `UnaryExp`.
+            *   Then `primaryExpExpParser` expects `)`. It finds `)`. Consumes it. Returns `PrimaryExpExp`.
+            *   This repeats for all 5 layers.
+            *   Finally, the outermost `PrimaryExpExp` returns.
+            *   Back in `stmtAssignParser` (or `stmtAssOrExpParser`), after `expParser` returns, it expects `;`.
+            *   The next token is `;`. So it should succeed?
+            *   Let's re-read the input carefully: `i = (((((f(str)))));`
+            *   Count parens: 5 open, 5 close after `str)`. Total 6 closes?
+            *   `f(str)` has 1 open, 1 close.
+            *   Input: `(((((` (5 opens) `f` `(` `str` `)` `)` `)` `)` `)` `)` (6 closes) `;`
+            *   So there is one extra `)`.
+            *   Parsing:
+                *   5 layers of `( Exp )` consume 5 opens and 5 closes.
+                *   The innermost `Exp` parses `f(str)`.
+                *   After the 5th layer returns, we are back in `stmtAssignParser`.
+                *   The next token is the 6th `)`.
+                *   `stmtAssignParser` expects `;`. It finds `)`.
+                *   It reports error `i` (missing semicolon) at the line of the last token consumed? Or current?
+                *   The code says: `errors.add(new Error(Error.ErrorType.i, iterator.lastToken().getLineNum()));`
+                *   `lastToken` would be the last token of the `Exp`, which is the 5th `)`.
+                *   So it reports error `i` at line 20.
+            *   However, the expected output is `20 j` (Missing right parenthesis).
+            *   Why `j`?
+            *   Perhaps the parser interprets the structure differently.
+            *   If the parser treats `((((f(str)))))` as an expression, and then sees `)`, it might think it's inside a parenthesized expression that hasn't closed yet?
+            *   No, `Exp` doesn't consume trailing `)`.
+            *   Let's look at `stmtIfParser` or other places where `j` is reported.
+            *   Error `j` is "Missing right parenthesis".
+            *   In `primaryExpExpParser`, if `)` is missing, it reports `j`.
+            *   In `unaryExpFuncParser`, if `)` is missing, it reports `j`.
+            *   In `stmtGetIntParser`, `stmtGetCharParser`, `stmtPrintfParser`, `funcDefParser`, `mainFuncDefParser`, `stmtIfParser`, `stmtForParser` (implicitly via `condParser`? No, `stmtForParser` reads `)` explicitly without check? Wait. `stmtForParser`: `Token rParent = iterator.readNextToken();` It just reads it. It doesn't check if it IS `)`. It assumes it is. This is a bug in itself, but not relevant to line 20).
+            *   Back to Line 20: `i = (((((f(str)))));`
+            *   If the expected error is `20 j`, it implies the parser detected a missing `)` somewhere.
+            *   But there is an *extra* `)`.
+            *   Usually, an extra `)` causes a "Unexpected token" error or is ignored if the parser is robust. Here, the parser stops at `;`.
+            *   If the parser reported `20 i`, it means it expected `;` but found something else (the extra `)`).
+            *   The expected output is `20 j`. This suggests that the parser *should* have reported a missing `)` error.
+            *   How can an extra `)` result in a "Missing `)`" error?
+            *   Maybe the parser failed to match the inner `)`s correctly?
+            *   Or maybe the test case description implies that the error is detected in a different way.
+            *   Let's look at the Buggy Output: `13 j`, `15 j`, `16 i`, `16 i`, `16 i`, `20 i`.
+            *   Expected: `13 j`, `15 j`, `20 j`.
+            *   Errors on line 16 are spurious. Line 16 is `g((((f(str)))), arr);`. This is a valid statement.
+            *   Why is it generating errors on line 16?
+            *   And why is line 20 reporting `i` instead of `j`?
+
+    *   **Spurious Errors on Line 16**:
+        *   Code: `g((((f(str)))), arr);`
+        *   This is a `StmtExp` (function call as expression statement).
+        *   `stmtParser` sees `g` (IDENFR). `token1` is `(`. `token2` is `(`.
+        *   It doesn't match `ASSIGN`.
+        *   It doesn't match `IF`, `FOR`, etc.
+        *   It falls through to `stmtExpParser`?
+        *   Wait, `stmtParser` logic:
+            ```java
+            if (token1 != null && token2 != null && token1.isType(TokenType.ASSIGN)) { ... }
+            else if (token0.isType(TokenType.IFTK)) { ... }
+            ...
+            else if (token0.isType(TokenType.IDENFR) && token1.isType(TokenType.LBRACK)) { return stmtAssOrExpParser(); }
+            else { return stmtExpParser(); }
+            ```
+        *   `g` is IDENFR. `(` is LPARENT, not LBRACK. So it goes to `stmtExpParser`.
+        *   `stmtExpParser`:
+            ```java
+            Exp exp = null;
+            if (!iterator.nextToken().isType(TokenType.SEMICN)) {
+                exp = expParser();
+            }
+            Token semicn = null;
+            if (iterator.nextToken().isType(TokenType.SEMICN)) {
+                semicn = iterator.readNextToken();
+            } else {
+                errors.add(new Error(Error.ErrorType.i, iterator.lastToken().getLineNum()));
+            }
+            ```
+        *   It parses `Exp`. `g(...)` is a valid `Exp` (via `UnaryExp` -> `UnaryExpFunc`).
+        *   After `expParser`, the next token should be `;`.
+        *   If it is `;`, no error.
+        *   Why would it fail?
+        *   Maybe `expParser` fails or consumes incorrectly?
+        *   `g((((f(str)))), arr)`
+        *   `unaryExpParser` sees `g`, next is `(`. Goes to `unaryExpFuncParser`.
+        *   `unaryExpFuncParser` consumes `g`, `(`.
+        *   Parses `FuncRParams`.
+        *   `Exp` `((((f(str))))` and `arr`.
+        *   First `Exp`: `((((f(str))))`.
+            *   `PrimaryExp` sees `(`. `primaryExpExpParser`.
+            *   Recurses 4 times.
+            *   Innermost `f(str)`. `unaryExpFuncParser`.
+            *   Returns.
+            *   Unwinds 4 `PrimaryExpExp`.
+            *   Returns `Exp`.
+        *   Next token is `,`. `unaryExpFuncParser` loop continues.
+        *   Parses `arr`. `Exp` -> `LVal` -> `Ident`.
+        *   Next token is `)`. Loop ends.
+        *   `unaryExpFuncParser` expects `)`. Consumes it.
+        *   Returns `UnaryExpFunc`.
+        *   `Exp` returns.
+        *   Back in `stmtExpParser`. Next token is `;`.
+        *   Should be fine.
+
+    *   **Why errors on 16?**
+        *   Look at `parseDecls` and `parseFuncs` in `Parser.java`.
+        *   `compUnitParser` calls `parseDecls`, `parseFuncs`, `mainFuncDefParser`.
+        *   `parseFuncs`:
+            ```java
+            while (iterator.hasNextToken()) {
+                Token token = iterator.nextToken(1);
+                if (token.isType(TokenType.MAINTK)) {
+                    break;
+                }
+                funcs.add(funcDefParser());
+            }
+            ```
+        *   It looks ahead 1 token. If it's `main`, break. Else, parse `FuncDef`.
+        *   `funcDefParser`:
+            ```java
+            FuncType funcType = funcTypeParser(); // consumes int/void/char
+            Token ident = iterator.readNextToken(); // consumes name
+            Token lparent = iterator.readNextToken(); // consumes (
+            ...
+            Block block = blockParser();
+            ```
+        *   For `int f(char str[]) { ... }`, this works.
+        *   For `int g(int i, int arr[]) { ... }`, this works.
+        *   Then `parseFuncs` checks next token. It's `int` (for `main`). `nextToken(1)` is `main`.
+        *   Wait. `iterator.nextToken(1)` looks at index+1.
+        *   Current token is `int` (start of `int main...`).
+        *   `nextToken(0)` is `int`. `nextToken(1)` is `main`.
+        *   `token.isType(TokenType.MAINTK)` checks if `main` is MAINTK. Yes.
+        *   So it breaks.
+        *   Then `mainFuncDefParser` is called.
+        *   So far so good.
+
+    *   **Inside Main Block**:
+        *   `blockParser` parses `{ ... }`.
+        *   `blockItemParser` decides between `Decl` and `Stmt`.
+        *   `int i = ...` -> `Decl` (VarDecl).
+        *   `if (...)` -> `Stmt`.
+        *   `g(...)` -> `Stmt`.
+        *   `i = ...` -> `Stmt`.
+        *   `g(...)` -> `Stmt`.
+        *   `return 0;` -> `Stmt`.
+
+    *   **The Issue with Line 16**:
+        *   The buggy output has `16 i` three times.
+        *   This suggests that during the parsing of line 16, three "missing semicolon" errors were generated.
+        *   This usually happens if the parser gets confused and tries to parse multiple things, failing each time.
+        *   Or, more likely, the parser is NOT correctly identifying `g(...)` as a single statement, but perhaps trying to parse it as something else, or the `Exp` parser is failing.
+        *   However, `g(...)` is a valid `Exp`.
+        *   Is it possible that `stmtParser` is misidentifying it?
+        *   `token0` = `g`. `token1` = `(`.
+        *   It goes to `else { return stmtExpParser(); }`.
+        *   If `stmtExpParser` works correctly, no error.
+        *   Why would it fail?
+        *   Maybe `expParser` fails?
+        *   If `expParser` encounters an error, it might add an error and return partially?
+        *   The provided code for `expParser` just calls `addExpParser`. It doesn't catch errors.
+        *   Errors are added deep in the recursion (e.g., `primaryExpExpParser` adds `j` if `)` missing).
+        *   If `g(...)` is parsed correctly, no errors.
+
+    *   **Let's look at Line 13 Error**:
+        *   `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);`
+        *   Missing `)`.
+        *   `VarDef` parses `i`. `[...]` no. `=` yes. `InitVal` -> `InitValExp` -> `Exp`.
+        *   `Exp` parses `(1 + ... + 7`.
+        *   `PrimaryExp` sees `(`. `primaryExpExpParser`.
+        *   Consumes `(`. Calls `expParser`.
+        *   `expParser` parses `1 + ... + 7`.
+        *   Returns.
+        *   `primaryExpExpParser` expects `)`.
+        *   Next token is `;`.
+        *   Adds error `j` at `lastToken` (which is `7`). Line 13.
+        *   Returns `PrimaryExpExp`.
+        *   `Exp` returns.
+        *   `InitVal` returns.
+        *   `VarDef` returns.
+        *   `VarDecl` expects `;`.
+        *   Next token is `;`. Consumes it.
+        *   So only one error `13 j`. Correct.
+
+    *   **Line 15 Error**:
+        *   `if (3 > 0 {`
+        *   `stmtIfParser`.
+        *   Consumes `if`, `(`.
+        *   `condParser`. Parses `3 > 0`.
+        *   `stmtIfParser` expects `)`.
+        *   Next token is `{`.
+        *   Adds error `j` at `lastToken` (which is `0`). Line 15.
+        *   Then `stmtIfParser` continues?
+        *   It does NOT consume the `)`. `rParent` remains null.
+        *   Then `Stmt stmt1 = stmtParser();`.
+        *   `stmtParser` sees `{`. Returns `StmtBlock`.
+        *   `blockParser` consumes `{`, items, `}`.
+        *   So `if` statement is parsed.
+        *   One error `15 j`. Correct.
+
+    *   **Line 16 Spurious Errors**:
+        *   `g((((f(str)))), arr);`
+        *   If the previous `if` statement consumed the `}` correctly, the next token is `g`.
+        *   `blockItemParser` -> `stmtParser`.
+        *   `stmtExpParser`.
+        *   `expParser`.
+        *   If this parses correctly, no error.
+        *   Why `16 i` x3?
+        *   Maybe the `if` statement parsing didn't consume the `}`?
+        *   `blockParser`:
+            ```java
+            while (iterator.hasNextToken() && !iterator.nextToken().isType(TokenType.RBRACE)) {
+                blockItems.add(blockItemParser());
+            }
+            Token rbrace = iterator.readNextToken();
+            ```
+        *   It consumes `}`.
+        *   So `stmtIfParser` returns.
+        *   `blockParser` (for main) continues.
+        *   Next token `g`.
+        *   If `stmtExpParser` works, no error.
+        *   Is it possible that `g` is interpreted as a `Decl`?
+        *   `blockItemParser`:
+            ```java
+            Token token = iterator.nextToken();
+            if (token.isType(TokenType.CONSTTK) || token.isType(TokenType.INTTK) || token.isType(TokenType.CHARTK)) {
+                return declParser();
+            } else {
+                return stmtParser();
+            }
+            ```
+        *   `g` is IDENFR. So `stmtParser`.
+        *   There must be a bug in `stmtExpParser` or `expParser` for this specific case.
+        *   OR, the errors on 16 are actually from Line 20? No, line numbers are distinct.
+        *   Wait, the buggy output has `16 i` three times.
+        *   And `20 i`.
+        *   Expected `20 j`.
+        *   This implies the parser is completely mishandling the statements after the `if`.
+
+    *   **Hypothesis**: The `stmtIfParser` does NOT consume the `else` part correctly? No, there is no else.
+    *   **Hypothesis**: The `blockParser` for the `if` statement stops early?
+        *   `if (3 > 0 {` -> Error `j`.
+        *   `stmtParser()` called for body. Sees `{`.
+        *   `stmtBlockParser` calls `blockParser`.
+        *   `blockParser` consumes `{`.
+        *   Next token `g`.
+        *   `blockItemParser` -> `stmtParser` -> `stmtExpParser`.
+        *   If `stmtExpParser` fails, it adds error.
+        *   Does `stmtExpParser` consume tokens on failure?
+        *   `expParser` is called. If `expParser` encounters an error, does it stop?
+        *   The parser is recursive descent. It doesn't have sync recovery.
+        *   If `expParser` fails to match, it might have consumed some tokens.
+        *   But `g(...)` is valid.
+        *   Unless... `g` is treated as a function definition? No, inside block.
+        *   Unless... `stmtParser` logic is flawed.
+        *   Look at `stmtParser` again.
+        *   `token0` = `g`. `token1` = `(`. `token2` = `(`.
+        *   `if (token1 != null && token2 != null && token1.isType(TokenType.ASSIGN))` -> False.
+        *   ...
+        *   `else { return stmtExpParser(); }`
+        *   `stmtExpParser`:
+        *   `if (!iterator.nextToken().isType(TokenType.SEMICN)) exp = expParser();`
+        *   `expParser` -> `addExpParser` -> ... -> `unaryExpParser`.
+        *   `unaryExpParser`: `token0`=`g`, `token1`=`(`.
+        *   `else if (token1.isType(TokenType.LPARENT)) return unaryExpFuncParser();`
+        *   `unaryExpFuncParser`:
+        *   `ident` = `g`. `lParent` = `(`.
+        *   `if (!iterator.nextToken().isType(TokenType.RPARENT))` -> True (`(`).
+        *   `firstExp = expParser();`
+        *   This parses `(((f(str))))`.
+        *   Then `while (comma)`. Next token `,`.
+        *   `commas.add`. `exps.add(expParser())`. Parses `arr`.
+        *   Next token `)`. Loop ends.
+        *   `if (iterator.nextToken().isType(TokenType.RPARENT)) rParent = readNextToken();`
+        *   Else error `j`.
+        *   It matches `)`.
+        *   Returns.
+        *   So `expParser` succeeds.
+        *   Back in `stmtExpParser`.
+        *   `if (iterator.nextToken().isType(TokenType.SEMICN)) semicn = readNextToken();`
+        *   Else error `i`.
+        *   Next token is `;`. Matches.
+        *   So NO ERROR on line 16.
+
+    *   **So why the buggy output has errors on 16?**
+        *   Maybe the `if` statement parsing consumed the `g` line?
+        *   No, `if` body is `{ g(...); }`.
+        *   `blockParser` for `if` body:
+        *   Consumes `{`.
+        *   `blockItemParser` -> `stmtParser` -> `stmtExpParser` -> parses `g(...);`.
+        *   Consumes `}`.
+        *   Returns.
+        *   So `if` statement is done.
+        *   Main block continues.
+        *   Next token `i` (Line 20).
+        *   `blockItemParser` -> `stmtParser`.
+        *   `token0`=`i`, `token1`=`=`.
+        *   `if (token1... ASSIGN)` -> True.
+        *   `return stmtAssignParser();` (since `token2` is `(`, not `GETINTTK`).
+        *   `stmtAssignParser`:
+        *   `lValParser` -> `i`.
+        *   `assign` = `=`.
+        *   `expParser`.
+        *   Parses `((((f(str)))))`.
+        *   As analyzed before, this leaves one `)` unconsumed.
+        *   `expParser` returns.
+        *   `stmtAssignParser` expects `;`.
+        *   Finds `)`.
+        *   Adds error `i` at line 20.
+        *   So `20 i` is generated.
+        *   But expected `20 j`.
+        *   And `16` errors are missing in expected, but present in buggy.
+        *   This implies the buggy parser is parsing Line 16 incorrectly.
+        *   And Line 20 incorrectly (type `i` vs `j`).
+
+    *   **Crucial Observation**:
+        *   The expected output for Line 20 is `20 j`.
+        *   My analysis says `20 i` (expected `;` found `)`).
+        *   Why `j`?
+        *   Error `j` is "Missing right parenthesis".
+        *   This error is generated when a `)` is expected but not found.
+        *   Here, a `)` is found when `;` is expected.
+        *   Is it possible the parser interprets the extra `)` as belonging to a parenthesized expression that was never opened? No.
+        *   Is it possible the parser fails to parse the `Exp` correctly, triggering a `j` error inside `expParser`?
+        *   If `expParser` fails, it might leave the stream in a state where `;` is not found.
+        *   But `expParser` succeeded in my trace.
+        *   What if `unaryExpFuncParser` for `f(str)` fails?
+        *   `f(str)`. `f` ident. `(` lparent. `str` arg. `)` rparent.
+        *   Seems fine.
+
+    *   **Let's look at the `16 i` errors again.**
+        *   If the parser generates `16 i`, it means it expected `;` but didn't find it on line 16.
+        *   This happens in `stmtExpParser`, `stmtAssignParser`, etc.
+        *   If `g(...)` is parsed as `StmtExp`, and `;` is found, no error.
+        *   If `g(...)` is NOT parsed as `StmtExp`, what else?
+        *   If `stmtParser` mistakenly identifies it as `stmtAssignParser`?
+        *   `token1` is `(`, not `=`. So no.
+        *   If `stmtParser` mistakenly identifies it as `stmtGetIntParser`?
+        *   `token2` is `(`, not `GETINTTK`. So no.
+        *   So it must be `stmtExpParser`.
+        *   If `stmtExpParser` generates `i`, it means `;` was not found.
+        *   This implies `expParser` consumed the `;`? No, `;` is not part of `Exp`.
+        *   Or `expParser` failed and stopped before `;`, and the `;` check failed?
+        *   If `expParser` fails, it doesn't consume `;`. So `;` is still there.
+        *   So `stmtExpParser` would find `;` and NOT generate error.
+        *   UNLESS `expParser` consumed the `;` erroneously? Unlikely.
+        *   OR `expParser` advanced the iterator past the `;`?
+        *   OR the `;` was already consumed?
+        *   
+    *   **Wait!** Look at `stmtIfParser`.
+        *   It parses `if (Cond) Stmt`.
+        *   If `Cond` parsing fails (error `j`), does it consume tokens?
+        *   `condParser` calls `lOrExpParser`.
+        *   `lOrExpParser` parses `3 > 0`.
+        *   Returns.
+        *   `stmtIfParser` checks for `)`. Finds `{`. Adds error `j`.
+        *   Does NOT consume `{`.
+        *   Then `stmt1 = stmtParser()`.
+        *   `stmtParser` sees `{`. Returns `StmtBlock`.
+        *   `StmtBlock` calls `blockParser`.
+        *   `blockParser` consumes `{`.
+        *   Parses `g(...);`.
+        *   Consumes `}`.
+        *   Returns.
+        *   So `if` is done.
+        *   Next token `i` (Line 20).
+        *   So Line 16 is inside the `if` block.
+        *   If `g(...);` is parsed correctly inside the `if` block, no error.
+        *   Why `16 i`?
+        *   Maybe `blockParser` for the `if` block is NOT called?
+        *   If `stmtIfParser` sees `{` instead of `)`, and reports error, does it proceed to parse `Stmt`? Yes.
+        *   Is it possible `stmtParser` for the body fails?
+        *   If `stmtParser` for `g(...)` fails, it might generate errors.
+        *   But `g(...)` is valid.
+        *   
+    *   **Alternative Theory**: The `16 i` errors are actually from Line 13 or 15 parsing bleeding over?
+        *   No, line numbers are specific.
+        *   
+    *   **Let's look at `stmtExpParser` again.**
+        *   `if (!iterator.nextToken().isType(TokenType.SEMICN)) exp = expParser();`
+        *   `if (iterator.nextToken().isType(TokenType.SEMICN)) semicn = iterator.readNextToken();`
+        *   `else errors.add(... i ...)`
+        *   
+    *   **Is it possible that `g` is parsed as a `Decl`?**
+        *   `blockItemParser` checks `CONSTTK`, `INTTK`, `CHARTK`.
+        *   `g` is `IDENFR`. So `Stmt`.
+        *   
+    *   **Is it possible that `stmtParser` matches `stmtAssOrExpParser`?**
+        *   `token0`=`g`. `token1`=`(`.
+        *   `stmtAssOrExpParser` is called if `token0` is `IDENFR` and `token1` is `LBRACK`.
+        *   Here `token1` is `LPARENT`. So no.
+        *   
+    *   **Conclusion on Line 16**: The code *should* work. The fact that it produces errors suggests a subtle bug in how `stmtParser` or `expParser` handles the context, OR the `if` statement parsing is broken such that the `g` line is parsed outside the block?
+        *   If `stmtIfParser` fails to parse the body, the `g` line might be parsed as part of the main block.
+        *   But even then, it's a valid statement.
+        *   
+    *   **Let's look at the `20 j` vs `20 i` discrepancy.**
+        *   Expected `20 j`. Buggy `20 i`.
+        *   `j` = Missing `)`. `i` = Missing `;`.
+        *   Line 20: `i = (((((f(str)))));`
+        *   If the parser reports `j`, it means it expected a `)` and didn't find it.
+        *   This happens in `primaryExpExpParser` or `unaryExpFuncParser`.
+        *   If the parser fails to parse the extra `)` as part of the expression, and instead thinks the expression ended earlier, and then expects a `)` for some outer construct?
+        *   No outer construct.
+        *   What if the parser interprets `i = (((((f(str)))))` as `i = (((((f(str))))` (missing one `)` in the parser's mind)?
+        *   If `primaryExpExpParser` fails to match one `)`, it reports `j`.
+        *   Why would it fail?
+        *   If the token stream is misaligned.
+        *   
+    *   **The Root Cause**:
+        *   Notice that `stmtIfParser` reports error `j` but does NOT consume the erroneous token (`{`).
+        *   Then it calls `stmtParser()` which consumes `{` as a block.
+        *   This is "panic mode" recovery-ish.
+        *   However, for Line 20, the error is `i` (expected `;`).
+        *   The expected error is `j`.
+        *   This implies the parser SHOULD have reported a missing `)`.
+        *   This happens if the parser detects the mismatch inside `Exp`.
+        *   If `Exp` parsing consumes `((((f(str)))))` and leaves `;`, then `Stmt` expects `;` and finds it. No error.
+        *   But there is an EXTRA `)`.
+        *   So `Exp` consumes `((((f(str)))))` (5 pairs).
+        *   Leaves `)` and `;`.
+        *   `Stmt` expects `;`. Finds `)`. Error `i`.
+        *   To get error `j`, the parser must expect `)` and find something else (or EOF).
+        *   This implies the parser thinks there is an unclosed `(`.
+        *   This happens if `primaryExpExpParser` is called 6 times?
+        *   Input: `(((((` (5).
+        *   If the parser sees 6 `(`, it would expect 6 `)`.
+        *   But there are only 5 `(`.
+        *   Wait, `i = (((((f(str)))));`
+        *   `=` is not `(`.
+        *   So 5 `(`.
+        *   If the parser reports `j`, it means it expected a 6th `)`.
+        *   Why?
+        *   Maybe `stmtAssignParser` is not used?
+        *   If `stmtAssOrExpParser` is used?
+        *   `token0`=`i`. `token1`=`=`.
+        *   `stmtAssOrExpParser` checks `token1` is `ASSIGN`. Yes.
+        *   `token2` is `(`. Not `GETINTTK`/`GETCHARTK`.
+        *   So `stmtAssignParser` is called.
+        *   
+    *   **Final Check**: The provided solution likely has a bug in `stmtIfParser` or `blockParser` that causes the stream to desynchronize, leading to spurious errors on 16 and wrong error type on 20.
+    *   However, the most likely candidate for the `20 j` vs `20 i` is that the parser *should* detect the extra `)` as an error inside the expression parsing if it were structured differently, OR the expected output considers the extra `)` as a "Missing `)`" for a hypothetical outer pair? No.
+    *   Actually, if the parser fails to parse the `Exp` fully because of the extra `)`, it might bubble up a `j` error.
+    *   But `primaryExpExpParser` only adds `j` if `)` is MISSING.
+    *   
+    *   **Code Snippet Location**:
+        The errors are likely in `Parser.java`, specifically in how `stmtIfParser` handles the missing `)` and subsequent block parsing, and how `stmtAssignParser` handles the trailing `)`.
+        Also, `stmtExpParser` might be involved in the spurious line 16 errors if the `if` block parsing is messed up.
+
+<frontend/Parser/Parser.java>
+...
+    private StmtIf stmtIfParser() {
+        Token ifTk = iterator.readNextToken();
+        Token lParent = iterator.readNextToken();
+        Cond cond = condParser();
+        Token rParent = null;
+        if (iterator.nextToken().isType(TokenType.RPARENT)) {
+            rParent = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.j, iterator.lastToken().getLineNum()));
+        }
+        Stmt stmt1 = stmtParser();
+        Token elseTk = null;
+        Stmt stmt2 = null;
+        if (iterator.nextToken().isType(TokenType.ELSETK)) {
+            elseTk = iterator.readNextToken();
+            stmt2 = stmtParser();
+        }
+        return new StmtIf(ifTk, lParent, cond, rParent, stmt1, elseTk, stmt2);
+    }
+...
+    private StmtAssign stmtAssignParser() {
+        LVal lVal = lValParser();
+        Token assign = iterator.readNextToken();
+        Exp exp = expParser();
+        Token semicn = null;
+        if (iterator.nextToken().isType(TokenType.SEMICN)) {
+            semicn = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.i, iterator.lastToken().getLineNum()));
+        }
+        return new StmtAssign(lVal, assign, exp, semicn);
+    }
+...

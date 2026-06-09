@@ -1,0 +1,285 @@
+Based on the comparison between the buggy output and the expected output, the program fails to output the `RETURNTK return` token and the subsequent syntax components for the `return 0;` statement. Instead, it jumps directly from the inner block's closing brace to the integer constant `0` (which is part of the return statement's expression) and then the semicolon.
+
+This indicates that the `StmtParser` or `BlockParser` is consuming the `return` keyword but failing to process/print it correctly, or the `StmtReturnParser` is not being invoked/printed as expected. Looking at `StmtParser.java`, the `case RETURNTK` branch calls `StmtReturnParser`. However, looking at the `Buggy Output`, the `<Stmt>` tag appears after the inner block's `RBRACE }` and `<Block>`, but before `INTCON 0`. This suggests the `return` statement is being parsed as a `Stmt`, but the `RETURNTK` token itself is missing from the output.
+
+Let's look at `StmtReturnParser.java`. It reads `returnTk`. If it's `RETURNTK`, it proceeds. Then it checks for `Exp` or `;`.
+The issue might be in how `Stmt` outputs its content. `Stmt.java` calls `stmtEle.syntaxOutput()` and then appends `<Stmt>\n`.
+`StmtReturn.java` outputs `returnTk.syntaxOutput()`, then `exp.syntaxOutput()` (if exists), then `semicn.syntaxOutput()`.
+
+Wait, looking closely at the Buggy Output:
+```
+RBRACE }
+<Block>
+<Stmt>   <-- This <Stmt> corresponds to the inner block { int a=1; ... } which is a StmtBlock.
+INTCON 0
+<Number>
+...
+SEMICN ;
+<Stmt>   <-- This <Stmt> corresponds to the return statement? But where is RETURNTK?
+RBRACE }
+<Block>
+<MainFuncDef>
+```
+
+The inner block ` { int a = 1; printf(...); } ` is parsed as a `Stmt` (specifically `StmtBlock`). The output shows `<Block>` then `<Stmt>`. This is correct for a block statement.
+
+Then we have `INTCON 0`. This is the start of the `return 0;` statement.
+The `RETURNTK return` is missing.
+The `<Stmt>` tag appears *after* `SEMICN ;`.
+
+If `StmtReturnParser` was called correctly, it would read `RETURNTK`. `StmtReturn.syntaxOutput()` would print `RETURNTK return\n`.
+Since `RETURNTK return` is missing from the output, either:
+1. `StmtReturnParser` is not being called.
+2. `StmtReturn.syntaxOutput()` is not printing the token.
+3. The token is consumed elsewhere.
+
+Let's look at `StmtParser.java` again.
+```java
+            case RETURNTK: // 'return'
+                this.iterator.unReadToken(1);
+                StmtReturnParser stmtReturnParser = new StmtReturnParser(this.iterator);
+                this.stmtEle = stmtReturnParser.parseStmtReturn();
+                break;
+```
+This looks correct.
+
+Let's look at `StmtReturnParser.java`:
+```java
+    public StmtReturn parseStmtReturn() {
+        // 解析 'return' 关键字
+        Token returnTk = this.iterator.readNextToken();
+        if (returnTk.getType() != TokenType.RETURNTK) {
+            System.err.println("ERROR: Expected 'return' keyword (RETURNTK), but found: " + returnTk);
+        }
+        // ...
+```
+It reads the token. If it is `RETURNTK`, it creates `StmtReturn`.
+
+Let's look at `StmtReturn.java`:
+```java
+    @Override
+    public String syntaxOutput() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(this.returnTk.syntaxOutput());
+        if (exp != null) {
+            sb.append(this.exp.syntaxOutput());
+        }
+        sb.append(this.semicn.syntaxOutput());
+        return sb.toString();
+    }
+```
+This also looks correct.
+
+Is it possible that the `return` statement is being parsed as something else?
+In `StmtParser.caseIdenfr`, it handles identifiers. `return` is a keyword, so it goes to `case RETURNTK`.
+
+Let's look at the `BlockParser`.
+```java
+        while (!token.getType().equals(TokenType.RBRACE)) { 
+            // ...
+            iterator.unReadToken(1); 
+            blockItems.add(blockItemParser.parseBlockItem()); 
+            token = iterator.readNextToken(); 
+        }
+```
+`BlockItemParser` decides between `Decl` and `Stmt`.
+`return` is not `CONSTTK`, `INTTK`, or `CHARTK`. So it goes to `Stmt`.
+`StmtParser` sees `RETURNTK` and calls `StmtReturnParser`.
+
+Why is the output missing `RETURNTK return`?
+
+Let's re-examine the Buggy Output carefully.
+```
+...
+RBRACE }
+<Block>
+<Stmt>
+INTCON 0
+<Number>
+...
+SEMICN ;
+<Stmt>
+RBRACE }
+<Block>
+<MainFuncDef>
+```
+
+The `<Stmt>` before `INTCON 0` is likely the closing of the previous block statement? No, the previous block statement ended with `<Block>` then `<Stmt>`.
+So the sequence is:
+1. Inner Block Content (`int a=1;`, `printf...`)
+2. `RBRACE }`
+3. `<Block>` (End of inner block structure)
+4. `<Stmt>` (End of Block Statement wrapper)
+
+Then:
+5. `INTCON 0`
+6. ...
+7. `SEMICN ;`
+8. `<Stmt>` (End of Return Statement wrapper)
+
+The `RETURNTK return` should be between step 4 and 5. It is missing.
+
+If `StmtReturnParser` failed to parse `return`, it might have thrown an error or returned null? But the program continued.
+Or perhaps `StmtReturn` object was created but `returnTk` was null? No, it's read from iterator.
+
+Wait, look at `StmtReturnParser` logic for `exp`:
+```java
+        Token semicn = this.iterator.readNextToken();
+        Exp exp = null;
+        if (semicn.getType() != TokenType.SEMICN) {
+            if (!isValidExpressionStart(semicn)) {
+                // Error handling
+            } else {
+                // Valid expression
+                this.iterator.unReadToken(1);
+                ExpParser expParser = new ExpParser(this.iterator);
+                exp = expParser.parseExp();
+                semicn = this.iterator.readNextToken();
+                // ...
+            }
+        }
+        return (exp != null) ? new StmtReturn(returnTk, exp, semicn) : new StmtReturn(returnTk, semicn);
+```
+
+If `return 0;` is parsed:
+1. `returnTk` = `RETURNTK`.
+2. `semicn` (peek) = `INTCON`. Not `SEMICN`.
+3. `isValidExpressionStart(INTCON)` is true.
+4. Unread `INTCON`.
+5. Parse `Exp` (which parses `0`).
+6. Read `semicn` (`;`).
+7. Return `StmtReturn(returnTk, exp, semicn)`.
+
+This seems correct.
+
+Is it possible that `StmtReturn`'s `syntaxOutput` is not being called?
+`Stmt.syntaxOutput()` calls `stmtEle.syntaxOutput()`.
+
+Let's look at `CompUnitParser.parseDecls`. It has some lookahead logic.
+But `return` is inside `main`, so it's in `Block`.
+
+Let's look at `BlockParser` again. There is a weird loop counter logic:
+```java
+        int loopCounter = 0;
+        final int MAX_LOOP_COUNT = 2; 
+        // ...
+        while (!token.getType().equals(TokenType.RBRACE)) { 
+            if (loopCounter++ > MAX_LOOP_COUNT) {
+//                for (int i = 0; i < SKIP_TOKENS; i++) {
+//                    token = iterator.readNextToken(); 
+//                    System.out.println("Skipped token: " + token);
+//                }
+//                continue;  
+                 this.iterator.unReadToken(9);
+                TokenType type = this.iterator.readNextToken().getType();
+                // ... reads 9 tokens ...
+                if ( ( type8.equals(TokenType.RPARENT) && type9.equals(TokenType.RPARENT))
+                 && (   type7.equals(TokenType.LPARENT))
+                 && (type6.equals(TokenType.IDENFR))
+                 && (type5.equals(TokenType.RPARENT))
+                 &&( type4.equals(TokenType.LPARENT))
+                        && (type3.equals(TokenType.IDENFR))
+                        && (type2.equals(TokenType.LPARENT))
+                        && (type.equals(TokenType.IFTK))
+
+                        //&& (type10.equals(TokenType.LBRACE))
+                ) {
+
+                    //break; 
+                }
+
+
+            }
+
+            iterator.unReadToken(1); 
+            blockItems.add(blockItemParser.parseBlockItem()); 
+            token = iterator.readNextToken(); 
+        }
+```
+This `BlockParser` code is extremely suspicious. It seems to be a hacky attempt to handle infinite loops or specific patterns, but it modifies the iterator state unpredictably if `loopCounter > 2`.
+In the `main` function block:
+1. `printf(...);` (Stmt)
+2. `int a = 0;` (Decl) - Wait, `int a=0` is a Decl.
+3. `{ int a=1; ... }` (Stmt/Block)
+4. `return 0;` (Stmt)
+
+Let's trace `BlockParser` for `main`'s block:
+Tokens: `PRINTFTK`, ..., `SEMICN`, `INTTK`, `IDENFR`, ..., `SEMICN`, `LBRACE`, ..., `RBRACE`, `RETURNTK`, `INTCON`, `SEMICN`, `RBRACE`.
+
+1. `token` = `PRINTFTK`. Loop starts. `loopCounter` becomes 1. `unRead`. Parse `printf` stmt. `token` becomes `INTTK`.
+2. `token` = `INTTK`. Loop continues. `loopCounter` becomes 2. `unRead`. Parse `int a=0` decl. `token` becomes `LBRACE`.
+3. `token` = `LBRACE`. Loop continues. `loopCounter` becomes 3. **`loopCounter > MAX_LOOP_COUNT` (3 > 2) is TRUE.**
+
+Inside the `if`:
+`this.iterator.unReadToken(9);`
+The current token is `LBRACE`. The iterator is positioned *after* `LBRACE` was read by `iterator.readNextToken()` at the end of the previous loop iteration?
+No, `token = iterator.readNextToken()` happens at the end of the loop.
+So when entering the loop body for the 3rd time:
+`token` is `LBRACE`.
+`loopCounter` increments to 3.
+`if (3 > 2)` is true.
+`this.iterator.unReadToken(9);`
+The iterator currently points to the token *after* `LBRACE`.
+Unreading 9 tokens will move the iterator back significantly.
+Then it reads 9 tokens forward to check types.
+This logic completely disrupts the parsing flow. It likely consumes or skips the `return` statement tokens or messes up the iterator position such that `RETURNTK` is skipped or not processed correctly by `BlockItemParser`.
+
+Specifically, if `unReadToken(9)` moves the cursor back past `LBRACE`, and then it reads 9 tokens forward, it might land in the middle of the block or past it.
+However, the code inside the `if` block doesn't `break` or `continue` effectively (the `break` is commented out). It falls through to:
+`iterator.unReadToken(1);`
+`blockItems.add(blockItemParser.parseBlockItem());`
+
+This `BlockParser` implementation is fundamentally broken for blocks with more than 2 items. The `return` statement is the 4th item (Printf, Decl, Block, Return). The hack triggers on the 3rd item (`{...}` block).
+
+The error is in `BlockParser.java`.
+
+<frontend/statement/BlockParser.java>
+...
+        // 添加死循环检查相关变量
+        int loopCounter = 0;
+        final int MAX_LOOP_COUNT = 2; // 自定义一个合理的最大循环次数
+        final int SKIP_TOKENS = 1;
+
+        while (!token.getType().equals(TokenType.RBRACE)) { // 遇到右花括号 '}' 则结束
+            if (loopCounter++ > MAX_LOOP_COUNT) {
+//                for (int i = 0; i < SKIP_TOKENS; i++) {
+//                    token = iterator.readNextToken(); // 跳过指定数量的 token
+//                    System.out.println("Skipped token: " + token);
+//                }
+//                continue;  // 跳过指定 token 后继续解析
+                 this.iterator.unReadToken(9);
+                TokenType type = this.iterator.readNextToken().getType();
+                TokenType type2 = this.iterator.readNextToken().getType();
+                 TokenType type3 = this.iterator.readNextToken().getType();
+                 TokenType type4 = this.iterator.readNextToken().getType();
+                 TokenType type5 = this.iterator.readNextToken().getType();
+                TokenType type6 = this.iterator.readNextToken().getType();
+                TokenType type7 = this.iterator.readNextToken().getType();
+                TokenType type8 = this.iterator.readNextToken().getType();
+                TokenType type9 = this.iterator.readNextToken().getType();
+
+                TokenType type10 = this.iterator.readNextToken().getType();
+
+                if ( ( type8.equals(TokenType.RPARENT) && type9.equals(TokenType.RPARENT))
+                 && (   type7.equals(TokenType.LPARENT))
+                 && (type6.equals(TokenType.IDENFR))
+                 && (type5.equals(TokenType.RPARENT))
+                 &&( type4.equals(TokenType.LPARENT))
+                        && (type3.equals(TokenType.IDENFR))
+                        && (type2.equals(TokenType.LPARENT))
+                        && (type.equals(TokenType.IFTK))
+
+                        //&& (type10.equals(TokenType.LBRACE))
+                ) {
+
+                    //break; // 一旦匹配，跳出循环
+                }
+
+
+            }
+
+            iterator.unReadToken(1); // 回退到 BlockItem 的第一个 token
+            blockItems.add(blockItemParser.parseBlockItem()); // 解析 BlockItem
+            token = iterator.readNextToken(); // 继续读取下一个 token
+        }
+...

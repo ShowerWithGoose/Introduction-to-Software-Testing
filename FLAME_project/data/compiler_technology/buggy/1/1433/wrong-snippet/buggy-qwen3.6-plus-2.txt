@@ -1,0 +1,226 @@
+Based on the problem description and the provided code, the issue is that the program produces **no output file** (`parser.txt` or `error.txt`) for a valid input.
+
+Looking at `Compiler.java`:
+1. It reads the file.
+2. It runs the Lexer.
+3. It runs the Parser.
+4. It calls `writeResults`.
+
+The `writeResults` method writes to `lexer.txt` and `error.txt`. However, the problem description states that for correct source programs, the output should go to `parser.txt`. The expected output shows lexical tokens and syntax component names, which corresponds to the `printString()` result of the AST (CompUnit).
+
+In `Compiler.java`, `writeResults` writes `compUnit.printString()` to `lexer.txt`. This is likely incorrect based on standard compiler lab requirements where `lexer.txt` is for pure lexical analysis output and `parser.txt` is for syntax analysis output (which includes lexical tokens + syntax nodes). However, the immediate "No output file" error suggests an exception might be occurring or the file name is wrong causing the test harness to look for `parser.txt` and find nothing.
+
+Let's look closer at `Parser.java`.
+The `parseBlock` method has a potential infinite loop or index out of bounds if the block is empty or malformed, but the input is valid.
+```java
+    public Block parseBlock() {
+        Token lbraceToken = tokens.get(curPos);
+        curPos++;
+
+        ArrayList<BlockItem> blockItems = new ArrayList<>();
+        while (tokens.get(curPos).getType() != TokenType.RBRACE) { // Potential IndexOutOfBounds if EOF reached before RBRACE
+            BlockItem blockItem = parseBlockItem();
+            blockItems.add(blockItem);
+        }
+//...
+```
+If `curPos` reaches `tokens.size()`, `tokens.get(curPos)` throws an exception. This would crash the program before `writeResults` is called, resulting in no output files being created (or incomplete ones).
+
+However, the input is valid:
+```c
+int main() {
+    printf("21373119");
+    int a = 0;
+    {
+        int a = 1;
+        printf("%d",a); 
+    }
+    return 0;
+}
+```
+This should parse correctly.
+
+Let's look at `Compiler.java` again.
+```java
+    private static void writeResults(CompUnit compUnit, List<Token> errorTokens) throws IOException {
+        try (BufferedWriter lexerOut = new BufferedWriter(new FileWriter("lexer.txt"));
+             BufferedWriter errorOut = new BufferedWriter(new FileWriter("error.txt"))) {
+
+            lexerOut.write(compUnit.printString());
+//...
+```
+The problem asks for output to `parser.txt`. The code writes to `lexer.txt`. If the test system checks for `parser.txt`, it will find nothing. But usually "No output file" implies the program crashed or didn't write anything.
+
+Wait, looking at the `Lexer.java` `handleCommentOrDivision`:
+```java
+        if (source.charAt(curPos) == '/') {
+            curPos++;
+            while (curPos < source.length()) {
+                if (source.charAt(curPos) == '\n') {
+                    curPos++;
+                    lineNum++;
+                    break;
+                }
+                curPos++;
+            }
+            lineNum++; // <--- ERROR HERE
+        }
+```
+When a single-line comment `// ... \n` is processed:
+1. It enters the loop.
+2. It finds `\n`.
+3. It increments `curPos` (skipping `\n`).
+4. It increments `lineNum`.
+5. It breaks.
+6. **Then it increments `lineNum` AGAIN.**
+
+This causes the line numbers to be incorrect. While this is a bug, it wouldn't cause "No output file".
+
+Let's look at `Parser.java` `parseFuncDefs`:
+```java
+    public ArrayList<FuncDef> parseFuncDefs() {
+        ArrayList<FuncDef> funcDefs = new ArrayList<>();
+
+        while (curPos < tokens.size()) {
+            Token secondToken = tokens.get(curPos + 1); // <--- POTENTIAL INDEX OUT OF BOUNDS
+            if (secondToken.getType() == TokenType.MAINTK) {
+                return funcDefs;
+            }
+            funcDefs.add(parseFuncDef());
+        }
+        return funcDefs;
+    }
+```
+If `curPos` is at the last token (e.g., if there were no main function or malformed input), `tokens.get(curPos + 1)` will throw `IndexOutOfBoundsException`. In the specific test case, `main` exists, so this might not trigger immediately, but it's a fragile logic.
+
+However, the most critical issue leading to "No output file" in many student implementations is an uncaught exception during parsing or writing.
+
+Let's re-read the `Compiler.java` `writeResults`. It writes to `lexer.txt`. The expected output file is usually `parser.txt` for syntax analysis tasks. If the grading script looks for `parser.txt`, it won't find it. But the prompt says "Buggy Output: No output file". This usually means the file itself is missing.
+
+If I look at `Parser.java` -> `parsePrimaryExp`:
+```java
+        // Character
+        else if (tokens.get(curPos).getType() == TokenType.CHRCON) {
+            CharConst charConst = parseCharConst();
+            curPos++; // <--- DOUBLE INCREMENT?
+            Character character = new Character(charConst);
+            return new PrimaryExp(character);
+        }
+```
+And `parseCharConst`:
+```java
+    public CharConst parseCharConst() {
+        CharConst charConst = null;
+        if (tokens.get(curPos).getType() == TokenType.CHRCON) {
+            charConst = new CharConst(tokens.get(curPos));
+            curPos++; // <--- INCREMENT HERE
+        } else {
+            System.err.println("parseCharConst Error");
+        }
+        return charConst;
+    }
+```
+In `parsePrimaryExp`, `parseCharConst` is called, which increments `curPos`. Then `parsePrimaryExp` increments `curPos` **again**. This skips a token. This is a logical error, but might not crash the program immediately on this specific input (which doesn't use char constants).
+
+Let's look at `parseUnaryExp`:
+```java
+        if (curToken.getType() == TokenType.IDENFR &&
+                tokens.get(curPos + 1).getType() == TokenType.LPARENT) { // <--- POTENTIAL INDEX OUT OF BOUNDS
+```
+If `curPos` is the last token, this crashes.
+
+But the most likely reason for "No output file" is that the program crashes due to an exception.
+
+Let's look at `Lexer.java` `handleSymbols` again.
+```java
+        } else {
+            curPos++;
+            StringBuilder sb = new StringBuilder();
+            sb.append(c);
+            sb.append(c);
+            tokens.add(new Token(reserveWords.get(sb.toString()), String.valueOf(c), lineNum)); // reserveWords.get returns null
+            errorTokens.add(new Token(TokenType.a, String.valueOf(c), lineNum));
+        }
+```
+`new Token(null, ...)` might cause issues later if `toString()` is called on a null type. `TokenType` is an enum. `reserveWords.get` returns `null`. `new Token(null, ...)` sets `this.type = null`. Later `token.getType().toString()` in `writeResults` or `Token.toString()` will throw `NullPointerException`.
+
+`Token.toString()`:
+```java
+    @Override
+    public String toString() {
+        return type.toString() + ' ' + value + '\n';
+    }
+```
+If `type` is null, `type.toString()` throws NPE.
+
+Does the input contain any invalid symbols?
+`int main() { printf("21373119"); int a = 0; { int a = 1; printf("%d",a); } return 0; }`
+No invalid symbols.
+
+Let's look at `Compiler.java` again.
+```java
+            List<Token> errorList = parser.getErrorTokens();
+            errorList.addAll(lexer.getErrorTokens());
+            writeResults(compUnit, errorList);
+```
+If `compUnit` is null (parsing failed/crashed), `compUnit.printString()` throws NPE.
+
+Where would parsing crash?
+In `Parser.parseFuncDefs`:
+```java
+            Token secondToken = tokens.get(curPos + 1);
+```
+If the input was just `int main`, `curPos` points to `int`. `curPos+1` is `main`. OK.
+If the input ends unexpectedly, it crashes.
+
+However, there is a very common mistake in these assignments regarding the output file name. The problem says: "output ... to `parser.txt`". The code writes to `lexer.txt`.
+If the "No output file" message comes from the grading system complaining that `parser.txt` is missing, then the error is simply the filename in `Compiler.java`.
+
+But often "No output file" means the program terminated abnormally without creating *any* of the expected files, or the specific file checked is empty/missing.
+
+Let's assume the crash is the primary issue.
+In `Parser.java`, `parseBlock`:
+```java
+        while (tokens.get(curPos).getType() != TokenType.RBRACE) {
+```
+If the block is empty `{ }`, `curPos` points to `}`. The loop condition fails immediately. Correct.
+
+Let's look at `Parser.java` `parseDecls` and `parseFuncDefs`.
+The logic relies on lookahead.
+`parseDecls`:
+```java
+            if ( thirdToken != null && thirdToken.getType() == TokenType.LPARENT) {    // FuncDef MainFuncDef
+                return decls;
+            }
+```
+This assumes a Decl is followed by something that helps distinguish it.
+For `int a = 0;`, tokens are `INTTK`, `IDENFR`, `ASSIGN`. `thirdToken` is `ASSIGN`. Not `LPARENT`. So it parses as VarDecl. Correct.
+
+For `int main()`, tokens are `INTTK`, `MAINTK`, `LPARENT`.
+In `parseDecls`, `firstToken` is `INTTK`. `thirdToken` is `LPARENT`.
+So `parseDecls` returns early. Correct.
+
+Then `parseFuncDefs` is called.
+`curPos` is at `INTTK` of `main`.
+`secondToken` (curPos+1) is `MAINTK`.
+It returns empty list.
+Then `parseMainFuncDef` is called.
+
+This logic seems okay for this specific input.
+
+Let's look at `Compiler.java` `writeResults` again.
+It writes to `lexer.txt`.
+The expected output is clearly syntax analysis output (mixed tokens and `<NonTerminal>`).
+The problem statement says: "output ... to `parser.txt`".
+The code writes to `lexer.txt`.
+
+If the test harness expects `parser.txt` and it's not there, it reports "No output file" (meaning the expected file is missing).
+
+<Compiler.java>
+...
+    private static void writeResults(CompUnit compUnit, List<Token> errorTokens) throws IOException {
+        try (BufferedWriter lexerOut = new BufferedWriter(new FileWriter("lexer.txt"));
+             BufferedWriter errorOut = new BufferedWriter(new FileWriter("error.txt"))) {
+
+            lexerOut.write(compUnit.printString());
+...

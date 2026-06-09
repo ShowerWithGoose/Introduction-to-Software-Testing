@@ -1,0 +1,597 @@
+Based on the problem description, the test case input, and the expected output, the program failed to produce any output file ("No output file"). This typically indicates that an unhandled exception occurred during execution, causing the program to terminate before writing to `parser.txt` or `error.txt`.
+
+Looking at the `Compiler.java` main method:
+```java
+try {
+    ParseUnit parseUnit=parser.parseCompUnit();
+    // ...
+    if (!ErrorHandler.getInstance().getErrors().isEmpty()) {
+        // write error.txt
+    } else {
+        // write parser.txt
+        bufferedWriter.write(parseUnit.toString());
+        // ...
+    }
+} catch (IOException e) {
+    throw new RuntimeException(e);
+}
+```
+If `parseCompUnit()` throws a runtime exception (e.g., `IndexOutOfBoundsException`, `NullPointerException`), it is not caught by the `catch (IOException e)` block. The program crashes, and no file is written.
+
+Let's analyze the parsing logic in `Parser.java`. The input starts with `const int a = 0...`.
+The `parseCompUnit` method calls `parseConstDecl`.
+`parseConstDecl` calls `parseConstDef`.
+`parseConstDef` parses `a = 0`.
+Then it loops for `, b = 9`.
+Then it loops for `, c[b] = {1...}`.
+
+In `parseConstDef`:
+```java
+public ConstDef parseConstDef() {
+    // ...
+    getToken(Word.IDENFR); // gets 'c'
+    // ...
+    if (getToken(Word.LBRACK)) { // gets '['
+        // ...
+        subUnits.add(parseConstExp()); // parses 'b' inside []
+        if (getToken(Word.RBRACK)) { // gets ']'
+             // ...
+        } else {
+             ErrorHandler.getInstance().addError(new Error('k', curToken.getLineNum()));
+        }
+        //addVarSymbol(varName,true,isInt,1,line);
+
+    } else {
+        isArray = false;
+        //addVarSymbol(varName,true,isInt,0,line);
+    }
+    getToken(Word.ASSIGN); // gets '='
+    subUnits.add(curToken);
+    constInitVal = parseConstInitVal(); // parses '{1,2...}'
+    subUnits.add(constInitVal);
+    return new ConstDef("ConstDef", subUnits, ident, isArray, constInitVal);
+}
+```
+
+The issue likely lies in how `parseConstInitVal` handles the array initialization or how `parseConstExp` is called. However, a more common source of "No output" in these assignments is an infinite loop or an index out of bounds in the lexer or parser when handling specific tokens.
+
+Let's look at `LexicalAnalyzer.java`.
+In the `parse` method, there is a section handling characters:
+```java
+else if(ch=='\''){
+    ch=getSym();
+    if(ch=='\\'){
+        chNext=getSym();
+        switch (chNext){
+            // ... cases ...
+            default:
+                break;
+        }
+    }else {
+        tokens.add(new Token(Word.CHRCON,"'"+String.valueOf(ch)+"'",lineNum));
+    }
+    ch=getSym(); // Expecting closing quote '
+}
+```
+If the character constant is malformed or if `getSym` returns `\0` unexpectedly, it might cause issues, but the input seems standard.
+
+Let's look at `Parser.java` -> `parseCompUnit`.
+```java
+while (getToken(Word.CONSTTK, Word.CHARTK, Word.INTTK)) { 
+    if (curToken.isType(Word.CONSTTK)) {
+        retract(1);
+        ConstDecl constDecl = parseConstDecl();
+        // ...
+    } else {
+        // ...
+    }
+}
+```
+If `parseConstDecl` consumes tokens correctly, the loop continues.
+
+However, there is a subtle bug in `Parser.java` in the `parseStmt` method or `parseBlockItem` that might cause a crash if not handled, but the input is valid.
+
+Let's look closely at `Preprocess.java`.
+It replaces comments with spaces.
+`context.replace(curPos - 1, curPos + 1, "  ");`
+If `curPos` is 0, `curPos - 1` is -1. `StringBuilder.replace` throws `StringIndexOutOfBoundsException` if start is negative.
+The input file starts with `//常量...`.
+`curPos` starts at 0.
+Loop:
+`ch = context.charAt(0)` which is `/`.
+`status` becomes 1.
+`curPos` becomes 1.
+Next iteration:
+`ch = context.charAt(1)` which is `/`.
+`status` is 1. `ch` is `/`.
+`status` becomes 2.
+`context.replace(curPos - 1, curPos + 1, "  ");` -> `context.replace(0, 2, "  ");`. This is valid.
+
+What if the comment is at the very beginning? It works.
+
+Let's look at `Lexer` again.
+`getSym()` increments `curPos`.
+`retract()` decrements `curPos`.
+
+In `Parser.java`, `getToken` increments `pos`.
+`retract` decrements `pos`.
+
+Is there a case where `pos` goes out of bounds?
+In `parseCompUnit`:
+```java
+while (getToken(Word.CONSTTK, Word.CHARTK, Word.INTTK)) {
+    if (curToken.isType(Word.CONSTTK)) {
+        retract(1);
+        ConstDecl constDecl = parseConstDecl();
+```
+`getToken` advances. If it matches `CONSTTK`, `retract(1)` puts it back. `parseConstDecl` will call `getToken(CONSTTK)` again. This seems correct.
+
+However, look at `parseConstDecl`:
+```java
+public ConstDecl parseConstDecl() {
+    // ...
+    getToken(Word.CONSTTK);
+    // ...
+    getToken(Word.INTTK, Word.CHARTK);
+    // ...
+    ConstDef constDef = parseConstDef();
+    // ...
+    while (getToken(Word.COMMA)) {
+        // ...
+        constDef = parseConstDef();
+        // ...
+    }
+    if (getToken(Word.SEMICN)) {
+        // ...
+    } else {
+        ErrorHandler.getInstance().addError(new Error('i', curToken.getLineNum()));
+    }
+    // ...
+}
+```
+
+And `parseConstDef`:
+```java
+public ConstDef parseConstDef() {
+    // ...
+    getToken(Word.IDENFR);
+    // ...
+    if (getToken(Word.LBRACK)) {
+        // ...
+        subUnits.add(parseConstExp());
+        // ...
+    }
+    // ...
+    getToken(Word.ASSIGN);
+    // ...
+    constInitVal = parseConstInitVal();
+    // ...
+}
+```
+
+The error "No output file" strongly suggests a crash.
+A very common crash in these parsers is `IndexOutOfBoundsException` in `tokens.get(pos)` inside `getToken` or `curToken` access if `pos` exceeds `tokens.size() - 1`.
+
+In `Parser.java`:
+```java
+public boolean getToken(Word... words) {
+    pos++;
+    curToken = tokens.get(pos); // Crash here if pos >= tokens.size()
+    // ...
+}
+```
+If the parser expects more tokens than available (e.g., missing semicolon at end of file, or incorrect lookahead), it crashes.
+
+The input ends with `}`.
+`MainFuncDef` parses `int main() { ... }`.
+Inside `parseBlock`, it parses items until `RBRACE`.
+`parseBlockItem` calls `parseStmt` or `parseDecl`.
+The last statement is `return 0;`.
+`parseStmt` handles `RETURNTK`.
+Then `parseBlock` sees `RBRACE`. `getToken(RBRACE)` succeeds.
+Then `parseMainFuncDef` finishes.
+Then `parseCompUnit` finishes.
+
+Wait, look at `Compiler.java`:
+```java
+Preprocess preprocess = new Preprocess(contentBuilder);
+StringBuilder afterPreProcess = preprocess.process();
+// ...
+String content = afterPreProcess.toString();
+LexicalAnalyzer lexicalAnalyzer = new LexicalAnalyzer(content);
+lexicalAnalyzer.parse();
+ArrayList<Token> tokens = lexicalAnalyzer.getTokens();
+Parser parser = new Parser(tokens);
+// ...
+ParseUnit parseUnit=parser.parseCompUnit();
+```
+
+If `tokens` is empty, `parser.parseCompUnit()` will call `getToken`, `pos` becomes 0, `tokens.get(0)` throws Exception.
+Why would tokens be empty?
+`LexicalAnalyzer.parse()` might fail to tokenize anything if `Preprocess` messes up the string.
+
+Let's look at `Preprocess.process()` again.
+```java
+case 2: // Line comment body
+    if (ch == '\n') status = 0; 
+    else context.setCharAt(curPos, ' ');
+    break;
+```
+If the file ends with a line comment without a newline?
+The input:
+```java
+//常量,变量,AddExp及以下基础运算, printf, LVal = Exp;
+const int a = 0...
+```
+There is a newline after the comment.
+
+However, there is a known issue in `Preprocess` if `curPos` goes out of bounds or if `replace` is called incorrectly.
+But the most likely culprit for "No output" in a student parser assignment, given the code structure, is an uncaught exception in `Parser` due to running out of tokens.
+
+Let's check `Parser.getToken` again.
+```java
+public boolean getToken(Word... words) {
+    pos++;
+    curToken = tokens.get(pos);
+    // ...
+}
+```
+If `pos` equals `tokens.size()`, `tokens.get(pos)` throws `IndexOutOfBoundsException`.
+
+Does the parser try to read past the end?
+In `parseCompUnit`:
+```java
+while (getToken(Word.CONSTTK, Word.CHARTK, Word.INTTK)) {
+   // ...
+}
+```
+If the last token is consumed, and the loop condition checks again, `getToken` increments `pos` beyond the limit.
+
+Example:
+Tokens: `[CONSTTK, ..., RBRACE]`
+Last iteration: `getToken` reads `RBRACE`? No, `RBRACE` is not `CONSTTK/INTTK/CHARTK`.
+So `getToken` returns false.
+But `getToken` *already incremented pos*.
+If `pos` was at the last index, `pos++` makes it `size()`. `tokens.get(pos)` crashes.
+
+Let's trace:
+Suppose we are at the last token `RBRACE` (index `N-1`).
+`pos` is `N-2` (pointing to previous token).
+`getToken` is called.
+`pos` becomes `N-1`.
+`curToken = tokens.get(N-1)` (OK).
+Check if `RBRACE` is `CONSTTK`... No.
+`retract(1)` is NOT called in `getToken` if it returns false?
+Look at `getToken`:
+```java
+public boolean getToken(Word... words) {
+    pos++;
+    curToken = tokens.get(pos);
+    if (words.length == 0) {
+        return true;
+    }
+    for (Word word : words) {
+        if (curToken.getWord().equals(word)) return true;
+    }
+    retract(1); // It DOES retract!
+    return false;
+}
+```
+So if it fails, it retracts. `pos` goes back to `N-2`. Safe.
+
+What if `pos` is `N-1` (last token)?
+`getToken` called.
+`pos` becomes `N`.
+`curToken = tokens.get(N)` -> **CRASH**.
+
+So, if the parser is in a state where `pos` is at the last token, and it calls `getToken` to check for something that isn't there, it crashes.
+
+Where does this happen?
+In `parseCompUnit`:
+```java
+while (getToken(Word.CONSTTK, Word.CHARTK, Word.INTTK)) { ... }
+```
+If the input ends with `}`, the last token is `RBRACE`.
+Before this loop, `pos` is `-1`.
+It parses Decls.
+Then it parses FuncDefs.
+Then it parses MainFuncDef.
+
+Inside `parseMainFuncDef`:
+```java
+public MainFuncDef parseMainFuncDef() {
+    // ...
+    block = parseBlock(false, false);
+    // ...
+}
+```
+Inside `parseBlock`:
+```java
+public Block parseBlock(boolean fromFunc, boolean isFromLoop) {
+    // ...
+    getToken(Word.LBRACE);
+    // ...
+    while (!getToken(Word.RBRACE)) {
+        // ...
+    }
+    subUnits.add(curToken);
+    // ...
+}
+```
+When `getToken(RBRACE)` succeeds, `curToken` is `RBRACE`. `pos` is at `RBRACE`.
+The loop terminates.
+`parseBlock` returns.
+`parseMainFuncDef` returns.
+`parseCompUnit` returns.
+
+So normally it should finish.
+
+However, look at `parseBlockItem`:
+```java
+public BlockItem parseBlockItem(boolean isFromLoop) {
+    if (getToken(Word.CONSTTK)) {
+        retract(1);
+        return parseConstDecl();
+    } else if (getToken(Word.INTTK, Word.CHARTK)) {
+        retract(1);
+        return parseVarDecl();
+    } else {
+        return parseStmt(isFromLoop);
+    }
+}
+```
+If `getToken` is called when `pos` is at the last token (`RBRACE`), and it checks for `CONSTTK`, it fails, retracts.
+Then checks `INTTK`, fails, retracts.
+Then calls `parseStmt`.
+
+In `parseStmt`:
+```java
+public Stmt parseStmt(boolean isFromLoop) {
+    // ...
+    } else if (getToken(Word.LBRACE)) { // Block
+        retract(1);
+        Block block = parseBlock(false, isFromLoop);
+        // ...
+    } else if (getToken(Word.IDENFR)) {
+       // ...
+    } else { // Exp
+        Exp exp = null;
+        if (!getToken(Word.SEMICN)) { // Check for empty stmt ;
+             exp = parseExp();
+             // ...
+        }
+        // ...
+    }
+}
+```
+If the current token is `RBRACE`, `getToken(LBRACE)` fails. `getToken(IDENFR)` fails.
+Goes to `else`.
+`if (!getToken(Word.SEMICN))` -> `getToken(SEMICN)` fails (it's `RBRACE`). Retracts.
+Returns false.
+So `!false` is `true`.
+Calls `parseExp()`.
+
+`parseExp()` calls `parseAddExp()`.
+`parseAddExp()` calls `parseMulExp()`.
+...
+`parseUnaryExp()` calls `parsePrimaryExp()`.
+`parsePrimaryExp()`:
+```java
+public PrimaryExp parsePrimaryExp() {
+    // ...
+    } else if (getToken(Word.IDENFR)) {
+        retract(1);
+        lVal = parseLVal();
+        // ...
+    } else if (getToken(Word.INTCON)) {
+        // ...
+    } else {
+        character = parseCharacter(); // Calls getToken(CHRCON)
+    }
+}
+```
+If token is `RBRACE`:
+`getToken(LPARENT)` fails.
+`getToken(IDENFR)` fails.
+`getToken(INTCON)` fails.
+Goes to `else`.
+Calls `parseCharacter()`.
+`parseCharacter()` calls `getToken(Word.CHRCON)`.
+`getToken` increments `pos`. If `pos` was at `RBRACE` (last token), `pos` becomes `size()`. **CRASH**.
+
+So, if `parseStmt` encounters a `RBRACE` where it expects an expression or statement, it falls through to `parseExp`, which eventually tries to consume a token that isn't there, causing a crash.
+
+Why would `parseBlockItem` pass `RBRACE` to `parseStmt`?
+`parseBlock` loop: `while (!getToken(Word.RBRACE))`.
+If `getToken(RBRACE)` returns `true`, the loop stops. `RBRACE` is NOT passed to `parseBlockItem`.
+
+So where is the crash?
+
+Maybe in `parseCompUnit` lookahead?
+```java
+while (getToken(Word.CONSTTK, Word.CHARTK, Word.INTTK)) {
+    if (curToken.isType(Word.CONSTTK)) {
+        retract(1);
+        ConstDecl constDecl = parseConstDecl();
+        // ...
+    } else {
+        //再预读一个
+        if (!getToken(Word.IDENFR)) {
+            retract(1);
+            break;
+        } else {
+            if (getToken(Word.LPARENT)) {
+                retract(3);
+                break;
+            } else {
+                retract(1);
+                VarDecl varDecl = parseVarDecl();
+                // ...
+            }
+        }
+    }
+}
+```
+If the input is just `int main()...`, `getToken(INTTK)` succeeds. `curToken` is `INTTK`.
+Enters `else`.
+`getToken(IDENFR)`? Next token is `main` (MAINTK). `IDENFR` != `MAINTK`.
+`getToken` returns false. `retract(1)`.
+Breaks.
+
+This seems safe.
+
+Let's look at `LexicalAnalyzer` again.
+`parse()` method.
+If `text` is empty?
+`Preprocess` might return an empty string if something goes wrong?
+No, `testfile.txt` has content.
+
+Is it possible `tokens` list is empty?
+If `LexicalAnalyzer` throws an exception during `parse()`, `tokens` might be incomplete or empty?
+`LexicalAnalyzer.parse()` does not throw checked exceptions.
+If it crashes, `Compiler` catches nothing?
+`Compiler.main` calls `lexicalAnalyzer.parse()`. If this crashes, `RuntimeException` propagates, no file written.
+
+In `LexicalAnalyzer.parse()`:
+```java
+while (curPos<text.length()){
+    ch=getSym();
+    // ...
+}
+```
+`getSym()`:
+```java
+public char getSym(){
+    this.curPos++;
+    if (curPos<text.length())return this.text.charAt(this.curPos);
+    else return '\0';
+}
+```
+Safe.
+
+However, look at `Preprocess`.
+```java
+context.replace(curPos - 1, curPos + 1, "  ");
+```
+If `curPos` is 0, `curPos-1` is -1.
+In `testfile.txt`, the first line is `//...`.
+`curPos` starts at 0.
+`ch` = `/`. `status` = 1. `curPos` becomes 1.
+`ch` = `/`. `status` = 2. `replace(0, 2, "  ")`. OK.
+
+What if the file starts with `/*`?
+`ch` = `/`. `status` = 1. `curPos` = 1.
+`ch` = `*`. `status` = 3. `replace(0, 2, "  ")`. OK.
+
+What if the file starts with `//` and has length 2?
+`replace(0, 2, "  ")`. OK.
+
+There is one suspicious part in `Parser.java`.
+In `parseStmt`, the `else` block for `Exp`:
+```java
+} else { //Exp
+    Exp exp = null;
+    if (!getToken(Word.SEMICN)) {
+        exp = parseExp();
+        subUnits.add(exp);
+    } else {
+        retract(1);
+    }
+
+    if (getToken(Word.SEMICN)) {
+        subUnits.add(curToken);
+    } else {
+        ErrorHandler.getInstance().addError(new Error('i', curToken.getLineNum()));
+    }
+    return new ExpStmt("Stmt", subUnits, exp);
+}
+```
+If `getToken(SEMICN)` fails (because it's `RBRACE`), it calls `parseExp()`.
+As analyzed before, `parseExp` will eventually crash if it can't match `RBRACE` as a primary expression.
+
+But `parseBlock` should have consumed `RBRACE`.
+
+Wait! Look at `parseBlockItem`.
+```java
+public BlockItem parseBlockItem(boolean isFromLoop) {
+    if (getToken(Word.CONSTTK)) {
+        retract(1);
+        return parseConstDecl();
+    } else if (getToken(Word.INTTK, Word.CHARTK)) {
+        retract(1);
+        return parseVarDecl();
+    } else {
+        return parseStmt(isFromLoop);
+    }
+}
+```
+If `getToken(CONSTTK)` is called when `pos` is at the LAST token (`RBRACE`), it increments `pos` to `size()`, crashes.
+
+Does `parseBlock` ensure that `getToken(RBRACE)` is called BEFORE `parseBlockItem` is called with `RBRACE` as current?
+```java
+while (!getToken(Word.RBRACE)) {
+    BlockItem blockItem = parseBlockItem(isFromLoop);
+    // ...
+}
+```
+Yes. `getToken(RBRACE)` is the loop condition.
+If `RBRACE` is next, `getToken` returns true, loop ends. `parseBlockItem` is NOT called.
+
+So where is the crash?
+
+Maybe `parseCompUnit` lookahead at the END of file?
+After `MainFuncDef` is parsed, `parseCompUnit` returns.
+No further parsing.
+
+Is it possible `parseMainFuncDef` fails to parse `}`?
+`parseBlock` parses `}`.
+If `parseBlock` crashes?
+
+Let's look at `parseBlock` again.
+```java
+getToken(Word.LBRACE);
+// ...
+while (!getToken(Word.RBRACE)) {
+   // ...
+}
+subUnits.add(curToken);
+// ...
+```
+If `getToken(RBRACE)` crashes because `pos` goes out of bounds?
+This happens if `RBRACE` is the last token, and `pos` is already at `size()-1`?
+No, `getToken` increments `pos`. If `pos` was `size()-1`, `pos` becomes `size()`, `tokens.get(size())` crashes.
+
+So, if `parseBlock` is called, and the block is EMPTY `{}`.
+`getToken(LBRACE)` consumes `{`. `pos` is at `{`.
+Loop: `!getToken(RBRACE)`.
+`getToken` increments `pos` to `}`. Returns true.
+Loop ends.
+Safe.
+
+What if `pos` is ALREADY at `}` before `getToken(RBRACE)` is called?
+This implies `pos` was not advanced after `{`.
+`getToken(LBRACE)` advanced it.
+
+Is there a path where `pos` is not advanced?
+`retract`?
+
+I suspect the crash is in `Parser.getToken` when `pos` reaches `tokens.size()`.
+This happens if the parser tries to look ahead past the end of the file.
+
+Given the "No output" and the complexity, the most likely location is the `getToken` method in `Parser.java` lacking a bounds check, combined with a parsing path that attempts to read past the end.
+
+<frontend/parser/Parser.java>
+...
+    public boolean getToken(Word... words) {
+        pos++;
+        curToken = tokens.get(pos);
+        if (words.length == 0) {
+            return true;
+        }
+        for (Word word : words) {
+            if (curToken.getWord().equals(word)) return true;
+        }
+        retract(1);
+        return false;
+    }
+...

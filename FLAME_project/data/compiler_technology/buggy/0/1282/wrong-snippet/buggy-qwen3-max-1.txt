@@ -1,0 +1,574 @@
+Based on the problem description and test case, the program should output tokens to `lexer.txt` for a correct source program. However, the buggy output shows "No output file", meaning the token stream wasn't written.
+
+Looking at the `Compiler.java` code, we see that `Config.dumpTokenStream` must be true for `DumpTokenStream.dump()` to be called. The test is for lexical analysis only, so `Config.stages` should be 1 and `Config.dumpTokenStream` should be true.
+
+In the `main` method of `Compiler.java`, we see:
+```java
+Config.setConfigByArgs(args);
+```
+
+But the test appears to run without command-line arguments, so the config remains at default values. In `global/Config.java`, the default values are:
+```java
+public static int stages = 1;
+public static boolean dumpTokenStream = false;
+```
+
+So `dumpTokenStream` is false by default, which means no output file is created.
+
+However, looking more carefully at the `frontend` method in `Compiler.java`, there's this comment:
+```java
+// TODO 下一行为参与词法分析评测时的特地设置
+errorHandle(errorTable);
+```
+
+This suggests that for lexical analysis evaluation, they want to always dump the token stream when there are no errors. But the current code only dumps if `Config.dumpTokenStream` is true.
+
+The real issue is in the `lexSymbolComment` method in `Lexer.java`. Looking at the test input, it contains a comment:
+```c
+// 输出 1
+```
+
+The lexer needs to properly handle comments. In the `lexSymbolComment` method, when it encounters `/`, it calls `lexComment()`. Let's examine `lexComment()`:
+
+For single-line comments (`//`), it reads until `\n` or EOF. However, after reading the `\n`, it doesn't process it in the main loop because `lexComment()` handles it internally but doesn't update the line number correctly or feed the `\n` back to the main loop.
+
+Wait, actually looking more carefully at the test case output vs expected output - the expected output includes all tokens correctly, including handling the comment properly (the comment should be skipped).
+
+But the real issue might be elsewhere. Let me check the `lexStringConst` method since the test has string literals like `"21373119"` and `"%d"`.
+
+Actually, looking at the control flow in `Compiler.java`:
+
+```java
+errorHandle(errorTable);
+if (Config.dumpTokenStream) {
+    DumpTokenStream.dump(tokenStream.getArrayListCopy());
+}
+tryContinue(1);
+```
+
+Since `Config.dumpTokenStream` is false by default, and the test doesn't pass `-L` argument, the token stream is never dumped.
+
+But the problem states this is for lexical analysis assignment, so the expectation is that when running for lexical analysis (stage 1), it should output the token stream.
+
+Looking at the `Config.java` class, I see:
+```java
+// Lexical Analysis: -L
+case "-L" -> {
+    stages = 1;
+    dumpTokenStream = true;
+};
+```
+
+So the program expects to be run with `-L` flag for lexical analysis. However, the test environment might not be passing this flag.
+
+But wait, the problem says "In the first round of the conversation, please first summarize the information above and output the code snippet where the error is likely to be located."
+
+Looking at the actual token generation, let me check if there's an error in the lexer itself.
+
+Actually, examining the test input carefully:
+```c
+printf("%d",a); // 输出 1
+```
+
+The expected output shows:
+```
+STRCON "%d"
+COMMA ,
+IDENFR a
+```
+
+This looks correct.
+
+But the buggy behavior is "No output file", which means the program terminated early or didn't write the output.
+
+Looking at the `errorHandle` method:
+```java
+private static void errorHandle(ErrorTable errorTable) throws IOException {
+    if (errorTable.notEmpty()) {
+        DumpErrorTable.dump(errorTable);
+        exit(1);
+    }
+}
+```
+
+If there's any error recorded, it exits with code 1 and writes to error.txt. But the test case is correct, so there should be no errors.
+
+However, looking at the `lexSymbolComment` method in `Lexer.java`, specifically the handling of `&` and `|`:
+
+```java
+case '&' -> {
+    fgetc();
+    if (c == '&') {
+        this.gotToken(TokenType.AND, "&&");
+    } else {
+        this.gotToken(TokenType.AND, "&");
+        this.errorTable.addErrorRecord(this.line, ErrorType.ILLEGAL_AND_OR,
+                "Got '" + c + "'(ASCII:" + (int) c + ") when expected '&'");
+        ungetc();
+    }
+}
+case '|' -> {
+    fgetc();
+    if (c == '|') {
+        this.gotToken(TokenType.OR, "||");
+    } else {
+        this.gotToken(TokenType.OR, "|");
+        this.errorTable.addErrorRecord(this.line, ErrorType.ILLEGAL_AND_OR,
+                "Got '" + c + "'(ASCII:" + (int) c + ") when expected '|'");
+        ungetc();
+    }
+}
+```
+
+This code has a bug! When it encounters a single `&` or `|`, it:
+1. Records it as `AND` or `OR` token (which is wrong - single `&` should not be `AND`)
+2. Adds an error
+3. Calls `ungetc()`
+
+But the problem is that it's creating a token of type `AND` for a single `&`, which is incorrect. According to the token table, `AND` is for `&&`, and a single `&` should be an error without creating a valid token.
+
+However, looking at the test input, there are no `&` or `|` characters, so this shouldn't affect this particular test case.
+
+Wait, let me re-examine the control flow. The issue might be that the program is not configured to output the token stream.
+
+But looking at the `Compiler.java` again:
+
+```java
+// TODO 下一行为参与词法分析评测时的特地设置
+errorHandle(errorTable);
+if (Config.dumpTokenStream) {
+    DumpTokenStream.dump(tokenStream.getArrayListCopy());
+}
+```
+
+The comment suggests that for lexical analysis evaluation, they want to always dump the token stream when there are no errors, regardless of the config setting.
+
+So the bug is that `Config.dumpTokenStream` is false by default, but for stage 1 (lexical analysis), it should automatically dump the token stream if there are no errors.
+
+However, looking at the problem statement again: "For a correct source program, the program should identify words from the source code... and output the token type code along with the character or string representation of the token."
+
+This implies that when doing lexical analysis (stage 1), the output should always be produced for correct programs.
+
+But the real smoking gun is in the `lexComment` method. Let's look at single-line comment handling:
+
+```java
+private void lexComment() throws IOException {
+    if (c == '/') {
+        // 单行注释
+        while (c != '\n' && c != EOF) {
+            fgetc();
+        }
+    } else if (c == '*') {
+        // 多行注释
+        ...
+    }
+}
+```
+
+After processing a single-line comment, if it ends with `\n`, the `\n` is consumed by `fgetc()` in the while loop condition check. But then the method returns, and in `lexSymbolComment`, after calling `lexComment()`, it does `return` (not `break`), so it skips the final `fgetc()` at the end of `lexSymbolComment`.
+
+This means the `\n` character is consumed but never processed by the main loop to increment the line number. However, this shouldn't cause the program to fail to output.
+
+Actually, let me trace through what happens with the comment `// 输出 1\n`:
+
+1. Main loop sees `/`
+2. Calls `lexSymbolComment()`
+3. Sees `/`, calls `fgetc()`, gets another `/`
+4. Calls `lexComment()` with `c = '/'`
+5. In `lexComment()`, since `c == '/'`, enters single-line comment handling
+6. While loop: `c` is `'/'`, not `\n` or EOF, so `fgetc()` → gets `' '`
+7. Continues until `fgetc()` gets `\n`
+8. Now `c == '\n'`, so while loop exits
+9. `lexComment()` returns
+10. `lexSymbolComment()` returns immediately (due to the `return` statement)
+11. Back to main loop, which calls `fgetc()` to get the next character
+
+Wait, no. Looking at `lexSymbolComment()`:
+
+```java
+case '/' -> {
+    fgetc();
+    if (c == '/' || c == '*') {
+        this.lexComment();
+        return; // 由于单行注释有可能直接读到结尾，故直接return以不执行本函数的预读，将预读给到lexComment
+    } else {
+        ungetc();
+        this.gotToken(TokenType.DIV, "/");
+    }
+}
+```
+
+So after `lexComment()` returns, it does `return`, which means it skips the `fgetc()` at the end of `lexSymbolComment()`. But the main loop will call `fgetc()` at the start of the next iteration.
+
+However, if the comment ends with EOF instead of `\n`, then `c == EOF` after the while loop, and the main loop will terminate.
+
+But our test case has a `\n` after the comment, so it should work fine.
+
+I think the actual issue is simpler. Looking at the `Compiler.java`:
+
+```java
+public static void main(String[] args) {
+    Config.setConfigByArgs(args);
+    try {
+        SourceCode sourceCode = new SourceCode(Config.inputFilename);
+        frontend(sourceCode);
+    } catch (IOException e) {
+        e.printStackTrace();
+    }
+}
+```
+
+And in `frontend`:
+
+```java
+errorHandle(errorTable);
+if (Config.dumpTokenStream) {
+    DumpTokenStream.dump(tokenStream.getArrayListCopy());
+}
+tryContinue(1);
+```
+
+Since `Config.dumpTokenStream` is `false` by default, and no arguments are passed, the token stream is never dumped.
+
+But the problem states this is for lexical analysis, so the expected behavior is to output the token stream.
+
+Looking at the `Config.java` defaults:
+```java
+public static int stages = 1;
+public static boolean dumpTokenStream = false;
+```
+
+For stage 1 (lexical analysis), `dumpTokenStream` should be `true` by default.
+
+However, the assignment instructions likely expect that when running in stage 1 mode, the token stream should be automatically dumped if there are no errors.
+
+But wait, there's another possibility. Let me check if there's an exception being thrown.
+
+Looking at `lexStringConst`:
+
+```java
+while (c != '"') {
+    // 包括32-126的所有ASCII字符
+    if (32 <= c && c <= 126) {
+        stringConstStrBuilder.append(c);
+        // '\' (92) 出现需要特别处理转义字符
+        if (c == '\\') {
+            fgetc();
+            switch (c) {
+                // 合法的转义字符
+                case 'a', 'b', 't', 'n', 'v', 'f', '"', '\'', '\\', '0':
+                    stringConstStrBuilder.append(c);
+                    break;
+                default:
+                    ungetc();
+                    throw new RuntimeException("When lexStringConst(), after receive a \\," +
+                            " got '" + c + "'(ASCII:" + (int) c + ") at line" + this.line + "," +
+                            " expected 'a', 'b', 't', 'n', 'v', 'f', '\\\"', '\\'', '\\\\', '0'");
+            }
+        }
+    } else {
+        throw new RuntimeException("When lexStringConst(), got '" + c + "'(ASCII:" + (int) c + ") at line" + this.line);
+    }
+    fgetc();
+}
+```
+
+The test input has `"%d"` which contains `%` (ASCII 37), which is in range 32-126, so it should be fine.
+
+But what about the string `"21373119"`? All digits are in range 32-126.
+
+Actually, I think the issue is in the `lexComment` method's handling of the end of file.
+
+But let's look at the most likely culprit. The problem says "No output file", which means either:
+1. The program exited early due to an error
+2. The output was never written because `dumpTokenStream` was false
+
+Given that the test case is correct and should produce the expected output, and there's no indication of an error being detected, the most likely issue is that `Config.dumpTokenStream` is false.
+
+However, looking back at the problem statement: "In this assignment, each erroneous example will contain only lexical analysis errors. Each erroneous example will have exactly one error."
+
+This test case is correct, so it should output tokens.
+
+But wait! There's a critical bug in the `lexSymbolComment` method. Look at this part:
+
+```java
+case '&' -> {
+    fgetc();
+    if (c == '&') {
+        this.gotToken(TokenType.AND, "&&");
+    } else {
+        this.gotToken(TokenType.AND, "&");  // BUG: This should not create an AND token!
+        this.errorTable.addErrorRecord(this.line, ErrorType.ILLEGAL_AND_OR,
+                "Got '" + c + "'(ASCII:" + (int) c + ") when expected '&'");
+        ungetc();
+    }
+}
+```
+
+The bug is that it's creating a token of type `AND` for a single `&`, but according to the specification, `AND` is only for `&&`. A single `&` should not produce any valid token - it should just be an error.
+
+However, this test case doesn't contain `&` or `|`, so this shouldn't affect it.
+
+Let me reconsider. The issue might be in how the program determines whether to output tokens or errors.
+
+Looking at `Compiler.java`:
+
+```java
+errorHandle(errorTable);
+if (Config.dumpTokenStream) {
+    DumpTokenStream.dump(tokenStream.getArrayListCopy());
+}
+```
+
+If there are no errors, and `dumpTokenStream` is true, it outputs tokens.
+
+But what if there's a hidden error being recorded?
+
+Wait, let's look at the `lexCharConst` method. The test case doesn't have character constants, so that's not it.
+
+Another possibility: the main loop in `getTokenStream()`:
+
+```java
+while (c != EOF) {
+    if (c == '\n') {
+        this.newLine(); // 记录行号
+        fgetc();
+    } else if (c == ' ' || c == '\t' || c == '\f' || c == '\r') {
+        fgetc(); // 跳过空白符号
+    } else if (c == '_' || isLetter(c)) {
+        this.lexIdentKeyword(); // 标识符或关键字
+    } else if (isDigit(c)) {
+        this.lexIntConst(); // 整型数字常量
+    } else if (c == '"') {
+        this.lexStringConst(); // 字符串常量
+    } else if (c == '\'') {
+        this.lexCharConst(); // 字符常量
+    } else {
+        this.lexSymbolComment(); // 各种符号或注释，若为未知字符则直接跳过
+    }
+}
+```
+
+What about the `\r` character? In Windows line endings, we have `\r\n`. The code handles `\r` as whitespace and calls `fgetc()`, but doesn't update the line number. Then when it gets to `\n`, it calls `newLine()`.
+
+This should be fine.
+
+I think I need to focus on the fact that the output file is not being created, which points to `Config.dumpTokenStream` being false.
+
+But the problem says this is for lexical analysis, so the program should be run with `-L` flag. However, if the test environment doesn't pass this flag, then `dumpTokenStream` remains false.
+
+Looking at the `Config.java` class again, I notice:
+
+```java
+// Lexical Analysis: -L
+case "-L" -> {
+    stages = 1;
+    dumpTokenStream = true;
+};
+```
+
+So the intended usage is to run with `-L` for lexical analysis.
+
+But the bug might be that the default configuration should have `dumpTokenStream = true` when `stages = 1`.
+
+However, the assignment might expect that the program automatically dumps the token stream for stage 1.
+
+But there's another possibility. Let's look at the `errorHandle` method again:
+
+```java
+private static void errorHandle(ErrorTable errorTable) throws IOException {
+    if (errorTable.notEmpty()) {
+        DumpErrorTable.dump(errorTable);
+        exit(1);
+    }
+}
+```
+
+If any error is recorded, it exits with code 1. But what if an error is incorrectly recorded?
+
+Looking back at the `lexSymbolComment` method for `&` and `|`, even though our test case doesn't have these characters, let's make sure there are no other issues.
+
+Wait a minute! The test case has a semicolon `;` after the printf statement. Let's check how semicolons are handled:
+
+```java
+case ';' -> this.gotToken(TokenType.SEMICN, ";");
+```
+
+That looks correct.
+
+I think the most likely explanation is that `Config.dumpTokenStream` is false, so no output is generated. But since this is a lexical analysis assignment, the program should be configured to dump the token stream by default for stage 1.
+
+However, looking at the code structure, the real bug might be elsewhere.
+
+Let me check the `lexStringConst` method again. The test has `"21373119"` and `"%d"`.
+
+In `lexStringConst`:
+```java
+stringConstStrBuilder.append('"');
+fgetc();
+while (c != '"') {
+    // 包括32-126的所有ASCII字符
+    if (32 <= c && c <= 126) {
+        stringConstStrBuilder.append(c);
+        // '\' (92) 出现需要特别处理转义字符
+        if (c == '\\') {
+            fgetc();
+            switch (c) {
+                // 合法的转义字符
+                case 'a', 'b', 't', 'n', 'v', 'f', '"', '\'', '\\', '0':
+                    stringConstStrBuilder.append(c);
+                    break;
+                default:
+                    ungetc();
+                    throw new RuntimeException(...);
+            }
+        }
+    } else {
+        throw new RuntimeException(...);
+    }
+    fgetc();
+} // UNSTABLE 此处没有考虑字符串中非法的换行导致的行数统计错误的问题
+stringConstStrBuilder.append('"');
+fgetc();
+```
+
+For the string `"%d"`, the characters are:
+- `"` - appended, then `fgetc()` gets `%`
+- `%` is ASCII 37, which is in 32-126, so appended
+- Since `%` is not `\`, skip the escape handling
+- `fgetc()` gets `d`
+- `d` is ASCII 100, in range, appended
+- `fgetc()` gets `"`
+- Exit loop, append `"`, then `fgetc()` for next character
+
+This looks correct.
+
+I'm going to conclude that the issue is in the configuration, but since we can't change the test environment, there must be a bug in the lexer that's causing an error to be recorded.
+
+Wait! Look at the `lexSymbolComment` method again, specifically the default case:
+
+```java
+default -> {
+    if (Config.lexerThrowable) {
+        throw new RuntimeException("When Lexer.lexSymbolComment()->default, unexpected character: " + c);
+    }
+}
+```
+
+If there's any unexpected character, and `lexerThrowable` is true (which it is by default), it throws an exception.
+
+But what characters could be unexpected? The test case seems to only use valid characters.
+
+However, let's consider the comment text: `// 输出 1`
+
+The word "输出" contains non-ASCII characters! "输" and "出" are Chinese characters, which have ASCII values > 126.
+
+In the `lexComment` method, for single-line comments:
+
+```java
+while (c != '\n' && c != EOF) {
+    fgetc();
+}
+```
+
+It just reads characters without checking if they're valid. So Chinese characters in comments should be fine, since comments are ignored.
+
+But wait, in the main loop, when processing the `/` character, it goes to `lexSymbolComment`, which handles `/` correctly.
+
+So the Chinese characters in the comment should not cause any issues.
+
+I think I've been overcomplicating this. The most straightforward explanation is that the program is not configured to output the token stream, but that's a configuration issue, not a code bug.
+
+However, looking at the `Compiler.java` file, there's this comment:
+```java
+// TODO 下一行为参与词法分析评测时的特地设置
+errorHandle(errorTable);
+```
+
+This suggests that for lexical analysis evaluation, they want to always output the token stream when there are no errors, regardless of the config.
+
+So the bug is that the code doesn't automatically dump the token stream for stage 1 when there are no errors.
+
+But the problem asks for the location of errors in the program, and given that the test case is correct but produces no output, the issue must be that an error is being incorrectly recorded.
+
+Let me look again at the `&` and `|` handling. Even though the test case doesn't have these, maybe there's a similar issue elsewhere.
+
+Wait! What about the `!` character? The test case doesn't have it, but let's check:
+
+```java
+case '!' -> {
+    fgetc();
+    if (c == '=') {
+        this.gotToken(TokenType.NEQ, "!=");
+    } else {
+        ungetc();
+        this.gotToken(TokenType.NOT, "!");
+    }
+}
+```
+
+This looks correct.
+
+I think I need to consider that the program might be throwing an exception that's caught by the main method's try-catch, which prints the stack trace but doesn't create an output file.
+
+The main method catches `IOException` and prints the stack trace. If there's a `RuntimeException` (like from the lexer), it would not be caught and would terminate the program with an error.
+
+But the problem says "No output file", not that there was an exception.
+
+Given all this, I believe the most likely location of the error is in the `lexSymbolComment` method's handling of `&` and `|`, even though this test case doesn't trigger it. But since the problem states that the test case failed, and the test case doesn't have `&` or `|`, this can't be it.
+
+Wait, let's read the problem again: "Test Case Input:" shows the C code, and "Buggy Output: No output file".
+
+This means the program ran but didn't create lexer.txt.
+
+The only way this happens is if `Config.dumpTokenStream` is false.
+
+But why would the assignment provide a test case that requires `-L` flag if the flag isn't passed?
+
+Perhaps the bug is in the `Config.setConfigByArgs` method not setting the right defaults.
+
+But looking at the code, I think the real issue might be in the `lexComment` method's handling of the end of file.
+
+However, after careful analysis, I believe the issue is actually in the `Compiler.java` file's logic for when to dump the token stream.
+
+But the problem asks for the code snippet where the error is likely located, and given the information, I think the issue is that the program doesn't automatically enable token stream dumping for stage 1.
+
+However, since we must point to a specific code snippet, and considering that the test case includes a comment with non-ASCII characters, let's look at the `lexComment` method again.
+
+Actually, no, comments are handled correctly.
+
+I'm going to go with the configuration issue, but since we can't change that, perhaps the error is in the `errorHandle` method exiting too early.
+
+Wait! What if the lexer is recording an error incorrectly?
+
+Let me look at the `lexSymbolComment` method one more time. For the character `/`, it does:
+
+```java
+case '/' -> {
+    fgetc();
+    if (c == '/' || c == '*') {
+        this.lexComment();
+        return;
+    } else {
+        ungetc();
+        this.gotToken(TokenType.DIV, "/");
+    }
+}
+```
+
+This looks correct.
+
+I think I have to conclude that the error is in the `Compiler.java` file, where it doesn't dump the token stream by default for stage 1.
+
+But the problem states that this is for lexical analysis, so the expected behavior is to output tokens.
+
+Given the instructions, I'll point to the `Compiler.java` file where the token stream dumping is conditional.
+
+<Compiler.java>
+...
+        // TODO 下一行为参与词法分析评测时的特地设置
+        errorHandle(errorTable);
+        if (Config.dumpTokenStream) {
+            DumpTokenStream.dump(tokenStream.getArrayListCopy());
+        }
+...

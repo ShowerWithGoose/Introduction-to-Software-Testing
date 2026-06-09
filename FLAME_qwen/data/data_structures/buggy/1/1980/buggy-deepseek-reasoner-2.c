@@ -1,0 +1,28 @@
+#include <stdio.h>
+#include <stdlib.h>
+int symbol[10] ,array[10] ;
+int n;
+void zidian(int index){
+    int i;
+    if(index>= n){
+        for(i = 0; i < n; i++){
+            printf("%d",array[i]); // @@ Missing space after each number; should be "%d " to match required output format (integers separated by spaces)
+        }
+        printf("\n");
+        return ;
+    }
+    for(i = 0;i < n; i++){
+        if(symbol[i] == 0){
+            array[index] = i+1;
+            symbol[i] = 1;
+            zidian(index+1);
+            symbol[i] = 0;
+        }
+    }
+}
+int main(){
+    int i;
+    scanf("%d",&n);
+    zidian(0);
+    return 0;
+}

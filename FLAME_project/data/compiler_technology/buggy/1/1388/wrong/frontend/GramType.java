@@ -1,0 +1,42 @@
+package frontend;
+
+public enum GramType {
+    CompUnit,
+    FuncDef,
+    FuncType,
+    MainFuncDef,
+    FuncFParams,
+    ConstInitVal,
+    FuncFParam,
+    Block,
+    BlockItem,
+    Decl,
+    ConstDecl,
+    BType,
+    ConstDef,
+    Ident,//
+    ConstExp,//
+    StringConst,//
+    VarDecl,
+    VarDef,
+    InitVal,
+    Exp,
+    AddExp,
+    MulExp,
+    UnaryExp,
+    PrimaryExp,
+    Number,
+    IntConst,
+    Character,
+    CharConst,
+    FuncRParams,
+    UnaryOp,
+    Stmt,
+    LVal,
+    Cond,
+    LOrExp,
+    LAndExp,
+    EqExp,
+    RelExp,
+    ForStmt,
+}

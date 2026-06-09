@@ -1,0 +1,246 @@
+/**
+ * @Author:
+ * @Date: 2024-9-20
+ * @Version: 1.0
+ * @Description: 词法分析程序
+*/
+/*
+ * 词法分析程序整体思路（词法分析仅有a型错误）
+ * 1.字母开头
+ *  1.1检查是否是保留字
+ *  1.2标识符
+ *      1.2.1 对于标识符要区分常量还是变量
+ * 2.数字开头
+ *  2.1 atoi()函数转换
+ * 3.符号开头
+ *  3.1 检查是否是运算符
+ * 4.其他
+ *  4.1注释的处理
+ *
+ *
+ * 遇到错误要跳过，继续进行词法分析
+ */
+#include<iostream>
+#include <cstdio>
+#include <fstream>
+#include <cstring>
+
+#define FILE_PATH "testfile.txt"
+#define RIGHT_FILE_PATH "lexer.txt"
+#define ERROR_FILE_PATH "error.txt"
+
+#define NUM_RESERVED 14
+#define NUM_SYMBOL 23
+#define MAX_TOKEN_LEN 1000
+
+const char *reservedWords[NUM_RESERVED] = {
+        "main", "const", "int", "char", "break", "continue", "if", "else",
+        "for", "getint", "getchar", "printf", "return", "void"
+};
+const char *symbolWords[NUM_SYMBOL] = {
+        "!", "&&", "||", "+", "-", "*", "/", "%", "<", "<=", ">", ">=", "==", "!=", "=", ";", ",", "(", ")", "[", "]",
+        "{", "}"
+};
+const char *reservedWordsType[NUM_RESERVED] = {
+        "MAINTK", "CONSTTK", "INTTK", "CHARTK", "BREAKTK", "CONTINUETK", "IFTK", "ELSETK",
+        "FORTK", "GETINTTK", "GETCHARTK", "PRINTFTK", "RETURNTK", "VOIDTK"
+};
+const char *symbolType[NUM_SYMBOL] = {
+        "NOT", "AND", "OR", "PLUS", "MINU", "MULT", "DIV", "MOD", "LSS", "LEQ", "GRE", "GEQ",
+        "EQL", "NEQ", "ASSIGN", "SEMICN", "COMMA", "LPARENT", "RPARENT", "LBRACK", "RBRACK", "LBRACE", "RBRACE"
+};
+int line_count = 1;
+
+char *token = (char *) malloc(MAX_TOKEN_LEN * sizeof(char) * 2);
+
+char getChar(FILE *file) {
+    char ch;
+    if ((ch = fgetc(file)) != EOF) {
+        return ch;
+    } else {
+        return EOF;
+    }
+}
+
+void getNBC(FILE *file) {
+    char ch;
+    while ((ch = getChar(file)) != EOF) {
+        if (ch == ' ' || ch == '\n' || ch == '\t') {
+            if(ch == '\n'){
+                line_count++;
+            }
+            continue;
+        } else {
+            break;
+        }
+    }
+    if (ch != EOF) {
+        ungetc(ch, file);
+    }
+}
+
+void clearToken() {
+    memset(token,0,MAX_TOKEN_LEN * sizeof(char) * 2);
+}
+
+void cat(char ch) {
+    int len = strlen(token);
+    if (len < MAX_TOKEN_LEN - 1) {
+        token[len] = ch;
+        token[len + 1] = '\0';
+    }
+}
+
+void getToken(char ch, FILE *fp) {
+    while (isalpha(ch) || isdigit(ch) || ch == '_') {
+        cat(ch);
+        ch = getChar(fp);
+    }
+    ungetc(ch, fp);
+}
+
+int isReservedWord(char *token, std::ofstream &rightFile) {
+    for (int i = 0; i < NUM_RESERVED; i++) {
+        if (strcmp(token, reservedWords[i]) == 0) {
+            rightFile << reservedWordsType[i] << " " << token << "\n";
+            return i + 1;
+        }
+    }
+    return -1;
+}
+void skipSingleLineComment(FILE *fp) {
+    char ch;
+    while ((ch = getChar(fp)) != EOF) {
+        if (ch == '\n') {
+            line_count++;
+            break;
+        }
+    }
+}
+
+void skipMultiLineComment(FILE *fp) {
+    char ch;
+    while ((ch = getChar(fp)) != EOF) {
+        if (ch == '*') {
+            ch = getChar(fp);
+            if (ch == '/') {
+                break;
+            }
+        }
+        if (ch == '\n') {
+            line_count++;
+        }
+    }
+}
+int main() {
+    //输出当前文件路径
+//    std::cout << "当前文件路径: " << __FILE__ << std::endl;
+    FILE *fp = fopen(FILE_PATH, "r");
+    if (fp == nullptr) {
+        printf("文件打开失败\n");
+        return 0;
+    }
+    //创建输出文件
+    std::ofstream rightFile(RIGHT_FILE_PATH);
+    std::ofstream errorFile(ERROR_FILE_PATH);
+
+    char ch;
+    getNBC(fp);
+    ch = getChar(fp);
+    while (ch != EOF) {
+        clearToken();
+        if (isalpha(ch) || ch == '_') {
+            //字母开头
+            getToken(ch, fp);
+            //判断是否是保留字
+            if (isReservedWord(token, rightFile) == -1) {
+                //不是保留字
+                rightFile << "IDENFR" << " " << token << "\n";
+            }
+        } else if (isdigit(ch)) {
+            getToken(ch, fp);
+            rightFile << "INTCON" << " " << token << "\n";
+        }
+        else if(ch == '&'){
+            ch = getChar(fp);
+            if(ch != '&'){
+                errorFile<< line_count << " " << "a"  << "\n";
+                ungetc(ch,fp);
+            }
+            else{
+                rightFile << "AND" << " " << "&&" << "\n";
+            }
+        }
+        else if(ch == '|'){
+            ch = getChar(fp);
+            if(ch != '|'){
+                errorFile<< line_count << " " << "a"  << "\n";
+                ungetc(ch,fp);
+            }
+            else{
+                rightFile << "OR" << " " << "||" << "\n";
+            }
+        }
+        else if (ch == '"') {
+            cat(ch);
+            ch = getChar(fp);
+            while (ch != '"') {
+                cat(ch);
+                ch = getChar(fp);
+            }
+            cat(ch);
+            rightFile << "STRCON" << " " << token << "\n";
+        } else if (ch == '\'') {
+            ch = getChar(fp);
+            rightFile << "CHRCON" << " \'" << ch << "\'\n";
+            ch = getChar(fp);
+        } else if (ch == '/') {
+            // 处理注释
+            ch = getChar(fp);
+            if (ch == '/') {
+                skipSingleLineComment(fp);
+            } else if (ch == '*') {
+                skipMultiLineComment(fp);
+            } else {
+                ungetc(ch, fp);
+                cat('/');
+                rightFile << "DIV" << " " << token << "\n";
+            }
+        }else {
+            cat(ch);
+            if(ch == '<' || ch == '>' || ch == '!' || ch == '='){
+                ch = getChar(fp);
+                if(ch == '='){
+                    cat(ch);
+                    for (int i = 0; i < NUM_SYMBOL; i++) {
+                        if (strcmp(token, symbolWords[i]) == 0) {
+                            rightFile << symbolType[i] << " " << token << "\n";
+                        }
+                    }
+                }
+                else{
+                    for (int i = 0; i < NUM_SYMBOL; i++) {
+                        if (strcmp(token, symbolWords[i]) == 0) {
+                            rightFile << symbolType[i] << " " << token << "\n";
+                        }
+                    }
+                    ungetc(ch,fp);
+                }
+            }
+            else{
+                for (int i = 0; i < NUM_SYMBOL; i++) {
+                    if (strcmp(token, symbolWords[i]) == 0) {
+                        rightFile << symbolType[i] << " " << token << "\n";
+                    }
+                }
+            }
+        }
+        getNBC(fp);
+        ch = getChar(fp);
+    }
+    //关闭文件
+    fclose(fp);
+    rightFile.close();
+    errorFile.close();
+    return 0;
+}

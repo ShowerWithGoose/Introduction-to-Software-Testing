@@ -1,0 +1,754 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The task is to implement a syntax analyzer (parser) that outputs lexical tokens and specific non-terminal syntax components (like `<Stmt>`, `<Block>`, etc.) in the order they are recognized. It must also handle syntax errors.
+2.  **Test Case**: A simple C-like program with `main`, `printf`, variable declarations, nested blocks, and a return statement.
+3.  **Expected Output**: A sequence of tokens and non-terminals. Crucially, it includes `<Stmt>` tags for statements like `printf(...)`, variable declarations inside blocks are wrapped in `<VarDecl>`, and blocks are wrapped in `<Block>`. The output ends with `<MainFuncDef>` and `<CompUnit>`.
+4.  **Buggy Output**: "No output file". This suggests the program crashed (exception) or terminated before writing any output, or the output file was not created/written to correctly. Given the code structure, an unhandled exception during parsing is the most likely cause for "No output file" if the `writeResults` method is inside a try-catch that swallows exceptions or if the crash happens before `writeResults` is called effectively. However, looking at `Compiler.java`, `writeResults` is called after parsing. If `parseCompUnit` throws an exception (e.g., `IndexOutOfBoundsException` or `AssertionError`), the program might terminate abruptly.
+5.  **Code Analysis**:
+    *   In `Parser.java`, the method `parsePrimaryExp` handles `Character` (CharConst).
+    *   Code snippet:
+        ```java
+        else if (tokens.get(curPos).getType() == TokenType.CHRCON) {
+            CharConst charConst = parseCharConst();
+            curPos++; // <--- ERROR HERE
+            Character character = new Character(charConst);
+            return new PrimaryExp(character);
+        }
+        ```
+    *   The method `parseCharConst()` is defined as:
+        ```java
+        public CharConst parseCharConst() {
+            CharConst charConst = null;
+            if (tokens.get(curPos).getType() == TokenType.CHRCON) {
+                charConst = new CharConst(tokens.get(curPos));
+                curPos++; // <--- curPos is incremented here
+            } else {
+                System.err.println("parseCharConst Error");
+            }
+            return charConst;
+        }
+        ```
+    *   **The Bug**: `parseCharConst()` already increments `curPos`. The caller `parsePrimaryExp()` increments `curPos` **again**. This double increment causes the parser to skip the next token. In the test case, this might not immediately crash if the skipped token is handled gracefully later, but it desynchronizes the parser.
+    *   More critically, let's look at `parseBlock()`:
+        ```java
+        public Block parseBlock() {
+            Token lbraceToken = tokens.get(curPos);
+            curPos++;
+
+            ArrayList<BlockItem> blockItems = new ArrayList<>();
+            while (tokens.get(curPos).getType() != TokenType.RBRACE) { // <--- Potential IndexOutOfBounds
+                BlockItem blockItem = parseBlockItem();
+                blockItems.add(blockItem);
+            }
+            // ...
+        }
+        ```
+        If `curPos` goes out of bounds (e.g., due to previous errors or malformed input), `tokens.get(curPos)` will throw `IndexOutOfBoundsException`.
+    *   Let's look at `parseFuncDefs()`:
+        ```java
+        public ArrayList<FuncDef> parseFuncDefs() {
+            ArrayList<FuncDef> funcDefs = new ArrayList<>();
+
+            while (curPos < tokens.size()) {
+                Token secondToken = tokens.get(curPos + 1); // <--- Potential IndexOutOfBounds
+                if (secondToken.getType() == TokenType.MAINTK) {
+                    return funcDefs;
+                }
+                funcDefs.add(parseFuncDef());
+            }
+            return funcDefs;
+        }
+        ```
+        If `curPos` is at the last token (`tokens.size() - 1`), `tokens.get(curPos + 1)` throws `IndexOutOfBoundsException`. This is a very likely cause for a crash if the input ends unexpectedly or if logic is slightly off. In the provided test case, `int main() {...}` is the only function. `parseDecls` returns empty. `parseFuncDefs` is called. `curPos` is 0. `tokens.get(1)` is `MAINTK`. It returns empty list. Then `parseMainFuncDef` is called. This seems okay for this specific input.
+    *   Let's re-examine `parsePrimaryExp` double increment.
+        Input: `printf("21373119");`
+        `printf` is parsed as `UnaryExp` -> `FuncCallExp`.
+        Inside `FuncCallExp`, `parseExp` is not called for arguments because there are none.
+        Wait, `printf` takes a string. `parsePrintfStmtEle` calls `parseStringConst`.
+        `parseStringConst`:
+        ```java
+        public StringConst parseStringConst() {
+            StringConst stringConst = null;
+            if (tokens.get(curPos).getType() == TokenType.STRCON) {
+                stringConst = new StringConst(tokens.get(curPos));
+                curPos++;
+            } else {
+                System.err.println("parseStringConst Error");
+            }
+            return stringConst;
+        }
+        ```
+        This looks correct.
+
+    *   Let's look at `parseCharConst` usage again. The test case doesn't have char constants. So that bug might not trigger here.
+
+    *   Let's look at `parseBlockItem`:
+        ```java
+        public BlockItem parseBlockItem() {
+            BlockItem blockItem;
+            Token curToken = tokens.get(curPos);
+            if (curToken.getType() == TokenType.CONSTTK ||
+                    curToken.getType() == TokenType.INTTK ||
+                    curToken.getType() == TokenType.CHARTK) {
+                Decl decl = parseDecl();
+                blockItem = new BlockItem(decl);
+            } else {
+                Stmt stmt = parseStmt();
+                blockItem = new BlockItem(stmt);
+            }
+            return blockItem;
+        }
+        ```
+    *   Let's look at `parseDecl`:
+        ```java
+        private Decl parseDecl() {
+            Decl decl = null;
+            Token firstToken = tokens.get(curPos);
+            Token thirdToken = null;
+            if (curPos + 2 < tokens.size()) {
+                thirdToken = tokens.get(curPos + 2);
+            }
+            if (thirdToken != null && thirdToken.getType() == TokenType.LPARENT) {    // FuncDef MainFuncDef
+                return decl; // Returns null!
+            } else if (firstToken.getType() == TokenType.CONSTTK) {
+                // ...
+            } else {
+                VarDecl varDecl = parseVarDecl();
+                decl = new Decl(varDecl);
+            }
+            return decl;
+        }
+        ```
+        If `parseDecl` returns `null` (because it thinks it's a FuncDef), `new Decl(null)` is created. `Decl.printString` checks `if (declEle != null)`. If null, returns "".
+        However, `parseDecls` adds `new Decl(constDecl)` or `new Decl(varDecl)`.
+        In `parseBlockItem`, if it calls `parseDecl`, and `parseDecl` returns `null` (because it detected a function definition pattern incorrectly?), then `blockItem` wraps a null decl.
+        
+        But the real issue is likely in `parseFuncDefs` or `parseMainFuncDef` logic regarding when to stop parsing Decls/FuncDefs.
+        
+        Actually, look at `parseDecls` in `Parser.java`:
+        ```java
+        public ArrayList<Decl> parseDecls() {
+            ArrayList<Decl> decls = new ArrayList<>();
+            while (curPos < tokens.size()) {
+                Token firstToken = tokens.get(curPos);
+                Token thirdToken = null;
+                if (curPos + 2 < tokens.size()) {
+                    thirdToken = tokens.get(curPos + 2);
+                }
+                if ( thirdToken != null && thirdToken.getType() == TokenType.LPARENT) {    // FuncDef MainFuncDef
+                    return decls;
+                } 
+                // ...
+            }
+            return decls;
+        }
+        ```
+        For `int main() { ... }`:
+        `curPos` = 0. `firstToken` = `int`. `thirdToken` = `(` (index 2). `thirdToken.getType()` == `LPARENT`.
+        So `parseDecls` returns empty list. Correct.
+        
+        Then `parseFuncDefs`:
+        ```java
+        public ArrayList<FuncDef> parseFuncDefs() {
+            ArrayList<FuncDef> funcDefs = new ArrayList<>();
+            while (curPos < tokens.size()) {
+                Token secondToken = tokens.get(curPos + 1); // CRASH if curPos is last element
+                if (secondToken.getType() == TokenType.MAINTK) {
+                    return funcDefs;
+                }
+                funcDefs.add(parseFuncDef());
+            }
+            return funcDefs;
+        }
+        ```
+        `curPos` is still 0. `tokens.get(1)` is `main`. `MAINTK`. Returns empty list. Correct.
+        
+        Then `parseMainFuncDef`:
+        ```java
+        public MainFuncDef parseMainFuncDef() {
+            if (curPos < tokens.size()) {
+                Token intToken = tokens.get(curPos); // int
+                curPos++;
+                Token mainToken = tokens.get(curPos); // main
+                curPos++;
+                Token lparentToken = tokens.get(curPos); // (
+                curPos++;
+                Token rparentToken = getAndCheckError_ijk(TokenType.RPARENT); // )
+                Block block = parseBlock(); // { ... }
+                return new MainFuncDef(intToken, mainToken, lparentToken, rparentToken, block);
+            } else {
+                return null;
+            }
+        }
+        ```
+        This seems correct for the happy path.
+
+    *   Why "No output file"?
+        Check `Compiler.java`:
+        ```java
+        try {
+            // ...
+            writeResults(compUnit, errorList);
+        } catch (IOException e) {
+            System.err.println("File error: " + e.getMessage());
+        }
+        ```
+        If `parseCompUnit` throws a RuntimeException (like `IndexOutOfBoundsException`), it is NOT caught by `catch (IOException e)`. The program terminates, and `writeResults` is never called. No file is written.
+
+    *   Where is the `IndexOutOfBoundsException`?
+        Look at `parseBlock`:
+        ```java
+        public Block parseBlock() {
+            Token lbraceToken = tokens.get(curPos);
+            curPos++;
+
+            ArrayList<BlockItem> blockItems = new ArrayList<>();
+            while (tokens.get(curPos).getType() != TokenType.RBRACE) {
+                BlockItem blockItem = parseBlockItem();
+                blockItems.add(blockItem);
+            }
+            // ...
+        }
+        ```
+        If the block is empty `{}`, `curPos` points to `}`. Loop condition `tokens.get(curPos).getType() != RBRACE` is false. Loop doesn't run. Correct.
+        
+        If the block has items, it parses them.
+        
+        Let's look at `parseStmt` for `printf`:
+        ```java
+        else if (curToken.getType() == TokenType.PRINTFTK) {
+            stmt = parsePrintfStmtEle();
+        }
+        ```
+        `parsePrintfStmtEle`:
+        ```java
+        public PrintfStmtEle parsePrintfStmtEle() {
+            Token printfToken = tokens.get(curPos);
+            curPos++;
+            Token lparentToken = tokens.get(curPos);
+            curPos++;
+            StringConst stringConst = parseStringConst(); // Consumes STRCON
+
+            ArrayList<Token> commaTokens = new ArrayList<>();
+            ArrayList<Exp> exps = new ArrayList<>();
+            while (tokens.get(curPos).getType() == TokenType.COMMA) { // Checks next token
+                // ...
+            }
+
+            Token rparentToken = getAndCheckError_ijk(TokenType.RPARENT);
+            Token semicolonToken = getAndCheckError_ijk(TokenType.SEMICN);
+            // ...
+        }
+        ```
+        This looks safe.
+
+    *   Let's check `parseVarDecl` inside a block.
+        `int a = 0;`
+        `parseBlockItem` sees `INTTK`. Calls `parseDecl`.
+        `parseDecl`:
+        `firstToken` = `int`. `thirdToken` = `a` (IDENFR). Not `LPARENT`.
+        Goes to `else`: `parseVarDecl`.
+        `parseVarDecl`:
+        `parseBType` consumes `int`.
+        `parseVarDef`:
+        `parseIdent` consumes `a`.
+        `tokens.get(curPos)` is `=`. Not `LBRACK`.
+        `tokens.get(curPos)` is `=`. Is `ASSIGN`.
+        `assignToken` = `=`. `curPos++`.
+        `parseInitVal`:
+        `tokens.get(curPos)` is `0` (INTCON).
+        Goes to `else`: `parseExp`.
+        `parseExp` -> `parseAddExp` -> `parseMulExp` -> `parseUnaryExp` -> `parsePrimaryExp`.
+        `parsePrimaryExp`:
+        `tokens.get(curPos)` is `INTCON`.
+        ```java
+        else if (tokens.get(curPos).getType() == TokenType.INTCON) {
+            IntConst intConst = parseIntConst();
+            Number number = new Number(intConst);
+            return new PrimaryExp(number);
+        }
+        ```
+        `parseIntConst`:
+        ```java
+        public IntConst parseIntConst() {
+            IntConst intConst = null;
+            if (tokens.get(curPos).getType() == TokenType.INTCON) {
+                intConst = new IntConst(tokens.get(curPos));
+                curPos++;
+            } else {
+                System.err.println("parseIntConst Error");
+            }
+            return intConst;
+        }
+        ```
+        Consumes `0`. Returns.
+        
+        Back in `parseVarDef`:
+        Returns `VarDef`.
+        Back in `parseVarDecl`:
+        `while (tokens.get(curPos).getType() == TokenType.COMMA)`. Next is `;`. False.
+        `getAndCheckError_ijk(SEMICN)`. Consumes `;`.
+        Returns `VarDecl`.
+        Back in `parseDecl`:
+        Returns `new Decl(varDecl)`.
+        Back in `parseBlockItem`:
+        Returns `new BlockItem(decl)`.
+        
+        This seems correct too.
+
+    *   Is there an issue with `parseFuncDefs` accessing `curPos + 1`?
+        If the input was just `int main() {}`, `parseDecls` returns. `curPos`=0.
+        `parseFuncDefs`: `curPos` < size. `tokens.get(1)` is `main`. OK.
+        
+        What if `parseDecls` consumed some tokens?
+        Suppose we had `int a; int main() {}`.
+        `parseDecls`:
+        `curPos`=0. `first`=int, `third`=a. Not LPARENT.
+        Parses `int a;`. `curPos` becomes 2 (after `;`).
+        Loop continues.
+        `curPos`=2. `first`=int, `third`=main? No, `tokens[2]`=int, `tokens[3]`=main, `tokens[4]`=(.
+        `thirdToken` = `tokens[4]` = `(`. LPARENT.
+        Returns decls.
+        `curPos` is still 2.
+        `parseFuncDefs`:
+        `curPos`=2. `tokens[3]` is `main`. OK.
+        
+        It seems robust enough for valid input.
+
+    *   Let's look closely at `parsePrimaryExp` again.
+        ```java
+        else if (tokens.get(curPos).getType() == TokenType.CHRCON) {
+            CharConst charConst = parseCharConst();
+            curPos++; // BUG: Double increment
+            Character character = new Character(charConst);
+            return new PrimaryExp(character);
+        }
+        ```
+        Although the test case doesn't use `CHRCON`, if this bug exists, it's a strong candidate for "logical error". But it wouldn't cause "No output file" for *this* test case unless it crashes elsewhere.
+
+    *   Wait, look at `parseBlock` again.
+        ```java
+        while (tokens.get(curPos).getType() != TokenType.RBRACE) {
+             BlockItem blockItem = parseBlockItem();
+             blockItems.add(blockItem);
+        }
+        ```
+        If `parseBlockItem` fails to consume any token (infinite loop) or consumes too many, it could crash.
+        
+    *   Let's look at `parseDecl` inside `parseBlockItem`.
+        If `parseDecl` returns `null` (as seen in the `FuncDef` check), `new Decl(null)` is returned.
+        `Decl.printString` returns `""`.
+        This is valid.
+
+    *   Is it possible `parseMainFuncDef` fails?
+        If `curPos` is out of bounds?
+        
+    *   Let's look at `getAndCheckError_ijk`.
+        ```java
+        public Token getAndCheckError_ijk(TokenType tokenType) {
+            Token token = null;
+            Token errorToken = null;
+            if (tokens.get(curPos).getType() == tokenType) { // Crash if curPos >= size
+                token = tokens.get(curPos);
+                curPos++;
+            } else {
+                // ...
+                errorToken = new Token(..., tokens.get(curPos - 1).getLineno()); // Crash if curPos == 0
+                // ...
+            }
+            return token;
+        }
+        ```
+        If `curPos` is equal to `tokens.size()`, `tokens.get(curPos)` throws `IndexOutOfBoundsException`.
+        
+        When can `curPos` be equal to `tokens.size()`?
+        At the end of parsing.
+        `parseMainFuncDef` calls `parseBlock`.
+        `parseBlock` parses until `RBRACE`.
+        After `parseBlock`, `curPos` should be at the token after `}`.
+        If `}` is the last token, `curPos` == `tokens.size()`.
+        `parseMainFuncDef` returns.
+        `parseCompUnit` returns.
+        No further calls to `getAndCheckError_ijk`.
+        
+        However, inside `parseBlock`, if the block is NOT closed properly (missing `}`), the `while` loop:
+        ```java
+        while (tokens.get(curPos).getType() != TokenType.RBRACE) {
+        ```
+        Will eventually access `tokens.get(curPos)` where `curPos` == `tokens.size()`, causing a crash.
+        
+        But the input is correct: `int main() { ... }`. It has a closing brace.
+
+    *   Let's look at `parseFuncDefs` again.
+        ```java
+        while (curPos < tokens.size()) {
+            Token secondToken = tokens.get(curPos + 1);
+            // ...
+        }
+        ```
+        If `curPos` is `tokens.size() - 1` (last token), `curPos + 1` is `tokens.size()`. `tokens.get(tokens.size())` throws `IndexOutOfBoundsException`.
+        
+        Can `curPos` be at the last token when entering `parseFuncDefs`?
+        Only if `parseDecls` consumed all tokens except the last one, and the last one is NOT preceded by a `MAINTK` check that returns early.
+        
+        In our case, `parseDecls` returns early. `curPos`=0.
+        
+        What if there were no `main`? The problem says `MainFuncDef` is part of `CompUnit`.
+        
+        Let's look at the `parsePrimaryExp` double increment bug again.
+        If the test case *did* have a char constant, it would skip a token.
+        
+        Is there another bug?
+        
+        Look at `parseUnaryExp`:
+        ```java
+        if (curToken.getType() == TokenType.IDENFR &&
+                tokens.get(curPos + 1).getType() == TokenType.LPARENT) {
+            Ident ident = parseIdent();
+            Token lparentToken = curToken; // BUG: curToken is the token at curPos BEFORE parseIdent.
+            curPos++; // This increments curPos past the IDENFR? No.
+            
+            // parseIdent:
+            // public Ident parseIdent() {
+            //     Ident ident = null;
+            //     if (tokens.get(curPos).getType() == TokenType.IDENFR) {
+            //         ident = new Ident(tokens.get(curPos));
+            //         curPos++;
+            //     }
+            //     return ident;
+            // }
+            
+            // So after parseIdent, curPos is at LPARENT.
+            
+            Exp firstFuncRParam = null;
+            // ...
+            Token rparentToken = getAndCheckError_ijk(TokenType.RPARENT);
+            FuncCallExp funcCallExp = new FuncCallExp(ident, lparentToken, ...);
+            return new UnaryExp(funcCallExp);
+        }
+        ```
+        Wait, `Token lparentToken = curToken;` assigns the `IDENFR` token to `lparentToken`?
+        No, `curToken` was fetched at the start of `parseUnaryExp`: `Token curToken = tokens.get(curPos);`.
+        So `lparentToken` holds the `IDENFR` token.
+        Then `parseIdent()` is called, which consumes `IDENFR`.
+        Then `curPos` is at `LPARENT`.
+        The code does NOT consume `LPARENT` explicitly before parsing params?
+        
+        Inside `FuncCallExp` constructor/printing, it expects `lparentToken`.
+        But `parseUnaryExp` does NOT consume `LPARENT`.
+        
+        Let's trace `printf("...")`:
+        1. `parseUnaryExp` called. `curToken` = `printf` (IDENFR). `next` = `(`.
+        2. Enters `if`.
+        3. `parseIdent()` consumes `printf`. `curPos` is now at `(`.
+        4. `lparentToken` is set to `printf` token (WRONG).
+        5. `curPos++` is executed? NO. The code snippet I pasted earlier had `curPos++`?
+        
+        Let's re-read `Parser.java` `parseUnaryExp`:
+        ```java
+        if (curToken.getType() == TokenType.IDENFR &&
+                tokens.get(curPos + 1).getType() == TokenType.LPARENT) {
+            Ident ident = parseIdent();
+            Token lparentToken = curToken; // This is the IDENFR token
+            curPos++; // <--- THIS LINE EXISTS IN THE PROVIDED CODE?
+            
+            // Let's check the provided code carefully.
+        ```
+        
+        Provided Code:
+        ```java
+    public UnaryExp parseUnaryExp() {
+        Token curToken = tokens.get(curPos);
+        // Ident '(' [FuncRParams] ')'
+        // FuncRParams -> Exp {',' Exp}
+        if (curToken.getType() == TokenType.IDENFR &&
+                tokens.get(curPos + 1).getType() == TokenType.LPARENT) {
+            Ident ident = parseIdent();
+            Token lparentToken = curToken;
+            curPos++;
+
+            Exp firstFuncRParam = null;
+            // ...
+        }
+        ```
+        Yes, `curPos++` is there.
+        So:
+        1. `parseIdent` consumes `printf`. `curPos` at `(`.
+        2. `lparentToken` = `printf` token.
+        3. `curPos++`. `curPos` moves to `"` (STRCON).
+        
+        This is WRONG. `lparentToken` should be the `(` token. And `curPos` should be at `(` when starting to parse params or consuming `(`.
+        
+        By incrementing `curPos`, it skips the `(`.
+        Then it tries to parse `FuncRParams`.
+        `curToken` = `"` (STRCON).
+        It checks `if (curToken.getType() == PLUS ... INTCON ...)`. STRCON is NOT in that list.
+        So `firstFuncRParam` remains null.
+        Then `getAndCheckError_ijk(RPARENT)`.
+        `tokens.get(curPos)` is `"` (STRCON). Not `RPARENT`.
+        So it records an error `j` (missing right parenthesis).
+        And returns `null` for `rparentToken`.
+        
+        Then `FuncCallExp` is created.
+        
+        Later, `parsePrintfStmtEle` called?
+        No, `printf` is parsed as `UnaryExp` inside `parseExp`?
+        
+        Wait, `printf` is a statement.
+        `parseStmt`:
+        ```java
+        else if (curToken.getType() == TokenType.PRINTFTK) {
+            stmt = parsePrintfStmtEle();
+        }
+        ```
+        So `parsePrintfStmtEle` is called directly. `parseUnaryExp` is NOT called for `printf` statement.
+        
+        So the bug in `parseUnaryExp` affects function CALLS inside expressions, e.g., `a = getchar();` or `printf(...)` inside an expression (which is invalid in C but might be parsed).
+        
+        In the test case: `printf("21373119");` is a statement.
+        `parsePrintfStmtEle`:
+        ```java
+        public PrintfStmtEle parsePrintfStmtEle() {
+            Token printfToken = tokens.get(curPos);
+            curPos++;
+            Token lparentToken = tokens.get(curPos); // Gets (
+            curPos++;
+            StringConst stringConst = parseStringConst(); // Consumes "..."
+            // ...
+            Token rparentToken = getAndCheckError_ijk(TokenType.RPARENT); // Gets )
+            Token semicolonToken = getAndCheckError_ijk(TokenType.SEMICN); // Gets ;
+            // ...
+        }
+        ```
+        This path seems correct.
+
+    *   So why "No output file"?
+    
+    Let's look at `parseBlock` again.
+    
+    ```java
+    public Block parseBlock() {
+        Token lbraceToken = tokens.get(curPos);
+        curPos++;
+
+        ArrayList<BlockItem> blockItems = new ArrayList<>();
+        while (tokens.get(curPos).getType() != TokenType.RBRACE) {
+            BlockItem blockItem = parseBlockItem();
+            blockItems.add(blockItem);
+        }
+
+        Token rbraceToken = tokens.get(curPos);
+        curPos++;
+
+        return new Block(lbraceToken, blockItems, rbraceToken);
+    }
+    ```
+    
+    If `parseBlockItem` throws an exception, `parseBlock` throws it.
+    
+    Let's look at `parseDecl` again.
+    
+    ```java
+    private Decl parseDecl() {
+        Decl decl = null;
+        Token firstToken = tokens.get(curPos);
+        Token thirdToken = null;
+        if (curPos + 2 < tokens.size()) {
+            thirdToken = tokens.get(curPos + 2);
+        }
+        if (thirdToken != null && thirdToken.getType() == TokenType.LPARENT) {    // FuncDef MainFuncDef
+            return decl;
+        } else if (firstToken.getType() == TokenType.CONSTTK) {
+            ConstDecl constDecl = parseConstDecl();
+            decl = new Decl(constDecl);
+        } else {
+            VarDecl varDecl = parseVarDecl();
+            decl = new Decl(varDecl);
+        }
+        return decl;
+    }
+    ```
+    
+    If `parseDecl` is called when `curPos` is at `int a = 1;` inside the nested block.
+    `first` = `int`. `third` = `=`. Not `LPARENT`.
+    Parses `VarDecl`.
+    
+    What if `parseVarDecl` crashes?
+    
+    ```java
+    public VarDecl parseVarDecl() {
+        BType bType = parseBType();
+        VarDef firstvarDef = parseVarDef();
+        // ...
+    }
+    ```
+    
+    `parseBType`:
+    ```java
+    public BType parseBType() {
+        BType bType = null;
+        Token curToken = tokens.get(curPos);
+        if (curToken.getType() == TokenType.INTTK ||
+                curToken.getType() == TokenType.CHARTK) {
+            bType = new BType(curToken);
+            curPos++;
+        } else {
+            System.err.println("parseBType Error");
+        }
+        return bType;
+    }
+    ```
+    
+    If `curPos` is out of bounds, `tokens.get(curPos)` crashes.
+    
+    **Hypothesis**: The crash is due to `IndexOutOfBoundsException` in `parseFuncDefs` or `parseDecls` lookahead, OR in `parseBlock` loop condition if the block is not closed.
+    
+    But the input IS correct.
+    
+    Let's look at `parsePrimaryExp` double increment again.
+    
+    ```java
+        else if (tokens.get(curPos).getType() == TokenType.CHRCON) {
+            CharConst charConst = parseCharConst();
+            curPos++;
+            Character character = new Character(charConst);
+            return new PrimaryExp(character);
+        }
+    ```
+    
+    If this code is reached, it skips a token.
+    
+    Is there a `CHRCON` in the input? No.
+    
+    **Wait**, look at `parsePrimaryExp` for `INTCON`:
+    
+    ```java
+        else if (tokens.get(curPos).getType() == TokenType.INTCON) {
+            IntConst intConst = parseIntConst();
+            Number number = new Number(intConst);
+            return new PrimaryExp(number);
+        }
+    ```
+    
+    `parseIntConst` increments `curPos`. Correct.
+    
+    Look at `parsePrimaryExp` for `LPARENT`:
+    
+    ```java
+        if (tokens.get(curPos).getType() == TokenType.LPARENT) {
+            Token lparentToken = tokens.get(curPos);
+            curPos++;
+            Exp exp = parseExp();
+            Token rparentToken = getAndCheckError_ijk(TokenType.RPARENT);
+            Exp_parent expParent = new Exp_parent(lparentToken, exp, rparentToken);
+            return new PrimaryExp(expParent);
+        }
+    ```
+    
+    Correct.
+    
+    Look at `parsePrimaryExp` for `IDENFR`:
+    
+    ```java
+        else if (tokens.get(curPos).getType() == TokenType.IDENFR) {
+            LVal lVal = parseLVal();
+            return new PrimaryExp(lVal);
+        }
+    ```
+    
+    `parseLVal`:
+    
+    ```java
+    public LVal parseLVal() {
+        Ident ident = parseIdent();
+        // ...
+    }
+    ```
+    
+    `parseIdent` increments `curPos`. Correct.
+    
+    **Conclusion**: The provided code for the test case *should* work logically, EXCEPT for the potential `IndexOutOfBoundsException` in `parseFuncDefs` if the input structure was different.
+    
+    However, there is one subtle bug in `parseFuncDefs`:
+    
+    ```java
+    public ArrayList<FuncDef> parseFuncDefs() {
+        ArrayList<FuncDef> funcDefs = new ArrayList<>();
+
+        while (curPos < tokens.size()) {
+            Token secondToken = tokens.get(curPos + 1); // CRASH HERE if curPos is the last index
+            if (secondToken.getType() == TokenType.MAINTK) {
+                return funcDefs;
+            }
+            funcDefs.add(parseFuncDef());
+        }
+        return funcDefs;
+    }
+    ```
+    
+    If `curPos` is `tokens.size() - 1`, `curPos + 1` is `tokens.size()`. `tokens.get(tokens.size())` throws `IndexOutOfBoundsException`.
+    
+    In the test case, `parseDecls` returns early. `curPos` is 0. `tokens.size()` is likely > 1. So `tokens.get(1)` is safe.
+    
+    BUT, if `parseDecls` did NOT return early, and consumed all tokens except the last one, and the last one was NOT `main`, it would crash.
+    
+    Since the output is "No output file", and the test case is valid, the crash must be happening.
+    
+    Let's check `parseBlock` loop again.
+    
+    ```java
+    while (tokens.get(curPos).getType() != TokenType.RBRACE) {
+    ```
+    
+    If `parseBlockItem` does NOT consume any token (returns immediately or loops), this is an infinite loop.
+    
+    If `parseBlockItem` consumes tokens correctly, it eventually hits `RBRACE`.
+    
+    I suspect the error is the **double increment in `parsePrimaryExp` for `CHRCON`** is a red herring for this specific input, but the **`parseFuncDefs` lookahead** is a ticking time bomb.
+    
+    However, for THIS input, it shouldn't crash.
+    
+    Is it possible `lexer.txt` or `parser.txt` creation fails?
+    
+    `writeResults`:
+    ```java
+    try (BufferedWriter lexerOut = new BufferedWriter(new FileWriter("lexer.txt"));
+         BufferedWriter errorOut = new BufferedWriter(new FileWriter("error.txt"))) {
+
+        lexerOut.write(compUnit.printString());
+        // ...
+    }
+    ```
+    
+    It writes to `lexer.txt` and `error.txt`. The problem asks for `parser.txt`.
+    
+    **Ah!** The problem description says:
+    "Output the word category code ... to `parser.txt`"
+    
+    The code writes to `lexer.txt`.
+    
+    And the expected output file is likely `parser.txt`.
+    
+    If the grading system looks for `parser.txt` and finds nothing, it reports "No output file" or "Wrong Answer".
+    
+    But the prompt says "Buggy Output: No output file". This usually means the file itself is missing.
+    
+    If the code writes to `lexer.txt`, `parser.txt` will not exist.
+    
+    **Error Location**: `Compiler.java` `writeResults` method writes to `lexer.txt` instead of `parser.txt`.
+
+<Compiler.java>
+...
+    private static void writeResults(CompUnit compUnit, List<Token> errorTokens) throws IOException {
+        try (BufferedWriter lexerOut = new BufferedWriter(new FileWriter("lexer.txt"));
+             BufferedWriter errorOut = new BufferedWriter(new FileWriter("error.txt"))) {
+
+            lexerOut.write(compUnit.printString());
+
+            sortTokensByLineno(errorTokens);
+            for (Token token : errorTokens) {
+                errorOut.write(token.getLineno() + " " + token.getType().toString() + "\n");
+            }
+        }
+    }
+...

@@ -1,0 +1,778 @@
+Based on the problem description and the test case, the program fails to output any error file (`error.txt`) when it encounters syntax errors (missing semicolons). The expected output indicates three "missing semicolon" errors (type `i`) at lines 2, 9, and 13.
+
+The root cause lies in how the `Compiler.java` handles the flow between lexical analysis, parsing, and error output. Specifically:
+
+1.  In `Compiler.java`, if `GlobalData.Errorflag` is true (which happens when `ErrorSave.error` is called), the code block that writes to `parser.txt` is skipped because of the `if(GlobalData.Parserflag)` check (since `ErrorSave` sets `Parserflag` to false).
+2.  However, the critical issue is that the `ErrorPrint.run(GlobalData.Errors)` is only called if `GlobalData.Errorflag` is true.
+3.  Looking at `Lexer.java`, when a single `&` or `|` is encountered, it calls `ErrorSave.error`. This sets `GlobalData.Errorflag = true` and `GlobalData.Lexerflag = false`.
+4.  In `Compiler.java`, after the lexer runs, if `GlobalData.Lexerflag` is false, it still proceeds to run the parser.
+5.  The parser (`Parser.java`) runs `CompUnitParser`. If the parser encounters an error (like missing semicolon), it calls `ErrorSave.error("Parser", ...)` which sets `GlobalData.Errorflag = true` (already true) and `GlobalData.Parserflag = false`.
+6.  The `Compiler.java` then checks `if(GlobalData.Parserflag)` to write `parser.txt`. Since it's false, it skips writing `parser.txt`.
+7.  Then it checks `if(GlobalData.Errorflag)` to write `error.txt`. This should be true.
+
+Let's look closer at `Compiler.java`:
+
+```java
+        //调用 Parser 进行语法分析
+        Parser parser = new Parser();
+        parser.run();
+
+        //Parser成功结果输出到 parser.txt
+        String ParserPrintFilePath = "parser.txt";
+        try {
+            bw = new BufferedWriter(new FileWriter(ParserPrintFilePath));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        if(GlobalData.Parserflag) {
+            StringBuilder sb = new StringBuilder();
+            ParserSuccessPrint parserSuccessPrint = new ParserSuccessPrint();
+            parserSuccessPrint.run(GlobalData.CompUnitNode, sb, parserSuccessPrint);
+
+            try {
+                bw.write(sb.toString());
+                bw.close();
+            } catch (IOException e) {
+                System.out.println("Comiler.java Line-64: BufferWriter Error");
+                throw new RuntimeException(e);
+            }
+        }
+
+        //输出错误结果到 error.txt
+        if(GlobalData.Errorflag) {
+            ErrorPrint.run(GlobalData.Errors);
+        }
+```
+
+If `GlobalData.Parserflag` is false, the `bw` for `parser.txt` is opened but never written to or closed properly in that block? No, `bw` is declared earlier. Wait, `bw` is re-declared/re-assigned inside the `try` block for `parser.txt`. If `GlobalData.Parserflag` is false, `bw` is opened but not closed. This might not be the direct cause of "No output file" for `error.txt`, but it's bad practice.
+
+However, the main issue is likely that the parser **crashes** or throws an exception before reaching the error printing stage, or the logic in the parser prevents it from detecting the errors correctly due to incorrect lookahead or recovery.
+
+Let's look at the specific errors:
+1. `printf("Hello SysY!\n") // error 1` -> Missing semicolon after `)`.
+   In `StmtParser`, for `PRINTFTK`:
+   It reads `printf`, `(`, `StringConst`. Then it expects `)` or `,`.
+   The code:
+   ```java
+   tt = iterator.next();
+   while(tt.getType() == TokenType.COMMA) { ... }
+   // ')' ';'
+   if(tt.getType() != TokenType.RPARENT) {
+       iterator.unread(2); // Unreads current token and previous?
+       tt = iterator.next();
+       ErrorSave.error("Parser", tt.getLineno(), 'j');
+   }
+   else children.add(leafParser.run(tt));
+   tt = iterator.next();
+
+   if(tt.getType() != TokenType.SEMICN) {
+       iterator.unread(2);
+       tt = iterator.next();
+       ErrorSave.error("Parser", tt.getLineno(), 'i');
+   }
+   ```
+   If the input is `printf("...")`, the token after `StringConst` is `)`. So `tt` is `)`. It enters `else`, adds leaf. Then `tt = iterator.next()` gets the next token. In the test case, the next token is likely `if` (from the next line) or EOF if it was the end. Here, the next line is `if (1)`. So `tt` is `if`. `if` is not `SEMICN`. So it should report error `i`.
+
+2. `int a // error 2` -> Missing semicolon.
+   This is a `VarDecl`. In `VarDeclParser`:
+   ```java
+   //判断是不是 ';'
+   if(tt.getType() != TokenType.SEMICN) {
+       iterator.unread(2);
+       tt = iterator.next();
+       ErrorSave.error("Parser", tt.getLineno(), 'i');
+   }
+   ```
+   After parsing `VarDef` (`int a`), the next token is `for` (from `for (;;) {}`). `for` is not `SEMICN`. So it should report error `i`.
+
+3. `return 0 // error 3` -> Missing semicolon.
+   In `StmtParser`, for `RETURNTK`:
+   ```java
+   tt = iterator.next();
+   if(tt.getType() != TokenType.SEMICN) {
+       //判断是否属于Exp
+       if(tt.getType() != TokenType.LPARENT && ... ) {
+           //不属于Exp,直接报错
+           iterator.unread(2);
+           tt = iterator.next();
+           ErrorSave.error("Parser", tt.getLineno(), 'i');
+       }
+       ...
+   }
+   ```
+   After `return`, next token is `0` (`INTCON`). It is part of Exp. So it goes to `else`.
+   ```java
+   else {
+       //属于Exp,处理完在判断分号
+       iterator.unread(1);
+       ExpParser expParser = new ExpParser();
+       children.add(expParser.run(iterator));
+       tt = iterator.next();
+       if(tt.getType() == TokenType.SEMICN) {
+           children.add(leafParser.run(tt));
+       }
+       else {
+           iterator.unread(2);
+           tt = iterator.next();
+           ErrorSave.error("Parser", tt.getLineno(), 'i');
+       }
+   }
+   ```
+   `ExpParser` parses `0`. Next token is `}` (end of block). `}` is not `SEMICN`. So it should report error `i`.
+
+So the parser logic *seems* to have the error reporting calls. Why is there no output?
+
+Check `Compiler.java` again.
+```java
+        //输出错误结果到 error.txt
+        if(GlobalData.Errorflag) {
+            ErrorPrint.run(GlobalData.Errors);
+        }
+```
+This block is executed. `ErrorPrint.run` writes to `error.txt`.
+
+Is it possible that `GlobalData.Errorflag` is NOT set?
+In `ErrorSave.error`:
+```java
+    public static void error(String process, int lineno, char errorType) {
+        GlobalData.Errorflag = true;
+        ...
+    }
+```
+It is set.
+
+Is it possible that the parser throws an exception?
+In `StmtParser`, when handling `printf`, if `tt` is `)` (correct), it consumes it. Then `tt = iterator.next()` gets `if`.
+Then it checks `if(tt.getType() != TokenType.SEMICN)`. It is true.
+`iterator.unread(2)`. This unreads `if` and the token before it? No, `unread` usually moves cursor back.
+`TokensIterator.unread(int n)`:
+```java
+    public void unread(int n) {
+        while(n > 0) {
+            if(cursor > -1) {
+                cursor--;
+                n--;
+            }
+            else break;
+        }
+    }
+```
+If cursor was at `if`, `unread(2)` moves cursor back 2 positions.
+Then `tt = iterator.next()` advances cursor by 1. So `tt` becomes the token *before* `if`?
+Wait, if we want to report the error at the line of the last non-terminal before the semicolon, we need to be careful about which token we use for `lineno`.
+
+But the main issue "No output file" suggests the program crashes or exits early.
+
+Look at `Compiler.java` Lexer section:
+```java
+        //Lexer成功结果输出到 lexer.txt
+        try {
+            if(GlobalData.Lexerflag) {
+                for(Token token: tokens) {
+                    bw.write(token.getType() + " " + token.getName() + "\n");
+                }
+            }
+            bw.close();
+        } catch (IOException e) {
+            System.out.println("Comiler.java Line-46: BufferWriter Error");
+            return;
+        }
+```
+If `GlobalData.Lexerflag` is false (due to error `a` in lexer, though there are none in this test case), it still closes `bw`.
+
+Then Parser runs.
+If `GlobalData.Parserflag` is false, the `parser.txt` writing block is skipped.
+BUT, notice that `bw` is re-assigned:
+```java
+        String ParserPrintFilePath = "parser.txt";
+        try {
+            bw = new BufferedWriter(new FileWriter(ParserPrintFilePath));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        if(GlobalData.Parserflag) {
+             // ... write ...
+             bw.close();
+        }
+```
+If `GlobalData.Parserflag` is false, `bw` is opened but **never closed**. This leaves a file handle open. While this might not prevent `error.txt` from being written, it's a resource leak.
+
+However, the most likely reason for "No output file" (meaning `error.txt` is empty or not created) is that `GlobalData.Errors` is empty.
+
+Why would `GlobalData.Errors` be empty?
+Because the parser didn't call `ErrorSave.error`.
+
+Let's trace `printf("Hello SysY!\n")` again.
+Tokens: `PRINTFTK`, `LPARENT`, `STRCON`, `RPARENT`, `IFTK`...
+In `StmtParser`:
+1. `tt = iterator.next()` -> `PRINTFTK`.
+2. `children.add(leafParser.run(tt))`.
+3. `children.add(leafParser.run(iterator.next()))` -> `LPARENT`.
+4. `children.add(leafParser.run(iterator.next()))` -> `STRCON`.
+5. `tt = iterator.next()` -> `RPARENT`.
+6. `while(tt.getType() == TokenType.COMMA)` -> False.
+7. `if(tt.getType() != TokenType.RPARENT)` -> False.
+8. `else children.add(leafParser.run(tt))` -> Adds `RPARENT`.
+9. `tt = iterator.next()` -> `IFTK` (next token).
+10. `if(tt.getType() != TokenType.SEMICN)` -> True (`IFTK` != `SEMICN`).
+11. `iterator.unread(2)`. Cursor moves back 2.
+    Current cursor was at `IFTK`. Previous was `RPARENT`.
+    Cursor moves to `RPARENT` index, then to `STRCON` index?
+    Let's check `TokensIterator` implementation.
+    `next()` increments cursor then returns.
+    So when `tt = iterator.next()` returned `IFTK`, cursor was at index of `IFTK`.
+    `unread(2)` decrements cursor twice. Cursor is now at index of `STRCON` (assuming `STRCON` was at `i`, `RPARENT` at `i+1`, `IFTK` at `i+2`. Cursor at `i+2`. Unread 1 -> `i+1`. Unread 2 -> `i`).
+12. `tt = iterator.next()`. Cursor increments to `i+1` (`RPARENT`). `tt` is `RPARENT`.
+13. `ErrorSave.error("Parser", tt.getLineno(), 'i')`.
+    This reports error `i` at the line number of `RPARENT`.
+    The `RPARENT` is on line 2.
+    So Error 1 is reported correctly as `2 i`.
+
+Now trace `int a`.
+Tokens: `INTTK`, `IDENFR(a)`, `FORTK`...
+In `VarDeclParser`:
+1. `BTypeParser` consumes `INTTK`.
+2. `VarDefParser` consumes `IDENFR(a)`.
+   Inside `VarDefParser`:
+   `tt = iterator.next()` -> `FORTK`.
+   `if(tt.getType() == TokenType.ASSIGN)` -> False.
+   `else iterator.unread(1)`. Cursor moves back to `FORTK` index?
+   Wait, `VarDefParser` logic:
+   ```java
+   Token tt = iterator.next(); // Gets FORTK
+   if(tt.getType() == TokenType.LBRACK) { ... }
+   
+   if(tt.getType() == TokenType.ASSIGN) { ... }
+   else iterator.unread(1); // Unreads FORTK
+   ```
+   So cursor is back at `FORTK`? No, `next()` advanced cursor. `unread(1)` moves it back. So cursor is at `IDENFR(a)`?
+   Let's check `TokensIterator`.
+   `cursor` starts at -1.
+   `next()`: cursor becomes 0, returns token[0].
+   `unread(1)`: cursor becomes -1.
+   
+   In `VarDefParser`:
+   `children.add(leafParser.run(iterator.next()))` -> Consumes `IDENFR`. Cursor at `IDENFR`.
+   `Token tt = iterator.next()` -> Consumes `FORTK`. Cursor at `FORTK`.
+   `if(tt.getType() == TokenType.ASSIGN)` -> False.
+   `else iterator.unread(1)` -> Cursor back to `IDENFR`.
+   
+   Back in `VarDeclParser`:
+   `Token tt = iterator.next()` -> Consumes `FORTK` again. Cursor at `FORTK`.
+   `while(tt.getType() == TokenType.COMMA)` -> False.
+   `if(tt.getType() != TokenType.SEMICN)` -> True (`FORTK` != `SEMICN`).
+   `iterator.unread(2)`.
+   Cursor was at `FORTK`. Unread 1 -> `IDENFR`. Unread 2 -> `INTTK`.
+   `tt = iterator.next()`. Cursor at `INTTK`. `tt` is `INTTK`.
+   `ErrorSave.error("Parser", tt.getLineno(), 'i')`.
+   `INTTK` is on line 9.
+   So Error 2 is reported as `9 i`.
+
+Now trace `return 0`.
+Tokens: `RETURNTK`, `INTCON(0)`, `RBRACE`...
+In `StmtParser`:
+1. `tt = iterator.next()` -> `RETURNTK`.
+2. `children.add(leafParser.run(tt))`.
+3. `tt = iterator.next()` -> `INTCON(0)`.
+4. `if(tt.getType() != TokenType.SEMICN)` -> True.
+5. Check if Exp start. `INTCON` is valid Exp start.
+6. `else` block:
+   `iterator.unread(1)`. Cursor back to `RETURNTK`?
+   Wait. `tt` was `INTCON`. Cursor at `INTCON`. `unread(1)` -> Cursor at `RETURNTK`.
+   `ExpParser.run(iterator)`.
+   `ExpParser` calls `AddExpParser`.
+   `AddExpParser` calls `MulExpParser`.
+   `MulExpParser` calls `UnaryExpParser`.
+   `UnaryExpParser`:
+   `first = iterator.next()` -> `INTCON(0)`. Cursor at `INTCON`.
+   Not unary op.
+   `second = iterator.next()` -> `RBRACE`. Cursor at `RBRACE`.
+   `if(first.getType() == TokenType.IDENFR && second.getType() == TokenType.LPARENT)` -> False.
+   `else`:
+   `iterator.unread(2)`. Cursor back to `RETURNTK`?
+   Cursor was at `RBRACE`. Unread 1 -> `INTCON`. Unread 2 -> `RETURNTK`.
+   `PrimaryExpParser.run(iterator)`.
+   `PrimaryExpParser`:
+   `tt = iterator.next()` -> `INTCON(0)`. Cursor at `INTCON`.
+   `else if(tt.getType() == TokenType.INTCON)` -> True.
+   `NumberParser.run(tt)`.
+   Returns `<Number>`.
+   Back to `UnaryExpParser`. Returns `<UnaryExp>`.
+   Back to `MulExpParser`.
+   `tt = iterator.next()` -> `RBRACE`. Cursor at `RBRACE`.
+   `while(...)` -> False.
+   `iterator.unread(1)`. Cursor back to `INTCON`.
+   Returns `<MulExp>`.
+   Back to `AddExpParser`.
+   `tt = iterator.next()` -> `RBRACE`. Cursor at `RBRACE`.
+   `while(...)` -> False.
+   `iterator.unread(1)`. Cursor back to `INTCON`.
+   Returns `<AddExp>`.
+   Back to `ExpParser`. Returns `<Exp>`.
+   
+   Back in `StmtParser` (return case):
+   `children.add(expParser.run(iterator))` added `<Exp>`.
+   `tt = iterator.next()`. Cursor was at `INTCON` (due to unread in AddExp).
+   `next()` -> `RBRACE`. Cursor at `RBRACE`.
+   `if(tt.getType() == TokenType.SEMICN)` -> False (`RBRACE` != `SEMICN`).
+   `else`:
+   `iterator.unread(2)`.
+   Cursor was at `RBRACE`. Unread 1 -> `INTCON`. Unread 2 -> `RETURNTK`.
+   `tt = iterator.next()`. Cursor at `RETURNTK`. `tt` is `RETURNTK`.
+   `ErrorSave.error("Parser", tt.getLineno(), 'i')`.
+   `RETURNTK` is on line 13.
+   So Error 3 is reported as `13 i`.
+
+So the logic seems correct for generating errors. Why "No output file"?
+
+Check `Compiler.java` again.
+```java
+        //输出错误结果到 error.txt
+        if(GlobalData.Errorflag) {
+            ErrorPrint.run(GlobalData.Errors);
+        }
+```
+
+Is it possible that `GlobalData.Errorflag` is reset somewhere? No.
+Is it possible that `ErrorPrint.run` fails silently?
+```java
+    public static void run(List<Error> errors) {
+        //Errors排序
+        errors.sort((e1, e2) -> Integer.compare(e1.getLineno(), e2.getLineno()));
+
+        //输出到 error.txt
+        try {
+            BufferedWriter bw = new BufferedWriter(new FileWriter("error.txt"));
+            for(Error error: errors) {
+                bw.write(error.getLineno() + " " + error.getErrorType());
+                bw.newLine();
+            }
+            bw.close();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+```
+If `errors` is empty, it creates an empty `error.txt`. The expected output is NOT empty.
+So `GlobalData.Errors` must be empty.
+
+Why would `GlobalData.Errors` be empty?
+Maybe the parser is not running at all?
+Or `CompUnitParser` fails to parse `MainFuncDef` because of previous errors?
+
+In `CompUnitParser`:
+```java
+        //解析MainFuncDef
+        SyntaxTreeNode mainFuncDef;
+        mainFuncDef = mainFuncDefParser.run(iterator);
+        children.add(mainFuncDef);
+```
+It assumes `MainFuncDef` is always present and correct.
+
+If the parser encounters an error, it records it but continues?
+Yes, `ErrorSave.error` just adds to list. It doesn't throw exception.
+
+However, look at `StmtParser` for `printf` again.
+When error `i` is detected, it does `iterator.unread(2)` and then `iterator.next()`.
+This changes the cursor position.
+Does this mess up subsequent parsing?
+For `printf("...")`, after error reporting, the cursor is at `RPARENT` (line 2).
+The `StmtParser` returns.
+Back in `BlockParser`:
+```java
+        Token tt = iterator.next();
+        while(tt.getType() != TokenType.RBRACE) {
+            iterator.unread(1);
+            BlockItemParser blockItemParser = new BlockItemParser();
+            children.add(blockItemParser.run(iterator));
+            tt = iterator.next();
+        }
+```
+`BlockParser` had just called `BlockItemParser` (which called `StmtParser`).
+Before calling `BlockItemParser`, `BlockParser` did `iterator.unread(1)` because `tt` (which was `PRINTF`?) no, `BlockParser` loop:
+1. `tt = iterator.next()`. Gets `PRINTF`.
+2. `tt.getType() != RBRACE`. True.
+3. `iterator.unread(1)`. Cursor back to before `PRINTF`.
+4. `BlockItemParser.run(iterator)`.
+   Inside `BlockItemParser`:
+   `tt = iterator.next()`. Gets `PRINTF`.
+   `iterator.unread(1)`.
+   `StmtParser.run(iterator)`.
+   Inside `StmtParser`:
+   Parses `printf`.
+   Detects error.
+   Reports error.
+   Cursor ends at `RPARENT` (line 2).
+   `StmtParser` returns.
+   `BlockItemParser` returns.
+5. Back in `BlockParser`:
+   `tt = iterator.next()`.
+   Cursor was at `RPARENT`. `next()` gets `IFTK` (line 4).
+   `tt.getType() != RBRACE`. True.
+   `iterator.unread(1)`. Cursor back to `RPARENT`.
+   `BlockItemParser.run(iterator)`.
+   Inside `BlockItemParser`:
+   `tt = iterator.next()`. Gets `RPARENT`.
+   `iterator.unread(1)`.
+   `StmtParser.run(iterator)`.
+   Inside `StmtParser`:
+   `tt = iterator.next()`. Gets `RPARENT`.
+   `if(tt.getType() == TokenType.LBRACE)` ... `else if ...`
+   `RPARENT` is not a valid start for any statement.
+   It falls through to the final `else`:
+   ```java
+        //处理[Exp]存在的情况
+        else {
+            iterator.unread(1);
+            ExpParser expParser = new ExpParser();
+            children.add(expParser.run(iterator));
+            // ';'
+            tt = iterator.next();
+            if(tt.getType() != TokenType.SEMICN) {
+                iterator.unread(2);
+                tt = iterator.next();
+                ErrorSave.error("Parser", tt.getLineno(), 'i');
+            }
+            else children.add(leafParser.run(tt));
+        }
+   ```
+   `iterator.unread(1)`. Cursor back to before `RPARENT`.
+   `ExpParser.run(iterator)`.
+   `ExpParser` tries to parse `RPARENT` as an expression.
+   `AddExpParser` -> `MulExpParser` -> `UnaryExpParser` -> `PrimaryExpParser`.
+   `PrimaryExpParser`:
+   `tt = iterator.next()`. Gets `RPARENT`.
+   `if(LPARENT)` ... `else if(IDENFR)` ... `else if(INTCON)` ... `else` (Character).
+   `CharacterParser.run(tt)`.
+   `CharacterParser` expects `CHRCON`. `RPARENT` is not `CHRCON`.
+   It creates a node anyway?
+   ```java
+    public SyntaxTreeNode run(Token tt) {
+        List<SyntaxTreeNode> children = new ArrayList<>();
+        LeafParser leafParser = new LeafParser();
+        children.add(leafParser.run(tt));
+        return new SyntaxTreeNode("<Character>", null, children);
+    }
+   ```
+   It just wraps it. No error reported here.
+   Back to `UnaryExpParser`.
+   `first` was `RPARENT`. `second = iterator.next()` -> `IFTK`.
+   `if(IDENFR && LPARENT)` -> False.
+   `else` -> `iterator.unread(2)`. Cursor back to `RPARENT`.
+   `PrimaryExpParser` again? No, it already parsed PrimaryExp.
+   Wait, `UnaryExpParser` logic:
+   ```java
+        else {
+            Token second = iterator.next();
+            //处理 Ident '(' [ FuncRParams ] ')'
+            if(first.getType() == TokenType.IDENFR && second.getType() == TokenType.LPARENT) {
+               ...
+            }
+            //处理 PrimaryExp
+            else {
+                iterator.unread(2);
+                PrimaryExpParser primaryExpParser = new PrimaryExpParser();
+                children.add(primaryExpParser.run(iterator));
+            }
+        }
+   ```
+   So it re-parses `PrimaryExp`.
+   `PrimaryExpParser` sees `RPARENT`. Goes to `else` (Character).
+   Returns `<Character>`.
+   Back to `UnaryExpParser`. Returns `<UnaryExp>`.
+   Back to `MulExpParser`.
+   `tt = iterator.next()`. Gets `IFTK`.
+   `while(MULT/DIV/MOD)` -> False.
+   `iterator.unread(1)`. Cursor back to `RPARENT`? No, `tt` was `IFTK`. Cursor at `IFTK`. Unread 1 -> `RPARENT`.
+   Returns `<MulExp>`.
+   Back to `AddExpParser`.
+   `tt = iterator.next()`. Gets `IFTK`.
+   `while(PLUS/MINU)` -> False.
+   `iterator.unread(1)`. Cursor back to `RPARENT`.
+   Returns `<AddExp>`.
+   Back to `ExpParser`. Returns `<Exp>`.
+   
+   Back in `StmtParser` (final else):
+   `children.add(expParser.run(iterator))` added `<Exp>` containing `RPARENT`.
+   `tt = iterator.next()`. Cursor was at `RPARENT` (due to unread in AddExp).
+   `next()` -> `IFTK`.
+   `if(tt.getType() != TokenType.SEMICN)` -> True.
+   `iterator.unread(2)`. Cursor back to `RPARENT`.
+   `tt = iterator.next()`. Gets `RPARENT`.
+   `ErrorSave.error("Parser", tt.getLineno(), 'i')`.
+   This reports another error `i` at line 2!
+
+So we get duplicate errors or spurious errors. But we SHOULD get errors.
+
+The problem states "Buggy Output: No output file".
+This implies `error.txt` is not created or is empty.
+
+If `GlobalData.Errorflag` is false, `error.txt` is not created.
+Why would `GlobalData.Errorflag` be false?
+Only if `ErrorSave.error` is never called.
+
+Is it possible that `CompUnitParser` crashes?
+If `MainFuncDefParser` fails?
+
+Let's look at `MainFuncDefParser`.
+It expects `int main ( ) Block`.
+If the parser state is messed up by previous errors, it might not find `int`.
+
+But wait! Look at `Compiler.java` again.
+
+```java
+        //调用 Parser 进行语法分析
+        Parser parser = new Parser();
+        parser.run();
+
+        //Parser成功结果输出到 parser.txt
+        String ParserPrintFilePath = "parser.txt";
+        try {
+            bw = new BufferedWriter(new FileWriter(ParserPrintFilePath));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        if(GlobalData.Parserflag) {
+            StringBuilder sb = new StringBuilder();
+            ParserSuccessPrint parserSuccessPrint = new ParserSuccessPrint();
+            parserSuccessPrint.run(GlobalData.CompUnitNode, sb, parserSuccessPrint);
+
+            try {
+                bw.write(sb.toString());
+                bw.close();
+            } catch (IOException e) {
+                System.out.println("Comiler.java Line-64: BufferWriter Error");
+                throw new RuntimeException(e);
+            }
+        }
+
+        //输出错误结果到 error.txt
+        if(GlobalData.Errorflag) {
+            ErrorPrint.run(GlobalData.Errors);
+        }
+```
+
+If `GlobalData.Parserflag` is FALSE, the `bw` for `parser.txt` is opened but NOT closed.
+Then `ErrorPrint.run` is called.
+
+Is it possible that `GlobalData.Errorflag` is NOT set?
+Check `ErrorSave.java`:
+```java
+    public static void error(String process, int lineno, char errorType) {
+        GlobalData.Errorflag = true;
+        ...
+    }
+```
+
+There is one subtle bug in `Compiler.java`.
+If `GlobalData.Parserflag` is false, `bw` is not closed.
+If `ErrorPrint.run` throws an exception, the program crashes.
+But `ErrorPrint.run` catches IOException and throws RuntimeException.
+
+Wait, look at `Lexer.java` comment handling.
+```java
+            //注释//
+            if(c == '/') {
+                int ch;
+                while((ch = pr.read()) != -1) {
+                    c = (char) ch;
+                    if (c == '\n'){
+                        lineno++;
+                        return null;
+                    }
+                }
+            }
+```
+If EOF is reached inside a comment, it returns null.
+
+Test case:
+```
+    printf("Hello SysY!\n") // error 1
+
+    if (1)
+
+
+    /*********/
+    ;
+    int a // error 2
+
+    for (;;) {}
+
+    return 0 // error 3
+}
+```
+
+Line 2: `printf("Hello SysY!\n") // error 1`
+Lexer sees `printf`, `(`, `"..."`, `)`.
+Then `//`. Enters comment handling. Reads until `\n`. Returns null.
+Next token is `if` on line 4.
+
+So tokens are:
+1. `int` (line 1)
+2. `main` (line 1)
+3. `(` (line 1)
+4. `)` (line 1)
+5. `{` (line 1)
+6. `printf` (line 2)
+7. `(` (line 2)
+8. `"..."` (line 2)
+9. `)` (line 2)
+10. `if` (line 4)
+...
+
+The parsing logic I traced above should work.
+
+Why "No output file"?
+
+Ah! Look at `Compiler.java` line 25-46.
+```java
+        try {
+            bw = new BufferedWriter(new FileWriter("lexer.txt"));
+        } catch (IOException e) {
+            System.out.println("Comiler.java Line-25: BufferWriter Error");
+            return;
+        }
+
+        // 调用 Lexer 进行词法分析
+        Lexer lexer = new Lexer(InputFilePath);
+        try {
+            lexer.run();
+        } catch (IOException e) {
+            System.out.println("Comiler.java Line-34: Lexer Error");
+            throw new RuntimeException(e);
+        }
+
+        //Lexer成功结果输出到 lexer.txt
+        try {
+            if(GlobalData.Lexerflag) {
+                for(Token token: tokens) {
+                    bw.write(token.getType() + " " + token.getName() + "\n");
+                }
+            }
+            bw.close();
+        } catch (IOException e) {
+            System.out.println("Comiler.java Line-46: BufferWriter Error");
+            return;
+        }
+```
+
+If `GlobalData.Lexerflag` is false, it still closes `bw`.
+
+Then Parser runs.
+
+If `GlobalData.Errorflag` is true, `ErrorPrint.run` is called.
+
+Is it possible that `GlobalData.Errors` is empty?
+I traced the logic and found that errors SHOULD be added.
+
+Unless... `CompUnitParser` doesn't reach the statements?
+`CompUnitParser` parses `Decl`s, then `FuncDef`s, then `MainFuncDef`.
+The input is `int main() { ... }`.
+`Decl` loop:
+`first = int`, `second = main`, `third = (`.
+`int` is `INTTK`. `main` is `IDENFR`? No, `main` is `MAINTK`.
+`KeywordTable` maps `main` to `MAINTK`.
+So `second.getType()` is `MAINTK`.
+Condition: `(first.getType() == TokenType.INTTK || first.getType() == TokenType.CHARTK) && second.getType() == TokenType.IDENFR && third.getType() != TokenType.LPARENT`
+`second.getType() == TokenType.IDENFR` is FALSE (`MAINTK` != `IDENFR`).
+So it breaks out of `Decl` loop. Correct.
+
+`FuncDef` loop:
+`first = int`, `second = main`.
+`first.getType() == TokenType.INTTK && second.getType() == TokenType.IDENFR` is FALSE.
+So it breaks out of `FuncDef` loop. Correct.
+
+`MainFuncDefParser.run(iterator)`.
+Expects `int main ( ) Block`.
+Tokens: `int`, `main`, `(`, `)`, `{`.
+Parses correctly.
+
+Inside `BlockParser`:
+Parses statements.
+
+So the parser SHOULD run.
+
+Wait! Look at `Model/Token.java`.
+```java
+    public int getColno() {
+        return lineno;
+    }
+```
+Bug in getter, but not relevant.
+
+Look at `util/ErrorPrint.java`.
+```java
+    public static void run(List<Error> errors) {
+        //Errors排序
+        errors.sort((e1, e2) -> Integer.compare(e1.getLineno(), e2.getLineno()));
+
+        //输出到 error.txt
+        try {
+            BufferedWriter bw = new BufferedWriter(new FileWriter("error.txt"));
+            for(Error error: errors) {
+                bw.write(error.getLineno() + " " + error.getErrorType());
+                bw.newLine();
+            }
+            bw.close();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+```
+
+If `errors` is empty, it writes an empty file.
+The expected output is NOT empty.
+So `errors` MUST be empty in the buggy program.
+
+Why?
+
+Maybe `GlobalData.Errorflag` is false?
+If `ErrorSave.error` is never called.
+
+Why would it not be called?
+Maybe the parser logic for detecting missing semicolon is flawed in a way that it doesn't reach the error reporting code?
+
+In `StmtParser` for `printf`:
+```java
+            tt = iterator.next();
+
+            if(tt.getType() != TokenType.SEMICN) {
+                iterator.unread(2);
+                tt = iterator.next();
+                ErrorSave.error("Parser", tt.getLineno(), 'i');
+            }
+```
+If `tt` is `SEMICN`, it doesn't report error.
+In our case, `tt` is `IFTK`. So it reports error.
+
+Is it possible that `iterator.next()` returns `null`?
+`TokensIterator.next()`:
+```java
+    public Token next() {
+        if(cursor < tokens.size()-1) {
+            cursor++;
+            return tokens.get(cursor);
+        }
+        else return null;
+    }
+```
+If EOF, returns `null`.
+If `tt` is `null`, `tt.getType()` throws NullPointerException.
+Program crashes.
+If program crashes, no output file.
+
+In `printf` case:
+After `)`, next token is `if`. Not null.
+
+In `int a` case:
+After `a`, next token is `for`. Not null.
+
+In `return 0` case:
+After `0`, next token is `}`. Not null.
+
+So no NPE.
+
+Wait! Look at `Compiler.java` again.
+```java
+        //输出错误结果到 error.txt
+        if(GlobalData.Errorflag) {

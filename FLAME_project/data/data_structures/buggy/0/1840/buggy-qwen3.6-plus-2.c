@@ -1,0 +1,58 @@
+#include<stdio.h>
+#include<string.h>
+int main()
+{
+    char str[1000];
+    gets(str);
+    int i;
+    int j;
+    for (i = 0; i < strlen(str); i++)
+    {
+        if (str[i] == '-')
+        {
+            if (str[i - 1] >= '0' && str[i - 1] <= '9')
+            {
+                if (str[i + 1] >= '0' && str[i + 1] <= '9')
+                {
+                    if (str[i + 1] > str[i - 1])
+                    {
+                        for (j = str[i - 1] + 1; j < str[i + 1]; j++) // @@ The loop condition uses '<' instead of '<=', causing the last character of the expansion range to be missing. It should be 'j <= str[i + 1]'.
+                            printf("%c", j);
+                    }
+                    else
+                        printf("%c",str[i]);
+                }
+            }
+            else if (str[i - 1] >= 'a' && str[i - 1] <= 'z')
+            {
+                if (str[i + 1] >= 'a' && str[i + 1] <= 'z')
+                {
+                    if (str[i + 1] > str[i - 1])
+                    {
+                        for (j = str[i - 1] + 1; j < str[i + 1]; j++) // @@ The loop condition uses '<' instead of '<=', causing the last character of the expansion range to be missing. It should be 'j <= str[i + 1]'.
+                            printf("%c", j);
+                    }
+                    else
+                        printf("%c", str[i]);
+                }
+            }
+            else if (str[i - 1] >= 'A' && str[i - 1] <= 'Z')
+            {
+                if (str[i + 1] >= 'A' && str[i + 1] <= 'Z')
+                {
+                    if (str[i + 1] > str[i - 1])
+                    {
+                        for (j = str[i - 1] + 1; j < str[i + 1]; j++) // @@ The loop condition uses '<' instead of '<=', causing the last character of the expansion range to be missing. It should be 'j <= str[i + 1]'.
+                            printf("%c", j);
+                    }
+                    else
+                        printf("%c", str[i]);
+                }
+            }
+            else
+                printf("%c", str[i]); // @@ When the characters around '-' are not of the same type (e.g., 'B' and 'e'), the code falls through to this else block but only prints the '-'. It fails to print the character following the '-', resulting in incomplete output. It should print both '-' and str[i+1], or handle the non-expansion case by printing the original substring.
+        }
+        else
+            printf("%c", str[i]);
+    }
+}

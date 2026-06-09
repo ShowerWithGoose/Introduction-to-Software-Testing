@@ -1,0 +1,58 @@
+#include<stdio.h>
+
+char c[10000], s[10000];
+
+int main()
+{
+    scanf("%s", c);
+    if(c[1] == '.') @@ // This condition assumes the decimal point is always at index 1, which fails for numbers like "123.45" or "0.00123" where the format doesn't match "d.dd..."
+    {
+        if (c[0] == '0')
+        {
+            int j = 0, cnt = 0;
+            for (int i = 2; c[i] != '\0'; i++)
+            {
+                if (c[i] == '0') cnt++;
+                else break;
+            }
+            cnt++; @@ // Incorrectly increments cnt after counting leading zeros; this leads to off-by-one errors in indexing and exponent calculation
+            printf("%c", c[cnt + 1]); @@ // Accesses c[cnt + 1], which may be out of bounds or skip the first non-zero digit incorrectly
+            if(c[cnt + 2] != '\0') printf(".");
+            for(int i = cnt + 2; c[i] != '\0'; i++)
+            {
+                printf("%c", c[i]);
+            }
+            printf("e-%d", cnt);
+        }
+        else
+        {
+            printf("%se0", c); @@ // Fails to convert numbers like "5.67" into proper scientific notation (should be "5.67e0", but this prints "5.67e0" only if input already matches base format; however, per problem, single-digit before decimal should output without extra digits, but logic here doesn't normalize)
+        }
+    }
+    else
+    {
+        int cnt,flag = 0;
+        for(cnt = 0; c[cnt] != '\0'; cnt++)
+        {
+            if(c[cnt] == '.')
+            {
+                break;
+            }
+            if(c[cnt] != '0' && cnt > 0)
+            {
+                flag = 1;
+            }
+        }
+        printf("%c", c[0]);
+        if(flag) printf("."); @@ // Only prints decimal point if there's a non-zero digit after the first; but problem requires all digits to be significant and no trailing zeros, so this may omit necessary digits or decimal point incorrectly
+        for(int i = 1; c[i] != '\0'; i++)
+        {
+            if(c[i] != '.' && c[i] != '0') @@ // Incorrectly skips all '0' digits after the first, even if they are significant (e.g., "102.3" becomes "123" instead of "1.023")
+            {
+                printf("%c", c[i]);
+            }
+        }
+        printf("e%d", cnt - 1);
+    }
+    return 0;
+}

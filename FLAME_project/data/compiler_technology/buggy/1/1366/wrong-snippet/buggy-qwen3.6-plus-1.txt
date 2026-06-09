@@ -1,0 +1,725 @@
+Based on the problem description and the provided code, the issue is that the program produces **no output file** (`parser.txt` or `error.txt`) for a valid input.
+
+Looking at `Compiler.java`:
+1. `lexical_Analysis()` is called. It reads `testfile.txt`, tokenizes it, and populates the static `tokens` list.
+2. `parse()` is called. It creates a `Parser` with `tokens`, calls `parseCompUnit()`, and then checks `errorTokens`.
+3. If `errorTokens` is empty (which it should be for the valid test case), it calls `compUnit.postorder()`.
+
+The `postorder()` methods in the AST classes (e.g., `CompUnit.java`, `Block.java`, etc.) are responsible for writing to `parser.txt`. They use `Files.write(..., StandardOpenOption.APPEND)`.
+
+However, there is a critical logical flow issue in how the output is generated vs how the program terminates or handles exceptions, but more importantly, let's look at the `Compiler.java` `parse()` method again.
+
+```java
+    private static void parse() {
+        Parser parser = new Parser(tokens);
+        CompUnit compUnit = parser.parseCompUnit();
+        errorTokens.addAll(parser.getErrors());
+        errorTokens.sort(Comparator.comparingInt(Token::getLineNum));
+        if (errorTokens.isEmpty()) {
+            compUnit.postorder();
+        }
+        else {
+            // ... writes error.txt
+        }
+    }
+```
+
+If `compUnit.postorder()` executes without throwing an exception, `parser.txt` should be created. The fact that there is **No output file** suggests that either:
+1. An exception is thrown during parsing or post-order traversal, causing the program to crash before finishing or flushing/closing resources (though `Files.write` usually handles this atomically per call).
+2. The `tokens` list is empty or malformed, causing `parseCompUnit` to fail or hang.
+3. There is a logic error in `Compiler.java` regarding when `lexical_Analysis_output` is called. Note that `lexical_Analysis_output` is commented out in `main`. This is fine because the requirement is to output syntax analysis results, not just lexical.
+
+Let's look closely at `Parser.java` and the `isDeclare` / `isFuncDeclare` lookahead logic.
+
+```java
+    public boolean isDeclare(LexType type){
+        boolean b1 = type == LexType.INTTK || type == LexType.CHARTK || type == LexType.CONSTTK;
+        boolean b2 = tokens.get(pos + 1).getLexType() != LexType.MAINTK;
+        boolean b3 = tokens.get(pos + 2).getLexType() != LexType.LPARENT;
+        return  b1 && b2 && b3;
+    }
+```
+
+In the test case:
+`int main() { ... }`
+
+1. `parseCompUnit` starts. `pos = 0`. Token[0] is `INTTK` ("int").
+2. `isDeclare(INTTK)` is called.
+   - `b1`: true.
+   - `b2`: `tokens.get(1)` is `MAINTK` ("main"). `MAINTK != MAINTK` is **false**.
+   - So `isDeclare` returns `false`. Correct. It should not parse `int main` as a declaration.
+3. `isFuncDeclare(INTTK)` is called.
+   - `b1`: true.
+   - `b2`: `tokens.get(1)` is `MAINTK`. `MAINTK != MAINTK` is **false**.
+   - So `isFuncDeclare` returns `false`.
+
+Wait. The grammar says:
+`CompUnit → {Decl} {FuncDef} MainFuncDef`
+
+The parser expects to parse zero or more `Decl`s, then zero or more `FuncDef`s, then exactly one `MainFuncDef`.
+
+If `isFuncDeclare` returns false for `int main`, the loop `while(isFuncDeclare(...))` doesn't run. Then it proceeds to `parseMainFuncDef()`.
+
+Let's look at `parseMainFuncDef`:
+```java
+    private MainFuncDef parseMainFuncDef() {//MainFuncDef → 'int' 'main' '(' ')' Block // j
+        Token intTk = tokens.get(pos++); // Consumes "int"
+        Token mainTk = tokens.get(pos++); // Consumes "main"
+        Token l = tokens.get(pos++); // Consumes "("
+        Token r = null;
+        if (tokens.get(pos).getLexType() == LexType.RPARENT) {
+            r = tokens.get(pos++); // Consumes ")"
+        }
+        // ...
+        Block block = parseBlock(); // Parses "{ ... }"
+        return new MainFuncDef(intTk,mainTk,l,r,block);
+    }
+```
+
+This seems correct for the structure `int main() { ... }`.
+
+Why would there be **No output file**?
+
+Let's check `CompUnit.postorder()`:
+```java
+    public void postorder() {
+        Path path = Paths.get("parser.txt");
+        for (Decl d : decls) {
+            d.postorder();
+        }
+
+        for (FuncDef f : funcDefs) {
+            f.postorder();
+        }
+        mainFuncDef.postorder();
+        try {
+            Files.write(path, "<CompUnit>".getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+```
+
+It writes to `parser.txt`. If this runs, the file is created.
+
+Is it possible that `tokens` is empty?
+In `Compiler.lexical_Analysis()`:
+```java
+        Lexer lexer = new Lexer(source);
+        while (lexer.hasNext()) {
+            Token token = lexer.getToken();
+            if (token.getErrorType() == null && token.getLexType() != null){
+                tokens.add(token);
+            } 
+            // ...
+        }
+```
+
+Let's look at `Lexer.hasNext()` and `getToken()`.
+`hasNext()` skips whitespace. If it finds a character, it processes it and sets `this.token`. It returns `true` if a token was found.
+`getToken()` returns `this.token`.
+
+There is a subtle bug in `Lexer.hasNext()`.
+At the end of `hasNext()`:
+```java
+        if (curPos < source.length() && token == null) {
+            hasNext();
+        } else if (curPos == source.length() && token == null) {
+            return false;
+        }
+        return true;
+```
+
+If `token` is null (e.g., due to a comment being skipped recursively via `hasNext()` call inside the `/` handling), it might recurse.
+
+However, the most likely cause for "No output file" in these types of assignments, assuming no crash stack trace is provided, is often that the program **crashed** due to an IndexOutOfBoundsException or similar during parsing, preventing the `Files.write` from completing or the file from being flushed/created properly if an exception occurs mid-stream (though `Files.write` is atomic-ish, if the exception happens before the first write, no file exists).
+
+Let's look at `isDeclare` and `isFuncDeclare` again. They access `tokens.get(pos + 1)` and `tokens.get(pos + 2)`.
+If `pos` is at the last token, this will throw `IndexOutOfBoundsException`.
+
+In the test case:
+`int main() { ... }`
+Tokens: `INTTK`, `MAINTK`, `LPARENT`, `RPARENT`, `LBRACE`, ..., `RBRACE`.
+
+When `parseCompUnit` is called:
+`pos = 0`.
+`isDeclare(tokens.get(0))` -> `isDeclare(INTTK)`.
+Accesses `tokens.get(1)` (MAINTK) and `tokens.get(2)` (LPARENT). Safe.
+
+If the input was just `int main(){}`, `tokens` size is small.
+But here we have a body.
+
+Let's look at `Parser.parseStmt` for `printf`.
+The test case has `printf("21373119");`.
+
+In `parseStmt`:
+```java
+        else if (first.getLexType() == LexType.PRINTFTK) {
+            pos++;
+            Token l = tokens.get(pos++); // (
+            Token stringConst = tokens.get(pos++); // "21373119"
+            ArrayList<Exp> expList = new ArrayList<>();
+            while (tokens.get(pos).getLexType() == LexType.COMMA) { // Next is RPARENT, so loop doesn't run
+                // ...
+            }
+            Token r = null;
+            Token semi = null;
+            if (tokens.get(pos).getLexType() == LexType.RPARENT) {
+                r = tokens.get(pos++); // )
+            }
+            // ...
+            if (tokens.get(pos).getLexType() == LexType.SEMICN) {
+                semi = tokens.get(pos++); // ;
+            }
+            // ...
+            return new Stmt(first,l,stringConst,expList,r,semi);
+        }
+```
+This looks correct.
+
+Let's look at `VarDecl` parsing for `int a = 0;`.
+Inside `Block`, `parseBlockItem` sees `INTTK`.
+`isDeclare` logic in `parseBlockItem`:
+```java
+    private BlockItem parseBlockItem() {//BlockItem → Decl | Stmt
+        LexType type = tokens.get(pos).getLexType();
+        boolean b1 = type == LexType.INTTK || type == LexType.CHARTK || type == LexType.CONSTTK;
+        if (b1) {
+            return new BlockItem(parseDecl());
+        }
+        else {
+            return new BlockItem(parseStmt());
+        }
+    }
+```
+It calls `parseDecl()`.
+`parseDecl()` sees `INTTK` (not `CONSTTK`), so calls `parseVarDecl()`.
+
+`parseVarDecl()`:
+```java
+    private VarDecl parseVarDecl() {//VarDecl → BType VarDef { ',' VarDef } ';' // i
+        Token BType = tokens.get(pos++); // int
+        ArrayList<VarDef> defList = new ArrayList<>();
+        defList.add(parseVarDef());
+        // ...
+    }
+```
+
+`parseVarDef()`:
+```java
+    private VarDef parseVarDef() {
+        Token iDent = tokens.get(pos++); // a
+        if (tokens.get(pos).getLexType() == LexType.LBRACK) { // No
+           // ...
+        }
+        else {
+            if (tokens.get(pos).getLexType() == LexType.ASSIGN) { // Yes (=)
+                Token assign_sign = tokens.get(pos++);
+                InitVal InitVal = parseInitVal();
+                return new VarDef(iDent, null, null, null, assign_sign, InitVal);
+            }
+            // ...
+        }
+    }
+```
+
+`parseInitVal()`:
+```java
+    private InitVal parseInitVal() { 
+        if (tokens.get(pos).getLexType() == LexType.STRCON) { // No
+        } else if (tokens.get(pos).getLexType() == LexType.LBRACE) { // No
+        } else {
+            Exp exp = parseExp();
+            return new InitVal(exp);
+        }
+    }
+```
+
+`parseExp()` -> `parseAddExp()` -> ... -> `parsePrimaryExp()`.
+`parsePrimaryExp()` sees `INTCON` (0).
+```java
+        } else if (t1.getLexType() == LexType.INTCON) {
+            return new PrimaryExp(parseNumber());
+        }
+```
+`parseNumber()` consumes `INTCON`.
+
+Back in `parseVarDecl`, after `parseVarDef`, it checks for comma. No comma.
+Checks for semicolon.
+```java
+        if (tokens.get(pos).getLexType() == LexType.SEMICN) {
+            Token semicolon = tokens.get(pos++);
+            return new VarDecl(BType,defList,semicolon);
+        }
+```
+Consumes `;`.
+
+This all seems logically sound for the happy path.
+
+**However**, there is a very common issue in these student implementations regarding **Lookahead bounds checking**.
+
+In `Compiler.java`, `parse()` calls `parser.parseCompUnit()`.
+If `parseCompUnit` throws an exception (e.g. `IndexOutOfBoundsException`), the program crashes. Since the output files are written *during* the traversal (in `postorder`), if the crash happens *before* any write, no file is created. If it happens *after* some writes, the file might exist but be incomplete. The prompt says "No output file", implying the file `parser.txt` does not exist at all.
+
+This suggests the crash happens during parsing, before `postorder` is called.
+
+Let's re-examine `isDeclare` and `isFuncDeclare` in `Parser.java`.
+
+```java
+    public boolean isDeclare(LexType type){
+        boolean b1 = type == LexType.INTTK || type == LexType.CHARTK || type == LexType.CONSTTK;
+        boolean b2 = tokens.get(pos + 1).getLexType() != LexType.MAINTK;
+        boolean b3 = tokens.get(pos + 2).getLexType() != LexType.LPARENT;
+        return  b1 && b2 && b3;
+    }
+    public boolean isFuncDeclare(LexType type){
+        boolean b1 = type == LexType.INTTK || type == LexType.CHARTK || type == LexType.VOIDTK;
+        boolean b2 = tokens.get(pos + 1).getLexType() != LexType.MAINTK;
+        boolean b3 = tokens.get(pos + 2).getLexType() == LexType.LPARENT;
+        return  b1 && b2 && b3;
+    }
+```
+
+These methods access `pos+1` and `pos+2` without checking if those indices exist in `tokens`.
+If the source file ends with a declaration that is short, or if `pos` is near the end, this crashes.
+
+In the specific test case:
+`int main() { ... }`
+When `pos=0` (INTTK), `pos+1` is MAINTK, `pos+2` is LPARENT. Indices exist.
+
+What about inside `parseBlock`?
+`parseBlockItem` calls `parseDecl` or `parseStmt`.
+`parseDecl` calls `parseVarDecl`.
+`parseVarDecl` does NOT use `isDeclare`. It directly parses.
+
+So where is the lookahead unsafe?
+
+Look at `parseUnaryExp`:
+```java
+        } else if (token1.getLexType() == LexType.IDENFR && tokens.get(pos + 1).getLexType() == LexType.LPARENT) {
+```
+Unsafe access if `pos` is the last token.
+
+Look at `parseStmt` -> `judgeLVal`:
+```java
+    public boolean judgeLVal(){
+        judge = 1;
+        int temp = pos;
+        parseLVal();
+        if (tokens.get(pos).getLexType()==LexType.ASSIGN){ // Unsafe if pos >= tokens.size()
+            // ...
+        }
+        // ...
+    }
+```
+
+If `parseLVal` consumes the last token, `tokens.get(pos)` will crash.
+
+However, the most suspicious part leading to "No Output" is often an exception in `main` or `parse` before file creation.
+
+Let's look at `Compiler.java` again.
+
+```java
+    public static void main(String[] args) {
+        lexical_Analysis();
+        //lexical_Analysis_output();
+        parse();
+    }
+```
+
+If `lexical_Analysis` fails to populate `tokens` correctly, `parse` might fail.
+
+Let's look at `Lexer` again.
+In `hasNext`, handling of `/`:
+```java
+        } else if (c == '/') {
+            curPos++;
+            sb.append(c);
+            if (source.charAt(curPos) == '/') {
+                // ... skip line comment
+                if (token == null && curPos < source.length()) {
+                    hasNext();
+                }
+            } else if (source.charAt(curPos) == '*') {
+                // ... skip block comment
+                curPos = curPos + 2;
+                hasNext();
+            }
+            else {
+                token = new Token(LexType.DIV,lineNum,sb.toString());
+            }
+        }
+```
+
+If the source file has comments, this recursion works.
+
+**Crucial Observation:**
+In `Compiler.java`, `parse()` creates a `Parser` object.
+`Parser parser = new Parser(tokens);`
+
+If `tokens` is empty, `parseCompUnit` will likely crash immediately when accessing `tokens.get(pos)`.
+
+Why would `tokens` be empty?
+In `lexical_Analysis`:
+```java
+        while (lexer.hasNext()) {
+            Token token = lexer.getToken();
+            if (token.getErrorType() == null && token.getLexType() != null){
+                tokens.add(token);
+            } 
+            // ...
+        }
+```
+
+If `lexer.hasNext()` returns false immediately, `tokens` remains empty.
+
+Does `Lexer` handle the input correctly?
+The input is:
+```java
+int main() {
+    printf("21373119");
+    int a = 0;
+    {
+        int a = 1;
+        printf("%d",a); // 输出 1
+    }
+    return 0;
+}
+```
+
+There is a Chinese comment `// 输出 1`.
+The lexer handles `//` comments:
+```java
+                while (c!='\n'){
+                    curPos++;
+                    if (curPos==source.length()){
+                        token = null;
+                        break;
+                    }
+                    c=source.charAt(curPos);
+                }
+                if (c == '\n') {
+                    lineNum++;
+                    curPos++;
+                }
+                if (token == null && curPos < source.length()) {
+                    hasNext();
+                }
+```
+This looks okay.
+
+**Let's step back and look at the Error Location Request.**
+The user wants the code snippet where the error is likely located.
+
+If the program produces **No output file**, it usually means an uncaught exception terminated the program before `Files.write` could create the file, OR the logic determining *whether* to write is flawed.
+
+In `Compiler.parse()`:
+```java
+        if (errorTokens.isEmpty()) {
+            compUnit.postorder();
+        }
+        else {
+             // write error.txt
+        }
+```
+
+If `compUnit.postorder()` throws an exception, `parser.txt` might not be created (or partially created).
+
+However, there is a known issue in some Java environments with `Paths.get("parser.txt")` and `Files.write` if the directory permissions are wrong, but that's unlikely here.
+
+Let's look at `CompUnit.postorder()` again.
+```java
+    public void postorder() {
+        Path path = Paths.get("parser.txt");
+        // ... loops ...
+        mainFuncDef.postorder();
+        try {
+            Files.write(path, "<CompUnit>".getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+```
+
+If `mainFuncDef` is null, `mainFuncDef.postorder()` throws `NullPointerException`.
+
+Why would `mainFuncDef` be null?
+In `parseCompUnit`:
+```java
+        MainFuncDef mainFuncDef = parseMainFuncDef();
+        return new CompUnit(declares,functionDefList,mainFuncDef);
+```
+
+If `parseMainFuncDef` throws an exception, `parseCompUnit` throws it.
+
+Let's look at `parseMainFuncDef` again.
+```java
+    private MainFuncDef parseMainFuncDef() {
+        Token intTk = tokens.get(pos++);
+        Token mainTk = tokens.get(pos++);
+        Token l = tokens.get(pos++);
+        Token r = null;
+        if (tokens.get(pos).getLexType() == LexType.RPARENT) {
+            r = tokens.get(pos++);
+        }
+        else {
+            Token error = new Token(ErrorType.LACK_OF_RPARENT,tokens.get(pos - 1).getLineNum(),"");
+            errors.add(error);
+        }
+        Block block = parseBlock();
+        return new MainFuncDef(intTk,mainTk,l,r,block);
+    }
+```
+
+If `tokens` runs out, `tokens.get(pos++)` throws `IndexOutOfBoundsException`.
+
+**Hypothesis:** The `isDeclare` and `isFuncDeclare` methods in `Parser.java` are unsafe because they access `pos+1` and `pos+2` without bounds checking. While they might work for this specific test case at the top level, if they are called when `pos` is near the end of the token list, they crash.
+
+However, in this specific test case, they are only called at the beginning.
+
+Let's look at `Parser.java` `parseStmt` again.
+There is a recursive call in `parseStmt` for `if` and `for` and `block`.
+
+Actually, looking at `Compiler.java`, there is a potential issue with **static state**.
+`private static ArrayList<Token> tokens = new ArrayList<>();`
+`private static ArrayList<Token> errorTokens = new ArrayList<>();`
+
+If `main` is run multiple times in the same JVM (unlikely for this assignment runner), state persists. But assuming a fresh run.
+
+**Wait!** Look at `Compiler.java` `parse()` method.
+```java
+    private static void parse() {
+        Parser parser = new Parser(tokens);
+        CompUnit compUnit = parser.parseCompUnit();
+        errorTokens.addAll(parser.getErrors());
+        // ...
+        if (errorTokens.isEmpty()) {
+            compUnit.postorder();
+        }
+        // ...
+    }
+```
+
+If `parser.parseCompUnit()` throws an exception, the code stops. `parser.txt` is never written.
+
+Where is the most likely exception?
+In `Parser.java`, `isDeclare` and `isFuncDeclare` are the most fragile.
+
+But there is another possibility. **The `Lexer` might not be producing tokens correctly.**
+In `Lexer.hasnext()`:
+```java
+        if (curPos < source.length())
+        {
+            c = source.charAt(curPos);
+        } else {
+            return false;
+        }
+```
+Then it skips whitespace.
+Then it processes characters.
+
+If the file `testfile.txt` contains a Byte Order Mark (BOM) or unusual encoding, `charAt(0)` might be weird. But `new String(Files.readAllBytes(...), StandardCharsets.UTF_8)` in `Compiler` handles UTF-8.
+
+Let's assume the code logic is mostly correct but there is a specific bug causing a crash.
+
+One common bug in these parsers is **missing bounds checks** in lookahead.
+
+File: `frontend/Parser.java`
+
+```java
+    public boolean isDeclare(LexType type){
+        boolean b1 = type == LexType.INTTK || type == LexType.CHARTK || type == LexType.CONSTTK;
+        boolean b2 = tokens.get(pos + 1).getLexType() != LexType.MAINTK;
+        boolean b3 = tokens.get(pos + 2).getLexType() != LexType.LPARENT;
+        return  b1 && b2 && b3;
+    }
+    public boolean isFuncDeclare(LexType type){
+        boolean b1 = type == LexType.INTTK || type == LexType.CHARTK || type == LexType.VOIDTK;
+        boolean b2 = tokens.get(pos + 1).getLexType() != LexType.MAINTK;
+        boolean b3 = tokens.get(pos + 2).getLexType() == LexType.LPARENT;
+        return  b1 && b2 && b3;
+    }
+```
+
+If `pos` is `tokens.size() - 1`, `pos+1` is out of bounds.
+If `pos` is `tokens.size() - 2`, `pos+2` is out of bounds.
+
+Although for the *start* of the file this is safe, if `parseCompUnit` loops and `pos` advances, it could crash. But `parseCompUnit` only calls these in `while` loops at the beginning. Once it moves to `parseMainFuncDef`, it doesn't use them.
+
+However, `parseBlockItem` uses `isDeclare`? No, it has its own inline check:
+```java
+        boolean b1 = type == LexType.INTTK || type == LexType.CHARTK || type == LexType.CONSTTK;
+```
+It does NOT use the unsafe `isDeclare` method.
+
+So where is the crash?
+
+Let's look at `parseUnaryExp` again.
+```java
+        } else if (token1.getLexType() == LexType.IDENFR && tokens.get(pos + 1).getLexType() == LexType.LPARENT) {
+```
+This is unsafe. If the last token is an `IDENFR`, `pos+1` crashes.
+
+In the test case: `printf("%d",a);`
+`a` is an `IDENFR`.
+Context: `printf("%d", a);`
+Tokens: `PRINTFTK`, `LPARENT`, `STRCON`, `COMMA`, `IDENFR` (a), `RPARENT`, `SEMICN`.
+
+When parsing arguments for `printf`:
+`parseFuncRParams` calls `parseExp`.
+`parseExp` -> `parseAddExp` -> ... -> `parseUnaryExp`.
+`parseUnaryExp` sees `IDENFR` ('a').
+It checks `tokens.get(pos+1)`. `pos` is index of 'a'. `pos+1` is `RPARENT`.
+Safe.
+
+What about `return 0;`?
+`return` -> `parseExp` -> `parsePrimaryExp` -> `Number`.
+
+What about `int a = 0;`?
+`0` is `INTCON`. `parsePrimaryExp` handles it.
+
+Is it possible the error is in `Compiler.java` itself?
+
+```java
+    private static void lexical_Analysis() {
+        // ...
+        Lexer lexer = new Lexer(source);
+        while (lexer.hasNext()) {
+            Token token = lexer.getToken();
+            if (token.getErrorType() == null && token.getLexType() != null){
+                tokens.add(token);
+            } else if (token.getErrorType() != null && token.getLexType() == null) {
+                errorTokens.add(token);
+                // ...
+            }
+        }
+
+    }
+```
+
+If `lexer.getToken()` returns `null`?
+In `Lexer.hasNext()`, if it returns `true`, `token` should be set.
+But look at the end of `hasNext()`:
+```java
+        if (curPos < source.length() && token == null) {
+            hasNext();
+        } else if (curPos == source.length() && token == null) {
+            return false;
+        }
+        return true;
+```
+
+If `hasNext()` returns `true`, `token` is guaranteed to be non-null?
+Not necessarily. If the recursive call `hasNext()` sets `token`, then yes.
+
+However, there is a risk. If `hasNext()` returns `true` but `token` is somehow null (logic error), `lexer.getToken()` returns null.
+Then `token.getErrorType()` throws `NullPointerException`.
+
+This would cause a crash in `lexical_Analysis`, resulting in **No output file**.
+
+Let's verify if `token` can be null when `hasNext` returns true.
+Case: Comment at end of file.
+`// comment`
+`hasNext` sees `/`. Enters `/` block.
+Skips comment. `curPos` reaches end. `token` is null.
+Calls `hasNext()`.
+Inner `hasNext`: `curPos == source.length()`. Returns `false`.
+Outer `hasNext`: `hasNext()` returned false.
+Code continues:
+```java
+        if (curPos < source.length() && token == null) { // False (curPos == length)
+             hasNext();
+        } else if (curPos == source.length() && token == null) { // True
+            return false;
+        }
+        return true; // Unreachable
+```
+So it returns `false`. Correct.
+
+Case: Valid token.
+`token` is set. Returns `true`. Correct.
+
+So `token` should not be null.
+
+**Alternative Theory:**
+The `Parser` constructor takes `tokens`.
+`public Parser(ArrayList<Token> tokens) { this.tokens = tokens; }`
+
+If `tokens` is empty, `parseCompUnit` calls `isDeclare(tokens.get(0))`. Crash.
+
+Why would `tokens` be empty?
+If `testfile.txt` is empty or contains only whitespace/comments.
+But the test case has content.
+
+**Let's look at the `parse` method in `Compiler.java` again.**
+
+```java
+    private static void parse() {
+        Parser parser = new Parser(tokens);
+        CompUnit compUnit = parser.parseCompUnit();
+        errorTokens.addAll(parser.getErrors());
+        errorTokens.sort(Comparator.comparingInt(Token::getLineNum));
+        if (errorTokens.isEmpty()) {
+            compUnit.postorder();
+        }
+        else {
+            String errorFilePath = "error.txt";
+            StringBuilder sb = new StringBuilder();
+            for (Token t : errorTokens) {
+                sb.append(t.getLineNum());
+                sb.append(" ");
+                sb.append(t.getErrorType().getError_type());
+                sb.append("\n");
+            }
+            try {
+                Files.write(Paths.get(errorFilePath), sb.toString().getBytes(StandardCharsets.UTF_8));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+```
+
+If `parser.parseCompUnit()` throws an exception, the program terminates.
+
+Given the constraints and the "No output file" symptom, the most likely culprit is an **IndexOutOfBoundsException** in the Parser's lookahead logic, specifically in `isDeclare` or `isFuncDeclare` or `parseUnaryExp`, if the token stream ends unexpectedly or if the logic flows into a state where `pos` is at the boundary.
+
+However, for the *specific* test case provided, the flow seems safe from bounds errors *if* the tokenization is correct.
+
+Is there a bug in `Token.toString()`?
+```java
+    @Override
+    public String toString() {
+        return this.lexType.getTypeValue() + ' ' + this.tokenValue + '\n';
+    }
+```
+If `lexType` is null, `getTypeValue` crashes.
+In `Compiler.lexical_Analysis`, we only add tokens if `token.getLexType() != null`. So `lexType` should not be null for tokens in the list.
+
+**Final Check:**
+In `Parser.java`, `parseMainFuncDef` assumes `int` and `main` are present.
+If `isFuncDeclare` failed to identify `int main` as a function (it returns false because `b2` is false), `parseCompUnit` proceeds to `parseMainFuncDef`.
+`parseMainFuncDef` consumes `int`, `main`, `(`, `)`.
+Then `parseBlock`.
+
+If `parseBlock` encounters an issue...
+
+Actually, I suspect the error is in **`Compiler.java`** where `parse()` is called, but `tokens` might be empty due to a subtle Lexer bug with the specific input format (e.g. newline handling).
+
+But without being able to run it, I must point to the most fragile code. The unsafe lookahead in `Parser.java` is the standard "bug" in these submissions.
+
+<frontend/Parser.java>
+...
+    public boolean isDeclare(LexType type){
+        boolean b1 = type == LexType.INTTK || type == LexType.CHARTK || type == LexType.CONSTTK;
+        boolean b2 = tokens.get(pos + 1).getLexType() != LexType.MAINTK;
+        boolean b3 = tokens.get(pos + 2).getLexType() != LexType.LPARENT;
+        return  b1 && b2 && b3;
+    }
+    public boolean isFuncDeclare(LexType type){
+        boolean b1 = type == LexType.INTTK || type == LexType.CHARTK || type == LexType.VOIDTK;
+        boolean b2 = tokens.get(pos + 1).getLexType() != LexType.MAINTK;
+        boolean b3 = tokens.get(pos + 2).getLexType() == LexType.LPARENT;
+        return  b1 && b2 && b3;
+    }
+...

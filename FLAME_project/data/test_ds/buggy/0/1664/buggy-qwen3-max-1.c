@@ -1,0 +1,47 @@
+#include<stdio.h>
+#include<string.h>
+
+char s[10000];
+
+int main()
+{
+    scanf("%s", &s); // @@ [Using &s is incorrect; s is already a pointer to char array, should be scanf("%s", s); but this may not cause the observed error directly]
+    
+    int i, k = strlen(s);
+    char j;
+    
+    for(i = 0; i < k; i++)
+    {
+        if(s[i] != '-')
+        {
+            printf("%c", s[i]);
+        }
+        else
+        {
+            if(s[i - 1] <= 'z' && s[i - 1] >='a' && s[i + 1] <= 'z' && s[i + 1] >='a' && s[i - 1] < s[i + 1])
+            {
+                for(j = s[i - 1] + 1; j < s[i + 1]; j++)
+                {
+                    printf("%c", j);
+                }
+            }
+            else if(s[i - 1] <= 'Z' && s[i - 1] >='A' && s[i + 1] <= 'Z' && s[i + 1] >='A' && s[i - 1] < s[i + 1])
+            {
+                for(j = s[i - 1] + 1; j < s[i + 1]; j++)
+                {
+                    printf("%c", j);
+                }
+            }
+            else if(s[i - 1] <= '9' && s[i - 1] >='0' && s[i + 1] <= '9' && s[i + 1] >='0' && s[i - 1] < s[i + 1])
+            {
+                for(j = s[i - 1] + 1; j < s[i + 1]; j++)
+                {
+                    printf("%c", j);
+                }
+            }
+            else
+                printf("-"); // @@ [Missing else clause to print '-' when expansion conditions are not met, causing '-' to be omitted in output like "B-e" becoming "Be"]
+        }
+    }
+    return 0;
+}

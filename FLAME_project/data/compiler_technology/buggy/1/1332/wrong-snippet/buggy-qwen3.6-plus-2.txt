@@ -1,0 +1,796 @@
+Based on the analysis of the problem description, test case, and source code:
+
+1.  **Problem Analysis**:
+    *   The test case contains three syntax errors:
+        *   Line 13: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);` -> Missing right parenthesis `)`. Expected error: `13 j`.
+        *   Line 15: `if (3 > 0 {` -> Missing right parenthesis `)`. Expected error: `15 j`.
+        *   Line 20: `i = (((((f(str)))));` -> This is an assignment statement `LVal '=' Exp ';'`. The expression part `((((f(str)))))` is valid (nested parentheses around a function call). However, there is a missing semicolon `;` at the end of the line? No, looking closely at line 20: `i = (((((f(str))))); // error 3`. Wait, let's re-read the input carefully.
+        Input Line 20: `    i = (((((f(str))))); // error 3`
+        Let's count parentheses in `((((f(str)))))`:
+        `(` `(` `(` `(` `(` `f` `(` `str` `)` `)` `)` `)` `)` `)`
+        Inner: `f(str)` is valid.
+        Wrapped in 5 pairs of parens?
+        `(` `(` `(` `(` `(` ... `)` `)` `)` `)` `)`
+        Let's trace:
+        `f(str)` -> UnaryExp
+        `(f(str))` -> PrimaryExp -> UnaryExp
+        `((f(str)))` -> PrimaryExp -> UnaryExp
+        `(((f(str))))` -> PrimaryExp -> UnaryExp
+        `((((f(str)))))` -> PrimaryExp -> UnaryExp
+        So `((((f(str)))))` is a valid Exp.
+        The statement is `i = ((((f(str)))));`.
+        Wait, the comment says `// error 3`.
+        Let's look at the Buggy Output: `20 j`, `20 i`, `20 j`.
+        Expected Output: `20 j`.
+        
+        Why is there an error on line 20?
+        Let's look at the code structure again.
+        Line 19 is empty.
+        Line 20: `    i = (((((f(str))))); // error 3`
+        
+        If the code is `i = (((((f(str)))));`, let's count parens again.
+        `i` `=` `(` `(` `(` `(` `(` `f` `(` `str` `)` `)` `)` `)` `)` `)` `;`
+        Open: 1 (after =), 2, 3, 4, 5 (before f), 6 (before str). Total 6 opens.
+        Close: 1 (after str), 2, 3, 4, 5, 6 (after last paren). Total 6 closes.
+        It seems balanced.
+        
+        However, the expected output is `20 j`. Error `j` is "Missing right parenthesis ')'".
+        This implies the parser thinks a right parenthesis is missing on line 20.
+        
+        Let's look at how `UnaryExp` handles `Ident '(' ... ')'`.
+        In `Parser.java`, `parseUnaryExp`:
+        ```java
+        if (getTokenType() == TokenType.IDENFR && getPreReadTokenType(1) == TokenType.LPARENT) {
+            ident = token;
+            nextToken();
+            if (getTokenType() == TokenType.LPARENT) {
+                lparent = token;
+                nextToken();
+                if (getTokenType() != TokenType.RPARENT) {
+                    funcRParams = parseFuncRParams();
+                }
+                if (getTokenType() == TokenType.RPARENT) {
+                    rparent = token;
+                    nextToken();
+                    return new UnaryExp(ident, lparent, rparent, funcRParams);
+                } else {
+                    // error j
+                    Error error = new Error();
+                    if (funcRParams != null) {
+                        error.lineNo = funcRParams.lineNo;
+                    } else {
+                        error.lineNo = ident.lineNo;
+                    }
+                    error.type = ErrorType.j;
+                    Error.errors.add(error);
+                    return new UnaryExp(ident, lparent,
+                            new Token(")", TokenType.LPARENT, -1, -1), funcRParams); // BUG HERE: TokenType.LPARENT instead of RPARENT
+                }
+            }
+            // ...
+        }
+        ```
+        
+        Now let's look at `PrimaryExp`:
+        ```java
+        if (getTokenType() == TokenType.LPARENT) {
+            lparent = token;
+            nextToken();
+            exp = parseExp();
+            if (getTokenType() == TokenType.RPARENT) {
+                rparent = token;
+                nextToken();
+                // ...
+            } else {
+                // error j
+                Error error = new Error();
+                error.lineNo = exp.lineNo;
+                error.type = ErrorType.j;
+                Error.errors.add(error);
+                return null; // Returns null!
+            }
+        }
+        ```
+
+        And `Exp` -> `AddExp`.
+        
+        Let's trace Line 20: `i = (((((f(str)))));`
+        1. `parseStmt` tries `tryParseLValExpStmt`.
+        2. `parseLVal` consumes `i`.
+        3. Consumes `=`.
+        4. `parseExp` is called.
+        5. `parseExp` -> `parseAddExp` -> `parseMulExp` -> `parseUnaryExp`.
+        6. Current token is `(`. `parseUnaryExp` checks `IDENFR` followed by `LPARENT`. It is not.
+        7. Checks `UnaryOp`. No.
+        8. Goes to `PrimaryExp`.
+        9. `PrimaryExp` sees `LPARENT`. Consumes it. Calls `parseExp`.
+        10. Inside nested `parseExp`... eventually we get to `f(str)`.
+        11. `parseUnaryExp` for `f(str)`:
+            - Ident `f`, Next `(`.
+            - Consumes `(`.
+            - `parseFuncRParams` -> `parseExp` -> ... `str` (LVal).
+            - Expects `)`. Finds `)`. Consumes it. Returns valid `UnaryExp`.
+        12. Back to `PrimaryExp` wrapping `f(str)`.
+            - `parseExp` returned the exp for `f(str)`.
+            - Expects `)`. Finds `)`. Consumes it. Returns valid `PrimaryExp`.
+        13. This continues for all nested parentheses.
+        14. Finally, the outermost `PrimaryExp` returns.
+        15. `parseUnaryExp` returns.
+        16. `parseMulExp`, `parseAddExp`, `parseExp` return.
+        17. Back in `tryParseLValExpStmt`:
+            - `exps.get(0)` is not null.
+            - Checks for `SEMICN`.
+            - The next token is `;`.
+            - So it should succeed without error.
+
+        Why does the expected output say `20 j`?
+        Let's re-read the input string provided in the prompt carefully.
+        `    i = (((((f(str))))); // error 3`
+        
+        Is it possible the number of parentheses is odd?
+        `(((((` (5 opens)
+        `f(str)`
+        `)))))` (5 closes)
+        `;`
+        
+        If it is 5 opens and 5 closes, it is balanced.
+        
+        Let's look at the Buggy Output again:
+        `13 j`
+        `15 j`
+        `20 j`
+        `20 i`
+        `20 j`
+        
+        Expected:
+        `13 j`
+        `15 j`
+        `20 j`
+        
+        The buggy output has EXTRA errors on line 20 (`20 i` and another `20 j`).
+        This suggests that the parser is failing to parse line 20 correctly, likely getting stuck or misinterpreting tokens, leading to cascading errors.
+        
+        If `PrimaryExp` returns `null` when it encounters a missing `)`, then `parseUnaryExp` returns `null`, `parseExp` returns `null`.
+        In `tryParseLValExpStmt`:
+        ```java
+        exps.add(parseExp());
+        if (exps.get(0) == null) {
+             return false;
+        }
+        ```
+        If it returns false, `parseStmt` recovers and tries other options.
+        
+        However, if the parentheses ARE balanced, why would it fail?
+        
+        Let's look at `parseFuncRParams`.
+        ```java
+        Exp exp = parseExp();
+        if (exp == null) {
+            return null;
+        }
+        ```
+        
+        Let's look at `parseUnaryExp` again.
+        There is a subtle bug in `parseUnaryExp` when handling the function call error recovery:
+        ```java
+        return new UnaryExp(ident, lparent,
+                new Token(")", TokenType.LPARENT, -1, -1), funcRParams);
+        ```
+        It creates a fake token with type `LPARENT` instead of `RPARENT`.
+        While this might cause issues later if that token is used, usually fake tokens are just placeholders for structure. But if subsequent logic checks token types, this could be problematic.
+        
+        However, the main issue causing the discrepancy on Line 20 is likely related to how `PrimaryExp` handles errors or how the recursion depth/stack works, OR there is a mismatch in what constitutes an error.
+        
+        Let's look at Line 13: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);`
+        Missing `)` at the end.
+        `parsePrimaryExp` sees `(`, calls `parseExp`.
+        `parseExp` parses `1 + ... + 7`.
+        Then `parsePrimaryExp` expects `)`. It finds `;`.
+        It reports Error `j` at line of `exp` (which is inside the expression, likely line 13).
+        It returns `null`.
+        
+        Because `PrimaryExp` returns `null`, `UnaryExp` returns `null`, `Exp` returns `null`.
+        In `tryParseLValExpStmt` (for `int i = ...`? No, `int i = ...` is a `VarDef` inside `VarDecl`).
+        
+        Let's trace `VarDecl` -> `VarDef` -> `InitVal` -> `Exp`.
+        `parseInitVal`:
+        ```java
+        } else {
+            exps.add(parseExp());
+            return new InitVal(exps);
+        }
+        ```
+        It doesn't check if `parseExp()` returned null!
+        If `parseExp` returns null (due to missing paren in PrimaryExp), `exps` contains `null`.
+        `InitVal` is created with `null` exp.
+        `VarDef` is created.
+        `VarDecl` continues.
+        
+        Later, when printing or processing, if `null` nodes are present, it might crash or behave unexpectedly. But here we are looking at error generation.
+        
+        The error `13 j` is generated inside `PrimaryExp`.
+        
+        Now Line 20: `i = (((((f(str)))));`
+        If this is actually syntactically correct, why is `20 j` expected?
+        
+        Maybe I miscounted the parentheses in the prompt's text representation?
+        `i = (((((f(str)))));`
+        Let's assume the prompt implies there IS an error on line 20.
+        If there is a missing `)`, then `PrimaryExp` will catch it, print `j`, and return `null`.
+        If `PrimaryExp` returns `null`, `parseExp` returns `null`.
+        In `tryParseLValExpStmt`:
+        ```java
+        exps.add(parseExp());
+        if (exps.get(0) == null) {
+             // ...
+             return false;
+        }
+        ```
+        It returns false.
+        Then `parseStmt` recovers index and tries `tryParseGetIntStmt`, `tryParseGetCharStmt`, `tryParseExpStmt`.
+        
+        `tryParseExpStmt`:
+        ```java
+        if (getTokenType() != TokenType.SEMICN) {
+            exps.add(parseExp());
+        }
+        // ...
+        ```
+        If `parseExp` returns null again, `exps` has null.
+        
+        The Buggy Output has `20 j`, `20 i`, `20 j`.
+        This suggests multiple error reporting paths are being triggered.
+        
+        The key difference between Buggy and Expected is that Expected has ONLY `20 j`.
+        This implies that after detecting the missing `)` (error `j`), the parser should NOT report subsequent errors like `i` (missing semicolon) or another `j`.
+        
+        This usually happens if the error recovery isn't stopping the parsing of that construct cleanly, or if the "fake" token inserted allows parsing to continue but in a broken state, triggering more errors.
+        
+        Look at `PrimaryExp` error handling:
+        ```java
+        } else {
+            // error j
+            Error error = new Error();
+            error.lineNo = exp.lineNo;
+            error.type = ErrorType.j;
+            Error.errors.add(error);
+            return null;
+        }
+        ```
+        It returns `null`.
+        
+        Look at `UnaryExp` error handling (function call):
+        ```java
+        } else {
+            // error j
+            Error error = new Error();
+            // ...
+            Error.errors.add(error);
+            return new UnaryExp(ident, lparent,
+                    new Token(")", TokenType.LPARENT, -1, -1), funcRParams);
+        }
+        ```
+        It returns a NON-NULL object, but with a malformed token (`LPARENT` type for a closing paren).
+        
+        If Line 20's error is actually inside a function call parameter or something similar, this might be relevant. But `f(str)` is correct.
+        
+        Let's look at `Compiler.java`'s `parserInfoPrint`:
+        ```java
+        if(Error.errors.size() > 0){
+            for (Error error : Error.errors) {
+                if(lastError != null){
+                    if(error.lineNo == lastError.lineNo && error.type == lastError.type){
+                        continue;
+                    }
+                }
+                info.append(error.lineNo).append(" ").append(error.type).append("\n");
+                lastError = error;
+            }
+            // ...
+        }
+        ```
+        This deduplicates consecutive identical errors.
+        
+        The buggy output is:
+        `20 j`
+        `20 i`
+        `20 j`
+        
+        These are not identical consecutive errors, so they all pass the filter.
+        
+        The expected output is just `20 j`.
+        
+        This means the extra `20 i` and `20 j` should not have been generated.
+        
+        Why are they generated?
+        Likely because the parser fails to parse the statement on line 20 completely, returns null or fails, and then the surrounding context (or the next iteration) tries to parse again or interprets the remaining tokens as errors.
+        
+        However, there is a specific bug in `PrimaryExp` returning `null` vs `UnaryExp` returning a partial object.
+        
+        If `PrimaryExp` returns `null`, the `Exp` is null.
+        In `tryParseLValExpStmt`, if `parseExp` returns null, it returns `false`.
+        Then `parseStmt` tries `tryParseExpStmt`.
+        `tryParseExpStmt` calls `parseExp` again (since index was recovered).
+        It will fail again, generating the same error `j` again?
+        
+        Wait, `Error.isExist` is NOT checked in `PrimaryExp`.
+        ```java
+        Error error = new Error();
+        error.lineNo = exp.lineNo;
+        error.type = ErrorType.j;
+        Error.errors.add(error); // Adds unconditionally
+        ```
+        
+        In `LVal.parseLVal`:
+        ```java
+        if (!Error.isExist(exp.lineNo, ErrorType.k)) {
+            Error.errors.add(new Error(exp.lineNo, ErrorType.k));
+        }
+        ```
+        
+        In `UnaryExp` (function call):
+        ```java
+        Error.errors.add(error); // Adds unconditionally
+        ```
+        
+        If the parser backtracks and retries, it might add the same error multiple times.
+        But `Compiler.parserInfoPrint` only removes *consecutive* duplicates.
+        
+        If the sequence is `j`, `i`, `j`, they are not consecutive duplicates.
+        
+        The root cause is likely that the parser is not consuming tokens correctly upon error, or is retrying parsing the same erroneous construct multiple times via the backtracking mechanisms in `parseStmt` (`tryParse...` methods), causing multiple errors to be logged for the same location.
+        
+        Specifically, in `parseStmt`, if `tryParseLValExpStmt` fails (returns false), it calls `recover()`.
+        Then it tries `tryParseGetIntStmt`.
+        If the input is `i = ...`, `tryParseGetIntStmt` will parse `i`, `=`, then check for `getint`. It won't match. It returns false.
+        Then `tryParseGetCharStmt`. Same.
+        Then `tryParseExpStmt`.
+        
+        `tryParseExpStmt`:
+        ```java
+        if (getTokenType() != TokenType.SEMICN) {
+            exps.add(parseExp());
+        }
+        ```
+        It calls `parseExp` again on the same input.
+        `parseExp` -> `PrimaryExp` -> Error `j` added again.
+        
+        So we have:
+        1. `tryParseLValExpStmt` calls `parseExp` -> Error `j` added. Fails.
+        2. `tryParseExpStmt` calls `parseExp` -> Error `j` added.
+        
+        This explains duplicate `j`s. What about `i`?
+        
+        In `tryParseLValExpStmt`:
+        ```java
+        if (getTokenType() != TokenType.SEMICN) {
+            Error error = new Error();
+            error.lineNo = exps.get(0).lineNo; // If exps.get(0) is null, this crashes? Or if exps.get(0) is valid but missing semicolon?
+            error.type = ErrorType.i;
+            Error.errors.add(error);
+            // ...
+        }
+        ```
+        If `parseExp` returned a VALID expression (e.g. if the error was deeper or handled differently), but the semicolon was missing, it would add `i`.
+        
+        But here `parseExp` returns `null` because `PrimaryExp` returned `null`.
+        So `exps.get(0)` is `null`.
+        The code checks:
+        ```java
+        if (exps.get(0) == null) {
+             // ...
+             return false;
+        }
+        ```
+        So it returns false BEFORE adding error `i`.
+        
+        So where does `20 i` come from?
+        
+        Maybe `tryParseExpStmt`?
+        ```java
+        if (getTokenType() != TokenType.SEMICN
+                && exps.size() > 0 && exps.get(0) != null) { 
+            Error error = new Error();
+            // ...
+            error.type = ErrorType.i;
+            Error.errors.add(error);
+            // ...
+        }
+        ```
+        If `exps.get(0)` is null, it skips the `i` error block.
+        
+        Let's look at `parseStmt` -> `if` block.
+        Line 15: `if (3 > 0 {`
+        `parseCond` -> `parseLOrExp` ... `parsePrimaryExp` -> `3` `>` `0`.
+        Then expects `)`. Finds `{`.
+        `PrimaryExp`? No, `Cond` -> `LOrExp` -> ... `RelExp` -> `AddExp` -> `MulExp` -> `UnaryExp` -> `PrimaryExp`.
+        Wait, `3 > 0` is parsed.
+        In `parseCond` -> `parseLOrExp` -> `parseLAndExp` -> `parseEqExp` -> `parseRelExp`.
+        `parseRelExp`:
+        ```java
+        addExp = parseAddExp(); // parses 3
+        if (getTokenType() == LSS...) { // > matches GRE
+             op = token; nextToken();
+             relExp = parseRelExp(); // parses 0
+        }
+        ```
+        Returns `RelExp`.
+        Back up to `Cond`.
+        Back to `parseStmt` (If branch):
+        ```java
+        cond = parseCond();
+        if (getTokenType() == TokenType.RPARENT) {
+             // ...
+        } else {
+             // error j
+             Error error = new Error();
+             error.lineNo = cond.lineNo;
+             error.type = ErrorType.j;
+             Error.errors.add(error);
+             // fix error
+             rparent = new Token(")", TokenType.RPARENT, -1, -1);
+        }
+        ```
+        It adds error `j`. It does NOT return null. It creates a fake `rparent` and continues to `parseStmt` (the body).
+        Body is `{ g(...); }`.
+        This parses successfully.
+        So Line 15 generates one `j`. Correct.
+        
+        Now back to Line 20.
+        Why `20 i`?
+        
+        If `tryParseLValExpStmt` is entered:
+        1. `parseLVal` (`i`).
+        2. `ASSIGN`.
+        3. `parseExp`.
+           Inside `parseExp` -> `PrimaryExp` (outer `(`).
+           Inside `parseExp` -> ... -> `PrimaryExp` (inner `(` around `f(str)`).
+           
+           If the input is `i = (((((f(str)))));` and it is BALANCED, `parseExp` succeeds.
+           Then `tryParseLValExpStmt` checks for `SEMICN`.
+           It finds `;`.
+           It succeeds.
+           NO ERROR.
+           
+           BUT Expected Output HAS `20 j`.
+           
+           This implies `((((f(str)))))` is NOT balanced in the eyes of the parser, or the input string in the prompt has a typo and actually has an odd number of parens.
+           
+           Let's assume the input actually has an error, e.g., `i = (((((f(str))));` (missing one close).
+           
+           If missing one close:
+           `parseExp` -> `PrimaryExp` sees `(`.
+           Recurses.
+           Eventually `f(str)` is parsed.
+           Unwinding:
+           `PrimaryExp` expects `)`.
+           If one is missing at the very end:
+           The innermost `PrimaryExp` corresponding to the missing paren will fail.
+           It adds Error `j`. Returns `null`.
+           
+           This `null` propagates up.
+           `parseExp` returns `null`.
+           
+           `tryParseLValExpStmt`:
+           `exps.get(0)` is `null`.
+           Returns `false`.
+           
+           `parseStmt` recovers.
+           Tries `tryParseExpStmt`.
+           `tryParseExpStmt`:
+           `getTokenType()` is `(` (start of the mess).
+           `exps.add(parseExp())`.
+           `parseExp` runs again.
+           Adds Error `j` AGAIN.
+           Returns `null`.
+           
+           `tryParseExpStmt`:
+           `exps.get(0)` is `null`.
+           Skips the `if` block for error `i`.
+           Goes to `else`:
+           ```java
+           } else {
+               // ...
+               semicns.add(token);
+               nextToken();
+               // ...
+           }
+           ```
+           Wait, `getTokenType()` is still `(`. It is NOT `SEMICN`.
+           So it enters the first `if`:
+           ```java
+           if (getTokenType() != TokenType.SEMICN) {
+               exps.add(parseExp());
+           }
+           if (getTokenType() != TokenType.SEMICN
+                   && exps.size() > 0 && exps.get(0) != null) {
+               // Error i
+           } else {
+               // ...
+               semicns.add(token); // Adds '(' as a semicolon??
+               nextToken();
+               // ...
+           }
+           ```
+           It adds `(` to `semicns`. Advances token.
+           Returns `true` (Stmt parsed).
+           
+           So `parseStmt` returns a Stmt.
+           
+           Errors generated:
+           1. From `tryParseLValExpStmt`'s `parseExp`: `20 j`.
+           2. From `tryParseExpStmt`'s `parseExp`: `20 j`.
+           
+           Result: `20 j`, `20 j`.
+           Deduplication in `Compiler`:
+           LastError `20 j`. Current `20 j`. Same line, same type. Skip.
+           Output: `20 j`.
+           
+           This matches Expected Output!
+           
+           So why does Buggy Output have `20 i` and `20 j`?
+           
+           The Buggy Output is:
+           `20 j`
+           `20 i`
+           `20 j`
+           
+           This implies that in the buggy version, `exps.get(0)` was NOT null in one of the attempts, allowing Error `i` to be generated.
+           
+           How can `exps.get(0)` be not null if `PrimaryExp` returns null?
+           
+           Look at `UnaryExp` (function call) again.
+           If the error was inside a function call, `UnaryExp` returns a NON-NULL object (with fake token).
+           
+           If Line 20 was `i = f(str;` (missing paren in func call):
+           `parseUnaryExp` -> `f` `(` `str` `;`.
+           Expects `)`. Finds `;`.
+           Adds Error `j`.
+           Returns `UnaryExp` (non-null).
+           
+           `parseExp` returns non-null `Exp`.
+           
+           `tryParseLValExpStmt`:
+           `exps.get(0)` is NOT null.
+           Checks `SEMICN`.
+           Current token is `;`.
+           Matches!
+           So it succeeds?
+           If it succeeds, no Error `i`.
+           
+           But wait, if `UnaryExp` consumed `str` and stopped at `;`, the `;` is still the current token?
+           No, `parseFuncRParams` parses `str`.
+           `parseUnaryExp` checks `RPARENT`. Finds `;`.
+           It does NOT consume `;`.
+           It returns.
+           
+           Back in `tryParseLValExpStmt`:
+           `parseExp` returned.
+           Current token is `;`.
+           `getTokenType() == SEMICN`.
+           So it consumes `;`.
+           Returns true.
+           
+           So only `20 j` is generated.
+           
+           Why `20 i` in Buggy Output?
+           
+           Maybe the error is `i = (((((f(str))))` (missing semicolon AND missing paren)?
+           
+           If missing semicolon:
+           `tryParseLValExpStmt`:
+           `parseExp` fails (missing paren) -> returns null? Or succeeds partially?
+           
+           If `PrimaryExp` returns `null`, `exps[0]` is null.
+           
+           There is a case in `tryParseLValExpStmt`:
+           ```java
+           if (getTokenType() != TokenType.SEMICN) {
+               Error error = new Error();
+               error.lineNo = exps.get(0).lineNo; // CRASH if null
+               error.type = ErrorType.i;
+               Error.errors.add(error);
+               // ...
+           }
+           ```
+           If `exps.get(0)` is null, this crashes.
+           
+           But if `exps.get(0)` is NOT null (e.g. `UnaryExp` returned partial), and `SEMICN` is missing:
+           It adds Error `i`.
+           
+           So, if Line 20 has BOTH missing `)` and missing `;`:
+           1. `tryParseLValExpStmt`:
+              `parseExp` -> `UnaryExp` (partial success, error `j` added).
+              `exps[0]` not null.
+              `getTokenType()` is NOT `SEMICN` (maybe EOF or next line).
+              Adds Error `i`.
+              Fixes semicolon.
+              Returns true.
+           
+           Output: `20 j`, `20 i`.
+           
+           Then why another `20 j`?
+           
+           Maybe `tryParseExpStmt` is also tried?
+           No, `tryParseLValExpStmt` returned true.
+           
+           So where does the 3rd error come from?
+           
+           Let's look at the Buggy Output order: `20 j`, `20 i`, `20 j`.
+           
+           If `PrimaryExp` returns `null` (instead of partial), `exps[0]` is null.
+           
+           The bug is likely in `PrimaryExp` returning `null` vs `UnaryExp` returning partial.
+           
+           In the provided code, `PrimaryExp` returns `null` on error.
+           `UnaryExp` (func call) returns partial.
+           
+           If the error is a missing `)` in a `PrimaryExp` (parenthesized expression), `PrimaryExp` returns `null`.
+           
+           If the error is a missing `)` in a `UnaryExp` (func call), `UnaryExp` returns partial.
+           
+           Line 20: `i = (((((f(str)))));`
+           
+           If it is missing a `)` at the end, it is a `PrimaryExp` error.
+           `PrimaryExp` returns `null`.
+           
+           If the Buggy Code behaves differently, maybe it doesn't return `null`?
+           
+           Actually, look at `Compiler.java` again.
+           
+           The Buggy Output has `20 j`, `20 i`, `20 j`.
+           
+           If I assume the code provided IS the buggy code:
+           
+           In `PrimaryExp`:
+           ```java
+           } else {
+               // error j
+               Error error = new Error();
+               error.lineNo = exp.lineNo;
+               error.type = ErrorType.j;
+               Error.errors.add(error);
+               return null;
+           }
+           ```
+           
+           In `UnaryExp`:
+           ```java
+           } else {
+               // error j
+               Error error = new Error();
+               // ...
+               Error.errors.add(error);
+               return new UnaryExp(ident, lparent,
+                       new Token(")", TokenType.LPARENT, -1, -1), funcRParams);
+           }
+           ```
+           
+           If Line 20 triggers `PrimaryExp` error, it returns `null`.
+           
+           If Line 20 triggers `UnaryExp` error, it returns partial.
+           
+           The input `i = (((((f(str)))));`
+           
+           If there is a missing `)` in the `PrimaryExp` chain, `null` is returned.
+           
+           If `null` is returned, `tryParseLValExpStmt` returns false.
+           `tryParseExpStmt` is tried.
+           
+           If `tryParseExpStmt` runs `parseExp` again, it adds `j` again.
+           
+           So we get `j`, `j`. Deduped to `j`.
+           
+           Where does `i` come from?
+           
+           It comes from a path where `exps.get(0)` is NOT null.
+           
+           This happens if `parseExp` returns non-null.
+           
+           This happens if the error is caught in `UnaryExp` (func call) AND the rest of the expression is valid.
+           
+           But `f(str)` is valid.
+           
+           Unless... `parseFuncRParams` fails?
+           
+           Or... `parseUnaryExp` identifies `f` as `IDENFR` and `(` as `LPARENT`.
+           
+           What if `str` is not parsed correctly?
+           
+           `str` is `IDENFR`. `parseLVal` -> `Ident`.
+           
+           It seems `f(str)` is fine.
+           
+           Conclusion: The extra errors are likely due to `PrimaryExp` returning `null` causing re-parsing, BUT the `i` error suggests a path where `exps` was not null.
+           
+           Wait! Look at `tryParseLValExpStmt` again.
+           
+           ```java
+           exps.add(parseExp());
+           if (exps.get(0) == null) {
+               // ...
+               return false;
+           }
+           stmt.exps = exps;
+           List<Token> semicns = new ArrayList<>();
+           // error i
+           if (getTokenType() != TokenType.SEMICN) {
+               Error error = new Error();
+               error.lineNo = exps.get(0).lineNo;
+               error.type = ErrorType.i;
+               Error.errors.add(error);
+               // ...
+           }
+           ```
+           
+           If `parseExp` returns NON-NULL (e.g. partial from `UnaryExp`), and `SEMICN` is missing, `i` is added.
+           
+           If `parseExp` returns NULL, `false` is returned.
+           
+           The Buggy Output has `i`. This implies `parseExp` returned NON-NULL.
+           
+           This implies the error was detected in `UnaryExp` (func call) or `PrimaryExp` returned non-null (it doesn't).
+           
+           So the parser MUST be entering the `UnaryExp` error path.
+           
+           But `f(str)` is correct.
+           
+           Is it possible `((((f(str)))))` is parsed as `UnaryExp`?
+           No, `(` starts `PrimaryExp`.
+           
+           Unless... `parseUnaryExp` is called directly?
+           
+           `parseMulExp` -> `parseUnaryExp`.
+           
+           If `getTokenType()` is `(`, `parseUnaryExp` goes to `PrimaryExp`.
+           
+           There is no way `UnaryExp` error path is taken for `(`.
+           
+           Therefore, `PrimaryExp` returns `null`.
+           
+           Therefore `exps.get(0)` is `null`.
+           
+           Therefore `i` should NOT be added.
+           
+           BUT `i` IS added in Buggy Output.
+           
+           This implies `exps.get(0)` is NOT null.
+           
+           Contradiction.
+           
+           Unless... `parseExp` did NOT return null.
+           
+           Did `PrimaryExp` return non-null?
+           
+           Only if it didn't encounter an error.
+           
+           If it didn't encounter an error, why `j`?
+           
+           Maybe `j` is added elsewhere?
+           
+           `parseStmt` -> `if` -> `cond` -> `j`.
+           
+           Line 20 is not an `if`.
+           
+           I suspect the bug is in `Compiler.java`'s deduplication or `Error` collection, OR `PrimaryExp` is NOT returning null in some cases.
+           
+           Actually, look at `PrimaryExp` again.
+           
+           ```java
+           if (getTokenType() == TokenType.LPARENT) {
+               // ...
+               if (getTokenType() == TokenType.RPARENT) {
+                   // ...
+               } else {
+                   // error j
+                   // ...
+                   return null;
+               }
+           }
+           ```
+           
+           It definitely returns null.
+           
+           The only explanation for `20 i` is if `tryParseLValExpStmt` is NOT the one adding it, but `tryParseExpStmt` is?
+           
+           In `tryParseExp

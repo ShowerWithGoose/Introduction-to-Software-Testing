@@ -1,0 +1,966 @@
+Based on the problem description, the test case input, the buggy output, and the expected output, here is the analysis:
+
+1.  **Problem Summary**: The program performs syntax analysis. It should output lexical tokens and specific non-terminal syntax components (like `<Block>`, `<Stmt>`, `<Exp>`, etc.) in the order they are recognized.
+2.  **Discrepancy Analysis**:
+    *   The **Buggy Output** stops after parsing the first two empty blocks inside `main`. It outputs `<Block>` and `<Stmt>` for the first `{ }` and the second `{ { } }` structure partially, but then immediately outputs `RBRACE }` and `<Block>` for the main function block, followed by `<MainFuncDef>` and `<CompUnit>`. It completely misses the `printf` statement, the nested blocks with `int a = 5;`, the `if` statement, and the `return` statement.
+    *   The **Expected Output** continues to parse all these remaining statements correctly.
+    *   Looking at the **Buggy Output** more closely:
+        ```
+        LBRACE {
+        LBRACE {
+        RBRACE }
+        <Block>
+        <Stmt>
+        LBRACE {
+        RBRACE }
+        <Block>
+        <Stmt>
+        RBRACE }
+        <Block>
+        <MainFuncDef>
+        <CompUnit>
+        ```
+        The parser seems to have exited the `main` function's block prematurely or failed to parse the subsequent items in the block.
+    *   Let's look at the `parseBlock` method in `Parser.java`.
+        ```java
+        private BlockNode parseBlock() {
+            List<BlockItemNode> blockItemNodes = null;
+            match("LBRACE");
+            while (!match("RBRACE")) {
+                if (blockItemNodes == null)
+                    blockItemNodes = new ArrayList<>();
+                blockItemNodes.add(parseBlockItem());
+            }
+            return new BlockNode(blockItemNodes);
+        }
+        ```
+        The `match` method returns `true` if the current token matches and advances, or `false` if it doesn't match (and potentially records an error).
+        The loop condition is `!match("RBRACE")`. This means: "If the current token is NOT `RBRACE`, enter the loop body."
+        Inside the loop, it calls `parseBlockItem()`.
+        
+    *   Let's look at `parseBlockItem`:
+        ```java
+        private BlockItemNode parseBlockItem() {
+            if (isDecl()) {
+                return new DeclBlock(parseDecl());
+            } else {
+                return new StmtBlock(parseStmt());
+            }
+        }
+        ```
+        
+    *   Let's look at `isDecl`:
+        ```java
+        private boolean isDecl() {
+            return currentToken().type.equals("CONSTTK") || (isBType() && peekNextToken().type.equals("IDENFR") && !Objects.requireNonNull(peekNextToken(2)).type.equals("LPARENT"));
+        }
+        ```
+        
+    *   Let's look at the input again around where it fails.
+        After parsing the second empty block `{ { } }`, the next token is `PRINTFTK printf`.
+        `isDecl()` checks if it's `CONSTTK` (No) or `BType` (`INTTK`/`CHARTK`) followed by `IDENFR` not followed by `LPARENT`.
+        `PRINTFTK` is not a BType. So `isDecl()` returns `false`.
+        Then `parseBlockItem` calls `parseStmt()`.
+        
+    *   In `parseStmt()`:
+        ```java
+        public StmtNode parseStmt() {
+            if (match("LBRACE")) { ... }
+            else if (match("IFTK")) { ... }
+            else if (match("FORTK")) { ... }
+            else if (match("BREAKTK")) { ... }
+            else if (match("CONTINUETK")) { ... }
+            else if (match("RETURNTK")) { ... }
+            else if (match("PRINTFTK")) {
+                // printf '(' StringConst {',' Exp} ')' ';'
+                match("LPARENT");
+                String stringConst = currentToken().s;
+                match("STRCON");
+                List<ExpNode> expList = new ArrayList<>();
+                while (match("COMMA")) {
+                    expList.add(parseExp());
+                }
+                match("RPARENT");
+                match("SEMICN");
+                return new PrintStmt(stringConst, expList);
+            } else {
+               // ... handles assignments and expression statements
+            }
+        }
+        ```
+        This looks correct for `printf`.
+        
+    *   Why did the buggy output stop?
+        Let's re-examine the buggy output sequence:
+        1. `int testblock;` -> Parsed correctly.
+        2. `int main() {` -> Parsed correctly.
+        3. `{ }` -> Parsed as Block/Stmt.
+        4. `{ { } }` -> Parsed as Block/Stmt.
+           Wait, the input is:
+           ```c
+           {
+           }
+           {
+               {
+               }
+           }
+           ```
+           The buggy output shows:
+           ```
+           LBRACE {
+           RBRACE }
+           <Block>
+           <Stmt>
+           LBRACE {
+           RBRACE }
+           <Block>
+           <Stmt>
+           RBRACE }
+           <Block>
+           ```
+           This corresponds to:
+           - First `{ }` inside main.
+           - Second `{ ... }` inside main. Inside this second block, there is `{ }`.
+           
+           The parser parsed the outer `{` of the second block. Then it parsed the inner `{ }` as a statement. Then it encountered the closing `}` of the second block.
+           
+           If the parser stopped here, it means `parseBlock` for `main` terminated.
+           The loop in `parseBlock` is `while (!match("RBRACE"))`.
+           If `match("RBRACE")` returns `true`, the loop terminates.
+           
+           Is it possible that `parseStmt` consumed the `RBRACE` incorrectly? No, `parseStmt` for a block calls `parseBlock` recursively.
+           
+           Let's look at `parseBlock` again.
+           ```java
+           while (!match("RBRACE")) {
+               // ...
+               blockItemNodes.add(parseBlockItem());
+           }
+           ```
+           
+           If `parseBlockItem` throws an exception or gets stuck, it might stop. But there's no indication of that.
+           
+           Let's look at the `match` function in `Parser.java`:
+           ```java
+           private boolean match(String expectedType) {
+               if (currentToken().type.equals(expectedType)) {
+                   advance();
+                   return true;
+               }
+               else{
+                   switch (expectedType){
+                       case "SEMICN":
+                           Compiler.isError = true;
+                           Compiler.errors.add(new Errors(latestToken().n, 'i'));
+                           break;
+                       case "RBRACK":
+                           Compiler.isError = true;
+                           Compiler.errors.add(new Errors(latestToken().n, 'k'));
+                           break;
+                       case "RPARENT":
+                           Compiler.isError = true;
+                           Compiler.errors.add(new Errors(latestToken().n, 'j'));
+                           break;
+                   }
+               }
+               return false;
+           }
+           ```
+           
+           There is a subtle bug in how `parseBlock` interacts with `match`.
+           When `match("RBRACE")` is called in the `while` condition:
+           - If the current token IS `RBRACE`, it advances and returns `true`. The `!true` becomes `false`, loop ends. Correct.
+           - If the current token IS NOT `RBRACE`, it returns `false`. The `!false` becomes `true`, loop continues. Correct.
+           
+           However, look at `parseStmt` when it handles a block:
+           ```java
+           if (match("LBRACE")) {
+               // Block → '{' { BlockItem } '}'
+               BlockNode block = parseBlock();
+               return new BlockStmt(block);
+           }
+           ```
+           This consumes `{`, calls `parseBlock`, which consumes contents and the final `}`, and returns.
+           
+           Let's trace the execution for the second block `{ { } }`:
+           1. `parseBlock` (for main) sees `{` (start of 2nd block). `match("RBRACE")` returns false. Loop enters.
+           2. `parseBlockItem` calls `parseStmt`.
+           3. `parseStmt` sees `{`. `match("LBRACE")` returns true. Advances past `{`.
+           4. `parseStmt` calls `parseBlock()` (inner block).
+           5. Inner `parseBlock` sees `{` (start of 3rd block). `match("RBRACE")` returns false. Loop enters.
+           6. Inner `parseBlockItem` calls `parseStmt`.
+           7. Inner `parseStmt` sees `{`. `match("LBRACE")` returns true. Advances past `{`.
+           8. Inner `parseStmt` calls `parseBlock()` (empty block).
+           9. Empty `parseBlock` sees `}`. `match("RBRACE")` returns true. Loop ends. Returns empty block.
+           10. Inner `parseStmt` returns `BlockStmt`.
+           11. Back to Inner `parseBlock` (step 5). It adds the item.
+           12. Inner `parseBlock` loops. Sees `}` (end of 2nd block's content? No, end of 3rd block was consumed in step 9. The current token is `}` closing the 2nd block).
+           Wait.
+           Input: `{` (2nd) `{` (3rd) `}` (3rd) `}` (2nd).
+           
+           Trace again:
+           - Main Block Parser is at `{` (2nd).
+           - Calls `parseStmt`.
+           - `parseStmt` matches `{` (2nd). Advances. Pos is now at `{` (3rd).
+           - `parseStmt` calls `parseBlock`.
+           - Inner Block Parser (for 2nd block content) is at `{` (3rd).
+           - `match("RBRACE")` checks `{` (3rd). False. Loop enters.
+           - `parseBlockItem` -> `parseStmt`.
+           - `parseStmt` matches `{` (3rd). Advances. Pos is now at `}` (3rd).
+           - `parseStmt` calls `parseBlock`.
+           - Innermost Block Parser (for 3rd block content) is at `}` (3rd).
+           - `match("RBRACE")` checks `}` (3rd). True. Advances. Pos is now at `}` (2nd). Loop ends.
+           - Returns empty block.
+           - Back to `parseStmt` (handling 3rd block). Returns `BlockStmt`.
+           - Back to Inner Block Parser (for 2nd block content). Adds item.
+           - Loops. `match("RBRACE")` checks `}` (2nd). True. Advances. Pos is now at `PRINTFTK`. Loop ends.
+           - Returns block containing one item (the 3rd block).
+           - Back to `parseStmt` (handling 2nd block). Returns `BlockStmt`.
+           - Back to Main Block Parser. Adds item.
+           - Loops. `match("RBRACE")` checks `PRINTFTK`. False. Loop continues.
+           
+           So far so good. The parser SHOULD continue to `PRINTFTK`.
+           
+           Why does the output stop?
+           
+           Let's look at the `Compiler.java` and `ASTPrinter`.
+           
+           In `ASTPrinter.visitBlock`:
+           ```java
+           @Override
+           public String visitBlock(BlockNode blockNode) throws IOException {
+               bw.write("LBRACE {\n" );
+               if (blockNode.blockItems != null)
+                   for (BlockItemNode blockItemNode : blockNode.blockItems)
+                       blockItemNode.accept(this);
+               bw.write("RBRACE }\n" );
+
+               bw.write("<Block>\n");
+               return null;
+           }
+           ```
+           
+           In `ASTPrinter.visitStmtBlock`:
+           ```java
+           @Override
+           public String visitStmtBlock(StmtBlock stmtBlock) throws IOException {
+               stmtBlock.getStmtNode().accept(this);
+               //bw.write("<BlockItem>\n");
+               return null;
+           }
+           ```
+           
+           In `ASTPrinter.visitBlockStmt`:
+           ```java
+           @Override
+           public String visitBlockStmt(BlockStmt blockStmt) throws IOException {
+               blockStmt.getBlock().accept(this);
+
+               bw.write("<Stmt>\n");
+               return null;
+           }
+           ```
+           
+           This structure seems fine.
+           
+           Is it possible the error is in `parseBlock` logic regarding `null` list?
+           
+           ```java
+           private BlockNode parseBlock() {
+               List<BlockItemNode> blockItemNodes = null;
+               match("LBRACE");
+               while (!match("RBRACE")) {
+                   if (blockItemNodes == null)
+                       blockItemNodes = new ArrayList<>();
+                   blockItemNodes.add(parseBlockItem());
+               }
+               return new BlockNode(blockItemNodes);
+           }
+           ```
+           
+           If the block is empty, `blockItemNodes` remains `null`.
+           
+           Let's check `visitBlock` again.
+           `if (blockNode.blockItems != null)`
+           
+           If `blockItems` is null, it skips the loop. Writes `RBRACE }` and `<Block>`. This is correct for empty blocks.
+           
+           So why does it stop?
+           
+           Let's look at the `Parser.java` `parseCompUnit` method.
+   
+           ```java
+           public CompUnitNode parseCompUnit() {
+               List<DeclNode> declNodes = new ArrayList<>();
+               List<FuncDefNode> funcDefNodes = new ArrayList<>();
+
+               // Parse declarations
+               while (isDecl()) {
+                   declNodes.add(parseDecl());
+               }
+
+               while (isFuncDef()) {
+                   funcDefNodes.add(parseFuncDef());
+               }
+
+               MainFuncDefNode mainFuncDefNode = parseMainFuncDef();
+
+               return new CompUnitNode(declNodes.isEmpty() ? null : declNodes,
+                       funcDefNodes.isEmpty() ? null : funcDefNodes,
+                       mainFuncDefNode);
+           }
+           ```
+           
+           And `parseMainFuncDef`:
+           ```java
+           private MainFuncDefNode parseMainFuncDef() {
+               match("INTTK");
+               match("MAINTK");
+               match("LPARENT");
+               match("RPARENT");
+               BlockNode blockNode = parseBlock();
+               return new MainFuncDefNode(blockNode);
+           }
+           ```
+           
+           Everything looks standard.
+           
+           Let's look closely at the `match` method again.
+           
+           ```java
+           private boolean match(String expectedType) {
+               if (currentToken().type.equals(expectedType)) {
+                   advance();
+                   return true;
+               }
+               else{
+                   switch (expectedType){
+                       case "SEMICN":
+                           Compiler.isError = true;
+                           Compiler.errors.add(new Errors(latestToken().n, 'i'));
+                           break;
+                       case "RBRACK":
+                           Compiler.isError = true;
+                           Compiler.errors.add(new Errors(latestToken().n, 'k'));
+                           break;
+                       case "RPARENT":
+                           Compiler.isError = true;
+                           Compiler.errors.add(new Errors(latestToken().n, 'j'));
+                           break;
+                   }
+               }
+               return false;
+           }
+           ```
+           
+           Wait! Look at `parseBlock`:
+           ```java
+           while (!match("RBRACE")) {
+               // ...
+           }
+           ```
+           
+           If `match("RBRACE")` fails (returns false), it does NOT advance.
+           
+           Now look at `parseStmt` for `LBRACE`:
+           ```java
+           if (match("LBRACE")) {
+               BlockNode block = parseBlock();
+               return new BlockStmt(block);
+           }
+           ```
+           
+           If `match("LBRACE")` succeeds, it advances.
+           
+           Is there any case where `parseBlockItem` or `parseStmt` does NOT consume a token when it should, leading to an infinite loop? Or consumes too many?
+           
+           If `parseStmt` encounters a token it doesn't expect, what happens?
+           
+           In the `else` branch of `parseStmt`:
+           ```java
+           else {
+               int temp = pos, f;
+               for (f = pos; !tokens.get(f).type.equals("SEMICN") && tokens.get(f).n == tokens.get(pos).n; f++){
+                   if (tokens.get(f).type.equals("ASSIGN")){
+                       temp = f;
+                       break;
+                   }
+               }
+               if (temp > pos){
+                   // ... assignment or getint/getchar
+               }
+               else {
+                   // [Exp] ';'
+                   ExpNode exp;
+
+                   if (currentToken().type.equals("SEMICN"))
+                       exp = null;
+                   else
+                       exp = parseExp();
+                   match("SEMICN");
+                   return new ExpStmt(exp);
+               }
+           }
+           ```
+           
+           If `parseExp()` fails to parse anything (e.g. if current token is invalid for an expression), it might return a node but not advance, or crash.
+           
+           However, `PRINTFTK` is handled explicitly before this `else` block.
+           
+           Let's look at the `printf` handling again:
+           ```java
+           else if (match("PRINTFTK")) {
+               // printf '(' StringConst {',' Exp} ')' ';'
+               match("LPARENT");
+               String stringConst = currentToken().s;
+               match("STRCON");
+               List<ExpNode> expList = new ArrayList<>();
+               while (match("COMMA")) {
+                   expList.add(parseExp());
+               }
+               match("RPARENT");
+               match("SEMICN");
+               return new PrintStmt(stringConst, expList);
+           }
+           ```
+           
+           If `match("PRINTFTK")` returns true, it advances.
+           Then `match("LPARENT")` must succeed.
+           Then `match("STRCON")` must succeed.
+           
+           If any of these fail, `match` returns false but does NOT advance.
+           
+           If `match("STRCON")` fails, `currentToken().s` might be accessed on a token that isn't STRCON. But more importantly, the parser state is stuck.
+           
+           But wait, look at the Buggy Output again.
+           
+           ```
+           LBRACE {
+           RBRACE }
+           <Block>
+           <Stmt>
+           RBRACE }
+           <Block>
+           <MainFuncDef>
+           <CompUnit>
+           ```
+           
+           It seems `parseBlock` for `main` terminated after parsing the second block item.
+           
+           The second block item was `{ { } }`.
+           
+           After parsing this, the current token SHOULD be `PRINTFTK`.
+           
+           The loop in `parseBlock` checks `!match("RBRACE")`.
+           Current token is `PRINTFTK`. `match("RBRACE")` returns `false`.
+           Loop continues.
+           `parseBlockItem` is called.
+           `isDecl()` is checked. `PRINTFTK` is not a decl.
+           `parseStmt()` is called.
+           
+           In `parseStmt()`:
+           `match("LBRACE")` -> False.
+           `match("IFTK")` -> False.
+           ...
+           `match("PRINTFTK")` -> **True**.
+           
+           So it SHOULD enter the printf block.
+           
+           Why did it not?
+           
+           Is it possible that `parseBlock` returned early?
+           
+           Let's look at `parseBlock` again.
+           
+           ```java
+           private BlockNode parseBlock() {
+               List<BlockItemNode> blockItemNodes = null;
+               match("LBRACE");
+               while (!match("RBRACE")) {
+                   if (blockItemNodes == null)
+                       blockItemNodes = new ArrayList<>();
+                   blockItemNodes.add(parseBlockItem());
+               }
+               return new BlockNode(blockItemNodes);
+           }
+           ```
+           
+           There is no early return.
+           
+           Is it possible that `parseBlockItem` threw an exception?
+           If `parseStmt` crashed, the program would likely terminate or produce no output file. But we have partial output.
+           
+           Let's look at `Compiler.java`.
+           
+           ```java
+           ASTNode astNode = parser.parseCompUnit();
+
+           if (Compiler.isError)
+           {
+               // write errors
+           }
+           else
+           {
+               // write parser.txt
+               ASTPrinter astPrinter = new ASTPrinter(bw);
+               astNode.accept(astPrinter);
+           }
+           ```
+           
+           If `Compiler.isError` became true during parsing, it would write to `error.txt` instead of `parser.txt`.
+           
+           Did an error occur?
+           
+           In `match`, errors are only added for missing `SEMICN`, `RBRACK`, `RPARENT`.
+           
+           Missing `RBRACE` is NOT an error in `match`.
+           
+           However, if `parseBlock` encounters a token that is not `RBRACE` and not a valid `BlockItem`, what happens?
+           
+           `parseBlockItem` calls `parseStmt`.
+           
+           If `parseStmt` cannot match anything, it falls through to the `else` block.
+           
+           In the `else` block:
+           
+           ```java
+           else {
+               int temp = pos, f;
+               for (f = pos; !tokens.get(f).type.equals("SEMICN") && tokens.get(f).n == tokens.get(pos).n; f++){
+                   if (tokens.get(f).type.equals("ASSIGN")){
+                       temp = f;
+                       break;
+                   }
+               }
+               if (temp > pos){
+                   // ...
+               }
+               else {
+                   // [Exp] ';'
+                   ExpNode exp;
+
+                   if (currentToken().type.equals("SEMICN"))
+                       exp = null;
+                   else
+                       exp = parseExp();
+                   match("SEMICN");
+                   return new ExpStmt(exp);
+               }
+           }
+           ```
+           
+           If `currentToken` is `PRINTFTK`, it goes to `else`.
+           `currentToken.type` is not `SEMICN`.
+           So it calls `parseExp()`.
+           
+           `parseExp()` calls `parseAddExp()`.
+           
+           `parseAddExp()` calls `parseMulExp()`.
+           
+           `parseMulExp()` calls `parseUnaryExp()`.
+           
+           `parseUnaryExp()`:
+           
+           ```java
+           public UnaryExpNode parseUnaryExp() {
+               System.out.println(pos+currentToken().s);
+               if (isUnaryOp()) { ... }
+
+               if (currentToken().type.equals("IDENFR")) {
+                   // ...
+               }
+               return new PrimaryUExp(parsePrimaryExp());
+           }
+           ```
+           
+           `PRINTFTK` is not `IDENFR`. Not unary op.
+           
+           So it calls `parsePrimaryExp()`.
+           
+           `parsePrimaryExp()`:
+           
+           ```java
+           private PrimaryExpNode parsePrimaryExp() {
+               ExpNode expNode;
+               if (match("LPARENT")) { ... }
+               else if (match("INTCON")) ...
+               else if (match("CHRCON")) ...
+               else
+                   return new LvalExp(parseLVal());
+           }
+           ```
+           
+           `PRINTFTK` is not `LPARENT`, `INTCON`, `CHRCON`.
+           
+           So it calls `parseLVal()`.
+           
+           `parseLVal()`:
+           
+           ```java
+           private LValNode parseLVal() {
+               String ident;
+               ExpNode expNode = null;
+               match("IDENFR");
+               ident = latestToken().s;
+               // ...
+           }
+           ```
+           
+           `match("IDENFR")` is called with `PRINTFTK`.
+           
+           `match` returns `false`. It does NOT advance.
+           
+           `latestToken()` returns the token BEFORE `PRINTFTK`.
+           
+           If `pos` was at `PRINTFTK`, `latestToken` is the previous token.
+           
+           Then `ident = latestToken().s`.
+           
+           Then it returns `new LvalExp(...)`.
+           
+           So `parsePrimaryExp` returns a `LvalExp` node based on the WRONG token (the previous one).
+           
+           Then `parseUnaryExp` returns.
+           Then `parseMulExp` returns.
+           Then `parseAddExp` returns.
+           Then `parseExp` returns.
+           
+           Back in `parseStmt` (else block):
+           
+           `exp` is assigned.
+           
+           `match("SEMICN")` is called.
+           
+           Current token is still `PRINTFTK`.
+           
+           `match("SEMICN")` returns `false`.
+           
+           Error 'i' (missing semicolon) is recorded!
+           
+           `Compiler.isError` becomes `true`.
+           
+           `parseStmt` returns `new ExpStmt(exp)`.
+           
+           Back in `parseBlockItem`, it returns `StmtBlock`.
+           
+           Back in `parseBlock`, it adds the item.
+           
+           Loop continues.
+           
+           Next token is STILL `PRINTFTK` (because `match("SEMICN")` didn't advance, and nothing else did).
+           
+           Infinite loop?
+           
+           If it's an infinite loop, the program would hang.
+           
+           But the output file was written.
+           
+           Ah, look at `Compiler.java`:
+           
+           ```java
+           ASTNode astNode = parser.parseCompUnit();
+           
+           if (Compiler.isError)
+           {
+               // write error.txt
+           }
+           else
+           {
+               // write parser.txt
+           }
+           ```
+           
+           If `Compiler.isError` is true, it writes `error.txt`.
+           
+           The problem says "Buggy Output" is what was produced. It looks like `parser.txt` content.
+           
+           This implies `Compiler.isError` was FALSE.
+           
+           How can `Compiler.isError` be false if `match("SEMICN")` failed?
+           
+           Wait, `match` ONLY sets error for `SEMICN`, `RBRACK`, `RPARENT`.
+           
+           Yes, it DOES set error for `SEMICN`.
+           
+           ```java
+           case "SEMICN":
+               Compiler.isError = true;
+               Compiler.errors.add(new Errors(latestToken().n, 'i'));
+               break;
+           ```
+           
+           So `Compiler.isError` SHOULD be true.
+           
+           If `Compiler.isError` is true, the code writes to `error.txt`.
+           
+           The "Buggy Output" provided in the prompt looks like the content of `parser.txt` (lexical tokens and syntax components).
+           
+           This suggests that either:
+           1. The "Buggy Output" shown is actually from a run where `isError` was false, meaning the error path wasn't taken.
+           2. OR, the "Buggy Output" is truncated/incomplete because the program crashed or stopped writing.
+           
+           But looking at the end of the Buggy Output:
+           
+           ```
+           <Block>
+           <MainFuncDef>
+           <CompUnit>
+           ```
+           
+           This indicates that `parseCompUnit` FINISHED.
+           
+           If `parseCompUnit` finished, and `isError` was true, it would write `error.txt`.
+           
+           If `isError` was false, it would write `parser.txt`.
+           
+           The fact that `parser.txt` contains incomplete output suggests that the AST was built incompletely, OR the printer stopped early.
+           
+           But `ASTPrinter` just traverses the AST. If the AST is complete, it prints everything.
+           
+           If the AST is incomplete, it means the parser stopped building it.
+           
+           How can the parser stop building the AST but still return from `parseCompUnit`?
+           
+           Only if `parseBlock` returned early.
+           
+           We established `parseBlock` only returns when `match("RBRACE")` is true.
+           
+           For `match("RBRACE")` to be true, the current token MUST be `RBRACE`.
+           
+           But the current token was `PRINTFTK`.
+           
+           Unless... `parseStmt` CONSUMED `PRINTFTK` and subsequent tokens, and left the position at `RBRACE`.
+           
+           Let's re-trace `parseStmt` with `PRINTFTK`.
+           
+           If `parseStmt` fell into the `else` block (expression statement), it called `parseExp`.
+           
+           `parseExp` -> `parseAddExp` -> ... -> `parsePrimaryExp` -> `parseLVal`.
+           
+           `parseLVal` called `match("IDENFR")`. Failed. Did not advance.
+           
+           So `parseLVal` used `latestToken` (previous token).
+           
+           This is definitely wrong behavior, but it doesn't consume `PRINTFTK`.
+           
+           So `pos` is still at `PRINTFTK`.
+           
+           Then `match("SEMICN")` failed. Did not advance.
+           
+           So `pos` is still at `PRINTFTK`.
+           
+           So `parseStmt` returns.
+           
+           `parseBlock` loops.
+           
+           `match("RBRACE")` checks `PRINTFTK`. Fails.
+           
+           Infinite loop.
+           
+           If it's an infinite loop, the program never finishes `parseCompUnit`.
+           
+           So `Compiler.main` never reaches the file writing part.
+           
+           So no output file would be generated, or it would be empty/partial if buffered.
+           
+           The "Buggy Output" shows content up to `<CompUnit>`.
+           
+           This implies `astNode.accept(astPrinter)` WAS called.
+           
+           This implies `parseCompUnit` RETURNED.
+           
+           This implies the parser DID NOT hang.
+           
+           This implies `match("RBRACE")` DID return true.
+           
+           This implies the current token WAS `RBRACE`.
+           
+           How did the current token become `RBRACE`?
+           
+           It must have been advanced to.
+           
+           Who advanced it?
+           
+           If `parseStmt` didn't advance, who did?
+           
+           Maybe `parseExp` DID advance?
+           
+           Let's look at `parsePrimaryExp` again.
+           
+           ```java
+           else
+               return new LvalExp(parseLVal());
+           ```
+           
+           `parseLVal`:
+           
+           ```java
+           match("IDENFR");
+           ident = latestToken().s;
+           if (match("LBRACK")) { ... }
+           return new LValNode(ident, expNode);
+           ```
+           
+           If `match("IDENFR")` fails, `pos` is unchanged.
+           
+           So `parseLVal` does not advance.
+           
+           So `parsePrimaryExp` does not advance.
+           
+           So `parseUnaryExp` does not advance.
+           
+           So `parseMulExp` does not advance.
+           
+           So `parseAddExp` does not advance.
+           
+           So `parseExp` does not advance.
+           
+           So `parseStmt` (else block) does not advance past `PRINTFTK`.
+           
+           So `match("SEMICN")` checks `PRINTFTK`. Fails.
+           
+           So `parseStmt` returns.
+           
+           So `parseBlock` loops.
+           
+           So `match("RBRACE")` checks `PRINTFTK`. Fails.
+           
+           Infinite loop.
+           
+           THEREFORE, the program should hang.
+           
+           But the output exists.
+           
+           Is it possible that `isDecl()` returned TRUE for `PRINTFTK`?
+           
+           ```java
+           private boolean isDecl() {
+               return currentToken().type.equals("CONSTTK") || (isBType() && peekNextToken().type.equals("IDENFR") && !Objects.requireNonNull(peekNextToken(2)).type.equals("LPARENT"));
+           }
+           ```
+           
+           `PRINTFTK` is not `CONSTTK`.
+           `isBType()` checks `INTTK` or `CHARTK`. `PRINTFTK` is neither.
+           
+           So `isDecl()` is false.
+           
+           Is it possible that `parseBlockItem` threw an exception that was caught somewhere? No catch blocks.
+           
+           Is it possible that `Compiler.isError` prevented the infinite loop? No, `isError` is just a flag.
+           
+           Wait. Look at `Lexer.java`.
+           
+           Does `Lexer` produce `PRINTFTK`?
+           
+           Yes.
+           
+           Is it possible the input file `testfile.txt` has different content?
+           
+           The prompt provides the input.
+           
+           Let's look at the Buggy Output again.
+           
+           It ends with `<CompUnit>`.
+           
+           In `ASTPrinter.visitCompUnit`:
+           
+           ```java
+           bw.write("<CompUnit>");
+           bw.close();
+           ```
+           
+           It closes the buffer.
+           
+           If the program hung, `bw.close()` would not be called.
+           
+           So the program DID finish.
+           
+           The only way `parseBlock` finishes is if `match("RBRACE")` returns true.
+           
+           The only way `match("RBRACE")` returns true is if `currentToken` is `RBRACE`.
+           
+           So the parser SKIPPED `PRINTFTK` ... `return 0;`.
+           
+           How?
+           
+           Maybe `parseStmt` matched something else?
+           
+           What if `PRINTFTK` was NOT the next token?
+           
+           What if the lexer failed to tokenize `printf`?
+           
+           If `printf` was tokenized as `IDENFR`, then:
+           
+           `isDecl()` -> False.
+           
+           `parseStmt()` -> `else` block.
+           
+           `parseExp()` -> `parseLVal()` -> `match("IDENFR")` SUCCESS!
+           
+           Advances past `printf`.
+           
+           `parseLVal` returns.
+           
+           `parsePrimaryExp` returns.
+           
+           `parseUnaryExp` returns.
+           
+           `parseMulExp` returns.
+           
+           `parseAddExp` returns.
+           
+           `parseExp` returns.
+           
+           Back in `parseStmt` (else block).
+           
+           `match("SEMICN")`.
+           
+           Current token is `(`.
+           
+           `match("SEMICN")` fails. Error 'i'.
+           
+           `Compiler.isError` = true.
+           
+           `parseStmt` returns.
+           
+           `parseBlock` loops.
+           
+           `match("RBRACE")`. Current token `(`. Fails.
+           
+           Infinite loop again.
+           
+           So even if `printf` is `IDENFR`, it hangs.
+           
+           UNLESS... `parseExp` consumes MORE tokens.
+           
+           `parseExp` -> `parseAddExp`.
+           
+           `parseAddExp` -> `parseMulExp`.
+           
+           `parseMulExp` -> `parseUnaryExp`.
+           
+           `parseUnaryExp`:
+           
+           ```java
+           if (currentToken().type.equals("IDENFR")) {
+               String ident = currentToken().s;
+               advance();
+
+               if (match("LPARENT")) {
+                   // Function call!
+                   FuncRParamsNode funcRParamsNode = null;
+                   if (!currentToken().type.equals("RPARENT")) {
+                       funcRParamsNode = parseFuncRParams();
+                   }
+                   match("RPARENT");
+                   return new IdentUExp(ident, funcRParamsNode);
+               } else {
+                   pos--;
+                   return new PrimaryUExp(parsePrimaryExp());
+               }
+           }
+           ```
+           
+           If `printf` is `IDENFR`:
+           
+           1. `ident = "printf"`. Advance. Pos at `(`

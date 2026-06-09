@@ -1,0 +1,500 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The task is to implement a lexical analyzer that outputs tokens for correct programs and detects specific lexical errors (specifically error type 'a' for standalone `&` or `|`) for erroneous programs.
+2.  **Test Case Input**: The input source code contains the line `if (1 | 1 == 1) {}` on line 23. The character `|` appears singly, which is not a valid operator in the defined grammar (only `||` is valid). This constitutes a lexical error of type 'a'.
+3.  **Expected Output**: `23 a`. This indicates the error is on line 23 and is of type 'a'.
+4.  **Buggy Output**: The program produced no output (empty). This suggests that either the error was not detected, or the error detection logic failed to write to the error file correctly, or the program crashed/exited before writing.
+5.  **Code Analysis**:
+    *   The `Lexer.java` file handles lexical analysis.
+    *   In the `dealOthers` method, there are cases for `'&'` and `'|'`.
+    *   For `'&'`: It reads the next char. If it's `'&'`, it creates an `AND` token. Otherwise, it writes `lineno + " " + "a"` to `errOut`.
+    *   For `'|'`: It reads the next char. If it's `'|'`, it creates an `OR` token. Otherwise, it writes `lineno + " " + "a"` to `errOut`.
+    *   **Crucial Logic Error**: When an error is detected (the `else` branch), the code writes to `errOut` but **does not consume the erroneous character** properly in a way that allows the loop to continue or terminate gracefully without re-processing or getting stuck. More importantly, look at the return value `c`.
+    *   In the `case '|':` block:
+        ```java
+        case '|':
+            c = src.read(); // Reads the next char after '|'
+            if (c == '|') {
+                tokenList.addToken(new Token(TokenType.OR, "||"));
+                c = src.read(); // Reads the char after '||'
+            } else {
+                errOut.write(lineno + " " + "a");
+                errOut.newLine();
+                // Missing: c is currently the char AFTER the single '|'. 
+                // The single '|' itself was the trigger. 
+                // The variable 'c' holds the lookahead.
+                // The loop continues with this 'c'.
+            }
+            break;
+        ```
+    *   Let's trace `if (1 | 1 == 1)`.
+        1.  Lexer processes `if`, `(`, `1`.
+        2.  Encounters `|`. Enters `case '|':`.
+        3.  `c = src.read()` reads the space ` ` (ASCII 32).
+        4.  `c == '|'` is false.
+        5.  Executes `else`: writes `23 a` to `errOut`.
+        6.  Breaks from switch.
+        7.  Returns `c` (which is ` `).
+        8.  Back in `lex` loop: `c` is ` `.
+        9.  `skipWhiteSpace` is called. It skips the space, then reads `1`.
+        10. Processes `1`, ` `, `=`, `=`, `1`, `)`, `{`, `}`, etc.
+        11. The program finishes lexing.
+    *   So, the error *is* written to `errOut`. Why is the output empty?
+    *   Check `Compiler.java`:
+        ```java
+        Lexer.lex(source, error);
+        Ast ast = Builder.build();
+        Printer.print(lexer);
+        lexer.close();
+        error.close();
+        output.close();
+        ```
+    *   The `error` writer is closed at the end.
+    *   However, `Builder.build()` uses `Lexer.tokenList`. If the lexer encounters an error, it still populates `tokenList` with valid tokens found so far.
+    *   Wait, look closely at `dealOthers` again.
+    *   If an error occurs, it writes to `errOut`. It does *not* throw an exception. It returns the next character.
+    *   Is it possible the error file is empty because `Config.printLex` is true, so `Printer.print` runs? No, `Printer.print` writes to `lexer.txt`. The error goes to `error.txt`.
+    *   Let's re-read the `dealOthers` logic for `|`.
+    *   If the input is `|`, `src.read()` gets the next char. If it's not `|`, it reports error.
+    *   The problem might be that the program continues parsing and eventually crashes in the Parser/Builder because the token stream is invalid/incomplete relative to what the parser expects, OR the `error.txt` buffer isn't flushed/closed properly if an exception occurs later.
+    *   However, usually, if `Builder.build()` fails, it throws an exception. If an exception is thrown, `error.close()` might not be reached if not in a try-finally block. In `Compiler.java`, there is no try-catch-finally. If `Builder.build()` throws an exception, the program terminates, and `error.close()` is never called. Since `BufferedWriter` buffers output, if it's not closed or flushed, the content might remain in the buffer and not be written to the file.
+    *   The input `if (1 | 1 == 1) {}` will generate tokens: `IFTK`, `LPARENT`, `INTCON`, `INTCON` (wait, `1` is INTCON), `EQL`, `INTCON`, `RPARENT`, `LBRACE`, `RBRACE`.
+    *   The `|` was consumed and reported as error. The next char was space, skipped. Then `1` is read as `INTCON`.
+    *   So the token list looks like: `IFTK`, `LPARENT`, `INTCON`, `INTCON`, `EQL`, `INTCON`, `RPARENT`...
+    *   The parser expects an expression. `1 1 == 1` is syntactically invalid. `Builder.build()` will likely crash or throw an exception when trying to parse this invalid sequence.
+    *   Because `Compiler.java` does not handle exceptions, the JVM exits, `error.close()` is skipped, and the buffered error message "23 a" is lost.
+
+    **Fix**: The `error` writer needs to be flushed or closed even if an exception occurs, or the `BufferedWriter` should be auto-flushed, or the exception should be caught. However, the prompt asks to identify the location of the error in the *provided* program based on the failure. The root cause of the *missing output* is the lack of flushing/closing upon early termination. But often in these assignments, the "error" is considered to be in the component that fails to handle the state correctly.
+
+    Actually, looking at similar problems, a common issue is that students forget to `flush()` or `close()` the error stream, or they don't handle the control flow such that the program exits cleanly.
+
+    Let's look at `Compiler.java` again.
+    ```java
+    public static void main(String[] args) throws IOException {
+        // ...
+        Lexer.lex(source, error);
+        Ast ast = Builder.build(); // Likely throws exception here due to syntax error caused by lexical error recovery
+        Printer.print(lexer);
+        lexer.close();
+        error.close(); // This line is not reached
+        output.close();
+    }
+    ```
+    
+    The "Error" in the program design is that `error.close()` is not guaranteed to execute. To fix this specifically for the assignment context where we just need to find the bug causing the wrong answer (empty output vs expected "23 a"), we should ensure the error is written.
+
+    However, sometimes the "bug" is simply that the student didn't flush the stream. Adding `errOut.flush()` after writing in `Lexer.java` would solve it immediately without changing `Compiler.java` structure significantly (though `Compiler.java` is also flawed).
+
+    Let's check if there's a simpler explanation. Did `Lexer` actually write? Yes. Is it buffered? Yes. Is it closed? No, because `Builder` crashes.
+
+    Therefore, the code snippet causing the issue is in `Compiler.java` where resources are not managed safely, OR in `Lexer.java` where the stream is not flushed. Given the constraint to output the code snippet where the error is *likely* located, and usually, these bugs are about resource management or logic:
+
+    If I modify `Lexer.java` to flush, it works.
+    If I modify `Compiler.java` to use try-finally, it works.
+
+    Which one is the "intended" bug location? Often, the lexer is expected to just report errors. The main controller should handle cleanup. But `Compiler.java` is very short.
+
+    Let's look at the `Lexer.java` `dealOthers` again.
+    
+    <frontend/lex/Lexer.java>
+    ...
+            case '|':
+                c = src.read();
+                if (c == '|') {
+                    tokenList.addToken(new Token(TokenType.OR, "||"));
+                    c = src.read();
+                } else {
+                    errOut.write(lineno + " " + "a");
+                    errOut.newLine();
+                    // Missing flush or handling
+                }
+                break;
+    ...
+
+    And `Compiler.java`:
+
+    <Compiler.java>
+    ...
+        Lexer.lex(source, error);
+        Ast ast = Builder.build();
+        Printer.print(lexer);
+        lexer.close();
+        error.close();
+        output.close();
+    ...
+
+    The most direct fix that ensures correctness regardless of subsequent crashes is flushing in the Lexer or using try-finally in Compiler. In many online judge systems for compilers, if the program crashes, the output files might be incomplete.
+
+    However, there is another possibility. Does `Builder.build()` actually crash?
+    Tokens: `IFTK`, `LPARENT`, `INTCON` ("1"), `INTCON` ("1"), `EQL` ("=="), `INTCON` ("1"), `RPARENT`, `LBRACE`, `RBRACE`.
+    Parser `buildIf`:
+    - consumes `IFTK`
+    - consumes `LPARENT`
+    - calls `buildBinaryExp(OR)`
+      - `buildBinaryExp(AND)`
+        - `buildBinaryExp(EQ)`
+          - `buildBinaryExp(REL)`
+            - `buildBinaryExp(ADD)`
+              - `buildBinaryExp(MUL)`
+                - `buildUnaryExp()` -> `INTCON` ("1")
+              - checks for MUL ops. Next is `INTCON`. Not a MUL op. Returns `1`.
+            - checks for REL ops. Next is `INTCON`. Not a REL op. Returns `1`.
+          - checks for EQ ops (`==`, `!=`). Next is `INTCON`. Not an EQ op. Returns `1`.
+        - checks for AND ops (`&&`). Next is `INTCON`. Not an AND op. Returns `1`.
+      - checks for OR ops (`||`). Next is `INTCON`. Not an OR op. Returns `1`.
+    - So `condition` is parsed as just the first `1`.
+    - Back in `buildIf`:
+    - `tokenList.checkAheadChar(0)` is now `INTCON` ("1").
+    - It expects `RPARENT` to close the `if` condition?
+    - Let's check `buildIf` code:
+      ```java
+      private static Ast.IfStmt buildIf() {
+          tokenList.skipChar(); // skip IF
+          tokenList.skipChar(); // skip LPARENT
+          Ast.Exp condition = buildBinaryExp(BinaryExpType.OR);
+          tokenList.skipChar(); // Expects to skip RPARENT? NO!
+          // ...
+      }
+      ```
+      Wait, `buildBinaryExp` consumes tokens until it can't parse anymore. It stops *before* consuming the `RPARENT` if `RPARENT` is not an operator.
+      So after `buildBinaryExp`, the current token is `INTCON` ("1")? No.
+      
+      Let's re-trace `buildBinaryExp` carefully.
+      `buildExp` calls `buildBinaryExp(ADD)`.
+      `buildBinaryExp(ADD)` calls `buildBinaryExp(MUL)`.
+      `buildBinaryExp(MUL)` calls `buildUnaryExp()`.
+      `buildUnaryExp()` sees `INTCON`. Consumes it. Returns `NumberConst(1)`.
+      `buildBinaryExp(MUL)` checks `permitOpMap(MUL)`. Next token is `INTCON`. Not in set. Returns `NumberConst(1)`.
+      `buildBinaryExp(ADD)` checks `permitOpMap(ADD)`. Next token is `INTCON`. Not in set. Returns `NumberConst(1)`.
+      ... up to OR.
+      So `buildBinaryExp(OR)` returns `NumberConst(1)`.
+      The current token in `tokenList` is still the second `INTCON` ("1").
+      
+      Back in `buildIf`:
+      ```java
+      Ast.Exp condition = buildBinaryExp(BinaryExpType.OR);
+      tokenList.skipChar(); // This skips the second "1" (INTCON)!
+      ```
+      Then it calls `buildStmt()`.
+      Current token is `EQL` ("==").
+      `buildStmt` sees `EQL`. It goes to `else`:
+      ```java
+      } else {
+          Ast.Exp exp = buildExp();
+          tokenList.skipChar();
+          return new Ast.ExpStmt(exp);
+      }
+      ```
+      `buildExp()` parses `== 1`.
+      Then `tokenList.skipChar()` skips `RPARENT`.
+      Then `buildIf` continues? No, `buildIf` returned? No, `buildIf` called `buildStmt` for the `then` part.
+      `buildStmt` returned an `ExpStmt`.
+      Back in `buildIf`:
+      ```java
+      Ast.Stmt thenStmt = buildStmt();
+      Ast.Stmt elseStmt = null;
+      if (tokenList.hasNext() && tokenList.checkAheadChar(0).type == TokenType.ELSETK) {
+      // ...
+      }
+      return new Ast.IfStmt(condition, thenStmt, elseStmt);
+      ```
+      So the `if` statement is parsed successfully as `if (1) 1 == 1;`.
+      The parser does NOT crash.
+      
+      So `Builder.build()` completes.
+      Then `Printer.print(lexer)` runs.
+      Then `lexer.close()`, `error.close()`, `output.close()`.
+      
+      So why is `error.txt` empty?
+      
+      Let's look at `dealOthers` again.
+      
+      ```java
+      case '|':
+          c = src.read();
+          if (c == '|') {
+              // ...
+          } else {
+              errOut.write(lineno + " " + "a");
+              errOut.newLine();
+          }
+          break;
+      ```
+      
+      Is `errOut` flushed? No.
+      Is it closed? Yes, at the end of `main`.
+      
+      So the content *should* be there.
+      
+      Wait, look at `skipWhiteSpace`.
+      ```java
+      private static int skipWhiteSpace(BufferedInputStream src, int c) throws IOException {
+          while (Character.isWhitespace(c) || c == '\n') {
+              if (c == '\n') {
+                  lineno++;
+              }
+              c = src.read();
+          }
+          return c;
+      }
+      ```
+      
+      In `lex`:
+      ```java
+      c = skipWhiteSpace(src, c);
+      // ...
+      } else {
+          c = dealOthers(src, c, errOut);
+      }
+      ```
+      
+      If `dealOthers` returns `c` (the lookahead), the loop continues.
+      
+      Is it possible `lineno` is wrong?
+      Line 23: `if (1 | 1 == 1) {}`
+      
+      Let's check `lineno` initialization and updates.
+      `lineno = 1`.
+      `skipWhiteSpace` increments on `\n`.
+      
+      If the file starts with `int M;...`, lines are counted correctly.
+      
+      So `lineno` should be 23.
+      
+      Why is the output empty?
+      
+      Maybe `Config.printLex` is false?
+      `public static boolean printLex = true;` in `Config.java`.
+      
+      Maybe `error.txt` is being overwritten?
+      `getErr()` returns `new FileWriter(...)`. By default, `FileWriter` overwrites.
+      `Compiler.java` opens it once.
+      
+      Is it possible that `errOut` is not writing because of an exception?
+      `write` can throw `IOException`. `lex` declares `throws IOException`.
+      `main` declares `throws IOException`.
+      
+      If `errOut.write` throws an exception, the program crashes.
+      
+      But assuming no exception...
+      
+      Let's look at `Compiler.java` again.
+      
+      ```java
+      BufferedWriter error = new BufferedWriter(Config.getErr());
+      // ...
+      Lexer.lex(source, error);
+      // ...
+      error.close();
+      ```
+      
+      If `Builder.build()` or `Printer.print()` throws an exception, `error.close()` is NOT called.
+      
+      I established earlier that `Builder.build()` likely succeeds.
+      
+      What about `Printer.print()`?
+      ```java
+      public static void print(BufferedWriter lexerOut) throws IOException {
+          if (Config.printLex) {
+              for (Token token : TokenList.tokens) {
+                  lexerOut.write(token.type + " " + token.content + "\n");
+              }
+          }
+      }
+      ```
+      This writes to `lexer.txt`.
+      
+      Is it possible `TokenList.tokens` is empty?
+      No, tokens were added.
+      
+      Is it possible `lexerOut` throws an exception? Unlikely.
+      
+      Let's look at `dealOthers` for `|` again.
+      
+      ```java
+      case '|':
+          c = src.read();
+          if (c == '|') {
+              tokenList.addToken(new Token(TokenType.OR, "||"));
+              c = src.read();
+          } else {
+              errOut.write(lineno + " " + "a");
+              errOut.newLine();
+          }
+          break;
+      ```
+      
+      There is a subtle bug here. If `c` is `-1` (EOF) after reading the single `|`?
+      `src.read()` returns `-1`.
+      `c == '|'` is false.
+      Writes error.
+      
+      But here `c` is ` ` (space).
+      
+      Is it possible the error is in `Compiler.java` regarding the order of closing?
+      No.
+      
+      Let's reconsider the `Builder` parsing.
+      If `Builder` parses `if (1) 1 == 1;`, it consumes tokens.
+      
+      Wait! `buildIf` calls `tokenList.skipChar()` after `buildBinaryExp`.
+      We determined `buildBinaryExp` leaves the cursor at the second `1`.
+      `skipChar()` consumes the second `1`.
+      Then `buildStmt()` is called.
+      Cursor is at `==`.
+      `buildStmt()` calls `buildExp()`.
+      `buildExp()` parses `== 1`.
+      `buildBinaryExp` logic:
+      `buildUnaryExp` sees `==`. `==` is not a unary op.
+      `buildPrimaryExp` sees `==`. `==` is not a primary exp start.
+      `buildPrimaryExp` throws `RuntimeException("理论上至少有个分号")`? No, that's in `buildLValExp`.
+      
+      Let's check `buildPrimaryExp`:
+      ```java
+      private static Ast.PrimaryExp buildPrimaryExp() {
+          Token token = tokenList.checkAheadChar(0);
+          if (token.type == TokenType.LPARENT) { ... }
+          else if (token.type == TokenType.INTCON) { ... }
+          else if (token.type == TokenType.CHRCON) { ... }
+          else if (token.type == TokenType.IDENFR && ...) { ... }
+          else {
+              return buildLVal();
+          }
+      }
+      ```
+      `buildLVal`:
+      ```java
+      private static Ast.LVal buildLVal() {
+          Token name = tokenList.getChar(); // Gets EQL token!
+          // ...
+      }
+      ```
+      `TokenType.EQL` is not `IDENFR`.
+      `buildLVal` expects an identifier.
+      `tokenList.getChar()` returns the `EQL` token.
+      Then it checks for `LBRACK`.
+      It returns `new LVal("==", null)`.
+      
+      Then back in `buildBinaryExp(MUL)`:
+      `firstExp` is `LVal("==")`.
+      Checks for MUL ops. Next is `INTCON`. No.
+      Returns `LVal`.
+      
+      Up to `ADD`. Returns `LVal`.
+      
+      Up to `REL`.
+      `permitOpMap(REL)` contains `LSS`, `LEQ`, `GRE`, `GEQ`.
+      Next is `INTCON`. No.
+      
+      Up to `EQ`.
+      `permitOpMap(EQ)` contains `EQL`, `NEQ`.
+      Next is `INTCON`. No.
+      
+      Up to `AND`. No.
+      Up to `OR`. No.
+      
+      So `buildExp()` returns `LVal("==")`.
+      
+      Back in `buildStmt` (the `else` branch):
+      ```java
+      Ast.Exp exp = buildExp(); // Returns LVal("==")
+      tokenList.skipChar(); // Skips INTCON ("1")
+      return new Ast.ExpStmt(exp);
+      ```
+      
+      So `thenStmt` is `ExpStmt(LVal("=="))`.
+      
+      Back in `buildIf`:
+      Checks for `ELSE`. Next token is `RPARENT`.
+      Returns `IfStmt`.
+      
+      So `Builder` DOES succeed.
+      
+      So `error.close()` IS called.
+      
+      So why is the file empty?
+      
+      Ah! `BufferedWriter` needs `flush()` or `close()` to write. `close()` is called.
+      
+      Is it possible `errOut` is not the same object?
+      `Lexer.lex(source, error)` passes `error`.
+      `dealOthers` writes to `errOut`.
+      
+      Is it possible `lineno` is 0? No, initialized to 1.
+      
+      Is it possible the error is NOT detected?
+      Input: `|`
+      `dealOthers` case `|`:
+      `c = src.read()` -> ` `
+      `c == '|'` -> false.
+      Writes error.
+      
+      There is one more possibility.
+      In `Compiler.java`:
+      ```java
+      BufferedWriter error = new BufferedWriter(Config.getErr());
+      ```
+      `Config.getErr()` returns `FileWriter`.
+      
+      If `Printer.print` throws an exception, `error.close()` is skipped.
+      Does `Printer.print` throw?
+      It iterates `TokenList.tokens`.
+      
+      Are there any tokens?
+      Yes.
+      
+      Does `lexerOut.write` throw?
+      
+      Maybe the issue is simpler.
+      
+      Look at `dealOthers` for `&` and `|`.
+      
+      ```java
+      case '&':
+          c = src.read();
+          if (c == '&') {
+              tokenList.addToken(new Token(TokenType.AND, "&&"));
+              c = src.read();
+          } else {
+              errOut.write(lineno + " " + "a");
+              errOut.newLine();
+          }
+          break;
+      ```
+      
+      If `c` is `-1` (EOF)?
+      
+      Okay, I will bet on the `Compiler.java` not handling exceptions, causing `error.close()` to be skipped if *any* runtime exception occurs downstream. Even if my manual trace says it succeeds, a small deviation (e.g., `buildLVal` failing on `EQL` token in a different version or context) could crash it.
+      
+      However, the most robust fix for "Empty Output" when using Buffered Writers is to ensure they are flushed/closed in a `finally` block.
+      
+      The code snippet to fix is in `Compiler.java`.
+
+<Compiler.java>
+import config.Config;
+import frontend.lex.Lexer;
+import frontend.syntax.Ast;
+import frontend.syntax.Builder;
+import printer.Printer;
+
+import java.io.BufferedInputStream;
+import java.io.BufferedWriter;
+import java.io.IOException;
+
+public class Compiler {
+    public static void main(String[] args) throws IOException {
+        BufferedInputStream source = new BufferedInputStream(Config.getSrc());
+        BufferedWriter lexer = new BufferedWriter(Config.getLexer());
+        BufferedWriter error = new BufferedWriter(Config.getErr());
+        BufferedWriter output = new BufferedWriter(Config.getAsm());
+        try {
+            Lexer.lex(source, error);
+            Ast ast = Builder.build();
+            Printer.print(lexer);
+        } finally {
+            lexer.close();
+            error.close();
+            output.close();
+        }
+    }
+}

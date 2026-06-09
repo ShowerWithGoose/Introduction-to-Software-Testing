@@ -1,0 +1,233 @@
+Based on the test case input and the discrepancy between the buggy output and expected output, the issue lies in **how the line number is recorded when reporting missing semicolon errors (error 'i')**.
+
+The problem program has three missing semicolons:
+1. After `printf("Hello SysY!\n")` → should be line **2**
+2. After `int a` → should be line **9**
+3. After `return 0` → should be line **13**
+
+But the buggy output reports lines **4, 11, 14**, which are **later** than the actual lines where the statements end.
+
+This suggests that **the lexer or parser is advancing the line number past the relevant token before recording the error**, likely because **the error is reported after consuming tokens beyond the statement**, or **the line number used for error reporting corresponds to a later token**.
+
+Looking at the `Parser.java` file, in multiple places (e.g., `VarDecl`, `Stmt` for return/printf/etc.), when a missing semicolon is detected, it calls:
+
+```java
+error('i');
+```
+
+which uses:
+
+```java
+fileOut2.printf("%d %c\n", Lexer.getLine(), 'i');
+```
+
+However, **`Lexer.getLine()` returns the current global line number**, which may have advanced **past** the line containing the last meaningful token of the statement due to subsequent token reads (e.g., reading a newline or next token).
+
+Crucially, **the line number of the last token before the expected semicolon should be used**, not the current global line counter.
+
+In particular, in the `VarDecl` method:
+
+```java
+if (type() != Type.SEMICN) {
+    error('i');
+} else {
+    getToken();
+}
+```
+
+At this point, the parser has already parsed the `VarDef` (e.g., `int a`), and the current token is whatever comes **after** `a` — possibly a newline or the next token (`for`). The global `line` counter in `Lexer` may have advanced when reading whitespace or the next token.
+
+Thus, **the error is that `Lexer.getLine()` does not reflect the line of the last consumed non-whitespace token**, but rather the current scanning position.
+
+However, looking more closely at the **test input**:
+
+```c
+int main() {
+    printf("Hello SysY!\n") // error 1
+
+    if (1)
+
+
+    /*********/
+    ;
+    int a // error 2
+
+    for (;;) {}
+
+    return 0 // error 3
+}
+```
+
+- The `printf(...)` is on **line 2**, and the next token is a newline (line ends). The missing `;` is on line 2.
+- But the parser only detects the missing `;` **when it sees the next token**, which could be `if` on line 4 → hence error reported on line 4.
+- Similarly, `int a` is on line 9, but the next token is `for` on line 11 → error on 11.
+- `return 0` is on line 13, next token is `}` on line 14 → error on 14.
+
+So the core issue is: **the parser reports the current line (where the unexpected token is found), but the spec says: "The error line number corresponds to the line where the last non-terminal before the semicolon is located."**
+
+Therefore, **we must record the line number of the last token that was successfully parsed as part of the statement**, not the current line.
+
+Looking at the code, **the `Token` class does not store line number information**, so `Lexer.getLine()` is just a global counter that moves forward and cannot be used to recover the line of a past token.
+
+But wait — in the provided code, **nowhere is the line number stored per token**. So when we are at the point of detecting a missing `;`, we have no way to know what line the previous token was on.
+
+However, note that in `Lexer.java`, the `getChar()` function increments `line` **when it reads a `\n`**:
+
+```java
+private static void getChar() {
+    if (c == '\n') line++;
+    ...
+}
+```
+
+And tokens are built character by character. So **the line number of a token is the value of `line` during its lexing**, but this is **not saved in the Token**.
+
+Thus, **the design flaw is that tokens do not carry their source line number**, making accurate error reporting impossible.
+
+But the assignment expects correct line numbers, so **the intended design must associate line numbers with tokens**.
+
+However, looking at the given code, **the `Token` class does not have a line field**, and `Lexer` only maintains a global `line`.
+
+Now, observe that in the **buggy output**, the reported lines are **exactly the lines of the next token**:
+- After `printf(...)` (line 2), next non-whitespace is `if` on line 4 → error on 4
+- After `int a` (line 9), next is `for` on line 11 → error on 11
+- After `return 0` (line 13), next is `}` on line 14 → error on 14
+
+But the **expected** lines are **2, 9, 13** — the lines where the incomplete statements reside.
+
+Therefore, **the parser should use the line number of the last successfully parsed token**, not the current global line.
+
+Since the current code doesn't store per-token line numbers, **one possible fix is to store the line number in the Token**. But the problem asks to **locate the error**, not fix it.
+
+However, note that in `Parser.java`, the `error('i')` is called at points where the **current token is the one after the statement**, so `Lexer.getLine()` is too late.
+
+But wait — perhaps **the `getToken()` function advances the token, and the line number of the previous token is lost**.
+
+Looking at the `Stmt` method for `printf`:
+
+```java
+} else if (type() == Type.PRINTFTK) {
+    getToken(); // printf
+    getToken(); // (
+    getToken(); // string
+    while (type() == Type.COMMA) {
+        getToken();
+        Exp();
+    }
+    if (type() != Type.RPARENT) {
+        error('j');
+    } else {
+        getToken();
+    }
+    if (type() != Type.SEMICN) {
+        error('i');   // <-- HERE
+    } else {
+        getToken();
+    }
+}
+```
+
+At the point of `error('i')`, the current token is whatever comes after the `)`, e.g., a newline or `if`. The global `line` has advanced.
+
+But the **last token of the printf call is the `)`**, which was on line 2. However, we called `getToken()` after matching `)`, so now `token` is the next one.
+
+So **we lost the line number of the `)` token**.
+
+Similarly, in `VarDecl`:
+
+```java
+VarDef();
+while (type() == Type.COMMA) {
+    getToken();
+    VarDef();
+}
+if (type() != Type.SEMICN) {
+    error('i');   // current token is next token after VarDef
+}
+```
+
+Again, too late.
+
+Thus, **the error location is in the `error('i')` calls in `Parser.java`**, because they use the **current global line number**, which is incorrect.
+
+But since we can't change the token structure, perhaps the intended solution is to **record the line number right after parsing the last component of the statement**.
+
+However, the problem only asks to **locate the error**.
+
+Given that, the **most direct cause** is that **in multiple places in `Parser.java`, when checking for missing semicolon, the error is reported using the current (advanced) line number**.
+
+The key locations are:
+
+1. `ConstDecl`
+2. `VarDecl`
+3. `Stmt` for `break`, `continue`, `return`, `printf`, expression statements, etc.
+
+But the test case triggers:
+- `printf` without `;` → handled in `Stmt`'s `PRINTFTK` branch
+- `int a` without `;` → handled in `VarDecl`
+- `return 0` without `;` → handled in `Stmt`'s `RETURNTK` branch
+
+So the error is in these three spots.
+
+However, all of them use the same `error('i')` function, which uses `Lexer.getLine()`.
+
+Therefore, the root issue is in the **design of error reporting**, but the immediate code causing wrong line numbers is the **use of `Lexer.getLine()` at a time when the line counter has moved past the relevant line**.
+
+Since the problem asks for the **code snippet where the error is likely to be located**, and the error manifests in **missing semicolon reporting**, the relevant code is in `Parser.java` in the `error` method and its callers.
+
+But the **most precise answer** is that **the `error` method in `Parser.java` uses `Lexer.getLine()`, which is not the line of the last parsed token**.
+
+However, looking at the provided code, there's **no way to get the line of the last token**, so the error is structural.
+
+But note: in `Lexer.java`, when a token is lexed, the `line` variable holds the **line number at the start of the token** (since `getChar()` increments line only when reading `\n`, and tokens don't span multiple lines in this grammar except strings/comments, but even then...).
+
+Actually, **the line number of a token is the value of `line` during its lexing**, but it's not stored.
+
+So to fix, we'd need to store `line` in `Token`. But again, we're only locating.
+
+Given the above, the **error is in the `error` method in `Parser.java`**, because it uses the current global line instead of the line of the last relevant token.
+
+But since the assignment likely expects us to see that **the line number is taken at the wrong time**, and the **call sites are in `Parser.java`**, we output the `error` method and its usage.
+
+However, the problem says: "output the code snippet where the error is likely to be located".
+
+Given the test case, the **first error** is after `printf`, so look at the `printf` handling in `Stmt`.
+
+<frontend/Parser.java>
+...
+        } else if (type() == Type.PRINTFTK) {
+            getToken();
+            getToken();
+            getToken();
+            while (type() == Type.COMMA) {
+                getToken();
+                Exp();
+            }
+            if (type() != Type.RPARENT) {
+                error('j');
+            } else {
+                getToken();
+            }
+            if (type() != Type.SEMICN) {
+                error('i');
+            } else {
+                getToken();
+            }
+        } ...
+...
+    private static void error(char c) {
+        switch (c){
+            case 'i':
+                fileOut2.printf("%d %c\n", Lexer.getLine(), 'i');
+                break;
+            case 'j':
+                fileOut2.printf("%d %c\n", Lexer.getLine(), 'j');
+                break;
+            case 'k':
+                fileOut2.printf("%d %c\n", Lexer.getLine(), 'k');
+                break;
+            default:
+                break;
+        }
+    }
+...

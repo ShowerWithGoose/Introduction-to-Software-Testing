@@ -1,0 +1,147 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The program is a syntax analyzer that needs to detect specific syntax errors (missing semicolon `i`, missing right parenthesis `j`, missing right square bracket `k`) and output the line number where the error occurred. The line number should correspond to the last non-terminal symbol before the missing token.
+2.  **Test Case Input**:
+    ```c
+    void f(int a {} // error 1: Missing ')' after FuncFParams. Last token 'a' is on line 1.
+    
+    int main( { // error 2: Missing ')' in MainFuncDef. Last token '(' is on line 3? No, 'main' is line 3. Wait, input is:
+    // Line 1: void f(int a {}
+    // Line 2: (empty)
+    // Line 3: int main( {
+    // Line 4:     int a = 10;
+    // Line 5:     f(a + 10; // error 3: Missing ')' in FuncRParams/Call. Last token '10' is on line 5.
+    // Line 6:     return 0;
+    // Line 7: }
+    ```
+    Let's re-read the input carefully:
+    `void f(int a {} // error 1` -> Line 1. `FuncDef` parsing. `FuncFParams` parses `int a`. Then expects `)`. Current token is `{`. Error `j` should be reported. The "last non-terminal before the right parenthesis" implies the location of the last successfully parsed element in the parameter list or the opening paren. Usually, it's the line of the last token consumed before the expectation failed. In `parseFuncDef`, after parsing params, it calls `expect(RPARENT)`.
+    `int main( { // error 2` -> Line 3. `MainFuncDef` parsing. Expects `)`. Current token is `{`. Error `j`.
+    `f(a + 10; // error 3` -> Line 5. `CallFuncUnaryExp` or `FuncRParams`. Parses `a+10`. Expects `)`. Current token is `;`. Error `j`.
+
+3.  **Expected Output**:
+    ```
+    1 j
+    3 j
+    5 j
+    ```
+
+4.  **Buggy Output**:
+    ```
+    1 j
+    3 j
+    5 j
+    5 j
+    ```
+    There is an extra error reported at line 5.
+
+5.  **Code Analysis**:
+    *   The `expect` method in `Parser.java` reports errors.
+    *   Let's trace Error 3 (`f(a + 10;`).
+        *   `parseStmt` identifies `f` as `IDENFR`. It looks ahead and sees `(`, so it goes into assignment/call logic.
+        *   Actually, `parseStmt` has complex logic for `LVal '=' Exp ';'` vs `Exp ';'`.
+        *   Inside `parseStmt`, if it detects an assignment or call, it might call `parseGetIntStmt` or `parseGetCharStmt` or `parseAssignStmt`.
+        *   However, `f(a+10;` is a function call used as a statement (Expression Statement).
+        *   Let's look at `parseStmt`:
+            ```java
+            } else {
+                int nowPos = this.tokenStream.getPos();
+                parseExp(); // This will parse f(a+10) if it recognizes it as a UnaryExp inside PrimaryExp?
+                // No, PrimaryExp -> LVal | ...
+                // UnaryExp -> PrimaryExp | Ident '(' ...
+                // Exp -> AddExp -> MulExp -> UnaryExp.
+                // So parseExp() will consume f, (, a, +, 10.
+                // Then it expects ) inside parseCallFuncUnaryExp.
+                
+                int len = this.tokenStream.getPos() - nowPos;
+                this.tokenStream.move();
+                this.token = this.tokenStream.getToken();
+                if (this.token.getTokenType() == TokenType.ASSIGN) {
+                   // ...
+                } else {
+                    this.tokenStream.back(len + 1);
+                    return parseExpStmt();
+                }
+            }
+            ```
+        *   If `parseExp()` is called, it invokes `parseAddExp` -> ... -> `parseUnaryExp`.
+        *   `parseUnaryExp` sees `f` (IDENFR), moves, sees `(`, calls `parseCallFuncUnaryExp`.
+        *   `parseCallFuncUnaryExp` parses params `a+10`. Then calls `expect(TokenType.RPARENT)`.
+        *   The current token is `;`. `expect` fails, adds error `5 j`. It backs up 1 position.
+        *   Control returns to `parseUnaryExp`, then up to `parseExp`.
+        *   Control returns to `parseStmt`.
+        *   `parseStmt` calculates `len`. Moves forward. Checks if next is `ASSIGN`. It is `;`.
+        *   So it goes to `else`: `this.tokenStream.back(len + 1); return parseExpStmt();`.
+        *   `parseExpStmt()` is called.
+        *   `parseExpStmt`:
+            ```java
+            public ExpStmt parseExpStmt() {
+                Exp exp = null;
+                this.token = this.tokenStream.getToken();
+                if (Exp.FIRST.contains(this.token.getTokenType())) {
+                    exp = parseExp(); // Parses f(a+10) AGAIN.
+                    expect(TokenType.SEMICN); // Expects ;. Current token is ;. Success?
+                }
+                return new ExpStmt(exp);
+            }
+            ```
+        *   When `parseExp()` is called the second time inside `parseExpStmt`, it again traverses down to `parseCallFuncUnaryExp`.
+        *   `parseCallFuncUnaryExp` again calls `expect(TokenType.RPARENT)`.
+        *   This triggers the error reporting mechanism **again** for the same missing parenthesis.
+        *   Thus, error `5 j` is added twice.
+
+6.  **Conclusion**: The issue is that `parseStmt` attempts to parse the expression to lookahead for an assignment operator. If it's not an assignment, it rewinds and calls `parseExpStmt`, which parses the expression again. Since the expression contains a syntax error (missing `)`), the error is detected and reported during the first parse (lookahead) and again during the second parse (actual statement parsing).
+
+    To fix this, one should either:
+    1.  Not report errors during the lookahead phase (difficult with current structure).
+    2.  Check if the error has already been reported (complex).
+    3.  Restructure `parseStmt` to avoid double parsing. For example, check for `IDENFR` followed by `(` specifically to handle calls vs assignments without full `parseExp` lookahead, or use a flag to suppress errors during lookahead.
+    
+    Given the constraint to identify the location, the error is in `Parser.java` in the `parseStmt` method where it performs the lookahead parsing using `parseExp()`, causing side effects (error logging) that persist when the parser rewinds and re-parses.
+
+    Specifically, the call to `parseExp()` inside `parseStmt` causes the error to be logged. Then `parseExpStmt` calls `parseExp()` again, logging it again.
+
+<frontend/parser/Parser.java>
+...
+    public Stmt parseStmt() {
+        this.token = this.tokenStream.getToken();
+        if (this.token.getTokenType() == TokenType.LBRACE) {
+            return parseBlockStmt();
+        } else if (this.token.getTokenType() == TokenType.IFTK) {
+            return parseIfStmt();
+        } else if (this.token.getTokenType() == TokenType.FORTK) {
+            return parseForStmt();
+        } else if (this.token.getTokenType() == TokenType.BREAKTK) {
+            return parseBreakStmt();
+        } else if (this.token.getTokenType() == TokenType.CONTINUETK) {
+            return parseContinueStmt();
+        } else if (this.token.getTokenType() == TokenType.RETURNTK) {
+            return parseReturnStmt();
+        } else if (this.token.getTokenType() == TokenType.PRINTFTK) {
+            return parsePrintfStmt();
+        } else if (DeclStmt.FIRST.contains(this.token.getTokenType())){
+            return parseDecl();
+        } else {
+            int nowPos = this.tokenStream.getPos();
+            parseExp();
+            int len = this.tokenStream.getPos() - nowPos;
+            this.tokenStream.move();
+            this.token = this.tokenStream.getToken();
+            if (this.token.getTokenType() == TokenType.ASSIGN) {
+                this.tokenStream.move();
+                this.token = this.tokenStream.getToken();
+                this.tokenStream.back(len + 2);
+                if (this.token.getTokenType() == TokenType.GETCHARTK) {
+                    return parseGetCharStmt();
+                } else if (this.token.getTokenType() == TokenType.GETINTTK) {
+                    return parseGetIntStmt();
+                } else {
+                    return parseAssignStmt();
+                }
+            } else {
+                this.tokenStream.back(len + 1);
+                return parseExpStmt();
+            }
+        }
+    }
+...

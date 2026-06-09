@@ -1,0 +1,595 @@
+Based on the problem description and the test case, the program fails to output any error file (`error.txt` is empty or not created with content) when it should report syntax errors `j` (missing right parenthesis) at lines 1, 3, and 5.
+
+The input is:
+```
+void f(int a {} // error 1: missing ')' after params, but '}' is encountered. The parser expects ')'.
+// Line 2 is empty/comment
+int main( { // error 2: missing ')' after 'main('. '{' is encountered.
+    int a = 10;
+    f(a + 10; // error 3: missing ')' in function call. ';' is encountered.
+    return 0;
+}
+```
+
+Let's trace the execution for Error 1 (`void f(int a {}`):
+1. `compUnit` calls `funcDef`.
+2. `funcDef` parses `void` (FuncType), `f` (Ident), `(` (LPARENT).
+3. It checks if next token is `int` or `char` to parse `FuncFParams`. It is `int`, so it calls `funcFParams`.
+4. `funcFParams` calls `funcFParam`.
+5. `funcFParam` parses `int` (BType), `a` (Ident). It checks for `[`. It's not `[`. Returns.
+6. Back in `funcDef`, it tries to match `RPARENT`. The current token is `{` (LBRACE). `match` returns false.
+7. It executes: `myError.newError(myError.ErrorType.ERROR_J, tokens.get(current-1).getLineno());`.
+   - `current` points to `{`. `current-1` points to `a` (Ident). Line number of `a` is 1.
+   - This correctly records error `j` at line 1.
+8. Then it calls `block()`.
+9. `block()` matches `LBRACE` (`{`). `current` moves past `{`.
+10. `block()` enters while loop: `while (current < tokens.size() && !match(Token.TokenType.RBRACE))`.
+    - Current token is `}` (RBRACE) from the input `void f(int a {}`. Wait, the input is `void f(int a {}`. The tokens are `void`, `f`, `(`, `int`, `a`, `{`, `}`.
+    - So `match(RBRACE)` succeeds. The loop terminates.
+    - `r_token` is set to `}`.
+    - `block()` returns.
+11. Back in `funcDef`, it finishes.
+12. Back in `compUnit`, it continues to look for more FuncDefs or MainFuncDef.
+    - `isFuncDef` checks current token. Current token is likely end of file or next line.
+    - If there are more tokens, it might try to parse `int main...`.
+
+Let's trace Error 2 (`int main( {`):
+1. `compUnit` calls `mainFuncDef`.
+2. `mainFuncDef` matches `int`, `main`, `(`.
+3. It tries to match `RPARENT`. Current token is `{`. `match` returns false.
+4. It executes: `myError.newError(myError.ErrorType.ERROR_J, tokens.get(current-1).getLineno());`.
+   - `current` points to `{`. `current-1` points to `(`. Line number is 3 (assuming line 2 is empty/newline).
+   - This correctly records error `j` at line 3.
+5. Then it calls `block()`.
+6. `block()` matches `LBRACE`.
+7. Parses block items.
+8. Returns.
+
+Let's trace Error 3 (`f(a + 10;`):
+1. Inside `main`'s block, `blockItem` calls `stmt`.
+2. `stmt` sees `IDENFR` (`f`) and `checkAssignAfterLVal` likely returns false because next is `(`, not `=`. Or wait, `checkAssignAfterLVal` looks for `=`. It doesn't find it before `;` or `(`.
+   - Actually, `stmt` logic:
+     ```java
+     if (tokens.get(current).getType() == Token.TokenType.IDENFR && checkAssignAfterLVal()) { ... }
+     else if ...
+     else {
+         num = 2; // [Exp] ';'
+         if (tokens.get(current).getType() == Token.TokenType.SEMICN) { ... }
+         else {
+             exps.add(exp());
+             if (!match(Token.TokenType.SEMICN)) {
+                 myError.newError(myError.ErrorType.ERROR_I, tokens.get(current-1).getLineno());
+             } ...
+         }
+     }
+     ```
+   - `f(a+10` is an expression (function call). So it goes to `else` branch, `num=2`.
+   - It calls `exp()`.
+   - `exp()` -> `addExp()` -> ... -> `unaryExp()`.
+   - `unaryExp()` sees `IDENFR` `f` and next is `LPARENT`.
+   - It matches `IDENFR`, matches `LPARENT`.
+   - It checks `if (match(Token.TokenType.RPARENT))`. Current token is `a` (IDENFR). False.
+   - Else: `funcRParams = funcRParams();`.
+   - `funcRParams` parses `a+10`.
+   - Back in `unaryExp`, it tries `if (!match(Token.TokenType.RPARENT))`.
+   - Current token is `;`. `match` returns false.
+   - It executes: `myError.newError(myError.ErrorType.ERROR_J, tokens.get(current-1).getLineno());`.
+     - `current` points to `;`. `current-1` points to `10` (INTCON). Line number is 5.
+     - This correctly records error `j` at line 5.
+   - `unaryExp` returns.
+   - `exp` returns.
+   - Back in `stmt`, it tries `if (!match(Token.TokenType.SEMICN))`.
+   - Current token is `;`. `match` returns true.
+   - No error reported here.
+
+So the errors *are* being recorded in `myError.errorTreeMap`.
+
+Why is the output "No output file" or empty?
+Look at `Compiler.java`:
+```java
+        TreeMap<Integer, myError> errors = myError.getErrorTreeMap();
+        StringBuilder stringBuilder1 = new StringBuilder();
+        for (Map.Entry<Integer, myError> entry : errors.entrySet()) {
+            stringBuilder1.append(entry.getKey()).append(" ").append(entry.getValue().toString()).append("\n");
+        }
+        WriteFile.MakeFile_error(stringBuilder1.toString());
+```
+If `errors` is empty, it writes an empty string.
+If `errors` is NOT empty, it writes the content.
+
+However, there is a critical issue in `Parser.java` methods like `funcDef`, `mainFuncDef`, etc. When an error occurs (e.g., missing `)`), the parser reports the error but **does not synchronize** or skip tokens to recover. It just proceeds.
+In `funcDef`:
+```java
+        if (!match(Token.TokenType.RPARENT)) {
+            myError.newError(myError.ErrorType.ERROR_J, tokens.get(current-1).getLineno());
+        } else {
+            r_token = (tokens.get(current - 1));
+        }
+        Block block = block();
+```
+If `)` is missing, `current` is still at the token that caused the failure (e.g., `{`).
+Then `block()` is called. `block()` expects `{`. It matches it.
+This seems to work for the specific test case structure.
+
+Let's look closely at `Lexer.java`.
+```java
+            } else if (Character.isWhitespace(currentChar) || LineComments || ParagraphComments) {
+                continue;
+            }
+```
+And `isLinkBreak`:
+```java
+    private static boolean isLinkBreak(char c) {
+        return c == '\n';
+    }
+```
+If the input file uses `\r\n` (Windows line endings), `\r` is not handled as a line break or whitespace explicitly in the `isLinkBreak` check, but `Character.isWhitespace('\r')` returns true. So `lineno` only increments on `\n`. This is generally fine for line numbers if `\n` is present.
+
+Let's look at `myError.java`.
+```java
+    static TreeMap<Integer, myError> errorTreeMap = new TreeMap<>();
+```
+It is static.
+
+Is it possible that `Parser` throws an exception?
+In `funcDef`:
+```java
+        if (tokens.get(current).getType() == Token.TokenType.INTTK || tokens.get(current).getType() == Token.TokenType.CHARTK) {
+            funcFParams = funcFParams();
+        }
+```
+If `current` is out of bounds? `compUnit` checks `current < tokens.size()`. But inside `funcDef`, no check.
+In the test case `void f(int a {}`, tokens are valid.
+
+Let's look at `Compiler.java` again.
+```java
+        CompUnit compUnit = parser.getCompUnit();
+        compUnit.checkOut();
+```
+`compUnit.checkOut()` writes to `parser.txt`.
+If there are errors, should it still write `parser.txt`? The problem says "For incorrect source programs, output ... to `error.txt`". It doesn't explicitly forbid `parser.txt`, but usually, if there are errors, we might stop or just output errors. However, the code outputs both.
+
+Wait, look at `WriteFile.MakeFile_error`.
+```java
+    public static void MakeFile_error(String data) {
+        try {
+            FileWriter fileWriter = new FileWriter("error.txt", false);
+            BufferedWriter bufferedWriter = new BufferedWriter(fileWriter);
+            bufferedWriter.write(data);
+            bufferedWriter.flush();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+```
+If `data` is empty string, it creates an empty `error.txt`. The expected output is content. If the map is empty, content is empty.
+
+Why would the map be empty?
+Maybe `myError.newError` is not being called?
+Or maybe `Parser` crashes before reaching the error points?
+
+Let's look at `isDecl` and `isFuncDef` in `Parser`.
+```java
+    private boolean isDecl() {
+        int i = current;
+        if (tokens.get(i).getType() == Token.TokenType.CONSTTK) {
+            return true;
+        } else if (tokens.get(i).getType() != Token.TokenType.INTTK && tokens.get(i).getType() != Token.TokenType.CHARTK) {
+            return false;
+        }
+        //跳过 BType Ident
+        i += 2;
+        return tokens.get(i).getType() != Token.TokenType.LPARENT;
+    }
+```
+If `i += 2` goes out of bounds, `tokens.get(i)` throws `IndexOutOfBoundsException`.
+In `compUnit`:
+```java
+        while (current < tokens.size() && isDecl()) {
+            decls.add(decl());
+        }
+```
+If `isDecl` throws exception, `Parser` constructor crashes. `Compiler` catches `IOException` in `main`? No, `main` throws `IOException`. It does not catch `RuntimeException`. So the program crashes. No output files are generated (or incomplete).
+
+Test Case Input:
+`void f(int a {}`
+Tokens: `VOIDTK`, `IDENFR(f)`, `LPARENT`, `INTTK`, `IDENFR(a)`, `LBRACE`, `RBRACE`.
+
+1. `compUnit` starts. `current = 0`.
+2. `isDecl()`:
+   - `tokens[0]` is `VOIDTK`. Not `CONSTTK`.
+   - Is it `INTTK` or `CHARTK`? No.
+   - Returns `false`.
+3. `isFuncDef()`:
+   - `tokens[0]` is `VOIDTK`. Matches `VOIDTK`.
+   - Returns `true`.
+4. `funcDef()`:
+   - Parses `void`, `f`, `(`.
+   - Checks `tokens[current]` which is `INTTK`. Calls `funcFParams`.
+   - `funcFParams` parses `int a`.
+   - Back in `funcDef`. Tries to match `RPARENT`. Current is `LBRACE`. Fails. Records Error J.
+   - Calls `block()`. Matches `LBRACE`, `RBRACE`.
+   - Returns.
+5. `compUnit` loop continues. `current` is at end of tokens?
+   - Tokens size is 7. Indices 0-6.
+   - After `funcDef`, `current` should be 7 (size).
+   - `while (current < tokens.size() && isFuncDef())` -> `7 < 7` is false. Loop ends.
+6. `mainFuncDef()`:
+   - `current` is 7. `tokens.get(7)` throws `IndexOutOfBoundsException`.
+
+Ah! The parser does not handle the case where `MainFuncDef` is missing or when it runs out of tokens expecting `MainFuncDef`.
+The grammar says `CompUnit → {Decl} {FuncDef} MainFuncDef`. It *requires* `MainFuncDef`.
+The test input has `void f...` and `int main...`.
+Wait, the test input is:
+```
+void f(int a {} // error 1
+
+int main( { // error 2
+    int a = 10;
+    f(a + 10; // error 3
+    return 0;
+}
+```
+There ARE two functions. `void f` and `int main`.
+
+Let's re-trace `compUnit`.
+1. `isDecl` false.
+2. `isFuncDef` true (`void`).
+3. `funcDef` parses `void f(int a {}`.
+   - Consumes `void`, `f`, `(`, `int`, `a`.
+   - Fails `)`. Error J recorded.
+   - `block()` consumes `{`, `}`.
+   - `current` is now at index 6 (RBRACE was 6? No. `void`(0) `f`(1) `(`(2) `int`(3) `a`(4) `{`(5) `}`(6)).
+   - After `block()`, `current` is 7.
+4. Loop `while (current < tokens.size() && isFuncDef())`. `7 < 7` is false.
+5. `mainFuncDef()` is called.
+   - `current` is 7.
+   - `int_token = (tokens.get(current));` -> **CRASH**. `IndexOutOfBoundsException`.
+
+But wait, the input has `int main...` on the next lines.
+Did `funcDef` consume the newline? No, Lexer skips whitespace/newlines but increments `lineno`. Tokens don't include newlines.
+So where are the tokens for `int main...`?
+They are in the `tokens` list.
+Why did `funcDef` stop at `}`?
+Input: `void f(int a {}`
+Tokens:
+0: VOIDTK `void`
+1: IDENFR `f`
+2: LPARENT `(`
+3: INTTK `int`
+4: IDENFR `a`
+5: LBRACE `{`
+6: RBRACE `}`
+
+Next line: `int main( {`
+7: INTTK `int`
+8: MAINTK `main`
+9: LPARENT `(`
+10: LBRACE `{`
+...
+
+So `tokens.size()` is > 7.
+After parsing `void f...`, `current` is 7.
+`while (current < tokens.size() && isFuncDef())`
+`isFuncDef()` at `current=7`:
+- `tokens[7]` is `INTTK`.
+- `isFuncDef`:
+  ```java
+        if (tokens.get(i).getType() == Token.TokenType.VOIDTK || tokens.get(i).getType() == Token.TokenType.CHARTK) {
+            return true;
+        }
+        //跳过 FuncType
+        i += 1;
+        return tokens.get(i).getType() != Token.TokenType.MAINTK;
+  ```
+  - `tokens[7]` is `INTTK`. Not VOID/CHAR.
+  - `i` becomes 8.
+  - `tokens[8]` is `MAINTK`.
+  - `tokens[8].getType() != MAINTK` is **FALSE**.
+  - So `isFuncDef` returns **FALSE**.
+
+So the loop terminates.
+Then `mainFuncDef()` is called.
+`current` is 7.
+`mainFuncDef`:
+```java
+        int_token = (tokens.get(current)); // tokens[7] is INTTK. OK.
+        match(Token.TokenType.INTTK); // current becomes 8.
+        main_token = (tokens.get(current)); // tokens[8] is MAINTK. OK.
+        match(Token.TokenType.MAINTK); // current becomes 9.
+        l_token = (tokens.get(current)); // tokens[9] is LPARENT. OK.
+        match(Token.TokenType.LPARENT); // current becomes 10.
+
+        if (!match(Token.TokenType.RPARENT)) { // tokens[10] is LBRACE. Match fails.
+            myError.newError(myError.ErrorType.ERROR_J, tokens.get(current-1).getLineno()); // Error J at line of tokens[9] which is '('. Line 3.
+        } else {
+            r_token = (tokens.get(current - 1));
+        }
+        Block block = block(); // block() expects LBRACE. tokens[10] is LBRACE. Matches.
+```
+This seems to work correctly for Error 2.
+
+Then inside `block()`, it parses `int a = 10;`, `f(a + 10;`, `return 0;`.
+Error 3 is detected in `stmt` -> `exp` -> `unaryExp`.
+
+So the errors ARE recorded.
+Why "No output file"?
+
+Check `Compiler.java` again.
+```java
+        CompUnit compUnit = parser.getCompUnit();
+        compUnit.checkOut();
+```
+If `parser` construction threw an exception, `compUnit` would not be retrieved.
+But we established `parser` construction likely succeeds.
+
+Is it possible `WriteFile.MakeFile_error` is failing silently?
+Or is `stringBuilder1` empty?
+If `myError.errorTreeMap` is empty, `stringBuilder1` is empty.
+Why would it be empty?
+Maybe `myError.newError` is not static? No, it is static.
+Maybe `myError` class is reloaded? No.
+
+Let's look at `Lexer.java` again.
+```java
+            } else if (Character.isWhitespace(currentChar) || LineComments || ParagraphComments) {
+                continue;
+            }
+```
+If `LineComments` is true, it continues.
+`LineComments` is set to true when `//` is found.
+It is set to false when `isLinkBreak` (newline) is found.
+
+In `void f(int a {} // error 1`, the `//` starts a comment.
+The rest of the line is skipped.
+Newline increments `lineno`.
+`LineComments` becomes false.
+Next line `int main...` is processed.
+
+This seems correct.
+
+What if the error is in `checkAssignAfterLVal`?
+```java
+    public boolean checkAssignAfterLVal() {
+        int i = current;
+        while(i < tokens.size()) {
+            if (tokens.get(i).getType() == Token.TokenType.ASSIGN) {
+                return true;
+            } else if(tokens.get(i).getType() == Token.TokenType.SEMICN) {
+                return false;
+            }
+            i++;
+        }
+        return false;
+    }
+```
+This method scans ahead. It doesn't change `current`.
+
+Let's look at the `Stmt` parsing for `f(a + 10;`.
+`stmt()` is called.
+`tokens[current]` is `IDENFR` (`f`).
+`checkAssignAfterLVal()` scans: `f`, `(`, `a`, `+`, `10`, `;`.
+It finds `;` before `=`. Returns `false`.
+So `stmt` goes to `else` branch (num=2).
+`exps.add(exp())`.
+`exp()` parses `f(a+10`.
+Inside `unaryExp()`:
+`ident` `f`, `l_token` `(`.
+`match(RPARENT)` fails (current is `a`? No, `funcRParams` consumed `a+10`).
+`funcRParams`:
+`exps.add(exp())`. `exp()` parses `a+10`.
+`match(COMMA)` fails.
+Returns.
+Back in `unaryExp`. `current` is at `;`.
+`if (!match(Token.TokenType.RPARENT))` -> `;` is not `)`. Fails.
+Records Error J. Line number of `tokens.get(current-1)`.
+`current` is at `;`. `current-1` is `10` (INTCON).
+Line number of `10` is 5.
+Correct.
+
+So errors are recorded.
+
+Is it possible that `Compiler.java` fails to write because `parser.txt` writing fails?
+`compUnit.checkOut()` writes to `parser.txt`.
+If `checkOut` throws an exception, `WriteFile.MakeFile_error` is never reached.
+
+In `Block.checkOut()`:
+```java
+    public void checkOut() {
+        WriteFile.MakeFile(l_token.toString() + "\n");
+        for (BlockItem blockItem : blockItems) {
+            blockItem.checkOut();
+        }
+        WriteFile.MakeFile(r_token.toString() + "\n");
+        WriteFile.MakeFile("<Block>\n");
+    }
+```
+If `blockItems` contains nulls?
+In `block()`:
+```java
+        while (current < tokens.size() && !match(Token.TokenType.RBRACE)) {
+            blockItems.add(blockItem());
+        }
+```
+`blockItem()` returns a `BlockItem`.
+
+In `BlockItem.checkOut()`:
+```java
+    public void checkOut() {
+        if (decl != null) {
+            decl.checkOut();
+        } else {
+            stmt.checkOut();
+        }
+        //Tools.WriteFile.MakeFile("<BlockItem>");
+    }
+```
+If both are null? `BlockItem` constructor:
+```java
+    public BlockItem(int lineno, Node node) {
+        super(lineno);
+        if (node instanceof Decl) {
+            this.decl = (Decl) node;
+        } else if (node instanceof Stmt) {
+            this.stmt = (Stmt) node;
+        } else {
+            WriteFile.MakeFile("BlockItem ERROR\n");
+        }
+    }
+```
+If `node` is neither, it writes error to `parser.txt` but `stmt` remains null.
+Then `checkOut` calls `stmt.checkOut()` -> NullPointerException.
+
+Does `blockItem()` return something invalid?
+```java
+    private BlockItem blockItem() {
+        Node node;
+        if (isDecl()) {
+            node = decl();
+        } else {
+            node = stmt();
+        }
+        return new BlockItem(100, node);
+    }
+```
+`isDecl` or `stmt` should return a valid Node.
+
+However, look at `isDecl` again.
+```java
+    private boolean isDecl() {
+        int i = current;
+        if (tokens.get(i).getType() == Token.TokenType.CONSTTK) {
+            return true;
+        } else if (tokens.get(i).getType() != Token.TokenType.INTTK && tokens.get(i).getType() != Token.TokenType.CHARTK) {
+            return false;
+        }
+        //跳过 BType Ident
+        i += 2;
+        return tokens.get(i).getType() != Token.TokenType.LPARENT;
+    }
+```
+If `i += 2` goes out of bounds, it crashes.
+In `main` block:
+`int a = 10;`
+Tokens: `INTTK`, `IDENFR`, `ASSIGN`, `INTCON`, `SEMICN`.
+`isDecl` at `INTTK`:
+`i=0` (relative to current). `tokens[i]` is `INTTK`.
+`i+=2` -> `tokens[2]` is `ASSIGN`.
+`ASSIGN != LPARENT`. Returns `true`.
+`decl()` is called.
+`varDecl()` parses `int a = 10;`.
+Correct.
+
+Next item: `f(a + 10;`
+`isDecl` at `IDENFR` (`f`):
+`tokens[i]` is `IDENFR`. Not `CONSTTK`, `INTTK`, `CHARTK`.
+Returns `false`.
+`stmt()` is called.
+Correct.
+
+Next item: `return 0;`
+`isDecl` at `RETURNTK`:
+Returns `false`.
+`stmt()` is called.
+Correct.
+
+Next item: `}`
+`block()` loop condition: `!match(RBRACE)`.
+Matches `}`. Loop ends.
+
+So `checkOut` should proceed without NPE.
+
+Is it possible the error is in `WriteFile`?
+`MakeFile` appends. `MakeFile_error` overwrites.
+
+Wait! Look at `Compiler.java`.
+```java
+        CompUnit compUnit = parser.getCompUnit();
+        compUnit.checkOut();
+
+
+        TreeMap<Integer, myError> errors = myError.getErrorTreeMap();
+        StringBuilder stringBuilder1 = new StringBuilder();
+        for (Map.Entry<Integer, myError> entry : errors.entrySet()) {
+            stringBuilder1.append(entry.getKey()).append(" ").append(entry.getValue().toString()).append("\n");
+        }
+        WriteFile.MakeFile_error(stringBuilder1.toString());
+```
+If `compUnit.checkOut()` throws an exception, the code stops.
+Does `checkOut` throw?
+`CompUnit.checkOut`:
+```java
+    public void checkOut() {
+        for (Decl decl : decls) {
+            decl.checkOut();
+        }
+        for (FuncDef funcDef : funcDefs) {
+            funcDef.checkOut();
+        }
+        mainFuncDef.checkOut();
+        WriteFile.MakeFile("<CompUnit>\n");
+    }
+```
+`decls` is empty.
+`funcDefs` has 1 element (`void f...`).
+`funcDef.checkOut()`:
+```java
+    public void checkOut() {
+        funcType.checkOut();
+        ident.checkOut();
+        WriteFile.MakeFile(l_token.toString() + "\n");
+        if (funcFParams != null) {
+            funcFParams.checkOut();
+        }
+        WriteFile.MakeFile(r_token.toString() + "\n"); // r_token is NULL!
+        block.checkOut();
+        WriteFile.MakeFile("<FuncDef>\n");
+    }
+```
+In `funcDef()` parser:
+```java
+        if (!match(Token.TokenType.RPARENT)) {
+            myError.newError(myError.ErrorType.ERROR_J, tokens.get(current-1).getLineno());
+        } else {
+            r_token = (tokens.get(current - 1));
+        }
+```
+If match fails, `r_token` remains **NULL**.
+Then `funcDef.checkOut()` calls `WriteFile.MakeFile(r_token.toString() + "\n");`.
+**NullPointerException!**
+
+The program crashes during `compUnit.checkOut()`.
+The `WriteFile.MakeFile_error` is never executed.
+Thus, `error.txt` is not created/updated with the errors.
+
+The same issue exists in `MainFuncDef.checkOut()` if `r_token` is null.
+And potentially other nodes.
+
+The fix should be to ensure `r_token` is handled or not printed if null, OR to ensure the parser assigns a dummy token or handles the error recovery such that the AST is consistent. But primarily, the crash is due to calling `.toString()` on a null token.
+
+<Parser.java>
+...
+    private FuncDef funcDef() {
+        Token l_token = null;
+        Token r_token = null;
+        FuncType funcType = funcType();
+        Ident ident = new Ident(100, tokens.get(current));
+        match(Token.TokenType.IDENFR);
+        match(Token.TokenType.LPARENT);
+        l_token = (tokens.get(current - 1));
+        FuncFParams funcFParams = null;
+        if (tokens.get(current).getType() == Token.TokenType.INTTK || tokens.get(current).getType() == Token.TokenType.CHARTK) {
+            funcFParams = funcFParams();
+        }
+
+        if (!match(Token.TokenType.RPARENT)) {
+            myError.newError(myError.ErrorType.ERROR_J, tokens.get(current-1).getLineno());
+        } else {
+            r_token = (tokens.get(current - 1));
+        }
+        Block block = block();
+
+        //TODO("<FuncDef>" + "\n");
+        return new FuncDef(100, funcType, ident, l_token, funcFParams, r_token,  block);
+    }
+...

@@ -1,0 +1,117 @@
+<frontend/Lexer.java>
+...
+            case '/': {
+                peekChar(); @@ The code consumes the character immediately after '/' to check for comments. If it is not a comment, the current character (the one after '/') is lost and not processed as a potential token (e.g., if the next char is an identifier or digit, it is skipped). Furthermore, if it is not a comment, the DIV token is output, but the state remains Operation or resets to Start without re-processing the consumed character, leading to missing tokens or incorrect parsing. In the specific failing case `/* code */`, the logic for block comments might be interfering or the consumption logic here is flawed relative to how `peekChar` advances `curPos`. However, looking at the buggy output: `DIV /` appears where `yuming` should be. This suggests that the `/` in `/*` was treated as DIV, and the `*` was likely consumed or mishandled, or the comment detection failed. Wait, looking at the input: `/* code */`. The lexer sees `/`. It peeks `*`. It enters `BlkCom`. Inside `BlkCom`, it loops. The issue in the buggy output is that `DIV /` is printed, and then `IDENFR yuming`. This implies the comment `/* code */` was NOT skipped correctly, or the `/` was emitted as DIV. Let's look closer at `OperParse` for `/`. It peeks. If `*`, it sets state to `BlkCom`. It does NOT output DIV. So why is DIV output? Ah, look at the previous token. `SEMICN ;`. Then `LBRACE {`. Then `/* code */`. The buggy output shows `DIV /` then `IDENFR yuming`. This means the `/` was output as DIV. This happens if the check `current.equals('*')` fails or if the logic falls through. But wait, if it enters `BlkCom`, it doesn't output DIV. The only way DIV is output is if the `else` branch is taken. This implies `current` was not `*`. But the input is `/*`. 
+                
+                Actually, let's look at the `BlkCom` logic.
+                `boolean done = false, half = false;`
+                `while (!done && current != null) {`
+                `    peekChar();`
+                `    if (half && current.equals('/')) { done = true; }`
+                `    else { half = false; }`
+                `    if (current.equals('*')) { half = true; }`
+                `}`
+                
+                When entering `BlkCom`, `current` is `*` (because `peekChar()` was called in the `/` case).
+                The loop starts. `peekChar()` reads the next char (space). `half` is false. `current` is space. `half` remains false.
+                ... eventually it reads `*`. `half` becomes true.
+                Then it reads `/`. `half` is true, `current` is `/`. `done` becomes true. Loop ends.
+                State becomes `Start`.
+                
+                So why is `DIV /` in the output?
+                Let's re-read the `OperParse` for `/`.
+                `case '/': { peekChar(); if (current.equals('/')) ... else if (current.equals('*')) ... else { tokenOut(LexType.DIV...); } break; }`
+                
+                If the input is `/*`, `peekChar()` makes `current` = `*`. `current.equals('*')` is true. State becomes `BlkCom`. Break.
+                So DIV should NOT be output.
+                
+                However, the buggy output HAS `DIV /`. This implies that the code executed the `else` block. This means `current` was NOT `*` and NOT `/`.
+                This can happen if `peekChar()` returned something else.
+                
+                Let's look at the input again:
+                `            /* code */`
+                
+                Is it possible there are spaces before `/*`? Yes. They are skipped in `Start` state.
+                
+                Wait, look at the buggy output around the error:
+                `RBRACE }`
+                `FORTK for`
+                ...
+                `LBRACE {`
+                `DIV /`  <-- Error here
+                `IDENFR yuming`
+                
+                The source line is: `            /* code */`
+                Followed by: `            yuming = yuming * 2;`
+                
+                If the lexer outputs `DIV /`, it means it saw `/`, peeked, and didn't see `/` or `*`.
+                Did it see a space? No, `peekChar` skips nothing in `OperParse`.
+                
+                Actually, there is a subtle bug in `peekChar`.
+                `private Character peekChar() { ... current = source.get(lineNum - 1).charAt(curPos++); return current; }`
+                
+                In `Start` state, if it sees a space, it calls `peekChar()` and breaks.
+                
+                In `OperParse`, when it sees `/`, it calls `peekChar()`.
+                
+                If the input is `/*`, `current` becomes `*`.
+                
+                Why would it fail?
+                
+                Let's look at the `BlkCom` state again.
+                When `BlkCom` finishes, `state` is set to `Start`.
+                The `lexerParse` loop continues.
+                Next iteration: `Start`.
+                `peekChar()` is called at the beginning of `lexerScan`? No, `lexerScan` calls `peekChar()` once before the loop.
+                Inside `lexerParse`, `Start` case:
+                If it's a letter/digit, it appends.
+                If it's space, it peeks and breaks.
+                
+                After `BlkCom` finishes, the `current` character is the one AFTER the closing `*/`.
+                The state is `Start`.
+                The loop continues.
+                It goes to `Start`.
+                It checks `current`.
+                
+                If `BlkCom` consumes `*/`, the last `peekChar()` inside `BlkCom` reads the character after `/`.
+                Let's trace `/* code */\n`.
+                Enter `BlkCom` with `current` = `*`.
+                1. `peekChar()` -> ` ` (space). `half`=false. `current`!=`*`.
+                2. `peekChar()` -> `c`. `half`=false.
+                ...
+                3. `peekChar()` -> `*`. `half`=true.
+                4. `peekChar()` -> `/`. `half`=true, `current`==`/`. `done`=true.
+                Loop ends.
+                `current` is `/`.
+                State `Start`.
+                
+                Next `lexerParse` call.
+                `Start` case.
+                `current` is `/`.
+                It goes to `else` -> `state = State.Operation`.
+                Break? No, `Operation` case is handled in the same switch? No, it sets state and breaks.
+                Next iteration.
+                `Operation` case.
+                `OperParse()`.
+                `current` is `/`.
+                `peekChar()`. Reads `\n` (or whatever is after `*/`).
+                If it's not `/` or `*`, it outputs `DIV /`.
+                
+                AH! The block comment logic consumes `*/` but leaves `current` pointing to the last character read, which is `/`.
+                Then it exits.
+                The next time `lexerParse` runs, it is in `Start` state.
+                It sees `/` (which is the closing slash of the comment).
+                It switches to `Operation`.
+                Next iteration, it processes `/`.
+                It peeks the next character (newline/space).
+                It is not `/` or `*`.
+                So it outputs `DIV /`.
+                
+                The error is that `BlkCom` does not advance past the closing `/`. Or rather, the logic identifies the end of comment when it sees `/` following `*`, but that `/` is still in `current`. When control returns to `Start`, that `/` is processed as a new token.
+                
+                To fix this, after detecting the end of the block comment, we should consume the final `/` (advance `curPos` / call `peekChar`) so that `current` points to the character AFTER the comment.
+
+                else {
+                    tokenOut(LexType.DIV, null, "/"); @@ The block comment state (BlkCom) leaves 'current' pointing to the closing '/' of the comment. When the state returns to Start, this '/' is processed as a division operator because the subsequent character is not '*' or '/'. The BlkCom logic needs to consume the final '/' or advance past the comment entirely before returning to Start.
+                }
+...

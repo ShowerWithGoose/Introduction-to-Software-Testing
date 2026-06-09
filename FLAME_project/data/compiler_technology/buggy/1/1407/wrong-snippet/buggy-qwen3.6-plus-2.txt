@@ -1,0 +1,233 @@
+Based on the problem description, the test case involves a source program with syntax errors (missing semicolons). The expected output indicates that the parser should detect these errors and report them with error code `i` (Missing semicolon) at specific line numbers.
+
+The buggy output is empty, which suggests that the parser either crashed, entered an infinite loop, or failed to trigger the error handling mechanism correctly when encountering the missing semicolons.
+
+Let's analyze the `Stmt` method in `frontend/Parser.java`. The grammar for `Stmt` includes:
+`Stmt → LVal '=' Exp ';' | [Exp] ';' | ...`
+
+In the provided test case:
+1. `printf("Hello SysY!\n") // error 1` -> This is a `Printf` statement. The parser expects a `;` after the `)`. The code handles `Printf` specifically.
+2. `if (1) ... ;` -> This is an `If` statement.
+3. `int a // error 2` -> This is a `VarDecl`. The parser expects a `;` after the `VarDef`.
+4. `return 0 // error 3` -> This is a `Return` statement. The parser expects a `;` after the `Exp`.
+
+The error reporting logic is centralized in the `getToken` method. When `getToken(TokenType.SEMICN)` is called and the current token is not a semicolon, it adds an error `i` using the line number of the *previous* token (`before.line`).
+
+However, looking at the `Stmt` method, specifically the handling of `Printf`, `Return`, and other statements that end with a semicolon, the code calls `getToken(TokenType.SEMICN)`.
+
+Let's look at the `CompUnit` method:
+```java
+public CompUnitBlock CompUnit(){
+    List<DeclBlock> declBlockList = new ArrayList<>();
+    List<FuncDefBlock> funcDefBlockList = new ArrayList<>();
+    MainFuncDefBlock mainFuncDefBlock = null;
+
+    while (tokenList.get(now + 1).type != TokenType.MAINTK && tokenList.get(now + 2).type != TokenType.LPARENT) {
+        nowToken = tokenList.get(now);
+        DeclBlock declBlock = Decl();
+        declBlockList.add(declBlock);
+    }
+    while (tokenList.get(now + 1).type != TokenType.MAINTK) {
+        FuncDefBlock funcDefBlock = FuncDef();
+        funcDefBlockList.add(funcDefBlock);
+    }
+    mainFuncDefBlock = MainFuncDef();
+    return new CompUnitBlock(declBlockList,funcDefBlockList,mainFuncDefBlock);
+}
+```
+This logic for identifying `Decl` vs `FuncDef` vs `MainFuncDef` is fragile and likely incorrect for general cases, but might work for this specific simple input if `main` is unique.
+
+The critical issue lies in how the parser recovers from errors or proceeds when a semicolon is missing.
+In `frontend/Parser.java`, the `getToken` method throws a `RuntimeException` if the token type doesn't match and it's not one of the three handled error cases (SEMICN, RPARENT, RBRACK).
+
+```java
+    public Token getToken(TokenType tokenType){
+        Token tmp = nowToken;
+        if(tmp.type == tokenType){
+            if(now < maxToken){
+                now++;
+                nowToken = tokenList.get(now);
+            }
+            return tmp;
+        } else {
+            Token before = tokenList.get(now-1);
+
+            if(tokenType == TokenType.SEMICN){
+                ErrorHandler.add(before.line,ErrType.i);
+                return new Token(TokenType.SEMICN,";", before.line);
+            } else if (tokenType == TokenType.RPARENT) {
+                ErrorHandler.add(before.line, ErrType.j);
+                return new Token(TokenType.RPARENT,")", before.line);
+            } else if (tokenType == TokenType.RBRACK) {
+                ErrorHandler.add(before.line, ErrType.k);
+                return new Token(TokenType.RBRACK,"]", before.line);
+            }else{
+                throw new RuntimeException("token const not right: " + tmp.token + " at line "+tmp.line);
+            }
+        }
+    }
+```
+
+When a semicolon is missing, `getToken(TokenType.SEMICN)` adds the error and returns a *virtual* semicolon token. Crucially, it **does not advance** the `now` index. The `nowToken` remains the same (the token that *should* have been preceded by a semicolon, or the next token in the stream).
+
+Let's trace `printf("Hello SysY!\n")`:
+1. `Stmt()` identifies `PRINTFTK`.
+2. Parses arguments.
+3. Calls `getToken(TokenType.RPARENT)`. Consumes `)`.
+4. Calls `getToken(TokenType.SEMICN)`. Current token is likely the next line's token or EOF. It's not `SEMICN`.
+5. Error `i` is added. Virtual `;` returned. `now` is NOT incremented.
+6. `Stmt()` returns.
+7. Control returns to `Block()`.
+8. `Block()` loops: `while(nowToken.type!=TokenType.RBRACE)`.
+9. It calls `BlockItem()` again.
+10. `BlockItem()` checks `if(nowToken.type == TokenType.CONSTTK || isBType())`.
+    - If the next token is `if` (IFTK), it goes to `else` -> `Stmt()`.
+    - If the next token is `int` (INTTK), it goes to `Decl()`.
+
+Wait, look at the first error: `printf("Hello SysY!\n") // error 1`.
+The next token after `)` is likely a newline or comment (skipped by lexer), then `if`.
+So `nowToken` is `IFTK`.
+`BlockItem()` calls `Stmt()`.
+`Stmt()` sees `IFTK`. Parses `if`.
+Inside `if`, it parses `Cond`.
+Then it parses `Stmt()`.
+The `if` body is empty or just `;`? The input is:
+```
+    if (1)
+
+
+    /*********/
+    ;
+```
+The `if` condition is `1`. Then `Stmt()` is called for the body.
+The next token is `;` (after the comment).
+So `Stmt()` sees `SEMICN`.
+It goes to the `else` block of `Stmt()`.
+`isExp()` returns false for `SEMICN`.
+`nowToken.type == TokenType.SEMICN` is true.
+It consumes `;` and returns an empty `Exp` stmt.
+This seems correct for the `if` part.
+
+Then `Block()` continues.
+Next token is `int` (INTTK).
+`BlockItem()` sees `isBType()` is true. Calls `Decl()`.
+`Decl()` calls `VarDecl()`.
+`VarDecl()` calls `BType()` (consumes `int`).
+Calls `VarDef()`.
+`VarDef()` consumes `a` (IDENFR).
+Checks for `[` (no).
+Checks for `=` (no).
+Returns `VarDef`.
+Back in `VarDecl()`: `while(nowToken.type!=TokenType.SEMICN)`.
+Current token is likely the next line's token, e.g., `for` or `return`?
+Input:
+```
+    int a // error 2
+
+    for (;;) {}
+```
+After `a`, the next token is `FORTK`.
+`nowToken.type` is `FORTK`. It is not `SEMICN`.
+Loop continues.
+`commaList.add(getToken(TokenType.COMMA))`.
+Current token is `FORTK`. `getToken(COMMA)` fails.
+`FORTK` is not `COMMA`.
+Goes to `else` in `getToken`.
+Throws `RuntimeException`.
+
+Ah, the `VarDecl` logic assumes that if it's not a semicolon, it MUST be a comma followed by another `VarDef`. It does not handle the error case where a semicolon is missing but the next token is not a comma. It crashes instead of reporting error `i`.
+
+Similarly for `return 0 // error 3`.
+`Stmt()` handles `RETURNTK`.
+Consumes `return`.
+Checks `if(nowToken.type!=TokenType.SEMICN)`. Current is `INTCON` (0).
+Calls `Exp()`.
+`Exp()` parses `0`.
+Back in `Stmt()`.
+Calls `getToken(TokenType.SEMICN)`.
+Current token is `RBRACE` (`}`).
+Not `SEMICN`.
+Adds error `i`. Returns virtual `;`.
+Does NOT advance `now`.
+`Stmt()` returns.
+Back in `Block()`.
+`nowToken` is still `RBRACE`.
+Loop `while(nowToken.type!=TokenType.RBRACE)` terminates.
+`Block()` consumes `RBRACE`.
+Returns.
+
+So `return 0` error IS detected.
+
+Why is `int a` error NOT detected?
+Because `VarDecl` crashes before calling `getToken(SEMICN)`.
+
+The fix should be in `VarDecl` (and potentially `ConstDecl`) to check if the next token is a comma. If it's not a comma and not a semicolon, it's likely a missing semicolon error.
+
+However, the prompt asks to identify the location of the errors. The primary error causing the "Wrong Answer" (empty output vs expected errors) is the crash in `VarDecl` preventing the error from being recorded, and potentially similar issues in other declaration parsing logic.
+
+Let's look at `ConstDecl` too.
+```java
+    public ConstDeclBlock ConstDecl() {
+        // ...
+        while(nowToken.type != TokenType.SEMICN){
+            commaList.add(getToken(TokenType.COMMA)); // Crashes here if missing ; and next is not ,
+            constDefBlockList.add(ConstDef());
+        }
+        // ...
+    }
+```
+
+And `VarDecl`:
+```java
+    public VarDeclBlock VarDecl() {
+        // ...
+        while(nowToken.type!=TokenType.SEMICN){
+            commaList.add(getToken(TokenType.COMMA)); // Crashes here
+            varDefBlockList.add(VarDef());
+        }
+        // ...
+    }
+```
+
+The `getToken` method throws an exception for unexpected tokens. The parser needs to handle the case where a semicolon is expected, but a comma is not present.
+
+Another potential issue: The `CompUnit` parsing logic.
+```java
+    while (tokenList.get(now + 1).type != TokenType.MAINTK && tokenList.get(now + 2).type != TokenType.LPARENT) {
+```
+This lookahead is very specific and might fail or crash if `now` is near the end of the list, or if the structure is slightly different. But for this input, it probably passes the declarations.
+
+The main culprit is the strict expectation of `,` in `VarDecl` and `ConstDecl` without error recovery for missing `;`.
+
+<frontend/Parser.java>
+...
+    public ConstDeclBlock ConstDecl() {
+        Token constToken = getToken(TokenType.CONSTTK);
+        BTypeBlock bTypeBlock = BType();
+        List<ConstDefBlock> constDefBlockList = new ArrayList<>();
+        List<Token> commaList = new ArrayList<>();
+        constDefBlockList.add(ConstDef());
+        while(nowToken.type != TokenType.SEMICN){
+            commaList.add(getToken(TokenType.COMMA));
+            constDefBlockList.add(ConstDef());
+        }
+        Token semicnToken = getToken(TokenType.SEMICN);
+        return new ConstDeclBlock(constToken,bTypeBlock,constDefBlockList,commaList,semicnToken);
+    }
+...
+    public VarDeclBlock VarDecl() {
+        BTypeBlock bTypeBlock;
+        List<VarDefBlock> varDefBlockList = new ArrayList<>();
+        List<Token> commaList = new ArrayList<>();
+        Token semicn;
+
+        bTypeBlock = BType();
+        varDefBlockList.add(VarDef());
+        while(nowToken.type!=TokenType.SEMICN){
+            commaList.add(getToken(TokenType.COMMA));
+            varDefBlockList.add(VarDef());
+        }
+        semicn = getToken(TokenType.SEMICN);
+        return new VarDeclBlock(bTypeBlock,varDefBlockList,commaList,semicn);
+    }
+...

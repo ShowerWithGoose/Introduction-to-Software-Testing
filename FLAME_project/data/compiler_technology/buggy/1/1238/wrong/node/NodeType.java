@@ -1,0 +1,42 @@
+package node;
+
+public enum NodeType {
+    // 非终结符类型
+    CompUnit,
+    Decl,
+    FuncDef,
+    MainFuncDef,
+    ConstDecl,
+    VarDecl,
+    BType,
+    ConstDef,
+    ConstExp,
+    ConstInitVal,
+    VarDef,
+    InitVal,
+    Exp,
+    FuncType,
+    FuncFParams,
+    Block,
+    FuncFParam,
+    BlockItem,
+    Stmt,
+    LVal,
+    Cond,
+    ForStmt,
+    AddExp,
+    LOrExp,
+    PrimaryExp,
+    Number,
+    UnaryExp,
+    UnaryOp,
+    FuncRParams,
+    MulExp,
+    RelExp,
+    EqExp,
+    LAndExp,
+    Character,
+
+    // 终结符类型
+    Terminal,
+}

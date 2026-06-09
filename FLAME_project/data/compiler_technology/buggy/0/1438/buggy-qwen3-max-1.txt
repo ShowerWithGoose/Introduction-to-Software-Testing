@@ -1,0 +1,92 @@
+<frontend/Lexer.java>
+...
+            } else if (c == '/') { // 第一个 /
+                if (curPos < currentLine.length() && currentLine.charAt(curPos) == '/') { //
+                    // 第二个 /
+                    c = currentLine.charAt(curPos++); //
+                    token += c;
+                    while (curPos < currentLine.length()) {
+                        // 非换行字符
+                        c = currentLine.charAt(curPos++);
+                        token += c;
+                    }
+                    //outputBuilder.append(TokenType.NOTE).append(" ").append(token).append("\n");
+                } else if (curPos < currentLine.length() && currentLine.charAt(curPos) == '*') {
+                    // /* 跨行注释 用状态机判断
+                    c = currentLine.charAt(curPos++);
+                    token += c;
+                    while (curPos < currentLine.length()) {  // 状态转换循环（直至末尾）
+                        while (curPos < currentLine.length() && currentLine.charAt(curPos) != '*') {
+                            // 非*字符 对应状态q5
+                            c = currentLine.charAt(curPos++);
+                            token += c;
+                            if (curPos == currentLine.length()) {
+                                lineNumber++;
+                                curPos = 0;
+                                currentLine = inputLines.get(lineNumber);
+                            }
+                        }
+                        // *
+                        while (curPos < currentLine.length() && currentLine.charAt(curPos) == '*') {
+                            // *字符 对应状态q6 如果没有转移到q7，则会在循环中转移到q5
+                            c = currentLine.charAt(curPos++);
+                            token += c;
+                        }
+                        if (curPos < currentLine.length() && currentLine.charAt(curPos) == '/') {
+                            // /字符 对应状态q7
+                            c = currentLine.charAt(curPos++);
+                            token += c;
+                            break;
+                        }
+                    }
+                    //outputBuilder.append(TokenType.NOTE).append(" ").append(token).append("\n");
+                } else {
+                    outputBuilder.append(TokenType.DIV).append(" ").append(token).append("\n");
+                }
+...
+            } else if (c == '<' || c == '>' || c == '=' || c == '!') { // <= >= == !=
+                if (curPos < currentLine.length() && currentLine.charAt(curPos) == '=') {
+                    token += currentLine.charAt(curPos++);
+                }
+                outputBuilder.append(tokenMap.get(token)).append(" ").append(token).append("\n"); // @@ [If token is a single '!', it is handled here, but '!' alone is valid (NOT), however, the real issue is that after processing block comment '/* ... */', the lexer continues processing the rest of the line, but in the provided test case, after "*/" there is nothing, yet the buggy output shows extra tokens "MULT *" and "DIV /" from the trailing "*/" comment content. The core error is that the block comment handling modifies `lineNumber` and `currentLine` but does not properly skip the rest of the comment or handle end-of-input, causing leftover characters like '*' and '/' from the closing "*/" to be reprocessed as tokens. Specifically, when the block comment ends with "*/", the code appends '/' to token and breaks, but the outer loop continues and may reprocess characters. However, the actual bug causing the wrong output is that the block comment handler does not consume the entire comment correctly and leaves the closing '/' or other characters to be parsed again. But looking at the test case: the erroneous output includes "MULT *" and "DIV /" at the very end, which come from the final line "*/" inside the comment. This indicates that the block comment parsing did not fully skip the comment content, and the '*' and '/' from "*/" were treated as separate tokens. The issue is in the block comment handling: after breaking out of the loop upon seeing "*/", the code does not skip further processing of those characters, but since they were already consumed into `token`, they are not output because the note output is commented out. However, the real problem is that the block comment logic modifies `lineNumber` and `currentLine` in the middle of `analyzeLine()`, which assumes it's processing one line at a time. When `lineNumber` is incremented inside the block comment loop, the outer for-loop in `analyze()` will later process the same line again or skip lines incorrectly. More critically, after exiting the block comment, the lexer continues processing the current line from `curPos`, but if the block comment spanned multiple lines, `currentLine` has been changed to a new line, and `curPos` might be beyond the length of the original line, leading to inconsistent state. However, the immediate cause of the extra "MULT *" and "DIV /" is that the trailing part of the comment "*/" is not being skipped — but in the code, the entire "/* ... */" is read into `token` and then ignored (since output is commented out). So why are '*' and '/' appearing as tokens? Because the block comment handling is flawed: when the input ends with "*/", the code reads '*' and then '/', appends them to `token`, breaks, and then the function returns. But the outer loop in `analyzeLine()` continues, and if there are leftover characters... Actually, looking at the test input, the last non-empty line is "*/", which is inside a comment. The lexer should skip it entirely. But in the buggy output, after the main function, we see:
+IDENFR zhe
+...
+IDENFR shi
+MULT *
+DIV /
+This means that the comment was not skipped; instead, the words inside the comment were treated as identifiers and symbols. The reason is that the block comment handling only activates when it sees "/*", but in the test input, the comment is:
+/*
+    zhe shi yi ge hen niu bi de ce shi
+*/
+So the first line is "/*", which triggers the block comment. However, the block comment parsing loop has a flaw: when it reaches the end of the first line (which is just "/*"), `curPos` becomes equal to `currentLine.length()`, so it enters the inner while loop that checks for non-'*' characters. Since the line ends, it increments `lineNumber`, sets `curPos=0`, and loads the next line. It continues until it finds "*/". But when it finally finds "*/", it breaks out of the loop and finishes processing the current line (which is now the line containing "*/"). However, after breaking, the function `analyzeLine()` continues processing from `curPos`, which is now past the "*/", so that line is done. But the problem is: the lines inside the comment (like "    zhe shi ...") were read as `currentLine` during the block comment parsing, but the outer loop in `analyze()` will still process those lines again because `lineNumber` was incremented inside `analyzeLine()`, but the for-loop in `analyze()` also increments `lineNumber` each iteration. This causes lines to be processed twice: once during block comment scanning, and once by the main loop. Specifically, when `analyzeLine()` is called for the line containing "/*", it scans ahead, increments `lineNumber` to, say, L+1, L+2, etc., until it finds "*/". Then `analyzeLine()` returns. The main loop then increments `lineNumber` again, so the lines between "/*" and "*/" are never processed by the main loop — but wait, no: the main loop calls `analyzeLine()` once per initial `lineNumber`. If inside `analyzeLine()` we change `lineNumber` and `currentLine`, then when we return, the main loop will call `analyzeLine()` for the next index, skipping the lines we already advanced through. However, the content of those skipped lines was never lexed as code — which is correct for comments. But in the buggy output, we see the Chinese-looking identifiers ("zhe", "shi", etc.) and then "MULT *" and "DIV /", which correspond to the "*/" at the end. This suggests that the block comment was not recognized at all. Why? Because the first line of the comment is "/*", but in the input, it's written as:
+/*
+    zhe shi yi ge hen niu bi de ce shi
+*/
+So the first line is exactly "/*". In the code, when processing this line, c = '/', then next char is '*', so it enters the block comment branch. Then it reads the '*' (curPos becomes 2, which is end of line). Then it enters the while (curPos < currentLine.length()) loop — but curPos=2 and currentLine.length()=2, so the loop condition fails immediately. Thus, it never scans beyond the first line. Therefore, the block comment is not closed, and the rest of the file is treated as comment? But no, because the loop exits, and the function returns. Then the main loop continues to the next line, which is "    zhe shi ...", and processes it as code, producing the identifiers. And the last line "*/" is processed as two tokens: '*' -> MULT, '/' -> DIV.
+
+The root cause is that the block comment handling does not continue scanning beyond the current line if the comment is not closed within the same line. The condition `while (curPos < currentLine.length())` at the top of the block comment loop prevents multi-line scanning because once curPos reaches the end of the current line, the loop exits, leaving the comment unclosed. The intended logic inside tries to handle multi-line by updating lineNumber and currentLine, but it's inside a loop that only runs while curPos < currentLine.length(), which is false at the end of the line. Therefore, the multi-line comment handling is broken.
+
+Specifically, the error is that the outer while loop for block comment processing terminates at the end of the current line, so it never processes subsequent lines. The fix would require a different structure, but as per the task, we only need to identify the error location.
+
+The immediate symptom is that the "*/" at the end is lexed as two separate tokens, and the comment body is lexed as code. This happens because the block comment was never properly consumed beyond the first line.
+
+Thus, the error is in the block comment handling logic. The line that starts the block comment processing has a flawed loop condition that doesn't allow crossing line boundaries properly.
+
+However, the question asks to mark the line where the error occurs. The critical flaw is that after detecting "/*", the code attempts to handle multi-line comments but fails because the main loop condition `while (curPos < currentLine.length())` prevents advancing to the next line at the right time. But the specific line that causes the failure to consume the entire comment is the structure of the loop.
+
+But looking at the output difference: the expected output stops after the main function, while the buggy output continues with the comment content as tokens. This means the comment was not skipped. The reason is that the block comment handler only processes within the current line and doesn't continue to subsequent lines. Therefore, the error is in the block comment parsing section.
+
+The most precise location is the while loop condition that prevents multi-line scanning. However, the instructions say to add @@ after the line where the error may occur.
+
+Given that, the key issue is that when the block comment spans multiple lines, the lexer doesn't handle it, and the lines inside the comment are processed as code. The error manifests because the block comment logic doesn't consume the entire comment, so the content is lexed as tokens.
+
+But in the provided code snippet, the problematic part is the block comment handling. Specifically, after reading "/*", if the line ends, the loop `while (curPos < currentLine.length())` doesn't execute, so it never looks at the next lines. Therefore, the comment remains unclosed, and subsequent lines are processed normally.
+
+So the error is in the design of the block comment loop. The line that starts the loop is:
+
+                    while (curPos < currentLine.length()) {  // 状态转换循环（直至末尾）
+
+This condition should not be limited to the current line because block comments can span multiple lines. But as written, it exits at the end of the line, failing to close the comment.
+
+Therefore, we mark this line as the location of the error.
+@@ [The while loop condition 'curPos < currentLine.length()' prevents processing beyond the current line, causing multi-line block comments to be incompletely parsed. As a result, the content inside the comment (including the closing '*/') is treated as regular tokens, leading to erroneous output like 'MULT *' and 'DIV /' from the '*/' sequence.]

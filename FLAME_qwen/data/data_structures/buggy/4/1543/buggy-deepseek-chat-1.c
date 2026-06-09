@@ -1,0 +1,66 @@
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+#define MAXWORD  32
+#define MAXSIZE  1024
+struct lnode {
+    char word[MAXWORD];
+    int count;
+};
+int getWord(FILE *in,char *w);
+int searchWord(struct lnode list[], char *w);
+int N=0;
+int main()
+{
+    struct lnode wordlist[MAXSIZE];    
+    char word[MAXWORD];
+    FILE *in;
+    in=fopen("article.txt", "r");
+    while(getWord(in,word) != EOF)
+        searchWord(wordlist, word);
+    for(int i=0; i<= N-1; i++)
+        printf("%s %d\n", wordlist[i].word,   wordlist[i].count);
+    return 0;
+} 
+int getWord(FILE *in, char *w)
+{
+    int c;
+    while(!isalpha(c=fgetc(in)))  
+        if(c == EOF) return 0; // @@ [Error: Should return EOF (which is -1) instead of 0, because the caller checks for EOF. Returning 0 will cause the loop to never terminate when the file ends.]
+       else continue;
+    do  {
+         *w++ = tolower(c);
+    } while(isalpha(c=fgetc(in))); 
+    *w='\0';
+   return 1;
+}
+int insertWord(struct lnode list[ ], int pos, char *w)
+{
+      int i;
+
+      if  (N == MAXSIZE) return -1; 
+              
+     for(i=N-1; i>=pos; i--){
+        list[i+1]=list[i]; // @@ [Error: This assignment copies the entire struct, but the original reference program copies word and count separately. This is not a logical error per se, but the function insertWord is missing from the function declarations at the top of the file, causing a compilation error.]
+        }
+    strcpy(list[pos].word, w);
+    list[pos].count = 1;
+     N++;
+     return 1;
+}
+int searchWord(struct lnode list[ ], char *w)
+{
+int low=0, high=N-1, mid=0;
+while(low <= high){
+mid = (high + low) / 2;
+if(strcmp( w, list[mid].word)<0)
+   high = mid -1;
+else if(strcmp( w, list[mid].word)>0)
+   low = mid + 1;
+else{ 
+            list[mid].count++;
+   return 0;
+    }
+}
+return insertWord(list, low, w);
+}

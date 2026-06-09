@@ -1,0 +1,271 @@
+Based on the problem description and the test case, the program fails to output any error file (`error.txt`), resulting in "No output file". The expected output indicates three syntax errors:
+1.  Line 16: `j` (Missing right parenthesis ')') for `ch = getchar( ;`
+2.  Line 18: `a` (Invalid use of `&` instead of `&&`) for `if (f2() & f1())`
+3.  Line 19: `j` (Missing right parenthesis ')') for `printf("%c",s[0];`
+
+The root cause lies in how the parser handles errors. In the provided code, error reporting (via `ErrorLog.getInstance().addError`) is guarded by `if (print == 1)`. However, `print` is set to `0` in several places during speculative parsing or backtracking attempts (e.g., in `Stmt.java` when checking if an identifier is an LVal or an Exp). If an error occurs while `print == 0`, it is silently ignored. Furthermore, even if `print` were 1, the parser likely crashes or stops prematurely due to unhandled exceptions or infinite loops when encountering unexpected tokens, preventing the `ErrorLog.printErrors()` method in `Compiler.java` from being reached or writing to the file.
+
+Specifically, looking at `Stmt.java`:
+```java
+if (getNowTokenType() == TokenType.IDENFR) {
+    int curPos = AstNode.pos;
+    AstNode.print = 0; // <--- Error reporting disabled here
+    Exp exp = new Exp();
+    exp.parse();
+    AstNode.print = 1;
+    // ...
+}
+```
+If `getchar(` is parsed as part of an expression or statement where `print` is 0, errors inside it might be suppressed. More critically, the `Lexer` detects error `a` immediately. But the parser needs to detect `j` errors.
+
+Let's look at `UnaryExp.java`:
+```java
+} else if (getNowTokenType() == TokenType.IDENFR &&
+        getPreTokenType(1) == TokenType.LPARENT) {
+    append(2);
+    // ...
+    j_error();
+}
+```
+And `PrimaryExp.java`:
+```java
+if (getNowTokenType() == TokenType.LPARENT) {
+    append(1);
+    Exp exp = new Exp();
+    exp.parse();
+    j_error();
+}
+```
+
+The main issue causing "No output file" is likely that the parser throws an exception or enters an invalid state before `ErrorLog.printErrors()` is called, or the `print` flag logic suppresses all errors. However, a more fundamental issue in recursive descent parsers with error recovery is that if an error is detected, the parser must recover (skip tokens) to continue parsing subsequent errors. The current implementation does not seem to have robust error recovery; it just reports the error (if `print==1`) and continues. If `print` is 0, it doesn't report.
+
+In `Compiler.java`, `AstNode.print = 1;` is set globally.
+In `Stmt.java`, `AstNode.print = 0;` is set temporarily. If the error occurs during this window, it's lost.
+For `ch = getchar( ;`, the parser sees `IDENFR` (`ch`). It enters the `IDENFR` block in `Stmt`. It sets `print=0`, tries to parse `Exp`. `Exp` -> `AddExp` -> ... -> `UnaryExp`. `UnaryExp` sees `IDENFR` (`getchar`) and `LPARENT` ahead? No, `getPreTokenType(1)` checks the token *before* the current one? No, `getPreTokenType(1)` in `AstNode` is `tokens.get(pos + 1).getType()`. Wait, `getPreTokenType` name is misleading. It gets the token at `pos + num`.
+In `UnaryExp`, `getNowTokenType()` is `IDENFR` (`getchar`). `getPreTokenType(1)` is `LPARENT` (`(`). So it enters the function call branch.
+It `append(2)` (consumes `getchar` and `(`).
+Then it checks for params.
+Then `j_error()`. `j_error` checks if current token is `RPARENT`. It is `SEMICN`. So it adds error `j`.
+BUT, this happens inside `Stmt`'s `IDENFR` block where `print` was set to `0` before calling `exp.parse()`?
+Wait, `Stmt` logic:
+1. `curPos = pos`
+2. `print = 0`
+3. `exp.parse()` -> This consumes `getchar`, `(`, fails to find `)`, adds error `j` (but `print` is 0, so **ignored**).
+4. `print = 1`
+5. Checks if next token is `ASSIGN`. It is `SEMICN`.
+6. Goes to `else` block: `AstNode.pos = curPos;` (Resets position!)
+7. Then `while (getNowTokenType() != SEMICN) { exp.parse(); }`
+8. This re-parses `getchar( ;`.
+9. Inside this second parse, `print` is 1.
+10. `exp.parse()` -> `UnaryExp`.
+11. `UnaryExp` sees `IDENFR` (`getchar`) and `LPARENT`.
+12. `append(2)`.
+13. `j_error()`. Current token is `SEMICN`. Adds error `j` at line 16. **This should work.**
+
+Why no output?
+Maybe `CompUnit.parse` throws an exception?
+Or `Lexer` throws an exception?
+In `Lexer.getLogicalOperator`, if `&` is found alone, it adds error `a`.
+Line 18: `if (f2() & f1())`.
+Lexer sees `&`. Calls `getLogicalOperator`.
+`c = '&'`. `move()`. Next char is ` ` (space) or `f`. Not `&`.
+Adds error `a` at row 18.
+Returns `AND` token? No, `stringBuilder` has `&`. Returns `TokenType.AND`.
+Wait, `TokenType.AND` is `&&`. The lexer returns `AND` token for single `&` but logs error `a`.
+Parser sees `AND` token in `Cond` -> `LOrExp` -> `LAndExp`.
+`LAndExp` expects `AND` (`&&`). It sees `AND`. It consumes it.
+So Parser doesn't see an error here, Lexer already handled it.
+
+So errors `a` (line 18) and `j` (line 16) should be logged.
+What about line 19 `printf("%c",s[0];`?
+`Stmt` sees `PRINTFTK`.
+`append(3)` (`printf`, `(`, `"%c"`).
+`while (token != RPARENT)`:
+`append(1)` (`,`).
+`exp.parse()`. `s[0]`.
+`LVal` -> `IDENFR` `[` `Exp` `]`.
+`k_error()` checks for `]`. Found.
+Back to `Stmt`. Loop continues.
+Next token is `SEMICN`.
+Loop condition `getNowTokenType() != RPARENT` is true.
+`append(1)` (`;`).
+`exp.parse()`. `Exp` tries to parse `;`. Fails?
+`AddExp` -> `MulExp` -> `UnaryExp` -> `PrimaryExp`.
+`PrimaryExp` sees `SEMICN`. None of the conditions match.
+It goes to `else`? No, `PrimaryExp` doesn't have an else for error. It just falls through?
+If `PrimaryExp` doesn't consume anything, `UnaryExp` doesn't consume anything.
+Infinite loop in `Stmt`?
+`while (getNowTokenType() != TokenType.RPARENT)`
+If `exp.parse()` doesn't advance `pos` because of error/mismatch, `pos` stays at `SEMICN`.
+Infinite loop. Program hangs. No output.
+
+Yes, `PrimaryExp` lacks error handling for unexpected tokens. If it encounters a token it can't parse (like `;` when expecting an expression component), it returns without consuming, causing infinite loops in parent structures like `Stmt` or `FuncRParams`.
+
+The specific location is `PrimaryExp.java` lacking error recovery/consumption, leading to infinite loop in `Stmt.java`'s `printf` handling. Also `Stmt.java`'s `printf` loop doesn't handle the case where `exp.parse()` fails to consume tokens.
+
+However, the prompt asks for the code snippet where the error is *likely* located. The infinite loop is the immediate cause of "No output". The lack of error synchronization in `PrimaryExp` or `Stmt` is the root.
+
+Let's look at `PrimaryExp.java`:
+
+<frontend/Parser/AST/PrimaryExp.java>
+package frontend.Parser.AST;
+import frontend.Lexer.TokenType;
+
+public class PrimaryExp extends AstNode{
+
+    public void parse() {
+        if (getNowTokenType() == TokenType.LPARENT) {
+            append(1);
+            Exp exp = new Exp();
+            exp.parse();
+            j_error();
+        } else if (getNowTokenType() == TokenType.INTCON){
+            Number number = new Number();
+            number.parse();
+        } else if (getNowTokenType() == TokenType.CHRCON) {
+            Character character = new Character();
+            character.parse();
+        } else {
+            LVal lval = new LVal();
+            lval.parse();
+        }
+        if (print == 1) {
+            stringBuilder.append("<PrimaryExp>").append("\n");
+        }
+    }
+}
+
+And `Stmt.java` printf part:
+
+<frontend/Parser/AST/Stmt.java>
+...
+        } else if (getNowTokenType() == TokenType.PRINTFTK) {
+            append(3);
+            while (getNowTokenType() != TokenType.RPARENT) {
+                append(1);
+                Exp exp = new Exp();
+                exp.parse();
+            }
+            j_error();
+            i_error();
+        }
+...
+
+The infinite loop occurs because `exp.parse()` eventually calls `PrimaryExp.parse()`. If `PrimaryExp` encounters `;` (SEMICN), it goes to `else` (LVal). `LVal` expects `IDENFR`. It sees `SEMICN`. `LVal.append(1)` consumes `SEMICN`? No, `LVal` starts with `append(1)`.
+Let's check `LVal.java`:
+
+<frontend/Parser/AST/LVal.java>
+package frontend.Parser.AST;
+
+import frontend.Lexer.TokenType;
+
+public class LVal extends AstNode{
+
+    public void parse() {
+        append(1);
+        if (getNowTokenType() == TokenType.LBRACK) {
+            append(1);
+            Exp exp = new Exp();
+            exp.parse();
+            k_error();
+        }
+        if (print == 1) {
+            stringBuilder.append("<LVal>").append("\n");
+        }
+    }
+}
+
+If `PrimaryExp` goes to `else`, it calls `LVal.parse()`.
+`LVal.parse()` calls `append(1)`. This consumes the `SEMICN`.
+Then `Stmt` loop checks `getNowTokenType() != RPARENT`.
+Next token is `}` (RBRACE).
+Loop continues.
+`append(1)` consumes `}`.
+`exp.parse()`...
+This will consume the rest of the file incorrectly, likely crashing or producing wrong errors, but not hanging infinitely on `;`.
+
+Wait, if `LVal` consumes `;`, then `printf` statement parses `;` as an LVal? That's syntactically wrong but prevents infinite loop.
+However, `LVal` expects an Identifier. Consuming `;` as an Identifier is wrong.
+But why "No output file"?
+Maybe `CompUnit` logic is flawed?
+
+<frontend/Parser/AST/CompUnit.java>
+...
+    public void parse() throws IOException {
+        while (getPreTokenType(2) != TokenType.LPARENT) {
+            Decl decl = new Decl();
+            decl.parse();
+        }
+...
+
+`getPreTokenType(2)` looks at `pos+2`.
+If the parser gets out of sync, this loop might be infinite or crash.
+
+Let's re-evaluate the `printf` error.
+Input: `printf("%c",s[0];`
+Tokens: `PRINTFTK`, `LPARENT`, `STRCON`, `COMMA`, `IDENFR`, `LBRACK`, `INTCON`, `RBRACK`, `SEMICN`, `RPARENT` (Missing).
+
+1. `Stmt` sees `PRINTFTK`.
+2. `append(3)`: Consumes `PRINTFTK`, `LPARENT`, `STRCON`. Pos at `COMMA`.
+3. `while (token != RPARENT)`:
+   - Token is `COMMA`.
+   - `append(1)`: Consumes `COMMA`. Pos at `IDENFR` (`s`).
+   - `exp.parse()`: Parses `s[0]`.
+     - `AddExp`... `PrimaryExp`.
+     - `PrimaryExp` sees `IDENFR`. Goes to `else` -> `LVal`.
+     - `LVal` consumes `s`. Sees `[`. Consumes `[`. Parses `Exp` (`0`). Expects `]`. `k_error` finds `]`. Consumes `]`.
+     - `LVal` returns. `PrimaryExp` returns. `Exp` returns.
+   - Loop check: Token is `SEMICN`. Not `RPARENT`.
+   - `append(1)`: Consumes `SEMICN`. Pos at `RPARENT`? No, `RPARENT` is missing in source?
+   Source: `printf("%c",s[0];` followed by newline/`}`.
+   The source line 19 is `printf("%c",s[0]; // error 3`.
+   Tokens after `SEMICN`: `RBRACE` (from line 20 `}`).
+   
+   - Loop check: Token is `RBRACE`. Not `RPARENT`.
+   - `append(1)`: Consumes `RBRACE`. Pos at `INTTK` (`int` of next line? No, `main` block ends).
+   - `exp.parse()`: Tries to parse `int`...
+   
+   This consumes the closing brace of the `if` block and potentially further.
+   Eventually, it might consume the `}` of `main`.
+   Then `j_error()` in `Stmt` checks for `RPARENT`. It sees whatever is next. Adds error `j`?
+   Then `i_error()` checks for `SEMICN`.
+   
+   If it consumes the `}` of the `if` block, the `Block` parser in `if` statement might fail later.
+   
+   The critical issue is likely that `ErrorLog.printErrors()` is never called because an exception is thrown earlier, OR the errors are added but the file write fails/is empty?
+   
+   Actually, look at `Compiler.java`:
+   ```java
+   parser.parse();
+   ErrorLog.getInstance().printErrors();
+   ```
+   If `parser.parse()` throws an exception (e.g. IndexOutOfBounds in `getPreTokenType` or `getToken`), `printErrors` is skipped.
+   
+   In `CompUnit.java`:
+   ```java
+   while (getPreTokenType(2) != TokenType.LPARENT) {
+       Decl decl = new Decl();
+       decl.parse();
+   }
+   ```
+   `getPreTokenType(2)` accesses `tokens.get(pos + 2)`.
+   If `pos` is near the end of the list, this throws `IndexOutOfBoundsException`.
+   There is no bounds checking in `getPreTokenType`.
+   
+   <frontend/Parser/AST/AstNode.java>
+   ...
+   public TokenType getPreTokenType(int num) {
+       return tokens.get(pos + num).getType();
+   }
+   ...
+
+   This method is unsafe. If the parser consumes too many tokens or misinterprets structure, `pos + num` can exceed `tokens.size()`.
+   
+   Given the "No output file" symptom, an uncaught exception during parsing is the most probable cause. The unsafe access in `getPreTokenType` used in `CompUnit` and `UnaryExp` is a strong candidate.
+
+<frontend/Parser/AST/AstNode.java>
+...
+    public TokenType getPreTokenType(int num) {
+        return tokens.get(pos + num).getType();
+    }
+...

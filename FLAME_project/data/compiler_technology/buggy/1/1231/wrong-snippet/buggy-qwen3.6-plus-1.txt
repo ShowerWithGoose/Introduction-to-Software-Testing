@@ -1,0 +1,728 @@
+Based on the problem description and the test case, the program fails to output any error file (`No output file`), while it should output three "missing semicolon" errors (type `i`) at lines 2, 9, and 13.
+
+The root cause lies in how the `Stmt` class handles statements starting with an identifier (`IDENFR`). The method `assignOrExp()` attempts to look ahead to distinguish between an assignment statement (`LVal = ...`), a function call/getint/getchar statement, or an expression statement.
+
+In the test case:
+1. Line 2: `printf("Hello SysY!\n")` is handled by `MyPrintfStmt`, which correctly detects the missing semicolon. However, the next token is `if`.
+2. Line 4-6: `if (1) ... ;` is an `if` statement followed by an empty statement (semicolon). This parses correctly.
+3. Line 9: `int a` is a declaration, handled by `Decl`/`VarDecl`. `VarDecl` calls `ErrorHandler.handleIError` when it expects a semicolon but finds something else (likely the `for` keyword or newline/end of block logic issues). Wait, `int a` is followed by a blank line and then `for`. The `VarDecl` parser consumes `int`, then `a`. It then looks for `,` or `;`. It sees `for` (or potentially nothing if iterator ends?). Actually, `BlockItem` decides between `Decl` and `Stmt`. `int` triggers `Decl`. `VarDecl` parses `BType` (`int`) and `VarDef` (`a`). Then it loops looking for `,`. It reads the next token. If it's not `,`, it steps back and calls `handleIError`. `handleIError` reads the next token. If it's not `;`, it reports error `i`. This part seems okay for `int a`.
+4. Line 13: `return 0` is handled by `MyReturnStmt`. It parses `return`, then `0` (Exp), then calls `handleIError`. This should also work.
+
+Let's look closer at `Stmt.assignOrExp()`.
+When the parser encounters an `IDENFR` (like `a` in `int a`? No, `int` is `INTTK`. `a` is inside `VarDef`).
+What about `printf`? `printf` is `PRINTFTK`, so it goes to `MyPrintfStmt`.
+What about `if`? `IFTK`, goes to `MyCondStmt`.
+What about `for`? `FORTK`, goes to `MyForStmt`.
+What about `return`? `RETURNTK`, goes to `MyReturnStmt`.
+
+The issue might be in `CompUnit.parseDecls()` or `parseFuncDefs()` lookahead logic consuming tokens incorrectly, or `Block` parsing.
+
+However, the most suspicious part regarding "No output file" is often an exception or infinite loop, or simply that errors are not being recorded/written.
+Let's check `Writer.writeSyntaxTree`. It checks `ErrorList.hasError()`. If true, it writes to `error.txt`.
+`ErrorList.addError` adds to a `TreeSet`.
+
+Let's look at `Stmt.assignOrExp()` again.
+```java
+    private void assignOrExp() {
+        int count = 0;
+        while (tokens.hasNext()) {
+            Token token = tokens.next();
+            count++;
+            if (token.getType().equals(TokenType.ASSIGN)) {
+                // ... handles assignment
+            }
+            if (token.getType().equals(TokenType.SEMICN)) {
+                tokens.stepBack(count);
+                stmtNode = new MyExpStmt(tokens);
+                break;
+            }
+        }
+    }
+```
+If `assignOrExp` is called for an identifier that is actually part of a valid statement like `a = 1;`, it works.
+But what if `assignOrExp` is called for an identifier that is NOT followed by `=` or `;` immediately, but rather is part of a larger structure that `Stmt` should have handled differently?
+Actually, `Stmt` switches on `IDENFR` to call `assignOrExp`.
+If we have `a[1] = 2;`, `assignOrExp` scans forward. It sees `a`, `[`, `1`, `]`, `=`, ... It finds `=`, steps back, and creates `MyAssignStmt`. `MyAssignStmt` parses `LVal` (`a[1]`), `=`, `Exp` (`2`), then `handleIError` for `;`. This seems correct.
+
+Let's look at the specific errors in the input:
+1. `printf("Hello SysY!\n")` -> Missing `;`. `MyPrintfStmt` handles this.
+2. `int a` -> Missing `;`. `VarDecl` handles this.
+3. `return 0` -> Missing `;`. `MyReturnStmt` handles this.
+
+Why "No output file"?
+Maybe `GlobalVars.curLab` is not `PARSER`?
+In `Compiler.java`:
+```java
+        if (GlobalVars.curLab == GlobalVars.CurLab.LEXER) {
+            Writer.writeTokens(tokens, lexer.isHasError());
+            return;
+        }
+        // ... parse ...
+        if (GlobalVars.curLab.equals(GlobalVars.CurLab.PARSER)) {
+            Writer.writeSyntaxTree(compUnit);
+        }
+```
+`GlobalVars.curLab` is initialized to `CurLab.PARSER`. So it should enter the parser block.
+
+Is it possible that parsing crashes or hangs?
+In `CompUnit.parseDecls()`:
+```java
+    private boolean parseDecls() {
+        Token token1 = tokens.next();
+        Token token2 = tokens.next();
+        while (tokens.hasNext()) {
+            Token token3 = tokens.next();
+            if (token3.getType().equals(TokenType.LPARENT)) {
+                tokens.stepBack(3);
+                break;
+            }
+            // ...
+        }
+        // ...
+    }
+```
+This lookahead logic is very fragile. If the file starts with `int main()`, `token1`=`int`, `token2`=`main`. `token3`=`(`. It steps back 3. Breaks. Correct.
+If the file has `int a`, `token1`=`int`, `token2`=`a`. `token3`=? If next is `for`, `token3`=`for`. Not `LPARENT`.
+It steps back 1 (`for`).
+Checks `token1` (`int`). `INTTK`. `token2` (`a`). `IDENFR`. Matches `VarDecl` condition.
+Steps back 2.
+Creates `Decl`. Parses `int a`.
+Inside `Decl`, it sees `INTTK`, creates `VarDecl`.
+`VarDecl` parses `BType` (`int`), `VarDef` (`a`).
+Then `VarDecl` loop: `tokens.next()`. This gets `for` (FORTK).
+Not `COMMA`. Steps back 1.
+Calls `ErrorHandler.handleIError`.
+`handleIError`: `tokens.next()` gets `for`. Not `SEMICN`.
+Steps back 2. (Back to before `for`? No, `stepBack(2)` from `for` means it goes back past `for` and past `a`?
+`TokenIterator` state:
+1. `next()` -> `for` (index moves to after `for`)
+2. `stepBack(2)` -> index moves back 2 positions. So it points to `a`? Or before `for`?
+`ListIterator.previous()` moves cursor backwards.
+If current index is `i` (next element is `i`), `next()` returns `i` and cursor becomes `i+1`.
+`previous()` returns `i` and cursor becomes `i`.
+So `stepBack(2)` calls `previous()` twice.
+If we were at `for` (consumed), cursor is after `for`.
+`previous()` -> returns `for`, cursor before `for`.
+`previous()` -> returns `a`, cursor before `a`.
+Then `token = tokens.next()` -> returns `a`.
+Adds error for line of `a`.
+Creates fake `;` token.
+Returns `false`.
+`VarDecl.parse()` returns `true` (ignores return value of handleIError? No, `handleIError` returns `false` if error, `true` if ok. But `VarDecl` doesn't check it, just breaks).
+So `VarDecl` finishes.
+`Decl` finishes.
+`parseDecls` continues.
+`token1 = tokens.next()` -> `a`? No, cursor was left before `a` by `handleIError`?
+Wait, `handleIError` does `tokens.stepBack(2)` then `tokens.next()`.
+If `handleIError` leaves the cursor after the fake semicolon?
+`children.add(new Token(...))`. It doesn't advance the iterator.
+So after `handleIError`, the iterator is pointing at `a` (the token returned by `next()` inside `handleIError`).
+So `VarDecl` returns.
+Back in `parseDecls`:
+`token1 = tokens.next()` -> This will get the token AFTER `a`. Which is `for`?
+No, `handleIError` consumed `a` via `next()`?
+Let's trace `handleIError` carefully.
+Input stream: `... a [cursor here] for ...`
+`VarDecl` calls `handleIError`.
+`handleIError`:
+`token = tokens.next()` -> returns `for`? No.
+In `VarDecl`, before calling `handleIError`:
+`token = tokens.next()` -> returns `for`.
+`if (token != COMMA)`:
+`tokens.stepBack(1)` -> cursor back before `for`.
+`ErrorHandler.handleIError(tokens, children)` called.
+Inside `handleIError`:
+`token = tokens.next()` -> returns `for`.
+`if (token != SEMICN)`:
+`tokens.stepBack(2)` -> cursor back before `for`, then back before `a`?
+Wait, `stepBack(1)` in `VarDecl` put cursor before `for`.
+So `next()` in `handleIError` gets `for`. Cursor after `for`.
+`stepBack(2)`:
+1. `previous()` -> returns `for`, cursor before `for`.
+2. `previous()` -> returns `a`, cursor before `a`.
+`token = tokens.next()` -> returns `a`. Cursor after `a`.
+`children.add(new Token(SEMICN, ";", a.getLineNum(), 0))` -> Adds fake semicolon to children, but DOES NOT advance iterator.
+So iterator is currently AFTER `a`.
+`handleIError` returns `false`.
+`VarDecl` breaks loop. Returns `true`.
+Back in `parseDecls`:
+`token1 = tokens.next()` -> Returns `for`. Cursor after `for`.
+`token2 = tokens.next()` -> Returns `(`. Cursor after `(`.
+Loop `while(hasNext)`:
+`token3 = tokens.next()` -> Returns `)`.
+`if (token3 == LPARENT)`? No, it's `RPARENT`.
+`stepBack(1)`. Cursor before `)`.
+Check `token1` (`for`). `FORTK`.
+Does `for` match `CONSTTK`? No.
+`INTTK && IDENFR`? No.
+`CHARTK && IDENFR`? No.
+Else: `tokens.stepBack(2)`. Cursor before `for`.
+Break.
+So `parseDecls` finishes.
+`parseFuncDefs`:
+`token1 = tokens.next()` -> `for`.
+`token2 = tokens.next()` -> `(`.
+`while(hasNext)`:
+`if (!token2.equals(MAINTK))`: `(` is not `main`.
+`stepBack(2)`. Cursor before `for`.
+`FuncDef funcDef = new FuncDef(tokens)`.
+`funcDef.parse()`.
+`FuncDef` expects `FuncType`. `FuncType` reads `for`. `for` is not `void/int/char`. `stepBack`. Returns `false`.
+`FuncDef` continues? `FuncType.parse()` returns false. `FuncDef` doesn't check return value?
+`funcType.parse()` returns false.
+`ident = new Ident(tokens)`. `Ident` reads `for`. `for` is not `IDENFR`. `Ident.parse()` returns false.
+This path is messy. `for` is a statement keyword, not a function definition.
+The `CompUnit` logic assumes that if it's not a Decl, it's a FuncDef. But `for` is neither. It's inside a Block.
+Ah! The input is:
+```c
+int main() {
+    printf...
+    if...
+    ;
+    int a
+    for...
+    return...
+}
+```
+`CompUnit` parses `{Decl} {FuncDef} MainFuncDef`.
+It parses `MainFuncDef` last.
+Before `MainFuncDef`, it tries to parse `FuncDef`s.
+But `int main()` IS the `MainFuncDef`.
+The code structure in `CompUnit`:
+1. `parseDecls()`: Consumes nothing? Or consumes `int a` if it was outside?
+   In the test case, `int main()` is the first thing.
+   `token1`=`int`, `token2`=`main`, `token3`=`(`.
+   `token3` is `LPARENT`. `stepBack(3)`. Break.
+   So `parseDecls` consumes nothing.
+2. `parseFuncDefs()`:
+   `token1`=`int`, `token2`=`main`.
+   `while(hasNext)`:
+   `if (!token2.equals(MAINTK))`: `main` IS `MAINTK`.
+   So `else`: `stepBack(2)`. Break.
+   So `parseFuncDefs` consumes nothing.
+3. `parseMainFuncDef()`:
+   `MainFuncDef` parses `int`, `main`, `(`.
+   `handleJError` for `)`.
+   `Block` parses `{ ... }`.
+
+So the structure is correct. The errors must be detected inside `Block` parsing.
+
+Inside `Block`:
+`Block` parses `{`.
+Loop `while (!RBRACE)`:
+`BlockItem` created.
+`BlockItem` checks `CONSTTK`, `INTTK`, `CHARTK`.
+1. `printf`: `PRINTFTK`. Else -> `Stmt`.
+   `Stmt` sees `PRINTFTK`. `MyPrintfStmt`.
+   `MyPrintfStmt` parses `printf`, `(`, `StringConst`.
+   Loop for args: `next()` is `)`. Not `,`. Step back.
+   `handleJError`: `next()` is `)`. OK.
+   `handleIError`: `next()` is `if` (IFTK). Not `;`.
+   Error `i` added for line of `if`? No, `token` inside `handleIError` is `if`.
+   Wait, `MyPrintfStmt` children: `printf`, `(`, `StringConst`.
+   `handleJError` consumes `)`.
+   `handleIError` consumes `if`.
+   Error added: `MyErrorType.I_MISSING_SEMICOLON`, line of `if` (Line 4).
+   BUT expected error is Line 2.
+   `handleIError` implementation:
+   ```java
+   token = tokens.next(); // gets 'if'
+   if (token.getType() != TokenType.SEMICN) {
+       tokens.stepBack(2); // back to before 'if', then before '('? No.
+       // Current cursor after 'if'.
+       // stepBack(1) -> before 'if'.
+       // stepBack(2) -> before ')'?
+       // Let's trace:
+       // Stream: ... ) [cursor] if ...
+       // handleJError consumed ). Cursor after ).
+       // handleIError:
+       // next() -> if. Cursor after if.
+       // stepBack(2):
+       // prev() -> if. Cursor before if.
+       // prev() -> ). Cursor before ).
+       // next() -> ).
+       // children.add(fake semi).
+       // Error line: token.getLineNum() which is 'if'.lineNum (4).
+   ```
+   The error line number is wrong. It should be the line of the last non-terminal before the semicolon, which is `printf` statement (Line 2).
+   However, the prompt says "No output file". This implies NO errors were written, or the program crashed.
+   If `ErrorList` has errors, `Writer` writes them.
+   
+   Is it possible `MyPrintfStmt` fails to parse?
+   `StringConst` parses `"Hello..."`.
+   
+   Let's look at `Stmt` for `if`.
+   After `MyPrintfStmt` returns, `Block` loop continues.
+   `token = tokens.next()`.
+   Since `handleIError` left cursor before `)`?
+   If `handleIError` did `stepBack(2)` then `next()`, cursor is after `)`.
+   So `Block`'s `token = tokens.next()` gets `if`.
+   `if` != `RBRACE`.
+   `stepBack(1)`.
+   `BlockItem` created.
+   `BlockItem` sees `IFTK`. Else -> `Stmt`.
+   `Stmt` sees `IFTK`. `MyCondStmt`.
+   `MyCondStmt` parses `if`, `(`.
+   `Cond` parses `1`.
+   `handleJError` for `)`. `next()` is `)`. OK.
+   `ifStmt = new Stmt`.
+   `Stmt` parses next token.
+   Next token is `;` (from Line 6? No, Line 5 is blank, Line 6 is `;`).
+   Wait, input:
+   ```
+   if (1)
+   
+   
+   /*********/
+   ;
+   ```
+   After `)`, there is a newline, comment, then `;`.
+   Lexer skips comments and whitespace.
+   So tokens are: `if`, `(`, `1`, `)`, `;`.
+   `MyCondStmt` parses `if`, `(`, `Cond` (`1`), `)` (handled by `handleJError`).
+   Then `ifStmt = new Stmt(tokens)`.
+   `Stmt` sees `;` (SEMICN).
+   Switch default: `MyNopStmt`.
+   `MyNopStmt.parse()`:
+   `token = tokens.next()` -> `;`.
+   `if (SEMICN)` return true.
+   So `if` statement parsed successfully.
+   
+   Back to `Block` loop.
+   `token = tokens.next()`.
+   Next token is `int` (Line 9).
+   `int` != `RBRACE`.
+   `stepBack(1)`.
+   `BlockItem`.
+   `BlockItem` sees `INTTK`.
+   `Decl`.
+   `Decl` sees `INTTK`. `VarDecl`.
+   `VarDecl` parses `BType` (`int`).
+   `VarDef` parses `Ident` (`a`).
+   `VarDecl` loop:
+   `token = tokens.next()`. Next is `for` (Line 11).
+   Not `,`.
+   `stepBack(1)`.
+   `handleIError`.
+   `next()` -> `for`.
+   Not `;`.
+   `stepBack(2)`.
+   `next()` -> `a`.
+   Add Error `i` at line of `a` (9).
+   Add fake `;`.
+   Cursor after `a`.
+   `VarDecl` returns.
+   `Decl` returns.
+   `BlockItem` returns.
+   
+   Back to `Block` loop.
+   `token = tokens.next()`.
+   Cursor was after `a`.
+   `next()` -> `for`.
+   `for` != `RBRACE`.
+   `stepBack(1)`.
+   `BlockItem`.
+   `BlockItem` sees `FORTK`. Else -> `Stmt`.
+   `Stmt` sees `FORTK`. `MyForStmt`.
+   `MyForStmt` parses `for`, `(`.
+   `checkSemicon = next()`. `;` (first one in `for(;;)`).
+   Is `;`? Yes. `stepBack(1)`.
+   `semicon1 = next()`. `;`.
+   `checkSemicon = next()`. `;` (second one).
+   Is `;`? Yes. `stepBack(1)`.
+   `semicon2 = next()`. `;`.
+   `checkRParent = next()`. `)`.
+   Is `)`? Yes. `stepBack(1)`.
+   `rParent = next()`. `)`.
+   `stmt = new Stmt`.
+   `Stmt` sees `{`. `Block`.
+   `Block` parses `{`, `}`.
+   `MyForStmt` returns.
+   
+   Back to `Block` loop.
+   `token = tokens.next()`.
+   Next is `return`.
+   `return` != `RBRACE`.
+   `stepBack(1)`.
+   `BlockItem`.
+   `Stmt`.
+   `MyReturnStmt`.
+   `MyReturnStmt` parses `return`.
+   `token = next()`. `0`.
+   `stepBack(1)`.
+   Switch `INTCON`: `exp = new Exp`.
+   `Exp` parses `0`.
+   `children.add(exp)`.
+   `handleIError`.
+   `next()` -> `}` (RBRACE).
+   Not `;`.
+   `stepBack(2)`.
+   `next()` -> `0`.
+   Add Error `i` at line of `0` (13).
+   Add fake `;`.
+   Cursor after `0`.
+   
+   Back to `Block` loop.
+   `token = tokens.next()`.
+   Cursor after `0`.
+   `next()` -> `}`.
+   `}` == `RBRACE`.
+   Loop ends.
+   `children.add(token)` (`}`).
+   `Block` returns.
+   
+   `MainFuncDef` returns.
+   `CompUnit` returns.
+   
+   `ErrorList` has 3 errors:
+   1. Line 4 (from printf) - Expected Line 2.
+   2. Line 9 (from int a) - Expected Line 9.
+   3. Line 13 (from return 0) - Expected Line 13.
+   
+   So errors ARE added.
+   Why "No output file"?
+   
+   Check `Writer.writeSyntaxTree`.
+   ```java
+   if (ErrorList.hasError()) {
+       try {
+           PrintWriter writer = new PrintWriter(ErrorFile);
+           writer.println(ErrorList.getInstance().toString());
+           writer.flush();
+           writer.close();
+       } ...
+   }
+   ```
+   `ErrorList.toString()`:
+   ```java
+   public String toString() {
+       StringBuilder sb = new StringBuilder();
+       for (Error error : errors) {
+           sb.append(error.toString()).append("\n");
+       }
+       return sb.toString();
+   }
+   ```
+   This looks correct.
+   
+   Is it possible `GlobalVars.curLab` is changed? No.
+   Is it possible `CompUnit.parse()` returns false and `writeSyntaxTree` is not called?
+   `Compiler.java`:
+   ```java
+   CompUnit compUnit = new CompUnit(tokenIterator);
+   compUnit.parse();
+   if (GlobalVars.curLab.equals(GlobalVars.CurLab.PARSER)) {
+       Writer.writeSyntaxTree(compUnit);
+   }
+   ```
+   It calls `writeSyntaxTree` regardless of `parse()` return value.
+   
+   Wait! Look at `Lexer.processLine` for comments.
+   ```java
+   } else if (c == '/') {
+       c = line.charAt(content++);
+       if (c == '/') { // 单行注释直接下一行
+           break;
+       } else if (c == '*') { // 多行注释
+           inAnnotation = true;
+       } else {
+           content--;
+           tokens.add(processWord("/"));// DIV
+       }
+   }
+   ```
+   Test case line 7: `/*********/`.
+   `c` = `/`. `content++`.
+   `c` = `*`. `inAnnotation = true`.
+   Loop continues.
+   Inside `inAnnotation`:
+   `c` = `*`. `content++`.
+   `c` = `*`.
+   ...
+   `c` = `*`. `content++`.
+   `c` = `/`. `inAnnotation = false`.
+   Loop continues.
+   End of line.
+   
+   This seems correct.
+   
+   What if `ErrorFile` creation fails?
+   `File ErrorFile = new File("error.txt");`
+   
+   Let's look at `ErrorHandler.handleIError` again.
+   ```java
+   public static boolean handleIError(TokenIterator tokens, ArrayList<SyntaxNode> children) {
+       Token token;
+       token = tokens.next();
+       // handle I_MISSING_SEMICOLON
+       if (token.getType() != TokenType.SEMICN) {
+           tokens.stepBack(2);
+           token = tokens.next();
+           children.add(new Token(TokenType.SEMICN, ";", token.getLineNum(), 0));
+           ErrorList.addError(MyErrorType.I_MISSING_SEMICOLON, token.getLineNum());
+           return false;
+       } else {
+           children.add(token);
+           return true;
+       }
+   }
+   ```
+   
+   There is a subtle bug in `stepBack`.
+   If `tokens.next()` throws `NoSuchElementException`?
+   `TokenIterator.next()` calls `iterator.next()`.
+   If `hasNext()` is false, it crashes.
+   In `handleIError`, it calls `tokens.next()` without checking `hasNext()`.
+   
+   In `MyPrintfStmt`:
+   `handleIError` is called.
+   Tokens remaining: `if`, `(`, `1`, `)`, `;`, `int`, `a`, `for`, ...
+   `next()` gets `if`. OK.
+   
+   In `VarDecl`:
+   `handleIError` called.
+   Tokens remaining: `for`, `(`, ...
+   `next()` gets `for`. OK.
+   
+   In `MyReturnStmt`:
+   `handleIError` called.
+   Tokens remaining: `}`, ...
+   `next()` gets `}`. OK.
+   
+   So no crash there.
+   
+   Let's check `CompUnit.parseDecls` again.
+   If `tokens.next()` is called when no tokens left?
+   `parseDecls` checks `while (tokens.hasNext())`.
+   Inside, `token3 = tokens.next()`. Safe.
+   
+   What about `parseFuncDefs`?
+   `while (tokens.hasNext())`.
+   Inside, no `next()` call directly, uses `token1`, `token2` from before loop?
+   No, `token1` and `token2` are initialized BEFORE loop.
+   Inside loop:
+   `if (!token2.equals(MAINTK))`
+   `stepBack(2)`
+   `FuncDef`
+   `token1 = tokens.next()`
+   `token2 = tokens.next()`
+   
+   If `tokens.hasNext()` is true, but there is only 1 token left?
+   `token1 = next()` OK.
+   `token2 = next()` Crash!
+   
+   In our case, `parseFuncDefs` breaks immediately because `token2` is `main`.
+   
+   Is it possible the error is in `Stmt.assignOrExp`?
+   If `assignOrExp` enters infinite loop?
+   `while (tokens.hasNext())`.
+   If it never finds `=` or `;`, it consumes all tokens.
+   Example: `a b c` (invalid).
+   It consumes `a`, `b`, `c`.
+   If it reaches end, loop terminates.
+   `stmtNode` remains null?
+   `private void assignOrExp()` does not set `stmtNode` if it falls through?
+   ```java
+   private void assignOrExp() {
+       int count = 0;
+       while (tokens.hasNext()) {
+           // ...
+           if (ASSIGN) { ... break; }
+           if (SEMICN) { ... break; }
+       }
+       // If loop finishes without break, stmtNode is null!
+   }
+   ```
+   If `stmtNode` is null, `stmtNode.parse()` in `Stmt.parse()` will throw `NullPointerException`.
+   
+   In the test case, does `assignOrExp` get called for anything that doesn't have `=` or `;`?
+   `printf` -> `MyPrintfStmt`.
+   `if` -> `MyCondStmt`.
+   `int` -> `Decl`.
+   `for` -> `MyForStmt`.
+   `return` -> `MyReturnStmt`.
+   
+   So `assignOrExp` is NOT called for these.
+   
+   However, look at `Stmt.parse()` switch:
+   ```java
+   case IDENFR:
+       assignOrExp();
+       break;
+   ```
+   If `assignOrExp` doesn't set `stmtNode`, `stmtNode` is null.
+   
+   Is there an `IDENFR` in the test case that is not part of a decl/stmt handled elsewhere?
+   `a` in `int a` is handled by `Decl`.
+   `main` is `MAINTK`.
+   
+   So `assignOrExp` is likely not the culprit for THIS test case.
+   
+   Let's look at `Writer.writeSyntaxTree` again.
+   ```java
+   File ErrorFile = new File("error.txt");
+   if (ErrorList.hasError()) {
+       try {
+           PrintWriter writer = new PrintWriter(ErrorFile);
+           writer.println(ErrorList.getInstance().toString());
+           writer.flush();
+           writer.close();
+       } catch (Exception e) {
+           e.printStackTrace();
+       }
+
+   } else {
+       // ...
+   }
+   ```
+   
+   If `ErrorList.hasError()` is false, it writes `parser.txt`.
+   If `ErrorList.hasError()` is true, it writes `error.txt`.
+   
+   The output is "No output file".
+   This usually means the program terminated without writing, or wrote to a different location, or `ErrorList` is empty.
+   
+   Why would `ErrorList` be empty?
+   Maybe `ErrorHandler` is not being called?
+   Or `ErrorList.addError` is not working?
+   
+   Let's check `MyPrintfStmt` again.
+   ```java
+   ErrorHandler.handleJError(tokens, children);
+   ErrorHandler.handleIError(tokens, children);
+   ```
+   
+   And `VarDecl`.
+   ```java
+   ErrorHandler.handleIError(tokens, children);
+   ```
+   
+   And `MyReturnStmt`.
+   ```java
+   ErrorHandler.handleIError(tokens, children);
+   ```
+   
+   All seem to call it.
+   
+   Is it possible `GlobalVars.curLab` is `LEXER`?
+   `public static CurLab curLab = CurLab.PARSER;`
+   
+   Wait, look at `Compiler.java` imports.
+   `import frontend.parser.CompUnit;`
+   
+   Is it possible `CompUnit` is not the right entry point?
+   
+   Let's look at the `Stmt` class `assignOrExp` again.
+   If `assignOrExp` is called, and it consumes tokens but doesn't find `=` or `;`, `stmtNode` is null.
+   If `stmtNode` is null, `stmtNode.syntaxPrinter()` in `Stmt.syntaxPrinter()` will crash.
+   But `Stmt.parse()` calls `stmtNode.parse()`. Crash.
+   
+   If the program crashes, it might not write output.
+   
+   But why would `assignOrExp` be called?
+   Only if `token.getType()` is `IDENFR`.
+   
+   In the test case, are there any `IDENFR` tokens at the start of a statement?
+   `printf` is `PRINTFTK`.
+   `if` is `IFTK`.
+   `int` is `INTTK`.
+   `for` is `FORTK`.
+   `return` is `RETURNTK`.
+   
+   So `assignOrExp` is NOT called.
+   
+   There is one more possibility: `BlockItem` logic.
+   ```java
+   if (token.getType().equals(TokenType.CONSTTK) ||
+           token.getType().equals(TokenType.INTTK) ||
+           token.getType().equals(TokenType.CHARTK)) {
+       tokens.stepBack(1);
+       blockItemNode = new Decl(tokens);
+   } else {
+       tokens.stepBack(1);
+       blockItemNode = new Stmt(tokens);
+   }
+   ```
+   
+   This looks correct.
+   
+   I suspect the issue is in `ErrorHandler.handleIError` or similar, specifically the `stepBack` logic causing the parser to lose sync or crash later, OR the `ErrorList` is not being populated because `handleIError` is not reached.
+   
+   Actually, look at `MyPrintfStmt` parsing.
+   `stringConst.parse()`.
+   `StringConst.parse()`:
+   ```java
+   token = tokens.next();
+   if (token.getType() == TokenType.STRCON) {
+       return true;
+   } else {
+       tokens.stepBack(1);
+       return false;
+   }
+   ```
+   If `StringConst` returns false, `MyPrintfStmt` continues?
+   `MyPrintfStmt` doesn't check return value.
+   
+   If `StringConst` fails, `children` doesn't have it.
+   
+   But `StringConst` should succeed.
+   
+   Let's look at `CompUnit.parseDecls` one more time.
+   If `parseDecls` consumes `int main` incorrectly?
+   `token1`=`int`, `token2`=`main`, `token3`=`(`.
+   `token3` is `LPARENT`.
+   `stepBack(3)`.
+   Break.
+   
+   This is correct.
+   
+   I will bet on the `assignOrExp` null pointer issue if an identifier appears where it shouldn't, OR the `stepBack` logic in `ErrorHandler` is corrupting the iterator state such that subsequent parsing fails/crashes silently or throws an exception that is caught/swallowed? No, `main` throws Exception.
+   
+   If an exception is thrown, the program stops. `Writer` is not called.
+   
+   Where could an exception occur?
+   `TokenIterator.next()` if `hasNext` is false.
+   
+   In `handleIError`:
+   `token = tokens.next();`
+   If this is the last token, and it's not `;`, it steps back 2.
+   If there are not 2 tokens to step back, `previous()` might behave unexpectedly or `next()` afterwards might fail?
+   `ListIterator.previous()` throws `NoSuchElementException` if no previous element.
+   
+   In `MyReturnStmt` error handling:
+   Tokens: `0`, `}`.
+   `handleIError`:
+   `next()` -> `}`.
+   `stepBack(2)`.
+   1. `prev()` -> `}`.
+   2. `prev()` -> `0`.
+   `next()` -> `0`.
+   OK.
+   
+   In `VarDecl` error handling:
+   Tokens: `a`, `for`.
+   `handleIError`:
+   `next()` -> `for`.
+   `stepBack(2)`.
+   1. `prev()` -> `for`.
+   2. `prev()` -> `a`.
+   `next()` -> `a`.
+   OK.
+   
+   In `MyPrintfStmt` error handling:
+   Tokens: `)`, `if`.
+   `handleJError` consumed `)`.
+   `handleIError`:
+   `next()` -> `if`.
+   `stepBack(2)`.
+   1. `prev()` -> `if`.
+   2. `prev()` -> `)`.
+   `next()` -> `)`.
+   OK.
+   
+   So `stepBack` seems safe here.
+   
+   Final check: `Writer.writeSyntaxTree`.
+   `ErrorList.hasError()` returns `!getInstance().errors.isEmpty()`.
+   
+   If `ErrorList

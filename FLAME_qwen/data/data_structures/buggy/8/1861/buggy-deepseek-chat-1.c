@@ -1,0 +1,102 @@
+#include <stdio.h>
+#include <stdlib.h>
+#define MAXSIZE 110
+
+int n, e;
+int del;
+
+int G[MAXSIZE][MAXSIZE] = {{0}};
+int visited[MAXSIZE] = {0};
+int queue[MAXSIZE] = {-1};
+
+void clear();
+void DFS(int point);
+void DFS_search(int p);
+void BFS(int point);
+
+int main() {
+    clear();
+
+    scanf("%d%d", &n, &e);
+
+    for (int i = 0; i < e; i++) {
+        int a, b;
+        scanf("%d%d", &a, &b);
+        G[a][b] = 1;
+        G[b][a] = 1;
+    }
+
+    scanf("%d", &del);
+
+    DFS(109); // @@ Error: The argument 109 is invalid. The function expects a vertex to delete, but 109 is out of range (vertices are 0 to n-1). It should be called with a special value (e.g., -1 or n) to indicate no deletion, or the logic should be restructured to handle the "before deletion" case without passing a vertex to delete.
+    BFS(109); // @@ Error: Same issue as above. The argument 109 is invalid and will cause incorrect behavior when marking visited[point] = 1, as point is out of bounds.
+    DFS(del);
+    BFS(del);
+
+    return 0;
+}
+void clear() {
+    for (int i = 0; i < MAXSIZE; i++) {
+        for (int j = 0; j < MAXSIZE; j++) {
+            G[i][j] = 0;
+        }
+    }
+}
+void DFS(int point) {
+    for (int i = 0; i < n; i++)
+        visited[i] = 0;
+    visited[point] = 1; // @@ Error: If point is 109 (out of range), this writes to visited[109] which is out of bounds, causing undefined behavior. Also, the logic incorrectly marks the deleted vertex as visited, which is not the intended behavior for the "before deletion" case.
+
+    printf("0 ");
+    visited[0] = 1;
+    DFS_search(0);
+
+    printf("\n");
+}
+void DFS_search(int p) {
+    for (int i = 0; i < n; i++) {
+        if (i == p)
+            continue;
+        if (visited[i] == 0 && G[i][p] == 1) {
+            printf("%d ", i);
+            visited[i] = 1;
+            DFS_search(i);
+
+        }
+    }
+}
+void BFS(int point) {
+    for (int i = 0; i < n; i++)
+        visited[i] = 0;
+    visited[point] = 1; // @@ Error: Same issue as in DFS. If point is 109, this causes out-of-bounds access.
+
+    visited[0] = 1;
+    printf("0 ");
+    queue[0] = 0;
+    int rear = 0, i = 0, k = 0;
+    do {
+        i = queue[k];
+        for (int j = 0; j < n; j++) {
+            if (G[i][j] == 1 && visited[j] == 0) {
+                printf("%d ", j);
+                visited[j] = 1;
+                queue[++rear] = j;
+            }
+        }
+        k++;
+
+    } while (k != rear);
+
+    /*for (int i = 0; i < n; i++) {
+        for (int j = i + 1; j < n; j++) {
+            if (visited[j] == 0 && G[i][j] == 1) {
+                printf("%d ", j);
+                visited[j] = 1;
+            }
+        }
+        visited[i] = 1;
+    }*/
+
+
+    printf("\n");
+}

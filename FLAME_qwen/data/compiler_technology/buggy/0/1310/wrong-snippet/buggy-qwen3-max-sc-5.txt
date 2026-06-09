@@ -1,0 +1,547 @@
+Based on the problem description and test case input, the error occurs when trying to run a Java program but `javac` is not found, indicating a compilation issue. However, focusing on the **lexical analysis logic** and the **error type 'a'** (which corresponds to standalone '&' or '|' symbols), we examine how the lexer handles these cases.
+
+The key issue lies in the **CharConst() method**, which incorrectly constructs the character constant string. It starts by doing:
+
+```java
+String wordname = "'" + curChar + "'";
+```
+
+But at this point, `curChar` is `'` (the opening quote), so this results in `wordname = "''"` initially, and then it appends more characters incorrectly. This leads to malformed token recognition and may interfere with proper error detection for other tokens like `&` or `|`.
+
+However, more critically, looking at the **OperatorOrAnnotation()** method, when handling `'&'` or `'|'`, if they are not followed by another `'&'` or `'|'`, it correctly calls `AddtoErrorList(Errortype.a)`. But after adding the error, the code still advances the character pointer via `nextChar(true)` inside `AddtoErrorList`, yet **does not continue processing properly**—it falls through without ensuring that the main loop continues correctly from the next character.
+
+But even more importantly, there's a **critical flaw in the main execution loop**: when an error is added, the code does **not break or skip the rest of the current character processing**, and since `curChar` is updated in `AddtoErrorList`, but the loop doesn't advance rows/columns correctly in all cases, it might get stuck or misalign.
+
+However, the **most direct and clear bug** related to **error type 'a'** is actually **not present in OperatorOrAnnotation**, because that part seems logically correct.
+
+Wait — looking again at the **test case input**:
+
+> Test Case Input:  
+> /bin/sh: 1: javac: not found
+
+This suggests that the actual test environment failed to compile the Java code. But per instructions, we must assume the code compiled and ran, and the **real test input** (in `testfile.txt`) likely contained something like:
+
+```
+if(1 & 2)
+```
+
+And the expected behavior is to output:
+```
+1 a
+```
+
+But if the program **did not output anything**, or crashed, then the issue might be that **after detecting error 'a', the program doesn't terminate lexical analysis properly**, or **fails to output the error due to incorrect file writing**.
+
+But reviewing `output()` method: it writes errors if `ErrorList` is non-empty. So if `AddtoErrorList` was called, it should appear.
+
+Now, focus on this line in `CharConst()`:
+
+```java
+String wordname = "'" + curChar + "'";
+```
+
+At entry to `CharConst()`, `curChar == '\''`, so this sets `wordname = "''"`. Then it enters a loop:
+
+```java
+while (nextChar(false) != '\'' && nextChar(false) != 0) {
+    curChar = nextChar(true);
+    wordname = wordname + curChar;
+}
+```
+
+Suppose input is `'a'`. Then:
+- Initially, `curChar = '\''`, `wordname = "''"`
+- `nextChar(false)` returns `'a'`, which is not `'` or 0 → enter loop
+- `curChar = nextChar(true)` → now `curChar = 'a'`, `curCol` advances
+- `wordname = "''" + 'a' → "'a"`
+
+Then check `nextChar(false)` → returns `'` → exit loop  
+Then: `if (nextChar(false) == '\'')` → true  
+→ `curChar = nextChar(true)` → now `curChar = '\''`, `curCol` advances  
+→ `wordname = "'a" + '\'' → "'a'"` → correct.
+
+So that seems okay.
+
+But what if the char const is invalid? Like `'abc'`? That’s a semantic error, but lexically, it might still be accepted as a token. However, the problem states only **lexical errors** exist, and only **error type 'a'** is relevant.
+
+Now consider this: in `OperatorOrAnnotation`, when we encounter `&` not followed by `&`, we call `AddtoErrorList(Errortype.a)`, which does:
+
+```java
+BaseError baseError = new BaseError(curRow+1, curCol+1, e);
+ErrorList.add(baseError);
+curChar = nextChar(true);
+```
+
+So it consumes the `&` and moves to next char. That seems correct.
+
+But here's the **real bug**: in the **main loop** in `excute()`:
+
+```java
+public void excute() {
+    while (curRow < CodeString.size()) {
+        curString = CodeString.get(curRow);
+        if (curCol < curString.length()) {
+            curChar = curString.charAt(curCol);
+            if (curChar == ' ' || ...) {
+                Blank();
+            } else if (...) {
+                ...
+            } else {
+                OperatorOrAnnotation();
+            }
+        } else {
+            curCol = 0;
+            curRow += 1;
+        }
+    }
+}
+```
+
+**Problem**: After calling any handler (like `OperatorOrAnnotation`), the loop **does not automatically advance** unless the handler itself advances `curCol`. But handlers like `AddtoWordList` and `AddtoErrorList` do call `nextChar(true)`, which increments `curCol`.
+
+However, what if `curCol` reaches the end of the line **inside a handler**? For example, in `OperatorOrAnnotation`, when processing `/` for comments, it calls `nextRow()`, which resets `curCol=0`, `curRow++`, and sets `curChar`.
+
+But in the case of error 'a', after `AddtoErrorList`, `curChar = nextChar(true)` is set, but if that makes `curCol >= curString.length()`, then in the **next iteration of the while loop**, it will go to the `else` branch (`curCol >= length`), reset `curCol=0`, `curRow++`, and load next line.
+
+So control flow seems okay.
+
+Wait — but look at `nextChar(boolean get)`:
+
+```java
+private char nextChar(boolean get) {
+    int tempCol = curCol + 1;
+    if (get) {
+        curCol++;
+    }
+    if (tempCol < curString.length()) {
+        return curString.charAt(tempCol);
+    } else {
+        return 0;
+    }
+}
+```
+
+This returns `0` when beyond string length. But `curString` is **not updated** when moving to next row **inside a handler**. For example, in comment handling, `nextRow()` updates `curString`, but in `AddtoErrorList`, it only does `curChar = nextChar(true)`, which uses the **current** `curString`.
+
+So if `curCol` is at last character, `nextChar(true)` sets `curCol = curCol + 1`, which is now `== curString.length()`, and returns `0`. Then `curChar = 0`.
+
+Now, in the next iteration of `while (curRow < CodeString.size())`, it does:
+
+```java
+curString = CodeString.get(curRow); // same row
+if (curCol < curString.length()) // false, because curCol == length
+→ goes to else: curCol=0; curRow++
+```
+
+So that works.
+
+But here's the **actual critical bug**:
+
+In the `CharConst()` method, the initial line is:
+
+```java
+String wordname = "'" + curChar + "'";
+```
+
+But `curChar` is `'`, so this becomes `"''"`. Then it tries to read the next character. But what if the input is just `'` (incomplete char const)? Then `nextChar(false)` returns `0`, so the while loop is skipped. Then it checks `if (nextChar(false) == '\'')` → false, so it doesn't add closing quote. Then it calls `AddtoWordList(wordname, WordType.CHRCON)` with `wordname = "''"`.
+
+But that’s not an error — the problem says only error type 'a' exists in erroneous inputs.
+
+So perhaps the real issue is elsewhere.
+
+Wait — look at the **test output**: Buggy Output is empty, Expected Output is also empty? But the test input says:
+
+> Test Case Input:  
+> /bin/sh: 1: javac: not found
+
+This implies the program didn’t even run. But per instructions, we must assume the code ran, and the **real failing test case** is one where input contains `&` alone, and the program **failed to output error 'a'**.
+
+But why?
+
+Look at `AddtoErrorList`:
+
+```java
+private void AddtoErrorList(Errortype e) {
+    BaseError baseError = new BaseError(curRow+1, curCol+1, e);
+    ErrorList.add(baseError);
+    curChar = nextChar(true);
+    //这里必须往后读一位
+}
+```
+
+It adds error at `(curRow+1, curCol+1)`. But at the time of call, `curCol` points to the `&`. So error column is `curCol+1` → correct.
+
+But what if after this, the program continues and **overwrites or ignores the error**?
+
+No, `ErrorList` is preserved.
+
+Unless... the program **crashes** before output.
+
+But the real issue is likely in **comment handling**, which can cause infinite loops or skipping.
+
+Look at this part in `OperatorOrAnnotation` for `/* */` comments:
+
+```java
+} else if (nextChar(false) == '*') {
+    curChar = nextChar(true);
+    //第一次读是读到了*，必须再读一次才能读下一个字符
+    curChar = nextChar(true);
+    while (true) {
+        if (curChar == '*') {
+            curChar = nextChar(true);
+            if (curChar == 0) {
+                //此行结束
+                nextRow();
+                continue;
+            }
+            if (curChar == '/') {
+                curChar = nextChar(true);
+                break;
+            }
+        } else {
+            curChar = nextChar(true);
+            if (curChar == 0) {
+                nextRow();
+            }
+        }
+    }
+}
+```
+
+If the input has unclosed `/*`, this loop may run forever or behave incorrectly. But the problem states each erroneous example has **exactly one lexical error**, and it's of type 'a'.
+
+So probably not that.
+
+Now, re-express the core issue: the program must detect `&` not followed by `&` and report error 'a'.
+
+Assume testfile.txt contains:
+
+```
+&
+```
+
+Then:
+- curRow=0, curCol=0, curChar='&'
+- goes to OperatorOrAnnotation
+- sees '&', checks nextChar(false) → returns 0 (since only one char)
+- so calls AddtoErrorList(Errortype.a)
+- which adds error at row=1, col=1
+- then curChar = nextChar(true) → curCol becomes 1, which equals string length (1), so curChar = 0
+- next loop: curCol=1, curString.length=1 → go to else: curCol=0, curRow=1
+- curRow=1 >= CodeString.size()=1 → exit
+- output error.txt with "1 a"
+
+So it should work.
+
+But what if the input is:
+
+```
+if(1 & 2)
+```
+
+Same thing: at `&`, next char is space or '2', not '&', so error 'a' reported.
+
+So why would it fail?
+
+Unless... the `nextChar(false)` call **advances curCol**? No, because `get=false`, so it doesn't.
+
+But look at `nextChar`:
+
+```java
+private char nextChar(boolean get) {
+    int tempCol = curCol + 1;
+    if (get) {
+        curCol++;
+    }
+    if (tempCol < curString.length()) {
+        return curString.charAt(tempCol);
+    } else {
+        return 0;
+    }
+}
+```
+
+Correct.
+
+But here's the **real bug**: in `ReservedWordsOrIdent`, `IntConst`, etc., they use `nextChar(false)` in loop condition, which is fine.
+
+But in `OperatorOrAnnotation`, for `&`, it does:
+
+```java
+if (nextChar(false) == '&') {
+```
+
+This is correct.
+
+However, after reporting error 'a', it calls `AddtoErrorList`, which does `curChar = nextChar(true)`. But what if `curCol` was at the last character? Then `nextChar(true)` sets `curCol` to `length`, and `curChar = 0`.
+
+Then the main loop will move to next line.
+
+Seems okay.
+
+But wait — what if the error occurs at the **last character of the file**? Still handled.
+
+I suspect the actual bug is in the **CharConst** method, but not for error 'a'.
+
+Given the information, and that the test case input shows a **compilation error** (`javac not found`), but we are to assume the code ran, the most likely **logical error** that would cause **failure to detect error 'a'** is if the `&` or `|` is being consumed by another rule.
+
+But no — they are only handled in `OperatorOrAnnotation`.
+
+Unless... whitespace handling is wrong.
+
+But no.
+
+Another possibility: the input contains `\r\n`, and `curChar == '\r'` is skipped in `Blank()`, but what if `&` is after `\r`? Should be fine.
+
+After careful analysis, the only plausible **code defect** that matches the symptom (failing to report error 'a') is if the **error is added but then overwritten or not output**.
+
+But `output()` seems correct.
+
+Wait! Look at the `output()` method:
+
+```java
+if (!ErrorList.isEmpty()) {
+    BufferedWriter errorWriter = new BufferedWriter(new FileWriter("error.txt"));
+    for (BaseError baseError : ErrorList) {
+        errorWriter.write(baseError.getRow() + " " + baseError.getErrortype());
+        errorWriter.newLine();
+    }
+    ...
+} else {
+    ... // lexer.txt
+}
+```
+
+But `baseError.getErrortype()` returns an `Errortype` enum, and when written, it becomes `a`, `b`, etc. So "1 a" is correct.
+
+So why no output?
+
+Unless `ErrorList` is empty.
+
+Which means `AddtoErrorList` was **not called**.
+
+Why wouldn't it be called?
+
+Because the `&` was not recognized as such.
+
+How? If the input file has **UTF-8 BOM** or encoding issue? Unlikely.
+
+Or if the `&` is part of a string or char const? But then it wouldn't be in `OperatorOrAnnotation`.
+
+So if test input is:
+
+```
+"&"
+```
+
+Then it's a string, no error.
+
+But the test case for error 'a' must have `&` outside quotes.
+
+So back to square one.
+
+Given all this, the **only remaining possibility** is a **bug in the main loop**: after processing a token or error, if `curCol` is advanced beyond the line, the loop moves to next line, but what if `curRow` is not updated correctly when inside a handler that calls `nextRow()`?
+
+But for error 'a', `nextRow()` is not called.
+
+I think the code is actually correct for error 'a'.
+
+But the problem says: "the program failed", and given the provided code, the **most suspicious and clearly buggy method** is `CharConst()`, because of this line:
+
+```java
+String wordname = "'" + curChar + "'";
+```
+
+This is **wrong**, because it assumes the current char is to be included as the content, but actually, the current char is the opening quote, and the content comes next.
+
+The correct approach is:
+
+```java
+String wordname = "" + curChar; // which is "'"
+// then read next char as content
+```
+
+But the current code does `"'" + curChar + "'"` = `"'" + "'" + "'"` = `"'''"` if curChar is `'` — wait no:
+
+At entry, `curChar = '\''`, so:
+
+```java
+String wordname = "'" + curChar + "'" = "'" + "'" + "'" = "'''"
+```
+
+That's **three quotes**! That's definitely wrong.
+
+For input `'a'`, this becomes:
+- Initially: `wordname = "'''"`
+- Then reads 'a', appends → `"'''a"`
+- Then reads closing `'`, appends → `"'''a'"`
+
+Which is completely wrong.
+
+So the **CharConst() method is fundamentally broken**.
+
+But how does that affect error 'a'? It shouldn't, unless the input has a char const before the `&`.
+
+But the problem states each erroneous example has **exactly one error**, of type 'a'.
+
+So if the test input is simply:
+
+```
+&
+```
+
+Then `CharConst` is never called.
+
+So why focus on it?
+
+Because the **assignment requires preserving exact string representation**, and this bug would cause **incorrect output for correct programs**, but for erroneous programs with error 'a', it might not matter.
+
+However, the **test case that failed** might be a correct program that includes a char const, and the output is wrong, leading to grading failure.
+
+But the user says: "the test case inputs that the program failed" and shows compilation error, but we must infer.
+
+Given the instructions, and that the **CharConst method has a clear logical error in token construction**, and the problem emphasizes **preserving exact string**, this is likely the bug.
+
+But the error type 'a' is about `&`, so maybe not.
+
+Wait — another possibility: in `OperatorOrAnnotation`, when it processes `/` for comments, if it's a single `/`, it should be DIV, but if it's `//`, it skips the line.
+
+But what if the input is:
+
+```
+/
+```
+
+Then it's DIV, correct.
+
+But what if:
+
+```
+/*
+```
+
+Unclosed comment — but problem says only error 'a' exists.
+
+So not relevant.
+
+After re-evaluating, the **only place where the program could fail to detect error 'a'** is if the `&` is not reaching the `OperatorOrAnnotation` branch.
+
+How? If the input has `&` but it's being interpreted as part of an identifier? No, because `&` is not letter/digit/_.
+
+So it should go to `OperatorOrAnnotation`.
+
+Unless... the `curChar` is not `&` due to encoding.
+
+But assuming ASCII, it should work.
+
+Given the time, and that the **CharConst method has an obvious bug**, and the problem says "each erroneous example will contain only lexical analysis errors", but also requires correct handling of correct programs, and the **test might be a correct program with char const**, I conclude the bug is in `CharConst`.
+
+But the user mentioned error type 'a', so maybe not.
+
+Wait! Look at the `AddtoErrorList` method:
+
+```java
+private void AddtoErrorList(Errortype e) {
+    BaseError baseError = new BaseError(curRow+1, curCol+1, e);
+    ErrorList.add(baseError);
+    curChar = nextChar(true);
+    //这里必须往后读一位
+}
+```
+
+But after adding the error, it sets `curChar = nextChar(true)`, which is correct.
+
+However, in the main loop, after this, the next iteration will use the new `curChar`.
+
+But what if `nextChar(true)` returns `0` (end of line), then in the next iteration, since `curCol >= curString.length()`, it will do `curCol=0; curRow++`, and then if `curRow >= size`, exit.
+
+So error is recorded.
+
+I think the code is correct for error 'a'.
+
+But the **real issue** might be that the program, upon encountering **any error**, should **stop** or **continue**, but the problem doesn't say to stop. It says "detect errors and output the line number... in ascending order". Since there's exactly one error, it's fine.
+
+Given all this, and since the test case input shows a **compilation error**, but we must assume the code ran, the most likely **actual bug** that would cause **no output** is if the `ErrorList` is not written because of an exception in `output()`.
+
+But no.
+
+Perhaps the **file paths** are wrong, but unlikely.
+
+After careful thought, I notice that in the `Compiler.java`, it calls:
+
+```java
+LexicAnalysis lexicAnalysis = LexicAnalysis.getInstance(CodeString);
+lexicAnalysis.excute();
+lexicAnalysis.output();
+```
+
+But `getInstance` is **synchronized** and uses a **singleton pattern**. If multiple test cases are run in the same JVM, the singleton retains state. But the problem likely runs one test case per execution.
+
+So not an issue.
+
+Given the instructions to identify the error based on the provided info, and the only concrete bug visible is in `CharConst`, I will output that.
+
+But the error type 'a' is about `&`, so maybe the bug is elsewhere.
+
+Wait! In the `OperatorOrAnnotation` method, for `&`, it does:
+
+```java
+} else if (curChar == '&') {
+    if (nextChar(false) == '&') {
+        ...
+    } else {
+        AddtoErrorList(Errortype.a);
+    }
+}
+```
+
+This is correct.
+
+But what if the input is `&&&`? 
+- First `&`: sees next is `&` → consumes both, outputs AND.
+- Then next `&`: now alone → error 'a'.
+
+Correct.
+
+So I think the code is correct.
+
+Unless... the `nextChar(false)` call **modifies state**? No, because `get=false`.
+
+But look at the implementation of `nextChar`:
+
+```java
+private char nextChar(boolean get) {
+    int tempCol = curCol + 1;
+    if (get) {
+        curCol++;
+    }
+    if (tempCol < curString.length()) {
+        return curString.charAt(tempCol);
+    } else {
+        return 0;
+    }
+}
+```
+
+This is correct.
+
+I am forced to conclude that the **CharConst method is the only visibly buggy part**, and perhaps the test case that failed was a correct program with a char constant, and the output was wrong, causing the overall failure.
+
+Therefore, the error is in:
+
+<src/fronted/LexicAnalysis/LexicAnalysis.java>
+...
+    private void CharConst() {
+//        curChar = nextChar(true);
+        String wordname = "'" + curChar + "'";
+        while (nextChar(false) != '\'' && nextChar(false) != 0) {
+            curChar = nextChar(true);
+            wordname = wordname + curChar;
+        }
+        if (nextChar(false) == '\'') {
+            curChar = nextChar(true);
+            wordname = wordname + curChar;
+        }
+        AddtoWordList(wordname, WordType.CHRCON);
+    }
+...

@@ -1,0 +1,163 @@
+Based on the problem description and the provided code, there are two main issues:
+
+1.  **Logical Error in `ErrorBlock` Comparison**: The `operator<` in `include/components.h` is defined as `return lineNum > other.lineNum;`. When used with `std::priority_queue` (which defaults to `std::less`, creating a max-heap based on this operator), this effectively sorts errors by line number in **ascending** order (smallest line number at the top). However, standard practice for `operator<` is to define strict weak ordering where `a < b` means `a` is "less than" `b`. If the intention was to use a standard sort or if the priority queue logic is misunderstood, this might be fragile. More importantly, looking at `outputTools.cpp`, it uses `std::priority_queue<ErrorBlock>`. With the current `operator<` (`lineNum > other.lineNum`), the "largest" element according to the comparator (which is actually the smallest line number) will be at the top. This seems to work for ascending output if popped sequentially. *However*, usually `operator<` should reflect natural ordering. Let's look closer at the output requirement: "sorted by line number in ascending order". The current implementation likely works for the priority queue but is semantically confusing. A more critical error is often found in the parsing logic or output logic.
+
+2.  **Missing Output for `CompUnit` and other Non-terminals**: The problem states: "Before completing the analysis of any syntax components in the grammar (except for `<BlockItem>`, `<Decl>`, `<BType>`), output the name of the current syntax component...".
+    In `outputTools.cpp`, the `outputComponent` function handles the output.
+    It explicitly excludes `BlockItem`, `Decl`, and `BType`.
+    However, it also has a specific block for `MulExp`, `AddExp`, etc., where it outputs children and then the parent *if* the child is not a TokenConst. This logic seems flawed because it prints the parent tag *inside* the loop or after specific children, potentially duplicating or misordering tags compared to the standard "post-order" traversal implied by "completing the analysis".
+    
+    The standard recursive descent output usually prints all children recursively, and *then* prints the current non-terminal's tag (unless excluded).
+    
+    Let's look at the exclusion list in `outputTools.cpp`:
+    ```cpp
+    if (src->getCType() == ComponentEnum::BlockItem || src->getCType() == ComponentEnum::Decl ||
+        src->getCType() == ComponentEnum::BType)
+    {
+        return;
+    }
+    fprintf(out, "<%s>\n", ComponentStrings[src->getCType()].c_str());
+    ```
+    
+    The problem says `<Decl>` and `<BType>` and `<BlockItem>` should *not* be output. This matches the code.
+    
+    However, look at `CompUnit`. It is not in the exclusion list. So it should be output.
+    Look at `MainFuncDef`. It should be output.
+    
+    The specific logic for `MulExp` etc.:
+    ```cpp
+    if (src->getCType() == ComponentEnum::MulExp || ... )
+    {
+        for (int i = 0; i < src->getParts().size(); i += 1)
+        {
+            outputComponent(src->getParts()[i], out);
+            if (src->getParts()[i]->getCType() != ComponentEnum::TokenConst)
+            {
+                fprintf(out, "<%s>\n", ComponentStrings[src->getCType()].c_str());
+            }
+        }
+        return;
+    }
+    ```
+    This logic prints the parent tag (`<MulExp>`) *after every non-token child*. This is incorrect. The parent tag should be printed only once, after *all* children have been processed. The general case below does this correctly (prints all children, then prints parent). The special case for binary expressions is broken.
+
+3.  **Compilation Error in Test Case**: The test case input shows `/bin/sh: 1: g++: not found`. This indicates the environment doesn't have a compiler, but the user asks to identify errors in the *program code* provided. The "Buggy Output" is empty, and "Expected Output" is empty, which aligns with a compilation failure or runtime crash before output. However, assuming the code *could* run, we need to find logical bugs.
+
+4.  **Critical Bug in `outputTools.cpp`**:
+    The special handling for `MulExp`, `AddExp`, etc., is logically wrong as described above. It prints the component name multiple times or in the wrong place.
+    
+    Additionally, in `include/components.h`, the `ErrorBlock` operator `<` is defined as `lineNum > other.lineNum`.
+    In `outputTools.cpp`, `std::priority_queue<ErrorBlock> errors(src.begin(), src.end());` is used.
+    `std::priority_queue` pops the "largest" element first.
+    If `A < B` is true when `A.lineNum > B.lineNum`, then an element with a *smaller* line number is considered "larger" by the comparator? No.
+    Let's trace:
+    Comparator `Compare` defaults to `std::less<T>`, which uses `operator<`.
+    `std::less<ErrorBlock>(a, b)` returns `a < b`.
+    If `a.lineNum = 1`, `b.lineNum = 2`.
+    `a < b` evaluates to `1 > 2` which is `false`.
+    `b < a` evaluates to `2 > 1` which is `true`.
+    So `b` is "less than" `a`? No, `b < a` is true means `b` is smaller than `a` in the strict weak ordering sense?
+    Actually, `std::priority_queue` puts the element that is "largest" according to the comparison at the top.
+    If `comp(a, b)` is `std::less`, it checks `a < b`.
+    If `a < b` is false and `b < a` is true, then `b` is "less" than `a`? No.
+    Standard `std::less` on ints: `1 < 2` is true. 2 is "greater". Top is 2.
+    Here: `1 < 2` (via operator) is `1 > 2` (false). `2 < 1` (via operator) is `2 > 1` (true).
+    So `2` is "less than" `1` according to this custom operator.
+    Therefore, `1` is "greater than" `2`.
+    So `1` (smaller line num) will be at the top of the priority queue.
+    Popping gives 1, then 2. This results in Ascending order.
+    So the `ErrorBlock` sorting logic is actually *correct* for producing ascending order using a max-heap with an inverted comparator. It's confusing but functional.
+
+5.  **Real Error Location**:
+    The most significant logical error that would cause incorrect output for valid programs is in `outputTools.cpp` regarding the expression nodes (`MulExp`, `AddExp`, etc.). The code prints the tag `<MulExp>` inside the loop for each non-token part. This violates the requirement to output the component name once upon completion.
+
+    Another potential issue: `CompUnit` parsing.
+    In `main.cpp`, `parseCompUnitPattern` handles `CompUnit`.
+    The grammar is `CompUnit → {Decl} {FuncDef} MainFuncDef`.
+    The code loops for `Decl`. Then it manually parses `FuncDef` (optional) and `MainFuncDef`.
+    
+    Let's look at `outputTools.cpp` again.
+    
+    ```cpp
+    void outputComponent(Component *src, FILE *out)
+    {
+        if (src->getCType() >= ComponentEnum::TokenConst && src->getCType() <= ComponentEnum::StringConst)
+        {
+            fprintf(out, "%s %s\n", TokenStrings[src->getTk().key].c_str(), src->getTk().content.c_str());
+        }
+        else
+        {
+            if (src->getCType() == ComponentEnum::MulExp || src->getCType() == ComponentEnum::AddExp ||
+                src->getCType() == ComponentEnum::RelExp || src->getCType() == ComponentEnum::EqExp ||
+                src->getCType() == ComponentEnum::LAndExp || src->getCType() == ComponentEnum::LOrExp)
+            {
+                for (int i = 0; i < src->getParts().size(); i += 1)
+                {
+                    outputComponent(src->getParts()[i], out);
+                    if (src->getParts()[i]->getCType() != ComponentEnum::TokenConst)
+                    {
+                        fprintf(out, "<%s>\n", ComponentStrings[src->getCType()].c_str());
+                    }
+                }
+                return;
+            }
+            for (int i = 0; i < src->getParts().size(); i += 1)
+            {
+                outputComponent(src->getParts()[i], out);
+            }
+            if (src->getCType() == ComponentEnum::BlockItem || src->getCType() == ComponentEnum::Decl ||
+                src->getCType() == ComponentEnum::BType)
+            {
+                return;
+            }
+            fprintf(out, "<%s>\n", ComponentStrings[src->getCType()].c_str());
+        }
+    }
+    ```
+
+    The block handling `MulExp` etc. is definitely wrong. It should just fall through to the general case, which correctly prints children then the parent tag. The special case introduces erroneous repeated tags.
+
+    Also, check `include/consts.h`.
+    `enum RelExpEnum { REL_EXP_ONR };` -> Typo `REL_EXP_ONR` instead of `REL_EXP_ONE`. This might not cause a runtime error if the value isn't used incorrectly, but it's a bug. However, it's an enum definition.
+
+    Let's focus on the `outputTools.cpp` logic error.
+
+<outputTools.cpp>
+#include "outputTools.h"
+#include "consts.h"
+#include <queue>
+void outputComponent(Component *src, FILE *out)
+{
+    if (src->getCType() >= ComponentEnum::TokenConst && src->getCType() <= ComponentEnum::StringConst)
+    {
+        fprintf(out, "%s %s\n", TokenStrings[src->getTk().key].c_str(), src->getTk().content.c_str());
+    }
+    else
+    {
+        if (src->getCType() == ComponentEnum::MulExp || src->getCType() == ComponentEnum::AddExp ||
+            src->getCType() == ComponentEnum::RelExp || src->getCType() == ComponentEnum::EqExp ||
+            src->getCType() == ComponentEnum::LAndExp || src->getCType() == ComponentEnum::LOrExp)
+        {
+            for (int i = 0; i < src->getParts().size(); i += 1)
+            {
+                outputComponent(src->getParts()[i], out);
+                if (src->getParts()[i]->getCType() != ComponentEnum::TokenConst)
+                {
+                    fprintf(out, "<%s>\n", ComponentStrings[src->getCType()].c_str());
+                }
+            }
+            return;
+        }
+        for (int i = 0; i < src->getParts().size(); i += 1)
+        {
+            outputComponent(src->getParts()[i], out);
+        }
+        if (src->getCType() == ComponentEnum::BlockItem || src->getCType() == ComponentEnum::Decl ||
+            src->getCType() == ComponentEnum::BType)
+        {
+            return;
+        }
+        fprintf(out, "<%s>\n", ComponentStrings[src->getCType()].c_str());
+    }
+}
+...

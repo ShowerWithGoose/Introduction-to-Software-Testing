@@ -1,0 +1,79 @@
+#include<stdio.h>
+#include<stdlib.h>
+struct ppe {
+    long long int m;
+    long long int n;
+};
+struct ppe data;
+struct node {
+    struct ppe data;
+    struct node* link ;
+};
+typedef struct node *nodeptr;
+typedef struct node zu;
+struct ppe mon[1000];
+int i=1,j;
+int main() {
+    long long    int a,u;
+    char c,f;
+    nodeptr p,q,head,e,r,first;
+    head=p=NULL;
+    do {
+        scanf("%lld%lld",&a,&u);
+        c=getchar();
+        q=(nodeptr)malloc(sizeof(zu));
+        q->data.m=a;
+        q->data.n=u;
+        q->link=NULL;
+        if(head==NULL)
+            head=p=q;
+        else {
+            p->link=q;
+            p=p->link;
+        }
+
+    } while(c!='\n');
+    do {
+        scanf("%lld%lld",&a,&u);
+        f=getchar();
+        for(p=head; p!=NULL; p=p->link) {
+            long long int xx,yy;
+            xx=(p->data.m)*a;
+            yy=(p->data.n)+u;
+            mon[i].m=xx;
+            mon[i].n=yy;
+            i++;
+        }//把链表相乘的结果读入到mon中
+    } while(f!='\n');//读入两个链表
+
+    int num=i-1; // @@ [Variable 'i' is declared as global and initialized to 1. After reading input, 'i' may be large, but 'num' assumes it's at least 1. However, more critically, the sorting and merging loops assume 1-based indexing, but if no terms are read (e.g., empty input), this leads to undefined behavior. Also, the use of global 'i' interferes with loop counters.]
+
+    long long int rr,nn;
+    for(i=1; i<=num; i++) {
+        for(int j=i+1; j<=num; j++) {
+            if(mon[j].n>mon[i].n) {
+                rr=mon[j].m;
+                nn=mon[j].n;
+                mon[j].m=mon[i].m;
+                mon[j].n=mon[i].n;
+                mon[i].m=rr;
+                mon[i].n=nn;
+            }
+        }
+    }//排序
+    for(i=1; i<=num; i++) {int sign=0;
+        for( j=i+1; j<=num; j++) {
+            if(mon[i].n!=mon[j].n) break;
+            else {
+                mon[i].m=mon[i].m+mon[j].m;
+                mon[j].m=0;sign=1;
+            }
+        }if(sign==1) i=j; // @@ [When merging like terms, setting 'i = j' skips indices because the outer 'for' loop will then do 'i++', potentially skipping terms or accessing out-of-bounds if 'j' exceeds 'num'. This causes incorrect merging and possible missed terms.]
+    }//整合
+    for(i=1; i<=num; i++) {
+        if(mon[i].m!=0) {
+            printf("%lld %lld ",mon[i].m,mon[i].n);
+        }
+    }
+    return 0;
+}

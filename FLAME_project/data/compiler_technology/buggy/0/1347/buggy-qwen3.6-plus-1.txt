@@ -1,0 +1,182 @@
+<Compiler.java>
+...
+    private static void rightProcedure(ArrayList<Token> tokens) throws IOException {
+        String path = "lexer.txt";
+        File file = new File(path);
+        try{
+            if (!file.exists()) {
+                file.createNewFile();
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        FileWriter writer = new FileWriter(file);
+        if (!tokens.isEmpty()) {
+            for (Token token: tokens) {
+                System.out.println(token.getLexType() + " " + token.getName());
+                writer.write(token.getLexType() + " " + token.getName() + "\n");
+            }
+            writer.flush();
+            writer.close();
+        } // @@ The FileWriter is not closed if tokens is empty, which may result in an empty or locked file depending on the system, but more importantly, if the program crashes or exits before this, no file is produced. However, the primary issue causing "No output file" in many contexts with this structure is often that the file creation/write logic is bypassed or fails silently. But looking closely at the logic: if tokens is NOT empty, it writes. If tokens IS empty, it creates an empty file. The prompt says "No output file". This implies the file `lexer.txt` does not exist. This happens if `rightProcedure` is never called or throws an exception before `createNewFile`. Or, if `tokens` is empty, `createNewFile` is called, so the file SHOULD exist. Wait, if `tokens` is empty, `file.createNewFile()` is called. So `lexer.txt` exists. Why "No output file"? Perhaps the judge checks for content? No, "No output file" usually means missing file.
+        
+        Let's re-read `Compiler.java`.
+        `getInput()` reads `testfile.txt`.
+        If `testfile.txt` is missing, `RuntimeException` is thrown. Program crashes. No `lexer.txt` created.
+        But the test case input is provided, so `testfile.txt` should exist.
+        
+        Is it possible `tokens` is empty?
+        If `sourceCode` is empty, `isEnd()` is true immediately. `next()` sets `arriveEnd`. Loop breaks. `tokens` is empty.
+        `rightProcedure` creates empty `lexer.txt`.
+        
+        Let's look at `Lexer.java` again.
+        
+        There is a bug in `otherReserveWord` regarding the line number passed to `Token`.
+        `this.newToken = new Token(ReservedWords.getInstance().isOtherReserve(stringTemp), stringTemp, line + 1);`
+        
+        And in `identLexer`:
+        `this.newToken = new Token(ReservedWords.getInstance().isReserve(string), string, line + 1);`
+        
+        And in `digitConst`:
+        `this.newToken = new Token(LexType.INTCON, ch.toString(), line + 1);`
+        
+        And in `DIV` case in `next()`:
+        `newToken = new Token(LexType.DIV, "/", line);`  <-- Uses `line` instead of `line + 1`.
+        
+        This is an inconsistency, but shouldn't cause "No output file".
+        
+        Let's look at `skipOneLine`.
+        ```java
+        private void skipOneLine() {
+            this.line++;
+            this.position = 0;
+            next();
+        }
+        ```
+        If `skipOneLine` is called, it calls `next()`.
+        Inside `next()`, if it finds a token, it sets `newToken`.
+        Then `skipOneLine` returns.
+        The original `next()` call (that found the `//`) returns.
+        So one token is generated for the line after the comment?
+        No, `skipOneLine` calls `next()`, which processes the next token.
+        So `newToken` is set to the token AFTER the comment.
+        This is correct behavior for skipping comments.
+        
+        What if there is a crash in `ReservedWords`?
+        `private static ReservedWords instance = new ReservedWords();`
+        Static initialization.
+        
+        I suspect the error is actually in `Compiler.java` where `rightProcedure` is called.
+        If `tokens` is empty, `lexer.txt` is created but empty.
+        If the expected output is non-empty, and the actual output is an empty file, some judges report "Wrong Answer", others might report "No Output" if they expect content and find none? Unlikely.
+        
+        However, there is a critical flaw in `Lexer.java`'s `getChar` method when `line` increments.
+        
+        ```java
+        private Character getChar() {
+            if (position + 1 > sourceCode.get(line).length()) {
+                line++;
+                position = 0;
+                return '\n';
+            }
+            Character temp = sourceCode.get(line).charAt(position);
+            position++;
+            return temp;
+        }
+        ```
+        
+        If `line` becomes equal to `sourceCode.size()`, the NEXT call to `getChar` will crash at `sourceCode.get(line)`.
+        
+        `isEnd()` checks `this.line + 1 > sourceCode.size()`.
+        
+        In `next()`:
+        ```java
+        if (!isEnd()) {
+            character = getChar();
+        } else {
+            setArriveEnd();
+            return;
+        }
+        ```
+        
+        If `line` is `size - 1` (last index), `isEnd()` is false (`size > size` is false).
+        `getChar()` is called.
+        If we are at the end of the last line, `line` becomes `size`. Returns `\n`.
+        
+        Back in `next()`:
+        `while (!isEnd() && ...)`
+        `isEnd()` is now true (`size + 1 > size`).
+        Loop terminates.
+        
+        `if (isEnd()) { setArriveEnd(); return; }`
+        
+        So it returns safely.
+        
+        So where is the crash?
+        
+        Maybe in `identLexer`?
+        
+        ```java
+        while (isIdentNonDigit(character) || Character.isDigit(character)) {
+            stringBuilder.append(character);
+            if (!isEnd()) {
+                character = getChar();
+            } else {
+                setArriveEnd();
+                break;
+            }
+        }
+        unGetChar(); 
+        ```
+        
+        If `isEnd()` becomes true inside the loop, it breaks.
+        Then `unGetChar()` is called.
+        `unGetChar()` does `this.position--`.
+        
+        If `isEnd()` became true, it means `getChar()` incremented `line` to `size`.
+        So `line` is `size`, `position` is `0`.
+        `unGetChar()` makes `position` `-1`.
+        
+        Next call to `next()`:
+        `isEnd()` is true. Returns.
+        
+        So `position` being `-1` is harmless if `isEnd()` prevents further `getChar()` calls.
+        
+        However, if `isEnd()` was NOT true, but `position` became `-1`?
+        `unGetChar` is only called after `getChar` succeeded.
+        
+        I will mark the `FileWriter` not being closed in `rightProcedure` as the likely culprit for "No output file" if the system is strict about file handles or if the empty file case is mishandled by the judge as "missing". But technically, the file is created.
+        
+        Actually, look at `errorProcedure`. It also doesn't close the writer if `errors1` is empty.
+        
+        If the program crashes, no file is created.
+        
+        I will bet on the `FileWriter` not being closed in the `else` branch (implicit else where tokens is empty) causing the file to be locked or incomplete, OR the judge interprets an empty file as no output. But the code creates the file.
+        
+        Let's look at the `Buggy Output` again: "No output file".
+        
+        If I must pick a line, it's the missing `writer.close()` in the empty tokens case.
+
+<Compiler.java>
+...
+    private static void rightProcedure(ArrayList<Token> tokens) throws IOException {
+        String path = "lexer.txt";
+        File file = new File(path);
+        try{
+            if (!file.exists()) {
+                file.createNewFile();
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        FileWriter writer = new FileWriter(file);
+        if (!tokens.isEmpty()) {
+            for (Token token: tokens) {
+                System.out.println(token.getLexType() + " " + token.getName());
+                writer.write(token.getLexType() + " " + token.getName() + "\n");
+            }
+            writer.flush();
+            writer.close();
+        } // @@ If tokens is empty, the FileWriter is not closed. While the file is created, some systems/judges may fail to recognize it properly if the stream isn't closed, or if an exception occurs later. More critically, if the intention was to output nothing, creating an empty file is correct, but failing to close the resource is bad practice. However, the main issue leading to "No output file" in similar bugs is often that the file creation/write block is skipped or crashes. Here, if tokens is NOT empty, it works. If tokens IS empty, it creates an empty file. If the judge expects a non-empty file and gets an empty one, it's WA. If it says "No output file", it implies the file doesn't exist. This code DOES create the file. Is it possible `getInput` failed? No. I will flag the missing close.
+    }
+...

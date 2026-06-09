@@ -1,0 +1,137 @@
+Based on the comparison between the buggy output and the expected output, the error lies in the handling of unary operators (`+` or `-`) within expressions.
+
+**Analysis:**
+1.  **Expected Output:** For the expression `... + -5 ...`, the expected output includes:
+    ```
+    PLUS +
+    MINU -
+    <UnaryOp>
+    INTCON 5
+    <Number>
+    <PrimaryExp>
+    <UnaryExp>
+    <UnaryExp>
+    <MulExp>
+    <AddExp>
+    ```
+    This indicates that the parser should recognize `-` as a `UnaryOp`, output `<UnaryOp>`, then parse the operand `5`, and wrap it in an additional `<UnaryExp>` layer (representing `UnaryOp UnaryExp`).
+
+2.  **Buggy Output:** The actual output is:
+    ```
+    PLUS +
+    MINU -
+    INTCON 5
+    <Number>
+    <PrimaryExp>
+    <UnaryExp>
+    <MulExp>
+    <AddExp>
+    ```
+    Here, the `MINU -` token is printed, but `<UnaryOp>` is missing. Furthermore, there is only one `<UnaryExp>` tag, implying the unary operator was not treated as a distinct syntactic structure wrapping the primary expression, or the `UnaryOp` printing logic is missing/bypassed.
+
+3.  **Root Cause:** Looking at `lexer_part/TokenList.java`, there is a `merge()` method called in `Compiler.java`. This method merges consecutive `PLUS` and `MINU` tokens.
+    ```java
+    public void merge() {
+        int i = 0;
+        ArrayList<Token> ans = new ArrayList<>();
+        while (i < list.size()) {
+            Token token = list.get(i);
+            if (token.getType() == Token.TokenType.PLUS || token.getType() == Token.TokenType.MINU) {
+                int flag = 1;
+                while (list.get(i).getType() == Token.TokenType.PLUS || list.get(i).getType() == Token.TokenType.MINU) {
+                    if (list.get(i).getType() == Token.TokenType.MINU) {
+                        flag *= -1;
+                    }
+                    i++;
+                }
+                if (flag == -1) {
+                    ans.add(new Token(Token.TokenType.MINU, "-", 0));
+                } else {
+                    ans.add(new Token(Token.TokenType.PLUS, "+", 0));
+                }
+                continue;
+            } else {
+                ans.add(token);
+            }
+            i++;
+        }
+        list = ans;
+    }
+    ```
+    This `merge` function collapses sequences like `+ -` into a single `-` (MINU) token. Consequently, when the parser encounters this merged token, it likely treats it as part of the additive expression (binary operator) or fails to trigger the `UnaryOp` parsing rule correctly because the distinct token sequence required to identify a unary context might be lost or handled incorrectly by the `BinaryExpParser` or `UnaryExpParser`. Specifically, the `UnaryExpParser` checks for `PLUS`/`MINU` to enter `UnaryOpExpParser`. If the token stream has been pre-merged, the structural distinction between a binary minus and a unary minus following a binary plus is obscured or simplified in a way that prevents the correct recursive descent for `UnaryOp`.
+
+    However, looking closer at the `UnaryExpParser`:
+    ```java
+    } else if (first.getType() == Token.TokenType.PLUS ||
+            first.getType() == Token.TokenType.MINU ||
+            first.getType() == Token.TokenType.NOT) {
+
+        /* UnaryExp -> UnaryOp UnaryExp */
+
+        tokenList.moveBack(2);
+        UnaryOpExpParser unaryOpExpParser = new UnaryOpExpParser(tokenList, symbolList);
+        unaryExpComponent = unaryOpExpParser.parseUnaryOpExp();
+    }
+    ```
+    And `UnaryOpExpParser`:
+    ```java
+    public UnaryOpExp parseUnaryOpExp() {
+        UnaryOpParser unaryOpParser = new UnaryOpParser(tokenList);
+        UnaryExpParser unaryExpParser = new UnaryExpParser(tokenList, symbolList);
+        UnaryOp unaryOp = unaryOpParser.parseUnaryOp();
+        UnaryExp unaryExp = unaryExpParser.parseUnaryExp();
+        return new UnaryOpExp(unaryOp, unaryExp);
+    }
+    ```
+    And `UnaryOp`:
+    ```java
+    @Override
+    public String toString() {
+        return token.toString() + "<UnaryOp>" + "\n";
+    }
+    ```
+    
+    The issue is indeed the `merge()` function in `TokenList.java`. By merging `+ -` into `-`, the parser sees a `MINU` token where it expects to parse an `AddExp`. In `BinaryExpParser.parseAddExp`, it parses a `MulExp` (which eventually becomes a `UnaryExp`). If the `MINU` is treated as a binary operator, it consumes the next term. But here, `-5` is a term. The `merge` function destroys the token boundary that allows the parser to see `+` then `-` as separate entities, or it simplifies `-5` into a negative number constant conceptually, but syntactically it should be `UnaryOp(-)` applied to `5`.
+
+    Actually, if `+ -` is merged to `-`, the parser sees `... AddExp MINU MulExp ...`. It will try to parse the `MulExp` starting with `5`. It won't see the `-` as a unary operator because the `-` was consumed as the binary operator between the previous term and `5`. Wait, if `+ -` becomes `-`, then the expression `a + -5` becomes `a - 5`. This is semantically different from `a + (-5)` only if we care about the tree structure, but `a-5` and `a+(-5)` are equivalent. However, the grammar requires `UnaryExp` to handle the sign.
+    
+    If the lexer merges `+ -` into `-`, the token stream is `IDENFR a`, `MINU -`, `INTCON 5`.
+    `parseAddExp` parses `a` as `MulExp`->`UnaryExp`->`PrimaryExp`->`LVal`.
+    Then it sees `MINU`. It enters the loop.
+    It parses the next `MulExp`.
+    `parseMulExp` calls `parseUnaryExp`.
+    `parseUnaryExp` sees `INTCON 5`. It goes to `PrimaryExp`.
+    So the `-` is treated as a binary subtraction operator.
+    Output: `a ... MINU - ... 5 ... <AddExp>`.
+    
+    The expected output shows `PLUS +` then `MINU -` then `<UnaryOp>`. This means the `+` and `-` must remain separate tokens. The `merge()` function is incorrectly combining them.
+
+<lexer_part/TokenList.java>
+...
+    public void merge() {
+        int i = 0;
+        ArrayList<Token> ans = new ArrayList<>();
+        while (i < list.size()) {
+            Token token = list.get(i);
+            if (token.getType() == Token.TokenType.PLUS || token.getType() == Token.TokenType.MINU) {
+                int flag = 1;
+                while (list.get(i).getType() == Token.TokenType.PLUS || list.get(i).getType() == Token.TokenType.MINU) {
+                    if (list.get(i).getType() == Token.TokenType.MINU) {
+                        flag *= -1;
+                    }
+                    i++;
+                }
+                if (flag == -1) {
+                    ans.add(new Token(Token.TokenType.MINU, "-", 0));
+                } else {
+                    ans.add(new Token(Token.TokenType.PLUS, "+", 0));
+                }
+                continue;
+            } else {
+                ans.add(token);
+            }
+            i++;
+        }
+        list = ans;
+    }
+...

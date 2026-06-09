@@ -1,0 +1,759 @@
+Based on the comparison between the buggy output and the expected output, the error lies in the parsing of relational expressions (`RelExp`).
+
+In the test case `if(i==2)`, the expression `i==2` is an Equality Expression (`EqExp`). The grammar defines:
+`EqExp → RelExp { ('==' | '!=') RelExp }`
+`RelExp → AddExp { ('<' | '>' | '<=' | '>=') AddExp }`
+
+When parsing `i==2`:
+1. `EqExp` calls `RelExp`.
+2. `RelExp` calls `AddExp`.
+3. `AddExp` parses `i` (an identifier).
+4. Control returns to `RelExp`. It checks if the next token is a relational operator (`<`, `>`, `<=`, `>=`). The next token is `==`, which is **not** a relational operator.
+5. Therefore, `RelExp` should finish and return control to `EqExp`.
+6. `EqExp` then checks for `==` or `!=`. It finds `==`, consumes it, and parses the right-hand side `RelExp` (which parses `2`).
+
+**The Bug:**
+In the provided `Parser.java`, the `RelExp` method contains `System.out.println` statements that print the current token's value to the console. While this doesn't directly change the logic, looking closely at the `Buggy Output` vs `Expected Output`:
+
+Buggy Output around `i==2`:
+```
+IDENFR i
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<RelExp>       <-- RelExp finishes here correctly in both? Let's check deeper.
+EQL ==         <-- Wait, in Buggy Output, <RelExp> is printed BEFORE EQL ==?
+INTCON 2
+...
+<RelExp>
+<EqExp>
+...
+```
+
+Let's look at the Expected Output around `i==2`:
+```
+IDENFR i
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<RelExp>       <-- RelExp finishes
+<EqExp>        <-- EqExp starts/continues? No, EqExp wraps RelExp.
+EQL ==
+INTCON 2
+...
+<RelExp>
+<EqExp>
+```
+
+Actually, let's look at the structure of `EqExp` in the code:
+```java
+private void EqExp(ASTNode parent){ 
+    addNode(parent,"RelExp");
+    RelExp(tmp);
+    while(curtoken.value.equals("==") || curtoken.value.equals("!=")){
+        addNode(parent,curtoken.value,curtoken.type);
+        nextToken();
+        addNode(parent,"RelExp");
+        RelExp(tmp);
+    }
+}
+```
+And `RelExp`:
+```java
+private void RelExp(ASTNode parent){ 
+    addNode(parent,"AddExp");
+    AddExp(tmp);
+    while(curtoken.value.equals("<") || curtoken.value.equals(">") || curtoken.value.equals("<=") || curtoken.value.equals(">=")){
+        addNode(parent,curtoken.value,curtoken.type);
+        nextToken();
+        System.out.println(curtoken.value); // Debug print
+        addNode(parent,"AddExp");
+        AddExp(tmp);
+        System.out.println(curtoken.value);  // Debug print
+    }
+}
+```
+
+The issue is likely not in the logic of `RelExp` itself for `i==2`, because `==` is not `<`, `>`, etc., so the loop doesn't execute.
+
+However, look at the first variable declaration `int x[10],i=0;`.
+Buggy Output:
+```
+...
+<ConstExp>
+RBRACK ]
+<VarDef>   <-- This VarDef corresponds to x[10]
+COMMA ,
+IDENFR i
+ASSIGN =
+INTCON 0
+...
+<Exp>
+<InitVal>
+<VarDef>   <-- This VarDef corresponds to i=0
+SEMICN ;
+<VarDecl>
+```
+This part looks correct in both.
+
+Let's look at the `for` loop condition `i<=10`.
+Buggy Output:
+```
+IDENFR i
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+LEQ <=     <-- Operator
+INTCON 10
+...
+<RelExp>   <-- Closing RelExp
+<EqExp>
+...
+```
+Expected Output:
+```
+IDENFR i
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<RelExp>   <-- Closing RelExp BEFORE LEQ? No.
+LEQ <=
+INTCON 10
+...
+<RelExp>
+<EqExp>
+```
+
+Wait, in the Expected Output for `i<=10`:
+```
+<AddExp>
+<RelExp>   <-- This tag appears BEFORE LEQ?
+LEQ <=
+```
+No, looking at the Expected Output provided in the prompt:
+```
+IDENFR i
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<RelExp>
+LEQ <=
+INTCON 10
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<RelExp>
+<EqExp>
+<LAndExp>
+<LOrExp>
+<Cond>
+```
+This implies that the first `<RelExp>` is printed *before* `LEQ`. This is impossible if `RelExp` is a non-terminal that wraps the whole expression `i <= 10`. The standard post-order traversal would print children first, then the parent.
+If `RelExp` node is created, it adds `AddExp` (left), then if `<=` exists, it adds `<=` token, then `AddExp` (right). Then it prints `<RelExp>`.
+So `<RelExp>` should appear *after* `10`'s subtree.
+
+Let's re-read the Expected Output carefully for `i<=10`:
+```
+IDENFR i
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<RelExp>   <--- HERE
+LEQ <=
+INTCON 10
+...
+<AddExp>
+<RelExp>   <--- HERE
+<EqExp>
+```
+This structure in the Expected Output suggests that the `RelExp` non-terminal is being printed **twice**? Or perhaps the first `<RelExp>` corresponds to the left operand? No, `RelExp` is the node name.
+
+Let's look at the Buggy Output for `i<=10`:
+```
+IDENFR i
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+LEQ <=     <--- Operator printed here
+INTCON 10
+...
+<AddExp>
+<RelExp>   <--- RelExp printed here
+<EqExp>
+```
+In the Buggy Output, the first `<RelExp>` is **missing** before `LEQ`.
+In the Expected Output, there is a `<RelExp>` before `LEQ`.
+
+This is extremely strange. A non-terminal tag `<RelExp>` usually marks the end of the `RelExp` parsing. If it appears before the operator, it might mean the parser is treating the left side as a complete `RelExp`? But the grammar is left-recursive (eliminated to right-recursive/loop).
+
+Let's look at `ASTNode.java` `printNodeInfo`:
+```java
+if(!VnName.equals("BType") && !VnName.equals("Decl") && !VnName.equals("BlockItem")){
+    writeToFile("parser.txt", "<" + VnName + ">");
+}
+```
+
+If the Expected Output has `<RelExp>` before `LEQ`, it implies that the `RelExp` node for the *left* side was printed? But `RelExp` isn't a child of itself in the flattened loop structure usually used.
+
+Let's look at the `RelExp` code again:
+```java
+private void RelExp(ASTNode parent){ 
+    addNode(parent,"AddExp");
+    AddExp(tmp);
+    // Loop for operators
+    while(...) {
+       addNode(operator);
+       nextToken();
+       addNode("AddExp");
+       AddExp(tmp);
+    }
+}
+```
+In this structure, only ONE `RelExp` node is added to the parent (implicitly, `tmp` is set by `addNode(parent, "RelExp")` before calling `RelExp(tmp)`? No, `addNode` sets `tmp` to the new node.
+In `Parser.java`:
+```java
+private void Cond(ASTNode parent){ 
+    addNode(parent,"LOrExp");
+    LOrExp(tmp);
+}
+```
+Inside `LOrExp`:
+```java
+private void LOrExp(ASTNode parent){ 
+    addNode(parent,"LAndExp");
+    LAndExp(tmp);
+    ...
+}
+```
+Inside `LAndExp`:
+```java
+private void LAndExp(ASTNode parent){ 
+    addNode(parent,"EqExp");
+    EqExp(tmp);
+    ...
+}
+```
+Inside `EqExp`:
+```java
+private void EqExp(ASTNode parent){ 
+    addNode(parent,"RelExp");
+    RelExp(tmp);
+    ...
+}
+```
+Inside `RelExp`:
+```java
+private void RelExp(ASTNode parent){ 
+    addNode(parent,"AddExp"); // Adds AddExp node to RelExp node (tmp)
+    AddExp(tmp);              // Parses into tmp (AddExp node)
+    while(...) {
+       addNode(parent, ...); // Adds operator to RelExp node (tmp)
+       ...
+       addNode(parent, "AddExp"); // Adds right AddExp to RelExp node (tmp)
+       ...
+    }
+}
+```
+So `RelExp` creates one node. Its children are `AddExp`, `Op`, `AddExp`, etc.
+Post-order traversal prints children, then `<RelExp>`.
+So `<RelExp>` must appear **after** all its children.
+
+Why does Expected Output show:
+```
+<AddExp>
+<RelExp>
+LEQ <=
+```
+This implies `LEQ` is NOT a child of that `RelExp`? Or `LEQ` is printed separately?
+If `LEQ` is printed separately, it means `LEQ` is a terminal token printed by lexical analysis? No, tokens are printed when they are consumed/added as nodes.
+
+Let's look at the Expected Output for `i==2` again:
+```
+<AddExp>
+<RelExp>
+<EqExp>
+EQL ==
+```
+Here `<RelExp>` is before `EQL ==`. And `<EqExp>` is before `EQL ==`.
+This implies that `EQL ==` is NOT inside `EqExp`? That contradicts the grammar.
+
+Wait, look at the Buggy Output for `i==2`:
+```
+<AddExp>
+<RelExp>
+EQL ==
+INTCON 2
+...
+<RelExp>
+<EqExp>
+```
+Here, `EQL ==` is printed, THEN `INTCON 2`, THEN `<RelExp>`, THEN `<EqExp>`.
+This matches the standard post-order traversal where `EqExp` contains `==` and the right `RelExp`.
+
+Now look at Expected Output for `i==2`:
+```
+<AddExp>
+<RelExp>
+<EqExp>
+EQL ==
+INTCON 2
+...
+<RelExp>
+<EqExp>
+<LAndExp>
+...
+```
+This Expected Output seems to have `<EqExp>` printed **before** `EQL ==`. This is only possible if `EqExp` is printed prematurely, or if the structure is different.
+
+Actually, looking closely at the Expected Output provided in the prompt:
+```
+IDENFR i
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<RelExp>
+<EqExp>
+EQL ==
+INTCON 2
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<RelExp>
+<EqExp>
+<LAndExp>
+<LOrExp>
+<Cond>
+```
+There are TWO `<EqExp>` tags. One before `EQL`, one after.
+There are TWO `<RelExp>` tags. One before `EQL`, one after.
+
+This suggests that the parser is printing the non-terminal tags **pre-order** or at specific points, OR the grammar implementation is creating nested nodes incorrectly?
+No, the problem description says: "Before completing the analysis of any syntax components... output the name...".
+Wait! **"Before completing the analysis... output the name"**?
+No, it says: "Before completing the analysis of any syntax components in the grammar (except for <BlockItem>, <Decl>, <BType>), output the name of the current syntax component on a new line...".
+This phrasing is ambiguous. Does it mean "At the start" or "At the end"?
+Usually, "completing the analysis" means at the end. And the format `<Stmt>` suggests a wrapper.
+However, if it meant "At the beginning", it would be pre-order.
+
+Let's check the Buggy Output for `MainFuncDef`:
+```
+...
+<Block>
+<MainFuncDef>
+<CompUnit>
+```
+These are at the end. So it is Post-Order.
+
+Why does Expected Output have tags before operators?
+Let's look at `i<=10` in Expected Output again:
+```
+<AddExp>
+<RelExp>
+LEQ <=
+```
+If this is post-order, `LEQ` must be a child of `RelExp`. So `LEQ` should be printed before `<RelExp>`.
+But here `<RelExp>` is printed BEFORE `LEQ`.
+
+This implies that the Expected Output provided in the prompt might be generated by a parser that prints the Non-Terminal tag **when it enters** the rule (Pre-Order) for some nodes, or there is a misunderstanding of the output format.
+
+HOWEVER, look at the Buggy Output for `i<=10`:
+```
+<AddExp>
+LEQ <=
+INTCON 10
+...
+<AddExp>
+<RelExp>
+```
+Here `<RelExp>` is at the end.
+
+Look at Expected Output for `i<=10`:
+```
+<AddExp>
+<RelExp>
+LEQ <=
+INTCON 10
+...
+<AddExp>
+<RelExp>
+```
+
+The difference is the position of the FIRST `<RelExp>`.
+In Buggy: Missing.
+In Expected: Present before `LEQ`.
+
+If the Expected Output is correct, then the parser MUST output `<RelExp>` before parsing the operator. This contradicts the post-order traversal of a single `RelExp` node containing the operator.
+
+Unless... The `RelExp` in the Expected Output refers to the **Left Hand Side** `RelExp`?
+Grammar: `RelExp → AddExp | RelExp ('<' ...) AddExp`
+If implemented recursively (not iteratively):
+`RelExp()` calls `RelExp()` for left side? No, that's left recursion.
+Eliminated: `RelExp() { AddExp(); while(op) { op; AddExp(); } }`
+
+Is it possible the Expected Output is from a parser that treats `AddExp` as a `RelExp` implicitly?
+No.
+
+Let's look at the `Buggy Output` for `i==2` again.
+```
+<RelExp>
+EQL ==
+```
+Vs Expected:
+```
+<RelExp>
+<EqExp>
+EQL ==
+```
+
+The Buggy Output is MISSING `<EqExp>` before `EQL`.
+The Expected Output HAS `<EqExp>` before `EQL`.
+
+This pattern (Tag appearing before the operator that belongs to it) suggests that the "Expected Output" might actually be printing the tags **upon entry** (Pre-Order) for these specific nodes, OR the Buggy Code is failing to print them at the right time.
+
+But wait, `ASTNode.postOrderVisit` is strictly post-order.
+If the Expected Output is truly post-order, then the tree structure must be different.
+
+Let's look at the `Buggy Output` for the whole `if(i==2)` block.
+It prints `<RelExp>` then `EQL`.
+It DOES NOT print `<EqExp>` before `EQL`.
+
+In `EqExp`:
+```java
+private void EqExp(ASTNode parent){ 
+    addNode(parent,"RelExp");
+    RelExp(tmp);
+    while(curtoken.value.equals("==") || curtoken.value.equals("!=")){
+        addNode(parent,curtoken.value,curtoken.type);
+        nextToken();
+        addNode(parent,"RelExp");
+        RelExp(tmp);
+    }
+}
+```
+The `EqExp` node is created in `LAndExp`:
+```java
+addNode(parent,"EqExp");
+EqExp(tmp);
+```
+So `EqExp` is a child of `LAndExp`.
+Inside `EqExp`, it adds `RelExp` (left), then `==`, then `RelExp` (right).
+Post-order of `EqExp`:
+1. Post-order of Left `RelExp` -> prints `<RelExp>`
+2. Print `==`
+3. Post-order of Right `RelExp` -> prints `<RelExp>`
+4. Print `<EqExp>`
+
+So the sequence should be:
+`<RelExp>` (left)
+`==`
+`<RelExp>` (right)
+`<EqExp>`
+
+Buggy Output for `i==2`:
+```
+<RelExp>   (Left)
+EQL ==
+INTCON 2
+...
+<RelExp>   (Right)
+<EqExp>
+```
+This matches the standard post-order logic perfectly.
+
+Expected Output for `i==2`:
+```
+<RelExp>
+<EqExp>   <-- THIS IS THE DIFFERENCE
+EQL ==
+INTCON 2
+...
+<RelExp>
+<EqExp>
+```
+The Expected Output prints `<EqExp>` **before** `EQL`.
+This is ONLY possible if `<EqExp>` is printed **Pre-Order** (on entry).
+
+But `MainFuncDef` is printed at the end (Post-Order).
+
+Is it possible that `EqExp`, `RelExp`, etc. are printed on entry, while `Stmt`, `Block` are printed on exit?
+The problem statement says: "Before completing the analysis... output the name". This usually means "After finishing".
+
+However, if I look at the `Buggy Output` for `i<=10`:
+```
+<AddExp>
+LEQ <=
+...
+<RelExp>
+```
+Expected:
+```
+<AddExp>
+<RelExp>
+LEQ <=
+```
+
+If the Expected Output is correct, then `<RelExp>` is printed before `LEQ`.
+This implies `RelExp` is printed on entry?
+If `RelExp` is printed on entry, then `EqExp` should also be printed on entry?
+Expected `i==2`:
+```
+<RelExp>
+<EqExp>
+EQL ==
+```
+Yes, both are before the operator.
+
+So, the requirement "Before completing the analysis" might be interpreted as "At the beginning of the analysis of the component" for Expressions?
+OR, more likely, the Buggy Code is **missing** the printing of these tags at the beginning?
+
+But `ASTNode` only prints in `postOrderVisit`. There is no `preOrderVisit`.
+
+Let's look at the `Buggy Output` for `x[10]`.
+```
+<ConstExp>
+RBRACK ]
+<VarDef>
+```
+`VarDef` contains `x`, `[`, `ConstExp`, `]`.
+Post-order: `x`, `[`, `<ConstExp>`, `]`, `<VarDef>`.
+Buggy: `x`, `[`, ..., `<ConstExp>`, `]`, `<VarDef>`. Correct.
+
+So why are Expressions different?
+
+Hypothesis: The "Expected Output" provided in the prompt description might be from a version of the parser that prints Expression tags **twice**? Once on entry, once on exit?
+Or maybe the Buggy Code is supposed to print them on entry?
+
+Let's look at the code `Parser.java` again.
+There are `System.out.println` in `RelExp`.
+```java
+System.out.println(curtoken.value); // Debug print
+```
+These go to Console, not file. They don't affect `parser.txt`.
+
+If the Expected Output is strictly correct, and it shows tags before operators, and the Buggy Output shows tags after operators (standard post-order), then the Buggy Code is implementing Post-Order, but the Expected Output requires **Pre-Order** for Expressions?
+
+But `CompUnit` is at the end.
+
+Let's look at the `Buggy Output` for `if(i==2)` again.
+It is missing `<EqExp>` before `==`.
+It is missing `<RelExp>` before `==`? No, it has `<RelExp>` before `==`.
+Wait.
+Buggy:
+```
+<AddExp>
+<RelExp>
+EQL ==
+```
+Expected:
+```
+<AddExp>
+<RelExp>
+<EqExp>
+EQL ==
+```
+
+The Buggy Output HAS `<RelExp>` before `EQL`.
+The Expected Output HAS `<RelExp>` AND `<EqExp>` before `EQL`.
+
+In standard Post-Order:
+`EqExp` node contains `RelExp`(left), `==`, `RelExp`(right).
+Print order: `<RelExp>`, `==`, `<RelExp>`, `<EqExp>`.
+So `<EqExp>` should be AFTER `==`.
+
+The Expected Output has `<EqExp>` BEFORE `==`.
+This confirms that for `EqExp` (and likely `RelExp`), the tag is printed **on Entry**.
+
+How can we achieve "Print on Entry" with the current `ASTNode` structure?
+We can't, unless we print manually in the Parser methods.
+
+Does the Buggy Code print manually?
+No.
+
+Does the Problem Description say "Output ... Before completing"?
+"Before completing the analysis of any syntax components ... output the name".
+This is bad English. It could mean "Before you finish, output it" (i.e., at the end).
+OR "Before you start the next thing, output the name of the current one" (i.e., at the beginning).
+
+Given the Expected Output, it seems **Expression-related non-terminals** are printed at the **Beginning** (Pre-Order), while **Statement/Block-related non-terminals** are printed at the **End** (Post-Order).
+
+OR, simpler explanation:
+The Buggy Code is correct in its Post-Order traversal.
+The Expected Output is WRONG in the prompt?
+No, I must assume Expected Output is correct.
+
+If Expected Output is correct, I need to modify the Parser to print `<EqExp>`, `<RelExp>`, etc. at the beginning of their respective methods.
+
+Let's check which ones are Pre-Order in Expected Output.
+`i==2`:
+`<RelExp>` (Pre)
+`<EqExp>` (Pre)
+`==`
+`<RelExp>` (Post? No, if Pre, it should be before 2?)
+Let's trace Expected `i==2` fully:
+```
+IDENFR i
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<RelExp>   <-- Pre-Order RelExp (Left)
+<EqExp>    <-- Pre-Order EqExp
+EQL ==
+INTCON 2
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<RelExp>   <-- Post-Order RelExp (Right)? Or Pre-Order?
+<EqExp>    <-- Post-Order EqExp?
+```
+If it were purely Pre-Order:
+`<EqExp>`, `<RelExp>`, `i`, ..., `<RelExp>`, `2`, ..., `==`? No, `==` is in the middle.
+
+This mixed order is characteristic of:
+**Print Tag on Entry.**
+Parse Left.
+Print Operator.
+Parse Right.
+**Print Tag on Exit?** No, if it printed on Exit, `<EqExp>` would be at the very end.
+
+In Expected Output:
+`<EqExp>` appears TWICE.
+Once before `==`.
+Once after `2`'s subtree.
+
+This implies:
+1. Print `<EqExp>` on Entry.
+2. Parse Left `RelExp`.
+3. Print `==`.
+4. Parse Right `RelExp`.
+5. Print `<EqExp>` on Exit.
+
+So, Expression nodes are printed **BOTH** on Entry and Exit?
+Let's check `RelExp` in Expected `i==2`.
+`<RelExp>` appears before `==`.
+Does it appear after `i`'s subtree?
+```
+<AddExp>
+<RelExp>
+<EqExp>
+```
+Yes. `<RelExp>` is after `<AddExp>`.
+So `RelExp` is also printed **BOTH** on Entry and Exit?
+
+Let's check `AddExp`.
+```
+<MulExp>
+<AddExp>
+```
+Only once?
+If `AddExp` was printed on Entry, it would be before `MulExp`.
+Here it is after. So `AddExp` is Post-Order only.
+
+So, `EqExp` and `RelExp` are Pre+Post?
+What about `LAndExp`, `LOrExp`?
+Expected:
+```
+<EqExp>
+<LAndExp>
+<LOrExp>
+<Cond>
+```
+These are at the end. Post-Order.
+
+So only `EqExp` and `RelExp` seem to have duplicate tags?
+Wait, look at `i<=10` in Expected:
+```
+<AddExp>
+<RelExp>
+LEQ <=
+INTCON 10
+...
+<RelExp>
+<EqExp>
+```
+Here `<RelExp>` appears twice.
+Once before `LEQ`.
+Once after `10`.
+And `<EqExp>` appears once (at the end).
+
+So `RelExp` is Pre+Post.
+`EqExp` in `i==2` appeared twice.
+
+Conclusion: The parser should print `<RelExp>` and `<EqExp>` (and possibly others) **both** when entering and leaving the function.
+
+The Buggy Code only prints them once (Post-Order, via `ASTNode`).
+
+To fix this, we need to manually print the tag at the beginning of `RelExp` and `EqExp` (and potentially `LAndExp`, `LOrExp` if they behave similarly, but Expected Output suggests they don't?).
+
+Actually, looking at `LAndExp` in Expected `i==2`:
+It's just `<LAndExp>` at the end.
+
+So, the error is that `RelExp` and `EqExp` (and maybe `LAndExp`/`LOrExp` depending on context) need to output their names at the **start** of the parsing process as well.
+
+However, modifying `ASTNode` to support Pre-Order is hard without changing structure.
+Easier fix: Add `writeToFile` calls at the start of `RelExp`, `EqExp`, etc. in `Parser.java`.
+
+Which ones?
+Based on `i==2`: `RelExp` and `EqExp`.
+Based on `i<=10`: `RelExp`. (`EqExp` is present at end).
+
+Let's check `LAndExp` / `LOrExp`.
+If input was `a && b`, would `<LAndExp>` appear twice?
+The test case doesn't have `&&`.
+
+I will assume `RelExp` and `EqExp` need Pre-Order printing.
+
+<frontend/Parser.java>
+...
+    private void RelExp(ASTNode parent){ // RelExp → AddExp | RelExp ('<' | '>' | '<=' | '>=') AddExp
+        writeToFile("parser.txt", "<RelExp>"); // Add this line
+        addNode(parent,"AddExp");
+        //System.out.println(curtoken.value); // i
+        AddExp(tmp);
+        //System.out.println(curtoken.value); // <
+        while(curtoken.value.equals("<") || curtoken.value.equals(">") || curtoken.value.equals("<=") || curtoken.value.equals(">=")){
+            addNode(parent,curtoken.value,curtoken.type);
+            nextToken();
+            System.out.println(curtoken.value); // j
+            addNode(parent,"AddExp");
+            AddExp(tmp);
+            System.out.println(curtoken.value);  // ) 不对
+        }
+    }
+
+    // 改写文法：EqExp → RelExp { ('==' | '!=') RelExp }
+    private void EqExp(ASTNode parent){ // EqExp → RelExp | EqExp ('==' | '!=') RelExp
+        writeToFile("parser.txt", "<EqExp>"); // Add this line
+        addNode(parent,"RelExp");
+        RelExp(tmp);
+        while(curtoken.value.equals("==") || curtoken.value.equals("!=")){
+            addNode(parent,curtoken.value,curtoken.type);
+            nextToken();
+            addNode(parent,"RelExp");
+            RelExp(tmp);
+        }
+    }
+...

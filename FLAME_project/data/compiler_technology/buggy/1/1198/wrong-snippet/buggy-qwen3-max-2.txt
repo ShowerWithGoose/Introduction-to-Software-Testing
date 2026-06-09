@@ -1,0 +1,385 @@
+Based on the problem description and test case analysis:
+
+1. The test input has missing semicolons at lines 2, 9, and 13 (1-indexed)
+2. The buggy output reports errors at lines 2, 8, and 12 instead
+3. This indicates the line number tracking in the parser's error reporting is off by 1 for some cases
+
+Looking at the error handling code in Parser.java, particularly in the VarDecl() method where the second error occurs (missing semicolon after "int a"), I can see the issue:
+
+In VarDecl(), when a semicolon is missing, it reports `Lexer.outs.get(i - 1).getLine_num()`. However, due to how the lexer processes tokens and handles whitespace/comments, the line number tracking might be incorrect.
+
+The key issue appears in the Stmt() method's printf handling and other statement handlers where similar error reporting occurs. But most critically, examining the test case:
+
+- Line 2: `printf("Hello SysY!\n") // error 1` → missing semicolon
+- Line 9: `int a // error 2` → missing semicolon  
+- Line 13: `return 0 // error 3` → missing semicolon
+
+The parser is reporting line 8 instead of 9, and line 12 instead of 13, suggesting that when processing the token after the comment, the line number hasn't been properly updated.
+
+However, looking more carefully at the Lexer.java file, I notice a critical bug in the initialization of the singles map:
+
+```java
+singles.put(">=", new Single("==", "EQL"));
+```
+
+This is clearly wrong - it should be:
+```java
+singles.put(">=", new Single(">=", "GEQ"));
+singles.put("==", new Single("==", "EQL"));
+```
+
+But this doesn't explain the line number discrepancy.
+
+The real issue is in the Parser.java error reporting logic. When reporting missing semicolon errors (type "i"), the code uses `Lexer.outs.get(i - 1).getLine_num()`, but depending on the current parsing state and how tokens are consumed, this might not point to the correct line.
+
+Looking specifically at the VarDecl() method:
+
+<frontend/Parser.java>
+...
+    public static Node VarDecl() {
+        Node node = new Node("<VarDecl>");
+        node.addChild(BType());
+        node.addChild(VarDef());
+        while (now.getName().equals(",")) {
+            node.addChild(new Node(/*","*/now.getType() + " " + now.getName()));
+            now = Lexer.outs.get(++i);
+            node.addChild(VarDef());
+        }
+        if (now.getName().equals(";")) {
+            node.addChild(new Node(/*";"*/now.getType() + " " + now.getName()));
+            if (i < Lexer.outs.size() - 1) {
+                now = Lexer.outs.get(++i);
+            }
+        } else {
+            //错误处理
+            w.add(cnt, new WrongExample(Lexer.outs.get(i - 1).getLine_num(), "i"));
+            cnt++;
+            //System.out.println(Lexer.outs.get(i - 1).getLine_num() + " " + "i");
+        }
+        return node;
+    }
+...
+
+The issue is that `Lexer.outs.get(i - 1)` may not correspond to the actual line where the declaration ends. In the test case "int a // error 2", the token "a" is on line 9, but after processing, `i - 1` might point to a different token.
+
+Similarly, in the Stmt() method for return statements:
+
+<frontend/Parser.java>
+...
+            } else {
+                /////////////////////////////
+                node.addChild(Exp());
+                if (now.getName().equals(";")) {
+                    node.addChild(new Node(/*";"*/now.getType() + " " + now.getName()));
+                    now = Lexer.outs.get(++i);
+                } else {
+                    //错误处理
+                    w.add(cnt, new WrongExample(Lexer.outs.get(i - 1).getLine_num(), "i"));
+                    cnt++;
+                    //System.out.println(Lexer.outs.get(i - 1).getLine_num() + " " + "i");
+                }
+            }
+...
+
+The same pattern occurs. The fundamental problem is that the error reporting uses `i - 1` to get the line number, but this doesn't always correspond to the correct source line for the missing semicolon error.
+
+However, looking at the test case more carefully:
+- The first error is correctly reported at line 2
+- The second error should be at line 9 but is reported at line 8
+- The third error should be at line 13 but is reported at line 12
+
+This suggests that the line numbers in the lexer output are actually correct, but the parser is looking at the wrong token when determining the error line.
+
+In the VarDecl case, after processing "int a", the current token `now` would be whatever comes next (probably the "for" keyword on line 11), so `i - 1` points to the "a" token which should be on line 9. But it's reporting line 8.
+
+This indicates the lexer itself might have incorrect line number tracking, particularly around comments.
+
+Looking at Lexer.java, in the single-line comment handling:
+
+<frontend/Lexer.java>
+...
+                    if ((char) ch == '/') {
+                        while ((char) ch != '\n') {
+                            ch = f.read();
+                            if(ch == -1) {
+                                return;
+                            }
+                            //System.out.println((char) ch + "!!");
+                        }
+                        line_num = line_num + 1;
+                    }
+...
+
+When it encounters `// error 1` on line 2, it reads until `\n` and then increments `line_num`. This is correct.
+
+But then for the next tokens, the line_num should be 3, and so on.
+
+However, there's another issue in the character literal handling:
+
+<frontend/Lexer.java>
+...
+                if ((char)ch == '\'') { //单引号（字符）
+                    //System.out.print("CHRCON '");
+                    x.write("CHRCON '");
+                    x.flush();
+                    ch = f.read();
+                    StringBuilder tmp = new StringBuilder("'");
+                    while ((char)ch != '\'') {
+                        //System.out.print((char) ch);
+                        x.write((char) ch);
+                        x.flush();
+                        tmp.append((char) ch);
+                        ch = f.read();
+                    }
+                    //System.out.println('\'');
+                    ch = f.read();
+                    if((char)ch == '\'') {
+                        x.write(String.valueOf("''\n"));
+                        x.flush();
+                        tmp.append("''");
+                        outs.add(cnt, new Lexer_out("CHRCON", tmp.toString(), line_num));
+                        cnt++;
+                    } else {
+                        x.write( "'\n");
+                        x.flush();
+                        tmp.append("'");
+                        outs.add(cnt, new Lexer_out("CHRCON", tmp.toString(), line_num));
+                        cnt++;
+                        if((char) ch == '\n') {
+                            line_num++;
+                        }
+                        continue;
+                    }
+...
+
+This has a bug where after reading the closing quote, it does `ch = f.read()` again, which consumes the next character. If that character is a newline, it increments line_num, but this is incorrect because the newline belongs to the next line.
+
+But our test case doesn't have character literals, so this isn't the issue.
+
+The real smoking gun is in the main parsing loop and how tokens are consumed. Looking at the test input:
+
+Line 2: `printf("Hello SysY!\n") // error 1`
+Line 3: (empty)
+Line 4: `if (1)`
+Line 5: (empty)
+Line 6: (empty)
+Line 7: `/*********/`
+Line 8: `;`
+Line 9: `int a // error 2`
+Line 10: (empty)
+Line 11: `for (;;) {}`
+Line 12: (empty)
+Line 13: `return 0 // error 3`
+
+The parser reports errors at lines 2, 8, 12.
+
+Line 8 contains just ";", which is correct.
+Line 12 is empty.
+
+This suggests that when the parser encounters the missing semicolon after "int a", it's actually looking at the token that comes after, which might be the ";" on line 8, hence reporting line 8-1 = 7? No, that doesn't match.
+
+Wait, let me reconsider. The expected errors are at lines 2, 9, 13. The actual output is 2, 8, 12. So it's consistently off by -1 starting from the second error.
+
+This suggests that after the first error is processed, the line number tracking gets desynchronized.
+
+Looking back at the VarDecl() method error handling:
+
+```java
+w.add(cnt, new WrongExample(Lexer.outs.get(i - 1).getLine_num(), "i"));
+```
+
+If the token at position `i - 1` has line number 8 instead of 9, then the lexer assigned the wrong line number to the "a" token.
+
+Why would "a" be assigned line 8 instead of 9?
+
+Because of the multi-line comment handling. Let's trace through:
+
+- Line 1: `int main() {` 
+- Line 2: `printf("Hello SysY!\n") // error 1` → after comment, line_num becomes 3
+- Lines 3-4: `if (1)` and empty line → line_num becomes 4, then 5
+- Lines 5-7: empty lines and `/*********/` → the multi-line comment ends, but how is line_num updated?
+
+In the multi-line comment handling:
+
+<frontend/Lexer.java>
+...
+                    } else if ((char) ch == '*') { //多行注释
+                        ch = f.read();
+                        while (true) {
+                            if ((char) ch == '*') {
+                                ch = f.read();
+                                if((char) ch == '/') {
+                                    ch = f.read();
+                                    break;
+                                } else if (ch == '\n'){
+                                    line_num = line_num + 1;
+                                } else {
+                                    continue;
+                                }
+                            } else if (ch == '\n') {
+                                line_num = line_num + 1;
+                            }
+                            ch = f.read();
+                        }
+...
+
+The multi-line comment `/*********/` is on line 7 and doesn't contain any newlines, so line_num shouldn't be incremented during its processing. After processing the comment, line_num should still be 7 (since we had line 1, then line 2 became 3, lines 3-6 increment to 7).
+
+Then line 8: `;` → this token gets line_num 7? No, it should be 8.
+
+Actually, let's recount properly with 1-indexed lines:
+
+- Start: line_num = 1
+- Process line 1: `int main() {` → no newline processing needed yet
+- Process line 2: `printf... // error 1` → when hitting `\n` at end, line_num becomes 2, then the comment processing sees `\n` and increments to 3
+- Line 3: `if (1)` → when we hit the `\n` at end, line_num becomes 4  
+- Line 4: (empty) → `\n` makes line_num 5
+- Line 5: (empty) → `\n` makes line_num 6  
+- Line 6: (empty) → `\n` makes line_num 7
+- Line 7: `/*********/` → no `\n` in comment, but there is a `\n` after, so line_num becomes 8
+- Line 8: `;` → token gets line_num 8
+- Line 9: `int a // error 2` → "int" and "a" get line_num 9, then comment makes line_num 10
+- Line 10: (empty) → line_num 11
+- Line 11: `for (;;) {}` → line_num 12 after `\n`
+- Line 12: (empty) → line_num 13
+- Line 13: `return 0 // error 3` → "return" and "0" get line_num 13
+
+So the tokens should have correct line numbers. Then why does the parser report line 8 instead of 9?
+
+Looking at the VarDecl() method again. When parsing "int a", the BType() consumes "int" (line 9), then VarDef() consumes "a" (line 9). After VarDef() returns, `now` points to the next token, which would be "for" on line 11. So `i - 1` points to the "a" token, which has line_num 9. 
+
+But the error is reported as line 8. This suggests that the "a" token was actually assigned line_num 8 by the lexer.
+
+Why would that happen? Because of the multi-line comment processing. The comment `/*********/` is on what we think is line 7, but let's count the actual lines in the test input:
+
+1: int main() {
+2:     printf("Hello SysY!\n") // error 1
+3: 
+4:     if (1)
+5: 
+6: 
+7:     /*********/
+8:     ;
+9:     int a // error 2
+10: 
+11:     for (;;) {}
+12: 
+13:     return 0 // error 3
+14: }
+
+Ah! The test input shows that the semicolon is on line 8, "int a" is on line 9, and "return 0" is on line 13.
+
+But the lexer might be counting differently. The key insight is in the whitespace handling:
+
+<frontend/Lexer.java>
+...
+                if (/*(char) ch == '\n' || (char) ch == '\t' || (char) ch == ' '*/Character.isWhitespace((char) ch)) {
+                    ch = f.read();
+                    if ((char) ch == '\n') {
+                        line_num++;
+                    }
+                    continue;
+                }
+...
+
+This has a bug! When it encounters whitespace (including newline), it reads the next character and only increments line_num if that next character is a newline. But it should increment line_num when the current character is a newline.
+
+The correct logic should be:
+- If current char is '\n', increment line_num
+- Then read next char
+
+But the current code does:
+- If current char is whitespace, read next char
+- If next char is '\n', increment line_num
+
+This means newlines are being attributed to the wrong tokens.
+
+For example, when processing the end of line 2:
+- Current char is '\n' (whitespace)
+- Read next char (first char of line 3)
+- Since next char is not '\n', don't increment line_num
+- But we should have incremented line_num because we just passed a newline
+
+This causes all line numbers to be off by 1 after the first newline.
+
+Actually, looking more carefully, the code structure is complex with multiple places handling newlines. But the critical issue is likely in the general whitespace handling.
+
+However, the most direct evidence is in the error reporting locations. Since the first error (line 2) is reported correctly, but subsequent ones are off by 1, this suggests the issue is in how the parser determines which token's line number to use for error reporting.
+
+Looking at the Stmt() method for the printf case:
+
+<frontend/Parser.java>
+...
+            if (now.getName().equals(")")) {
+                node.addChild(new Node(/*")"*/now.getType() + " " + now.getName()));
+                now = Lexer.outs.get(++i);
+                if (now.getName().equals(";")) {
+                    node.addChild(new Node(/*";"*/now.getType() + " " + now.getName()));
+                    now = Lexer.outs.get(++i);
+                } else {
+                    //错误处理
+                    w.add(cnt, new WrongExample(Lexer.outs.get(i - 1).getLine_num(), "i"));
+                    cnt++;
+                    //System.out.println(Lexer.outs.get(i - 1).getLine_num() + " " + "i");
+                }
+...
+
+After consuming the ")", `now` points to the next token. If that's not ";", then `i - 1` points to the ")" token. In the test case, the printf statement is on line 2, so the ")" should have line_num 2, which is correct.
+
+For the VarDecl case:
+- After processing VarDef() (which consumes "a"), `now` points to the next token
+- If that's not ";", then `i - 1` points to "a"
+- "a" should be on line 9
+
+But it's reporting line 8, which suggests "a" was assigned line 8.
+
+Given the complexity, the most likely location of the error is in the lexer's line number tracking, specifically in how it handles newlines after comments and whitespace.
+
+But looking at the provided code, I notice another critical issue in the singles map initialization:
+
+<frontend/Lexer.java>
+...
+        singles.put(">=", new Single("==", "EQL"));
+...
+
+This is clearly a typo - it should be:
+```java
+singles.put(">=", new Single(">=", "GEQ"));
+singles.put("==", new Single("==", "EQL"));
+```
+
+But this affects token recognition, not line numbers.
+
+After careful analysis, the most probable cause is in the parser's error reporting logic using `i - 1` instead of the correct token position. However, given the test case behavior, I believe the issue is in the lexer's line number assignment for tokens following comments.
+
+But since the first error is correct and others are off by 1, and considering the code structure, the error is most likely in the Parser.java file in the error reporting sections where `Lexer.outs.get(i - 1).getLine_num()` is used.
+
+Specifically, in the VarDecl() method and similar methods, when a semicolon is missing, the code should use the line number of the last meaningful token in the declaration/statement, but due to token consumption patterns, `i - 1` might not point to the right token.
+
+However, without being able to run the code, the safest bet is that the error is in the VarDecl() method's error handling, as that's where the second error (line 9 vs 8) originates.
+
+<frontend/Parser.java>
+...
+    public static Node VarDecl() {
+        Node node = new Node("<VarDecl>");
+        node.addChild(BType());
+        node.addChild(VarDef());
+        while (now.getName().equals(",")) {
+            node.addChild(new Node(/*","*/now.getType() + " " + now.getName()));
+            now = Lexer.outs.get(++i);
+            node.addChild(VarDef());
+        }
+        if (now.getName().equals(";")) {
+            node.addChild(new Node(/*";"*/now.getType() + " " + now.getName()));
+            if (i < Lexer.outs.size() - 1) {
+                now = Lexer.outs.get(++i);
+            }
+        } else {
+            //错误处理
+            w.add(cnt, new WrongExample(Lexer.outs.get(i - 1).getLine_num(), "i"));
+            cnt++;
+            //System.out.println(Lexer.outs.get(i - 1).getLine_num() + " " + "i");
+        }
+        return node;
+    }
+...

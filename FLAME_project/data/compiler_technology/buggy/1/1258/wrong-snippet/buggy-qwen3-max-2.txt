@@ -1,0 +1,478 @@
+Looking at the test case input and comparing the buggy output with the expected output, I can see the issue is in the variable declaration parsing for the line:
+
+```c
+int b = min(r, scan()), c = 58;
+```
+
+In the buggy output, the parsing goes wrong starting from `IDENFR r` - it incorrectly treats `r` as a standalone statement instead of part of the function call `min(r, scan())`.
+
+The problem appears to be in the `analyseVarDecl` method in the `GrammaticalAnalyser.java` file. When parsing multiple variable definitions separated by commas, the code calls `nextToken()` to move to the identifier, but then doesn't properly handle the case where the next token after the comma should be parsed as part of the `VarDef`.
+
+Looking more closely at the buggy output vs expected output:
+
+**Buggy output shows:**
+```
+IDENFR r
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+<Stmt>
+```
+
+**Expected output shows:**
+```
+IDENFR r
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+...
+```
+
+The issue is that after parsing the first variable `b = min(r, scan())`, when it encounters the comma and moves to parse `c = 58`, it's not properly resetting or handling the token stream, causing it to misinterpret `r` (which was already consumed as part of the first variable's initialization) as a new statement.
+
+Looking at the `analyseVarDecl` method:
+
+```java
+private void analyseVarDecl() {
+    //进入时为INTTK;
+    //BType VarDef { ',' VarDef } ';' // i
+    nextToken();// ident
+    //creatAndGoToNode("VarDef",currentNode);
+    analyseVarDef();
+    while (peekToken(0).getType().equals("COMMA"))
+    {
+        nextToken();//,
+        nextToken();//ident
+       // creatAndGoToNode("VarDef",currentNode);
+        analyseVarDef();
+    }
+    ...
+}
+```
+
+The problem is that after the first `analyseVarDef()` call (which parses `b = min(r, scan())`), the token pointer is positioned after the closing parenthesis of the function call. Then when it sees the comma, it calls `nextToken()` twice - once for the comma and once for what it expects to be the next identifier (`c`). However, due to how the function call parsing works, the token stream positioning might be off.
+
+But looking even more carefully at the actual difference, I notice that in the buggy output, after parsing the first part correctly up to `</FuncRParams>`, it then has:
+
+```
+RPARENT )
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+<InitVal>
+<VarDef>
+<VarDecl>
+IDENFR r
+<LVal>
+...
+```
+
+This suggests that the `analyseVarDecl` method is terminating prematurely and then the parser is treating `r` as a new statement. The issue is likely in the condition checking within `analyseVarDecl`.
+
+Actually, looking at the expected vs buggy output more systematically, I can see that the buggy output has extra `<VarDecl>` and `<VarDef>` tags in the wrong place, and then starts parsing `r` as if it's a new statement.
+
+The real issue appears to be in the `analyseStmt` method's logic for determining whether an identifier is part of an LVal assignment or just an expression statement. The `isLVal()` method is flawed.
+
+Looking at the `isLVal()` method:
+
+```java
+private boolean isLVal()
+{
+    for (int i = 0; ;i++)
+    {
+        if (peekToken(i).getType().equals("ASSIGN"))
+        {
+            return true;
+        }
+        if (peekToken(i).getType().equals("SEMICN"))
+        {
+            return false;
+        }
+    }
+}
+```
+
+This method is used in `analyseStmt()` to decide if an identifier should be treated as an LVal. However, in the context of `min(r, scan())`, when the parser encounters `r`, it calls `isLVal()` which looks ahead and doesn't find an `ASSIGN` before `SEMICN`, so it returns false. But this is wrong because `r` is actually part of a function argument list, not a statement.
+
+However, the bigger issue is in the `analyseVarDecl` method. Looking at the expected output, the correct parsing should be:
+
+```
+INTTK int
+IDENFR b
+ASSIGN =
+IDENFR min
+...
+<FuncRParams>
+RPARENT )
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+<InitVal>
+<VarDef>
+COMMA ,
+IDENFR c
+...
+```
+
+But in the buggy output, after the first `VarDef`, it immediately outputs `<VarDecl>` and then starts parsing `r` as a statement.
+
+The problem is in this section of `analyseVarDecl`:
+
+```java
+private void analyseVarDecl() {
+    //进入时为INTTK;
+    //BType VarDef { ',' VarDef } ';' // i
+    nextToken();// ident
+    //creatAndGoToNode("VarDef",currentNode);
+    analyseVarDef();
+    while (peekToken(0).getType().equals("COMMA"))
+    {
+        nextToken();//,
+        nextToken();//ident
+       // creatAndGoToNode("VarDef",currentNode);
+        analyseVarDef();
+    }
+    if (!peekToken(0).getType().equals("SEMICN"))
+    {
+        errors.put(thisToken.getLineNumber(),"i");
+    }
+    else
+    {
+        nextToken();//;
+    }
+    //退出时为;
+    //currentNode = currentNode.getFather();
+    grammar.add("<VarDecl>");
+}
+```
+
+The issue is that after the first `analyseVarDef()` call, the current token is positioned at the comma. Then the while loop checks `peekToken(0)` which is the comma, enters the loop, calls `nextToken()` (moving past comma), then calls `nextToken()` again expecting an identifier. But in the case of `int b = min(r, scan()), c = 58;`, after parsing `min(r, scan())`, the current token should be at the comma, so `nextToken()` gets the comma, and the second `nextToken()` should get `c`.
+
+However, looking at the buggy output, it seems like the parsing of the function call `min(r, scan())` is not consuming tokens properly, leaving `r` as the current token when it should have consumed the entire function call.
+
+Actually, looking more carefully at the exact point of divergence:
+
+In the buggy output, after correctly parsing the function call for `min(p, q)` in the first variable declaration, it works fine. But for the second variable declaration `int b = min(r, scan()), c = 58;`, the issue occurs.
+
+The key difference I notice is in the buggy output:
+
+```
+INTTK int
+IDENFR b
+ASSIGN =
+IDENFR min
+LPARENT (
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+<InitVal>
+<VarDef>
+<VarDecl>
+IDENFR r
+...
+```
+
+Wait, this shows that after `LPARENT (` it immediately goes to `<UnaryExp>` without parsing the arguments properly. This suggests the issue is in the `analyseUnaryExp` method when handling function calls.
+
+Looking at `analyseUnaryExp`:
+
+```java
+else if (thisToken.getType().equals("IDENFR") && peekToken(0).getType().equals("LPARENT"))
+    // Ident '(' [FuncRParams] ')'
+{
+    nextToken();//(
+    if (peekToken(0).getType().equals("RPARENT"))
+    {
+        nextToken();//)
+        grammar.add("<UnaryExp>");
+        return;
+    }
+    else
+    {
+        if (isExp())
+        {
+            nextToken();//第一位
+            analyseFuncRParams();
+            ...
+        }
+        else
+        {
+            errors.put(thisToken.getLineNumber(),"j");
+            grammar.add("<UnaryExp>");
+            return;
+        }
+    }
+}
+```
+
+The problem is that after `nextToken()` to consume the `(`, the current token becomes the first argument. But then it checks `if (isExp())` - if this returns false, it treats it as an error and returns early, which would leave the argument unparsed.
+
+In the case of `min(r, scan())`, after consuming `(`, the current token is `r` (IDENFR). The `isExp()` method should return true for an identifier, but let's check the `isExp()` method:
+
+```java
+public boolean isExp()
+{
+    String target = peekToken(0).getType();
+    if (target.equals("PLUS") || target.equals("MINU") || target.equals("NOT") ||
+            target.equals("IDENFR") || target.equals("LPARENT") || target.equals("INTCON") || target.equals("CHRCON"))
+    {
+        for (int i = 1;;i++)
+        {
+            if (peekToken(i).getType().equals("SEMICN"))
+            {
+                return true;
+            }
+            if (peekToken(i).getType().equals("ASSIGN") || peekToken(i).getType().equals("RBRACE"))
+            {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+```
+
+The issue is that `isExp()` looks at `peekToken(0)` (the next token after current), but in `analyseUnaryExp`, after consuming the `(`, the current token is the first argument (`r`), so `peekToken(0)` would be the token after `r`, which is `,`. 
+
+Since `,` is not in the list of valid starting tokens for an expression, `isExp()` returns false, causing the function call parsing to fail and return early.
+
+This is the root cause! The `isExp()` method should be checking the current token, not the next token, when called from `analyseUnaryExp`.
+
+But actually, looking at the call site in `analyseUnaryExp`:
+
+```java
+nextToken();//(
+// Now current token is the first token after (
+if (isExp())
+{
+    nextToken();//第一位
+    analyseFuncRParams();
+```
+
+The logic is flawed. After consuming `(`, the current token is the first argument. The code should directly call `analyseFuncRParams()` without checking `isExp()` first, because `FuncRParams` can handle the parsing.
+
+The correct approach would be to always attempt to parse function parameters if there's no closing parenthesis, rather than using `isExp()` as a guard.
+
+However, looking at the working case earlier in the output (the `max(min(p, q), max(s, scan()))` in the first variable), it seems like the function call parsing does work in some cases.
+
+Let me compare the two cases more carefully.
+
+In the first working case:
+- `max(min(p, q), max(s, scan()))`
+- This is parsed as a nested function call within an expression
+
+In the problematic case:
+- `min(r, scan())` 
+- This is parsed as part of a variable initialization
+
+The difference might be in how the token stream is positioned.
+
+Actually, looking at the buggy output again, I see:
+
+```
+IDENFR min
+LPARENT (
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+<InitVal>
+<VarDef>
+<VarDecl>
+```
+
+This shows that after `LPARENT (`, it immediately outputs `<UnaryExp>` etc., which means it didn't parse any arguments at all. This suggests that the `isExp()` check failed, so it went to the error branch and returned early.
+
+The issue is definitely in the `analyseUnaryExp` method's handling of function calls. The `isExp()` method is being used incorrectly.
+
+But wait, looking at the expected output for the same location:
+
+```
+IDENFR min
+LPARENT (
+IDENFR r
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+...
+```
+
+This shows that it should parse `r` as the first argument.
+
+So the problem is that in `analyseUnaryExp`, after `nextToken()` consumes the `(`, the current token is `r`, but then `isExp()` is called which looks at `peekToken(0)` (the token after `r`, which is `,`) and since `,` is not a valid expression starter, it returns false.
+
+The fix should be to change the logic in `analyseUnaryExp` to not use `isExp()` as a guard, but instead directly parse the function parameters.
+
+However, since I'm only asked to identify the location of the error, not fix it, the error is in the `analyseUnaryExp` method in the function call parsing logic, specifically the use of `isExp()` to guard the parameter parsing.
+
+But looking even more carefully at the code structure, I think the actual bug is in the `analyseVarDecl` method. Let me trace through what should happen:
+
+1. `analyseVarDecl` is called with current token = `INTTK` (for "int")
+2. `nextToken()` -> current token = `IDENFR` ("b")
+3. `analyseVarDef()` is called
+4. In `analyseVarDef()`, it sees `ASSIGN`, so calls `analyseInitVal()`
+5. In `analyseInitVal()`, since it's not a brace or string, it calls `analyseExp()`
+6. `analyseExp()` calls `analyseAddExp()`, which eventually calls `analyseUnaryExp()` for the function call
+7. `analyseUnaryExp()` should parse `min(r, scan())` completely
+8. After `analyseVarDef()` returns, current token should be at the comma
+9. `analyseVarDecl()` sees comma, processes it, then moves to `c`
+
+The fact that in the buggy output we see `<VarDecl>` printed before `IDENFR r` suggests that `analyseVarDecl()` completed and returned, which means it thought it had finished parsing the entire variable declaration.
+
+Looking at the `analyseVarDecl` method again:
+
+```java
+private void analyseVarDecl() {
+    nextToken();// ident
+    analyseVarDef();
+    while (peekToken(0).getType().equals("COMMA"))
+    {
+        nextToken();//,
+        nextToken();//ident
+        analyseVarDef();
+    }
+    if (!peekToken(0).getType().equals("SEMICN"))
+    {
+        errors.put(thisToken.getLineNumber(),"i");
+    }
+    else
+    {
+        nextToken();//;
+    }
+    grammar.add("<VarDecl>");
+}
+```
+
+The issue might be that after the first `analyseVarDef()`, `peekToken(0)` is not a comma, so the while loop doesn't execute, and it goes straight to checking for semicolon.
+
+But in our case, there should be a comma after `min(r, scan())`.
+
+This suggests that the function call parsing in `analyseUnaryExp` is not consuming the closing parenthesis properly, so the token after the function call is not the comma but something else.
+
+Looking back at the `analyseUnaryExp` method for function calls:
+
+```java
+else if (thisToken.getType().equals("IDENFR") && peekToken(0).getType().equals("LPARENT"))
+{
+    nextToken();//(
+    if (peekToken(0).getType().equals("RPARENT"))
+    {
+        nextToken();//)
+        grammar.add("<UnaryExp>");
+        return;
+    }
+    else
+    {
+        if (isExp())
+        {
+            nextToken();//第一位
+            analyseFuncRParams();
+            if (peekToken(0).getType().equals("RPARENT"))
+            {
+                nextToken();//)
+                grammar.add("<UnaryExp>");
+                return;
+            }
+            else
+            {
+                errors.put(thisToken.getLineNumber(),"j");
+                grammar.add("<UnaryExp>");
+                return;
+            }
+        }
+        else
+        {
+            errors.put(thisToken.getLineNumber(),"j");
+            grammar.add("<UnaryExp>");
+            return;
+        }
+    }
+}
+```
+
+If `isExp()` returns false, it adds error "j" (missing right parenthesis) and returns. This would leave the current token at the `(`, and not consume any further tokens.
+
+But in our buggy output, we don't see an error "j" being reported, and we do see the `<UnaryExp>` tag being added, which suggests it took the error branch but continued.
+
+However, looking at the actual buggy output, after `LPARENT (` it immediately shows `<UnaryExp>`, which means it must have taken the error branch and returned early.
+
+The core issue is that `isExp()` is checking the wrong token. It should be checking if the current token can start an expression, not the next token.
+
+In the context of `analyseUnaryExp`, after consuming the `(`, the current token is the first argument. So to check if there's a valid expression, it should check the current token type, not `peekToken(0)`.
+
+But the `isExp()` method is designed to look ahead from the current position to see if a complete expression exists before a semicolon. However, in the context of function parameters, expressions are terminated by commas or closing parentheses, not semicolons.
+
+This suggests that `isExp()` is not appropriate for this context.
+
+Given all this analysis, the error is located in the `analyseUnaryExp` method in the `GrammaticalAnalyser.java` file, specifically in the function call parsing logic where it uses `isExp()` to determine whether to parse function parameters.
+
+<frontend/GrammaticalAnalyser.java>
+...
+    private void analyseUnaryExp() {
+        //进入为第一位
+        if (thisToken.getType().equals("PLUS") || thisToken.getType().equals("MINU") || thisToken.getType().equals("NOT"))
+        {
+            analyseUnaryOp();
+            nextToken();
+            analyseUnaryExp();
+            grammar.add("<UnaryExp>");
+        }
+        //这里需要分辨是函数还是左值
+        else if (thisToken.getType().equals("IDENFR") && peekToken(0).getType().equals("LPARENT"))
+            // Ident '(' [FuncRParams] ')'
+        {
+            nextToken();//(
+            if (peekToken(0).getType().equals("RPARENT"))
+            {
+                nextToken();//)
+                grammar.add("<UnaryExp>");
+                return;
+            }
+            else
+            {
+                if (isExp())
+                {
+                    nextToken();//第一位
+                    analyseFuncRParams();
+                    if (peekToken(0).getType().equals("RPARENT"))
+                    {
+                        nextToken();//)
+                        grammar.add("<UnaryExp>");
+                        return;
+                    }
+                    else
+                    {
+                        errors.put(thisToken.getLineNumber(),"j");
+                        grammar.add("<UnaryExp>");
+                        return;
+                    }
+                }
+                else
+                {
+                    errors.put(thisToken.getLineNumber(),"j");
+                    grammar.add("<UnaryExp>");
+                    return;
+                }
+            }
+        }
+        else
+        {
+            analysePrimaryExp();
+            grammar.add("<UnaryExp>");
+        }
+    }
+...

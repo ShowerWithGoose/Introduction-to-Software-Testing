@@ -1,0 +1,51 @@
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct BstNode
+{
+    int data;
+    struct BstNode *left;
+    struct BstNode *right;
+} BstNode;
+
+BstNode *insBst(BstNode *root, int data)
+{
+    if (root == NULL)
+    {
+        root = (BstNode *)malloc(sizeof(BstNode));
+        root->data = data;
+        root->left = root->right = NULL;
+    }
+    else if (data <= root->data) // @@ Logical error: condition should be 'data < root->data' as per problem description (left child < root, right child >= root)
+    {
+        root->left = insBst(root->left, data);
+    }
+    else
+    {
+        root->right = insBst(root->right, data);
+    }
+    return root;
+}
+
+void printBst(BstNode *root, int height) // @@ Missing NULL check for root parameter, causes segmentation fault when root is NULL
+{
+    if (root->left != NULL) // @@ Dereferencing potentially NULL pointer 'root' without prior check
+        printBst(root->left, height + 1);
+    if (root->right != NULL)
+        printBst(root->right, height + 1);
+    if (root->left == NULL && root->right == NULL)
+        printf("%d %d\n", root->data, height);
+}
+
+int main()
+{
+    BstNode *root = NULL;
+    int n, i, data;
+    scanf("%d", &n);
+    for(i = 0; i < n; i++){
+        scanf("%d", &data);
+        root = insBst(root, data);
+    }
+    printBst(root, 1);
+    return 0;
+}

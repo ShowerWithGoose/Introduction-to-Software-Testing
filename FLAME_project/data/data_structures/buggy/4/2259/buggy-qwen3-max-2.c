@@ -1,0 +1,12 @@
+#include <stdio.h>
+#include<string.h>
+#include<stdlib.h>
+char ch[100],ch0[100];
+char str[100][100];
+int str_num[100];
+int main(int argc, char** argv) {
+    FILE *in=fopen("article.txt","r");
+    while((fgets(ch,10000,in))!=NULL)
+    printf("%s\n",ch); // @@ [The program simply reads and prints the input file line by line without processing words, converting to lowercase, counting frequencies, or sorting lexicographically as required.]
+    return 0;
+}

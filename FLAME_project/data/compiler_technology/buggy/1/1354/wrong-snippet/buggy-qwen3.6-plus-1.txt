@@ -1,0 +1,126 @@
+Based on the analysis of the problem description, test case, and source code:
+
+1.  **Problem Analysis**:
+    *   The test case input is `void f(int a {} // error 1 ...`.
+    *   Error 1 occurs at line 1. The function definition `void f(int a` is missing the closing parenthesis `)` before the block `{}` starts. This corresponds to error code `j` (Missing right parenthesis ')').
+    *   The expected output for line 1 is `1 j`.
+    *   The buggy output for line 1 is `1 j`. Wait, looking at the provided "Buggy Output": `1 j`, `3 j`, `5 i`. And "Expected Output": `1 j`, `3 j`, `5 j`.
+    *   Let's re-read carefully.
+        *   Input Line 1: `void f(int a {}` -> Missing `)`. Expected `1 j`. Buggy `1 j`. This matches.
+        *   Input Line 3: `f(a + 10;` -> Inside `main`, calling `f`. `f(a + 10` is missing `)`. Expected `3 j`. Buggy `3 j`. This matches.
+        *   Input Line 5: `return 0;` -> This line is inside `main`. The previous statement `f(a + 10;` caused an error. The parser likely recovered or continued.
+        *   Wait, let's look at the third error in the input: `f(a + 10; // error 3`.
+        *   The prompt says:
+            *   Buggy Output: `1 j`, `3 j`, `5 i`
+            *   Expected Output: `1 j`, `3 j`, `5 j`
+        *   So the discrepancy is at **Line 5**. The expected error is `5 j` (Missing right parenthesis), but the program outputs `5 i` (Missing semicolon).
+
+2.  **Code Analysis**:
+    *   The error reporting logic is centralized in `TokenList.java` in the method `getCharWithJudge`.
+    *   When `getCharWithJudge` fails to find the expected token type, it reports an error based on the *expected* token type passed to it.
+    *   If `SEMICN` is expected, it reports `i`.
+    *   If `RPARENT` is expected, it reports `j`.
+    *   If `RBRACK` is expected, it reports `k`.
+    *   The error line number is taken from `tokens.get(index-1).lineIndex`, which is the line of the last successfully consumed token.
+
+3.  **Tracing Line 5 Error**:
+    *   Why would Line 5 report `i` (missing semicolon) instead of `j` (missing right parenthesis)?
+    *   This implies that at some point during the parsing of the statement ending around line 5, the parser called `getCharWithJudge(TokenType.SEMICN)` and failed, whereas it *should* have been expecting a `)` or the error detection logic is misidentifying the missing symbol.
+    *   Let's look at the statement `f(a + 10;`.
+    *   Parser enters `parseStmt`. Sees `IDENFR` (`f`).
+    *   Checks `checkAheadChar(1)`. It is `LPARENT` (`(`).
+    *   Enters the branch:
+        ```java
+        if (tokenList.checkAheadChar(1).type == TokenType.LPARENT) {
+            Ast.AddExp exp = parseAddExp();
+            tokenList.getCharWithJudge(TokenType.SEMICN);
+            return new Ast.ExpStmt(exp);
+        }
+        ```
+    *   **Crucial Logic Flaw**: The parser sees `f(` and assumes it's an expression statement starting with a function call *but treats it as a generic expression*. It calls `parseAddExp()`.
+    *   `parseAddExp` will parse `a + 10`.
+    *   After `parseAddExp` returns, the current token is `;` (SEMICN).
+    *   The code then calls `tokenList.getCharWithJudge(TokenType.SEMICN)`. This succeeds! It consumes the `;`.
+    *   So, for `f(a + 10;`, this specific branch in `parseStmt` actually parses it successfully as an `ExpStmt` containing an expression that likely didn't fully parse the function call arguments correctly or just parsed `a+10` as an expression.
+    *   However, `f(a + 10` is syntactically a function call missing a `)`. The grammar for `UnaryExp` handles `Ident '(' [FuncRParams] ')'`.
+    *   In `parseStmt`, the check `if (tokenList.checkAheadChar(1).type == TokenType.LPARENT)` is intended to distinguish between `LVal = ...` and `Exp ;` or `FuncCall`. But `f(...)` is a `UnaryExp` which is part of `AddExp`.
+    *   If `parseAddExp` is called on `f(a + 10;`, let's trace `parseUnaryExp`.
+        *   Sees `IDENFR` (`f`) and next is `LPARENT`.
+        *   Enters: `Ast.Ident ident = new Ast.Ident(tokenList.getChar());` (consumes `f`).
+        *   `tokenList.getChar();` (consumes `(`). **Note: This does NOT use getCharWithJudge, so no error reported here if `(` is present.**
+        *   Checks if next is `RPARENT`. It is `IDENFR` (`a`).
+        *   Calls `parseFuncRParams()`.
+        *   `parseFuncRParams` calls `parseAddExp()`.
+        *   `parseAddExp` parses `a + 10`.
+        *   Returns to `parseFuncRParams`. Next token is `;`. Loop condition `COMMA` fails. Returns.
+        *   Back in `parseUnaryExp`: `tokenList.getChar();` is called? No, look at the code:
+            ```java
+            Ast.FuncRParams funcRParams = parseFuncRParams();
+            tokenList.getChar(); // <--- THIS CONSUMES THE NEXT TOKEN BLINDLY
+            return new Ast.UnaryExp(ident, funcRParams);
+            ```
+        *   The code blindly consumes the next token expecting it to be `)`. It consumes `;`.
+        *   It does **not** check if it was `)`. It does **not** report an error.
+        *   So `parseUnaryExp` returns. `parseAddExp` returns.
+        *   Back in `parseStmt`:
+            ```java
+            Ast.AddExp exp = parseAddExp();
+            tokenList.getCharWithJudge(TokenType.SEMICN); // Expects SEMICN
+            ```
+        *   The current token is now whatever is after `;`. In the input `f(a + 10; // error 3`, the next token is likely the newline or the next line's token.
+        *   Wait, the input is:
+            ```
+            void f(int a {} // error 1
+            
+            int main( { // error 2
+                int a = 10;
+                f(a + 10; // error 3
+                return 0;
+            }
+            ```
+        *   After consuming `;` in `parseUnaryExp`, the current token is the start of the next line: `return`.
+        *   `parseStmt` calls `getCharWithJudge(TokenType.SEMICN)`.
+        *   The current token is `RETURNTK`. It is not `SEMICN`.
+        *   Error `i` (Missing semicolon) is reported. The line number is taken from `tokens.get(index-1)`, which is the `;` token on line 5. So it outputs `5 i`.
+
+    *   **Why is it expected to be `5 j`?**
+        *   The error in `f(a + 10;` is fundamentally that the function call `f(...)` is missing its closing parenthesis `)`. The `;` is present, but it's in the wrong place (inside the call, or rather, the call wasn't closed).
+        *   A correct parser should detect the missing `)` when parsing the function call.
+        *   In `parseUnaryExp`, after `parseFuncRParams`, it should expect `RPARENT`.
+        *   Current Code:
+            ```java
+            Ast.FuncRParams funcRParams = parseFuncRParams();
+            tokenList.getChar(); // Blindly consumes
+            return new Ast.UnaryExp(ident, funcRParams);
+            ```
+        *   It should be:
+            ```java
+            Ast.FuncRParams funcRParams = parseFuncRParams();
+            tokenList.getCharWithJudge(TokenType.RPARENT); // Check for )
+            return new Ast.UnaryExp(ident, funcRParams);
+            ```
+        *   If this change is made, `getCharWithJudge(RPARENT)` will fail because the current token is `;`.
+        *   It will report error `j` (Missing right parenthesis).
+        *   The line number will be from the previous token (last token of `FuncRParams`, which is `10` on line 5). So it outputs `5 j`.
+        *   Then, since the `;` was not consumed by `parseUnaryExp`, it remains.
+        *   Back in `parseStmt`, `parseAddExp` has returned. The current token is `;`.
+        *   `tokenList.getCharWithJudge(TokenType.SEMICN)` succeeds.
+        *   No further error for this statement.
+
+    *   Therefore, the bug is in `frontend/syntax/Parser.java` in the `parseUnaryExp` method, where it blindly consumes the character after function parameters instead of verifying it is a right parenthesis.
+
+<frontend/syntax/Parser.java>
+...
+    private Ast.UnaryExp parseUnaryExp() {
+        if (tokenList.checkAheadChar(0).type == TokenType.IDENFR && tokenList.checkAheadChar(1).type == TokenType.LPARENT) {
+            Ast.Ident ident = new Ast.Ident(tokenList.getChar());
+            tokenList.getChar();
+            if (tokenList.checkAheadChar(0).type == TokenType.RPARENT) {
+                tokenList.getCharWithJudge(TokenType.RPARENT);
+                return new Ast.UnaryExp(ident);
+            }
+            Ast.FuncRParams funcRParams = parseFuncRParams();
+            tokenList.getChar();
+            return new Ast.UnaryExp(ident, funcRParams);
+        } else if (tokenList.checkAheadChar(0).type == TokenType.PLUS || tokenList.checkAheadChar(0).type == TokenType.MINU || tokenList.checkAheadChar(0).type == TokenType.NOT) {
+...

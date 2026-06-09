@@ -1,0 +1,32 @@
+#include <stdio.h>
+#include <string.h>
+
+int main() {
+    int k = 1;
+    char a[200], b[200];
+    scanf("%s", a);
+    b[0] = a[0];
+    for (int i = 1; i < strlen(a); i++) {
+        if (a[i] == '-') {
+            if (a[i - 1] >= 'a' && a[i + 1] <= 'z' && a[i - 1] < a[i + 1]) @@ [The condition does not ensure that both characters are lowercase letters; it only checks the left char is >= 'a' and right char <= 'z', which allows mixed cases like 'z-a' or '0-z'. Also, accessing a[i+1] when i is the last index causes out-of-bounds read.]
+                for (int j = a[i - 1] + 1; j < a[i + 1]; j++, k++) {
+                    b[k] = j;
+                } else if (a[i - 1] >= 'A' && a[i + 1] <= 'Z' && a[i - 1] < a[i + 1]) @@ [Same issue: missing check that a[i-1] <= 'Z' and a[i+1] >= 'A'; also potential out-of-bounds access to a[i+1].]
+                for (int j = a[i - 1] + 1; j < a[i + 1]; j++, k++) {
+                    b[k] = j;
+                } else if (a[i - 1] >= '0' && a[i + 1] <= '9' && a[i - 1] < a[i + 1]) @@ [Same issue: missing check that a[i-1] <= '9' and a[i+1] >= '0'; also potential out-of-bounds access to a[i+1].]
+                for (int j = a[i - 1] + 1; j < a[i + 1]; j++, k++) {
+                    b[k] = j;
+                } else {
+                b[k] = a[i];
+                k++;
+            }
+
+        } else {
+            b[k] = a[i];
+            k++;
+        }
+    }
+
+    printf("%s", b); @@ [Missing null terminator for string b, leading to undefined behavior when printing. Also, if input is empty, b[0] is uninitialized.]
+}

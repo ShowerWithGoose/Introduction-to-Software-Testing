@@ -1,0 +1,508 @@
+Based on the problem description, test case inputs, buggy output, and expected output, here is the analysis:
+
+**Summary:**
+The program is a syntax analyzer that needs to detect specific syntax errors (missing semicolons, missing parentheses, missing brackets) and output the line number and error code.
+The test case input contains three errors:
+1. Line 1: `char str[20 ;` -> Missing right square bracket `]`. Error code `k`. Expected output: `1 k`.
+2. Line 3: `int f(char str[) {` -> Missing right square bracket `]` in parameter declaration. Error code `k`. Expected output: `3 k`.
+3. Line 13: `g(str[f(str));` -> Inside the argument for `g`, `str[f(str)` is an LVal `str` followed by `[`, then an expression `f(str)`. The expression `f(str)` parses correctly as a function call. However, the LVal `str[...]` is missing the closing `]`. The parser encounters `)` instead of `]`. This is a missing right square bracket `]`. Error code `k`. Expected output: `13 k`.
+
+The buggy output is:
+```
+1 k
+3 k
+nullnull13 k
+null
+```
+
+The first two errors are detected correctly. The third error output is malformed (`nullnull13 k`) and there is an extra `null` line. This suggests that when the error for the missing `]` in `LVal` is generated, it is being concatenated with other strings that are `null`.
+
+Let's look at how errors are collected and printed.
+In `CompUnit.java`, `errors()` calls `getError()` on its children.
+In `Stmt.java`, `getError()` returns `statement.getError()`.
+In `StmtExp.java` (which likely handles the statement `g(str[f(str));`), `getError()` returns `exp.getError() + error`.
+The expression `g(str[f(str))` involves a function call `g(...)`.
+Inside `UFuncExp.java`, `getError()` returns `funcRParams.getError() + error`.
+`FuncRParams` contains `Exp`s.
+The argument is `str[f(str)`. This is parsed as an `Exp`.
+`Exp` -> `AddExp` -> ... -> `PrimaryExp` -> `LVal`.
+In `LVal.java`:
+```java
+    public String getError() {
+        if (exp != null) {
+            return exp.getError() + error;
+        } else {
+            return error;
+        }
+    }
+```
+If `rBracket` is null, `error` is set to `exp.getLineno() + " k\n"` in the constructor.
+Wait, let's look at `LVal` constructor:
+```java
+    public LVal(Token ident, Token lBracket, Exp exp, Token rBracket) {
+        this.ident = ident;
+        this.lBracket = lBracket;
+        this.exp = exp;
+        this.rBracket = rBracket;
+        this.error = "";
+        if (rBracket == null) {
+            this.error = exp.getLineno() + " k\n";
+        }
+    }
+```
+And `getError()`:
+```java
+    public String getError() {
+        if (exp != null) {
+            return exp.getError() + error;
+        } else {
+            return error;
+        }
+    }
+```
+This looks correct for `LVal`.
+
+Let's trace back up.
+`PrimaryExp` -> `PExp` (`LVal`).
+`PrimaryExp.getError()` returns `pExp.getError()`.
+`UnaryExp` -> `PrimaryExp`.
+`UnaryExp.getError()` returns `uExp.getError()`.
+`MulExp` -> `UnaryExp`.
+`MulExp.getError()` iterates through exps and appends errors.
+`AddExp` -> `MulExp`.
+`Exp` -> `AddExp`.
+`Exp.getError()` returns `addExp.getError()`.
+
+Now consider the function call `g(str[f(str))`.
+`UFuncExp` parses `g`. `FuncRParams` parses `str[f(str)`.
+Inside `FuncRParams`, it parses `Exp`.
+The `Exp` is `str[f(str)`.
+As established, `LVal` detects the missing `]` and sets `error = "13 k\n"`.
+So `LVal.getError()` returns `"13 k\n"`.
+This propagates up to `Exp.getError()`.
+Then `FuncRParams.getError()` returns `firstExp.getError()` (plus others if any).
+So `FuncRParams.getError()` returns `"13 k\n"`.
+Then `UFuncExp.getError()` returns `funcRParams.getError() + error`.
+In `UFuncExp`, `error` is set if `rParent` is null. Here `rParent` is `)`, which is present. So `error` is `""`.
+So `UFuncExp.getError()` returns `"13 k\n"`.
+This propagates up through `UnaryExp`, `MulExp`, `AddExp`, `Exp`.
+Then `StmtExp` (or similar statement wrapper) gets this error.
+
+Where do the `null`s come from?
+Look at `CompUnit.getError()`:
+```java
+    public String getError() {
+        StringBuilder out = new StringBuilder();
+        for (Decl decl : this.decls) {
+            out.append(decl.getError());
+        }
+        for (FuncDef funcDef : this.funcDefs) {
+            out.append(funcDef.getError());
+        }
+        out.append(this.mainFuncDef.getError());
+        return out.toString();
+    }
+```
+If `mainFuncDef` is null, `this.mainFuncDef.getError()` will throw a NullPointerException. But the output shows `null`, not an exception stack trace. This implies `System.out.println` is printing a string that contains "null".
+
+Wait, look at `Compiler.java`:
+```java
+            compUnit.output();
+            compUnit.errors();
+```
+It calls both. If the program is erroneous, it should probably only output errors. But the problem says "For incorrect source programs, output ... to error.txt". It doesn't explicitly say *not* to output parser.txt, but usually, one or the other is generated. However, the buggy output shows `1 k`, `3 k`, `nullnull13 k`, `null`. This looks like the content of `error.txt`.
+
+Let's look at `FuncDef.getError()`:
+```java
+    public String getError() {
+        StringBuilder out = new StringBuilder();
+        if (funcFParams != null) {
+            out.append(funcFParams.getError());
+        }
+        out.append(error);
+        out.append(block.getError());
+        
+        return out.toString();
+    }
+```
+And `Block.getError()`:
+```java
+    public String getError() {
+        StringBuilder out = new StringBuilder();
+        for (BlockItem i : BlockItems) {
+            out.append(i.getError());
+        }
+        return out.toString();
+    }
+```
+If `BlockItems` is null (empty block?), this might be an issue, but `main` has statements.
+
+Let's look closely at the `nullnull` prefix.
+In `CompUnit.getError()`:
+```java
+        out.append(this.mainFuncDef.getError());
+```
+If `mainFuncDef` is not null, this appends its error string.
+
+Let's look at `StmtPrintf` or similar. The statement is `g(str[f(str));`. This is a function call statement.
+In `Parser.parseStmt()`, if it starts with `IDENFR`, it checks for assignment. If not, it rewinds and calls `parseStmtExp()`.
+`parseStmtExp()` calls `parseExp()`.
+`parseExp()` parses `g(str[f(str))`.
+This forms a `UFuncExp` for `g`.
+Inside `UFuncExp`, `FuncRParams` is parsed.
+The argument is `str[f(str)`.
+This is parsed as an `Exp`.
+Inside `Exp`, it's an `AddExp`, etc., down to `PrimaryExp`.
+`PrimaryExp` sees `IDENFR` `str`. It calls `parseLVal()`.
+`parseLVal()` sees `[`, so it parses `LVal(ident, lBracket, exp, rBracket)`.
+`exp` is `f(str)`. This is a `UFuncExp`.
+`rBracket` is missing because the next token is `)`. So `rBracket` is null.
+`LVal` constructor sets `error = "13 k\n"`.
+`LVal.getError()` returns `exp.getError() + error`.
+`exp` is `f(str)`. `f(str)` is valid. `exp.getError()` should be `""`.
+So `LVal.getError()` returns `"13 k\n"`.
+
+This propagates up.
+Why `nullnull`?
+
+Let's check `UFuncExp.getError()` again.
+```java
+    public String getError() {
+        if (funcRParams != null) {
+            return funcRParams.getError() + error;
+        } else {
+            return error;
+        }
+    }
+```
+If `funcRParams` is not null, it returns `funcRParams.getError() + error`.
+
+Let's check `FuncRParams.getError()`.
+```java
+    public String getError() {
+        StringBuilder out = new StringBuilder();
+        out.append(firstExp.getError());
+        if (exps!= null && !exps.isEmpty()) {
+            for (int i = 0; i < exps.size(); ++i) {
+                out.append(exps.get(i).getError());
+            }
+        }
+
+        return out.toString();
+    }
+```
+
+Let's check `Exp.getError()`.
+```java
+    public String getError() {
+        return addExp.getError();
+    }
+```
+
+Let's check `AddExp.getError()`.
+```java
+    public String getError() {
+        StringBuilder out = new StringBuilder();
+        out.append(first.getError());
+        for (MulExp exp : exps) {
+            out.append(exp.getError());
+        }
+        return out.toString();
+    }
+```
+
+Let's check `MulExp.getError()`.
+```java
+    public String getError() {
+        StringBuilder out = new StringBuilder();
+        out.append(first.getError());
+        for (UnaryExp exp : exps) {
+            out.append(exp.getError());
+        }
+        return out.toString();
+    }
+```
+
+Let's check `UnaryExp.getError()`.
+```java
+    public String getError() {
+        return uExp.getError();
+    }
+```
+
+Let's check `PrimaryExp.getError()`.
+```java
+    public String getError() {
+        return pExp.getError();
+    }
+```
+
+Let's check `LVal.getError()`.
+```java
+    public String getError() {
+        if (exp != null) {
+            return exp.getError() + error;
+        } else {
+            return error;
+        }
+    }
+```
+
+Everything seems to return strings. Where does `null` come from?
+
+Maybe one of the `getError()` methods returns `null` instead of `""`?
+In `LVal`, `error` is initialized to `""`.
+In `UFuncExp`, `error` is not explicitly initialized in the field declaration, but set in constructors.
+```java
+    private String error;
+...
+        if (rParent == null) {
+            error = funcRParams.getLineno() + " j\n";
+        }
+```
+If `rParent` is NOT null, `error` remains `null`!
+Ah! In `UFuncExp`, if `rParent` is present, `error` is never assigned `""`. It stays `null`.
+Then `getError()` returns `funcRParams.getError() + error`.
+If `error` is `null`, string concatenation `"some string" + null` results in `"some stringnull"`.
+
+Let's verify this hypothesis.
+In `UFuncExp`:
+```java
+    public UFuncExp(Token ident, Token lParent, FuncRParams funcRParams, Token rParent) {
+        this.ident = ident;
+        this.lParent = lParent;
+        this.funcRParams = funcRParams;
+        this.rParent = rParent;
+
+        if (rParent == null) {
+            error = funcRParams.getLineno() + " j\n";
+        }
+    }
+```
+If `rParent` is not null, `error` is `null`.
+`getError()`:
+```java
+    public String getError() {
+        if (funcRParams != null) {
+            return funcRParams.getError() + error;
+        } else {
+            return error;
+        }
+    }
+```
+If `funcRParams` is not null and `error` is `null`, it returns `"...null"`.
+
+Is `UFuncExp` involved in the third error?
+The statement is `g(str[f(str));`.
+`g` is a function call. `parseUnaryExp` sees `g` followed by `(`, so it calls `parseUFuncExp`.
+`parseUFuncExp` creates a `UFuncExp`.
+`rParent` is `)`, which is present. So `error` is `null`.
+`funcRParams` is `str[f(str)`.
+`funcRParams.getError()` returns `"13 k\n"`.
+So `UFuncExp.getError()` returns `"13 k\nnull"`.
+
+This explains one `null`. Where is the second `null`?
+
+Let's look at `StmtExp`.
+```java
+    public String getError() {
+        return exp.getError() + error;
+    }
+```
+`error` in `StmtExp`:
+```java
+    public StmtExp(Exp exp, Token semicolon) {
+        this.exp = exp;
+        this.semicolon = semicolon;
+        this.error = "";
+        if (semicolon == null) {
+            this.error = exp.getLineno() + " i\n";
+        }
+    }
+```
+Here `error` is initialized to `""`. So no null here.
+
+Let's look at `Stmt`.
+```java
+    public String getError() {
+        return statement.getError();
+    }
+```
+
+Let's look at `BlockItem`.
+```java
+    public String getError() {
+        return item.getError();
+    }
+```
+
+Let's look at `Block`.
+```java
+    public String getError() {
+        StringBuilder out = new StringBuilder();
+        for (BlockItem i : BlockItems) {
+            out.append(i.getError());
+        }
+        return out.toString();
+    }
+```
+
+Let's look at `FuncDef`.
+```java
+    public String getError() {
+        StringBuilder out = new StringBuilder();
+        if (funcFParams != null) {
+            out.append(funcFParams.getError());
+        }
+        out.append(error);
+        out.append(block.getError());
+        
+        return out.toString();
+    }
+```
+`error` in `FuncDef`:
+```java
+        this.error = "";
+
+        if (rParent == null) {
+            this.error = funcFParams.getLineno() + " j\n";
+        }
+```
+Initialized to `""`. Safe.
+
+Let's look at `MainFuncDef`. It extends `FuncDef`.
+
+Let's look at `CompUnit`.
+```java
+    public String getError() {
+        StringBuilder out = new StringBuilder();
+        for (Decl decl : this.decls) {
+            out.append(decl.getError());
+        }
+        for (FuncDef funcDef : this.funcDefs) {
+            out.append(funcDef.getError());
+        }
+        out.append(this.mainFuncDef.getError());
+        return out.toString();
+    }
+```
+
+So the `null` comes from `UFuncExp`.
+Why `nullnull`?
+Maybe there are two `UFuncExp`s involved?
+`g(str[f(str))`
+Outer `UFuncExp` for `g`. `error` is `null`.
+Inner `UFuncExp` for `f`. `f(str)` is valid. `rParent` is `)`. `error` is `null`.
+`f(str)` is inside `LVal`'s `exp`.
+`LVal.getError()` returns `exp.getError() + error`.
+`exp` is `f(str)`. `exp.getError()` goes through `UFuncExp` for `f`.
+`UFuncExp` for `f` returns `funcRParams.getError() + error`.
+`funcRParams` for `f` is `str`. `str` is an `Exp` -> `LVal`.
+`LVal` for `str` (inside `f`) is simple, no brackets. `error` is `""`.
+So `UFuncExp` for `f` returns `"" + null` = `"null"`.
+Then `LVal` for `str[...]` (outer) gets `exp.getError()` which is `"null"`.
+And `LVal`'s own `error` is `"13 k\n"`.
+So `LVal.getError()` returns `"null" + "13 k\n"` = `"null13 k\n"`.
+
+Then this propagates up to `UFuncExp` for `g`.
+`UFuncExp` for `g` returns `funcRParams.getError() + error`.
+`funcRParams.getError()` contains the error from the `Exp` which is `"null13 k\n"`.
+`UFuncExp` for `g`'s `error` is `null`.
+So it returns `"null13 k\n" + "null"` = `"null13 k\nnull"`.
+
+This matches the `nullnull13 k` pattern somewhat, but the order is `nullnull13 k`.
+My trace produced `null13 k\nnull`.
+The output is `nullnull13 k`.
+This implies the `13 k` is at the end.
+
+Let's re-evaluate `LVal.getError()`.
+```java
+    public String getError() {
+        if (exp != null) {
+            return exp.getError() + error;
+        } else {
+            return error;
+        }
+    }
+```
+If `exp.getError()` is `"null"` and `error` is `"13 k\n"`, result is `"null13 k\n"`.
+
+Let's re-evaluate `UFuncExp.getError()`.
+```java
+    public String getError() {
+        if (funcRParams != null) {
+            return funcRParams.getError() + error;
+        } else {
+            return error;
+        }
+    }
+```
+
+If `UFuncExp` for `f` returns `"null"`, and it's used in `LVal` for `str[...]`, then `LVal` returns `"null13 k\n"`.
+Then `UFuncExp` for `g` wraps this.
+`funcRParams.getError()` returns `"null13 k\n"`.
+`UFuncExp` for `g` appends its own `error` (`null`).
+Result: `"null13 k\nnull"`.
+
+The buggy output is `nullnull13 k`.
+This suggests that the `13 k` part is coming from somewhere else or the `null`s are prepended.
+
+Actually, look at `PParentExp`.
+```java
+    public String getError() {
+        return exp.getError() + error;
+    }
+```
+`error` in `PParentExp`:
+```java
+        this.error = null;
+        if (rParent == null){
+            this.error = exp.getLineno() + " j\n";
+        }
+```
+If `rParent` is not null, `error` is `null`.
+
+Is there a `PParentExp` involved?
+`str[f(str))`
+`f(str)` is a `UFuncExp`.
+Is it wrapped in `PrimaryExp`? Yes.
+Is it wrapped in `UnaryExp`? Yes.
+Is it wrapped in `PParentExp`? No, unless it was `(f(str))`. It is not.
+
+However, `UFuncExp` is the likely culprit for the `null`s.
+The fix is to initialize `error` to `""` in `UFuncExp` (and potentially `PParentExp` and any other class that conditionally sets `error`).
+
+Let's check `PParentExp` just in case.
+In `testfile.txt`, are there parentheses?
+`g(str[f(str))`
+No explicit parentheses around expressions other than function calls.
+
+So the primary error is in `UFuncExp.java` where `error` is not initialized to `""`.
+
+<frontend/parser/ast/exp/UFuncExp.java>
+...
+    private Token rParent;
+    private String error;
+
+    public UFuncExp(Token ident, Token lParent, FuncRParams funcRParams, Token rParent) {
+        this.ident = ident;
+        this.lParent = lParent;
+        this.funcRParams = funcRParams;
+        this.rParent = rParent;
+
+        if (rParent == null) {
+            error = funcRParams.getLineno() + " j\n";
+        }
+    }
+
+    public UFuncExp(Token ident, Token lParent, Token rParent) {
+        this.ident = ident;
+        this.lParent = lParent;
+        this.funcRParams = null;
+        this.rParent = rParent;
+
+        if (rParent == null) {
+            error = lParent.getLineno() + " j\n";
+        }
+    }
+...

@@ -1,0 +1,6 @@
+#include<stdio.h> @@ [The provided source code is a hardcoded stub that prints "10 1 1" instead of implementing the logic described in the problem and reference program. The actual buggy code provided in the description is missing from the "Source Code" section, but based on the instructions, I must annotate the provided source code. However, the provided source code `#include<stdio.h>\nint main()\n{\n    printf("10 1 1\n");\n    return 0;\n}` does not match the reference program structure at all. It seems the user pasted the wrong source code block or a minimal reproducer. Given the constraint "Ensure that the number of lines in the source code remains unchanged; do not change the original code structure", I will annotate the lines of the *provided* source code which is clearly incorrect as it doesn't read input or process segments.]
+int main()
+{
+    printf("10 1 1\n"); @@ [This line hardcodes the output instead of calculating it based on input. This causes the Wrong Answer error.]
+    return 0;
+}

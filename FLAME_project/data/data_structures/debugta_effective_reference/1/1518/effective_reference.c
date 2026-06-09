@@ -1,0 +1,43 @@
+#include <stdio.h>
+#define MAX 10
+
+/*标记数组，用来标记某个数字是否已被使用成为*/
+int Mark[MAX] = {0}; 
+/*全排列数字串*/
+char s[MAX+1]; 
+/* m记录下一个要生成的全排列数字应放在Stack中的位置，n表示还剩几个数字需要
+生成*/
+void rank(int m, int n); 				  
+int x;
+int main ()
+{
+	scanf ("%d", &x);	
+	rank(0,x);	
+	return 0;
+}
+void rank(int m, int n)
+{
+	int i;
+	
+	if( n == 0){ 
+		s[m] = '\0';
+	int x;
+	for(x=0;x<m;x++)
+	printf("%c ",s[x]);	/* 输出全排列数字串*/
+	puts("");
+	return;
+	}
+	for(i=1; i<=x; i++)
+		if(Mark[i] == 0 ){
+			Mark[i] = 1; 	/* 标记该数字已被使用*/
+			s[m] = '0'+i;  	/*将当前数字加到全排列数字串中*/
+			rank(m+1,n-1); 	/* 生成全排列中下一个数字 */
+			Mark[i] = 0;	/*释放该数字*/
+		}
+		
+}
+
+
+
+
+

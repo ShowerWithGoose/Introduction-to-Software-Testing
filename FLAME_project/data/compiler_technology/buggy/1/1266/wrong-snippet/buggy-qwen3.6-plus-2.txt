@@ -1,0 +1,204 @@
+Based on the problem description, test case inputs, and expected outputs, here is the analysis:
+
+**Summary:**
+The program fails to correctly identify syntax errors in the input source code.
+1.  **Input Line 1:** `void f(int a {}` is missing a right parenthesis `)` before the block `{`. The expected error is `1 j`.
+2.  **Input Line 3:** `int main( {` is missing a right parenthesis `)` before the block `{`. The expected error is `3 j`.
+3.  **Input Line 5:** `f(a + 10;` inside `main` is a function call missing a right parenthesis `)`. The expected error is `5 j`.
+
+The actual output is empty, meaning the parser did not report these errors. This suggests that the parser is either consuming tokens incorrectly, failing to detect the missing `)`, or crashing/swallowing exceptions without logging.
+
+Looking at `frontend/Parser.java`:
+- In `parseFuncDef`, it calls `expectTokenId(RPARENT, "j")`.
+- In `parseMainFuncDef`, it calls `expectTokenId(RPARENT, "j")`.
+- In `parseUnaryExp` (for function calls like `f(...)`), it calls `expectTokenId(RPARENT, "j")`.
+
+The `expectTokenId` method uses `lexer.lookAhead(0)` to check the current token. If it doesn't match, it logs an error using `loggerErr.error(lexer.getCurrentLine(), errCode)`.
+
+Let's look at `frontend/Lexer.java`.
+The `lookAhead` method buffers tokens. The `read` method consumes them.
+Crucially, `lexer.getCurrentLine()` returns `currentLine`.
+In `Lexer.read()`:
+```java
+public Token read() throws IOException {
+    Token t;
+    if (!readTokens.isEmpty()) {
+        t = readTokens.removeFirst();
+        currentLine = lineNos.removeFirst();
+    } else {
+        t = parseToken();
+        currentLine = parsingLineNo;
+    }
+    loggerOut.println(t.output());
+    return t;
+}
+```
+`currentLine` is updated *after* a token is read.
+
+In `Parser.expectTokenId`:
+```java
+private void expectTokenId(Token.TokenId tokenId, String errCode) throws IOException {
+    if (lexer.lookAhead(0).getTokenId() == tokenId) {
+        lexer.read();
+    } else {
+        loggerErr.error(lexer.getCurrentLine(), errCode);
+    }
+}
+```
+If the expected token is missing, it reports the error at `lexer.getCurrentLine()`. `getCurrentLine()` returns the line number of the *last successfully read token*.
+
+Let's trace Error 1: `void f(int a {}`
+1. `parseFuncDef` reads `void` (FuncType), `f` (Ident), `(` (LPARENT).
+2. It checks for params. `int` is present. `parseFuncFParams` is called.
+3. `parseFuncFParam` reads `int` (BType), `a` (Ident).
+4. Checks for `[`. Next is `{`. Not `[`. Returns.
+5. Back in `parseFuncDef`. Calls `expectTokenId(RPARENT, "j")`.
+6. `lookAhead(0)` sees `{` (LBRACE). It is not `RPARENT`.
+7. Logs error at `lexer.getCurrentLine()`. The last token read was `a` (Ident) on line 1. So it should log `1 j`.
+
+Why is the output empty?
+Check `Compiler.java`.
+```java
+Parser parser = new Parser(lexer, "CompUnit", o, e);
+parser.parse();
+```
+It calls `parser.parse()`. It does **not** call `e.executePrint()`.
+The `Log` class buffers errors in a HashMap `errors`. They are only written to the writer when `executePrint()` is called.
+In `Compiler.java`, `o.close()` and `e.close()` are called, but `e.executePrint()` is missing.
+
+Wait, looking at `Log.close()`:
+```java
+public void close() throws IOException {
+    for (String writerName : writers.keySet()) {
+        writers.get(writerName).close();
+    }
+}
+```
+It just closes the writers. It does not flush the buffered errors.
+
+Therefore, the errors are detected (likely) but never written to `error.txt` because `executePrint()` is never invoked on the error logger `e`.
+
+Let's verify if errors are actually detected.
+If `expectTokenId` fails, it calls `loggerErr.error`.
+Does the parser continue? Yes.
+Does it crash?
+In `parseFuncDef`, after `expectTokenId(RPARENT, "j")` fails (because `{` is found instead of `)`), it proceeds to `funcDef.setBlock(parseBlock())`.
+`parseBlock` expects `{`. It finds `{`. Reads it.
+Then it parses block items.
+Inside `parseBlock`, it loops while `lookAhead(0) != RBRACE`.
+The next token is `}` (from line 1 `... a {}`).
+So the loop doesn't execute.
+Then it asserts `lookAhead(0) == RBRACE`. It is `}`. Reads it.
+Returns block.
+`parseFuncDef` finishes.
+
+Back in `parseCompUnit`:
+`while (lexer.lookAhead(1).getTokenId() != MAINTK)` ...
+The next tokens are `int`, `main`, `(`, `{` ...
+`lookAhead(1)` is `main`? No.
+`lookAhead(0)` is `int`. `lookAhead(1)` is `main`.
+So it enters the loop to parse FuncDefs?
+Wait, `CompUnit` grammar: `{Decl} {FuncDef} MainFuncDef`.
+The code:
+```java
+// { Decl }
+while (lexer.lookAhead(1).getTokenId() != MAINTK
+        && lexer.lookAhead(2).getTokenId() != LPARENT) {
+    compUnit.addDecl(parseDecl());
+}
+// { FuncDef }
+while (lexer.lookAhead(1).getTokenId() != MAINTK) {
+    compUnit.addFuncDef(parseFuncDef());
+}
+// MainFuncDef
+compUnit.setMainFuncDef(parseMainFuncDef());
+```
+After parsing `void f(...)`, the next token is `int`.
+`lookAhead(1)` is `main`. `lookAhead(2)` is `(`.
+First loop condition: `lookAhead(1) != MAINTK` is False. So it exits Decl loop.
+Second loop condition: `lookAhead(1) != MAINTK` is False. So it exits FuncDef loop.
+Then it calls `parseMainFuncDef()`.
+
+`parseMainFuncDef`:
+Reads `int`.
+Reads `main`.
+Reads `(`.
+Calls `expectTokenId(RPARENT, "j")`.
+Next token is `{`. Not `)`.
+Logs error `3 j` (line of `main` or `(`? Last read was `(` on line 3).
+Proceeds to `parseBlock()`.
+Reads `{`.
+Parses block items.
+Next token `int`. `parseBlockItem` -> `parseDecl` -> `parseVarDecl`.
+Reads `int`.
+`parseVarDef`. Reads `a`.
+Checks `[`. No.
+Checks `=`. No.
+Returns VarDef.
+`parseVarDecl` expects `;`.
+Next token is `f`. Not `;`.
+Calls `expectTokenId(SEMICN, "i")`.
+Logs error `4 i`? (Line of `a`).
+But wait, the input is:
+```
+void f(int a {} // error 1
+
+int main( { // error 2
+    int a = 10;
+    f(a + 10; // error 3
+    return 0;
+}
+```
+Line 4 is `int a = 10;`.
+After `main( {`, we are inside main's block.
+`int a = 10;` is parsed correctly.
+Next token `f`.
+`parseBlockItem` -> `parseStmt`.
+`parseStmt` sees `f`.
+It looks ahead for `;`.
+`f`, `(`, `a`, `+`, `10`, `;`.
+It sees `;` on line 5.
+It checks `hasAssignTk`. No `=`.
+So it calls `parseStmtSingleExp()`.
+`parseStmtSingleExp` calls `parseExp()`.
+`parseExp` -> `parseAddExp` -> ... -> `parseUnaryExp`.
+`parseUnaryExp` sees `f` (IDENFR) and `(` (LPARENT) at lookAhead 1.
+It identifies as FuncCall.
+Reads `f`.
+Reads `(`.
+Checks for params. `a` is present.
+`parseFuncRParams`.
+`parseExp` for `a`.
+`a` is LVal/Primary.
+Reads `a`.
+Next token `+`. Not `,`.
+Returns FuncRParams with one exp.
+Back in `parseUnaryExp`.
+Calls `expectTokenId(RPARENT, "j")`.
+Next token is `;`. Not `)`.
+Logs error `5 j`.
+Reads `;`? No, `expectTokenId` does NOT read if it fails.
+So `;` is still next.
+`parseUnaryExp` returns.
+`parseExp` returns.
+`parseStmtSingleExp` continues.
+It checks `if (lexer.lookAhead(0).getTokenId() != SEMICN)`.
+It is `SEMICN`.
+So it goes to `else`.
+`assert lexer.lookAhead(0).getTokenId() == SEMICN;`
+`lexer.read();`
+Returns Stmt.
+
+So the parser *does* detect the errors and calls `loggerErr.error`.
+The issue is definitely that `e.executePrint()` is never called in `Compiler.java`.
+
+<Compiler.java>
+...
+        Parser parser = new Parser(lexer, "CompUnit", o, e);
+        parser.parse();
+
+        sourceProgram.close();
+        o.close();
+        e.close();
+    }
+}

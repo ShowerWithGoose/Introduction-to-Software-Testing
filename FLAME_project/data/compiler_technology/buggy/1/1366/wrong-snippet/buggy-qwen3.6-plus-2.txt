@@ -1,0 +1,876 @@
+Based on the problem description, the test case input is a correct source program, but the program produces "No output file". This indicates that the `parser.txt` file is not being generated or written to.
+
+Looking at the `Compiler.java` file:
+1.  `lexical_Analysis()` is called. It reads `testfile.txt`, tokenizes it, and stores tokens in the static `tokens` list. It does **not** write any output file (the `lexical_Analysis_output()` method is commented out).
+2.  `parse()` is called. It creates a `Parser`, parses the `CompUnit`, and then checks for errors.
+3.  If there are no errors (`errorTokens.isEmpty()`), it calls `compUnit.postorder()`.
+4.  The `postorder()` methods in the AST classes (e.g., `CompUnit.java`, `Block.java`, etc.) are responsible for writing to `parser.txt`.
+
+However, looking closely at `Compiler.java`:
+```java
+    private static void parse() {
+        Parser parser = new Parser(tokens);
+        CompUnit compUnit = parser.parseCompUnit();
+        errorTokens.addAll(parser.getErrors());
+        errorTokens.sort(Comparator.comparingInt(Token::getLineNum));
+        if (errorTokens.isEmpty()) {
+            compUnit.postorder();
+        }
+        else {
+            // ... writes error.txt
+        }
+    }
+```
+
+The logic seems correct for triggering `postorder()`. Let's look at the `postorder()` implementation in `CompUnit.java`:
+
+```java
+<frontend/AST/CompUnit.java>
+...
+    public void postorder() {
+        Path path = Paths.get("parser.txt");
+        for (Decl d : decls) {
+            d.postorder();
+        }
+
+        for (FuncDef f : funcDefs) {
+            f.postorder();
+        }
+        mainFuncDef.postorder();
+        try {
+            Files.write(path, "<CompUnit>".getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+...
+```
+
+And `MainFuncDef.java`:
+```java
+<frontend/AST/Def/MainFuncDef.java>
+...
+    public void postorder() {
+        Path path = Paths.get("parser.txt");
+        try {
+            Files.write(path, token_int.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+            Files.write(path, token_main.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+            Files.write(path, lParent.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+            if (rParent != null)
+            {Files.write(path, rParent.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);}
+            block.postorder();
+            Files.write(path, "<MainFuncDef>\n".getBytes(StandardCharsets.UTF_8),StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+...
+```
+
+The code uses `StandardOpenOption.APPEND`. If the file `parser.txt` does not exist, `Files.write` with `APPEND` will create it.
+
+Wait, let's look at the `Token.toString()` method:
+```java
+<frontend/Token.java>
+...
+    @Override
+    public String toString() {
+        return this.lexType.getTypeValue() + ' ' + this.tokenValue + '\n';
+    }
+...
+```
+
+This looks fine.
+
+Let's re-examine `Compiler.java`.
+The issue might be that `parser.txt` is not being created because an exception is thrown silently or the program exits before writing? No, exceptions are thrown as `RuntimeException`.
+
+Let's look at the `Lexer` again.
+In `Compiler.java`, `lexical_Analysis()` populates `tokens`.
+If `tokens` is empty, `parseCompUnit` might fail or produce an empty tree?
+The input is:
+```c
+int main() {
+    printf("21373119");
+    int a = 0;
+    {
+        int a = 1;
+        printf("%d",a); // 输出 1
+    }
+    return 0;
+}
+```
+
+The lexer handles comments.
+```java
+<frontend/Lexer.java>
+...
+            } else if (source.charAt(curPos) == '/') {
+                curPos++;
+                sb.append(c);
+                if (source.charAt(curPos) == '/') {
+                    curPos++;
+                    c = source.charAt(curPos);
+                    while (c!='\n'){
+                        curPos++;
+                        if (curPos==source.length()){
+                            token = null;
+                            break;
+                        }
+                        c=source.charAt(curPos);
+                    }
+                    if (c == '\n') {
+                        lineNum++;
+                        curPos++;
+                    }
+                    if (token == null && curPos < source.length()) {
+                        hasNext();
+                    }
+                } 
+...
+```
+There is a potential bug in the Lexer's comment handling or general tokenization that causes an infinite loop or exception, but usually, that would crash the program. The symptom is "No output file".
+
+Let's look at `CompUnit.postorder()` again.
+It writes `<CompUnit>` at the end. It does NOT write a newline `\n` after `<CompUnit>`. The expected output shows `<CompUnit>` at the very end. The other nodes write `\n` inside their `toString()` or explicitly in `Files.write`.
+`Token.toString()` adds `\n`.
+`Files.write(path, "<MainFuncDef>\n".getBytes(...))` adds `\n`.
+`Files.write(path, "<CompUnit>".getBytes(...))` does NOT add `\n`. This is minor and wouldn't cause "No output file".
+
+Is it possible that `errorTokens` is NOT empty?
+In `Compiler.java`:
+```java
+    private static void lexical_Analysis() {
+        ...
+        Lexer lexer = new Lexer(source);
+        while (lexer.hasNext()) {
+            Token token = lexer.getToken();
+            if (token.getErrorType() == null && token.getLexType() != null){
+                tokens.add(token);
+            } else if (token.getErrorType() != null && token.getLexType() == null) {
+                errorTokens.add(token);
+                // ... adds corrected token to tokens
+            }
+        }
+
+    }
+```
+If the lexer generates an error token (e.g., illegal char), it is added to `errorTokens`.
+Then in `parse()`:
+```java
+        errorTokens.addAll(parser.getErrors());
+        errorTokens.sort(Comparator.comparingInt(Token::getLineNum));
+        if (errorTokens.isEmpty()) {
+            compUnit.postorder();
+        }
+        else {
+            // writes error.txt
+        }
+```
+If `errorTokens` is not empty, it writes `error.txt` and does NOT write `parser.txt`.
+The input is a correct program. So `errorTokens` should be empty.
+
+However, look at `Lexer.java` carefully.
+Does it handle all characters correctly?
+The input contains Chinese characters in the comment: `// 输出 1`.
+The lexer skips comments.
+```java
+                    while (c!='\n'){
+                        curPos++;
+                        if (curPos==source.length()){
+                            token = null;
+                            break;
+                        }
+                        c=source.charAt(curPos);
+                    }
+```
+This loop advances `curPos` until `\n` or end of file. It does not check for valid UTF-8 bytes, it just treats them as chars. This should be fine for skipping.
+
+Let's look at `Parser.java` -> `parseCompUnit`.
+```java
+    public CompUnit parseCompUnit() {   //CompUnit → {Decl} {FuncDef} MainFuncDef
+        ArrayList<Decl> declares = new ArrayList<>();
+        ArrayList<FuncDef> functionDefList = new ArrayList<>();
+        while(isDeclare(tokens.get(pos).getLexType())) {
+            declares.add(parseDecl());
+        }
+        while(isFuncDeclare(tokens.get(pos).getLexType())) {
+            functionDefList.add(parseFuncDef());
+        }
+        MainFuncDef mainFuncDef = parseMainFuncDef();
+        return new CompUnit(declares,functionDefList,mainFuncDef);
+    }
+```
+`isDeclare` checks:
+```java
+    public boolean isDeclare(LexType type){
+        boolean b1 = type == LexType.INTTK || type == LexType.CHARTK || type == LexType.CONSTTK;
+        boolean b2 = tokens.get(pos + 1).getLexType() != LexType.MAINTK;
+        boolean b3 = tokens.get(pos + 2).getLexType() != LexType.LPARENT;
+        return  b1 && b2 && b3;
+    }
+```
+For `int main()`, `type` is `INTTK`. `tokens.get(pos+1)` is `MAINTK`. So `b2` is false. `isDeclare` returns false. Correct.
+
+`isFuncDeclare` checks:
+```java
+    public boolean isFuncDeclare(LexType type){
+        boolean b1 = type == LexType.INTTK || type == LexType.CHARTK || type == LexType.VOIDTK;
+        boolean b2 = tokens.get(pos + 1).getLexType() != LexType.MAINTK;
+        boolean b3 = tokens.get(pos + 2).getLexType() == LexType.LPARENT;
+        return  b1 && b2 && b3;
+    }
+```
+For `int main()`, `b2` is false. Returns false. Correct.
+
+So it goes to `parseMainFuncDef`.
+
+Is there an `IndexOutOfBoundsException`?
+If `tokens` is empty, `tokens.get(pos)` throws exception.
+If `lexical_Analysis` fails to produce tokens, `tokens` is empty.
+
+Let's look at `Lexer.java` again.
+```java
+    public boolean hasNext() {
+        // ... skips whitespace
+        if (curPos < source.length())
+        {
+            c = source.charAt(curPos);
+        } else {
+            return false;
+        }
+        // ... tokenizes
+        // At the end:
+        if (curPos < source.length() && token == null) {
+            hasNext();
+        } else if (curPos == source.length() && token == null) {
+            return false;
+        }
+        return true;
+
+    }
+```
+If `token` is null (e.g. end of file reached inside comment processing without finding a token), it might return false.
+
+Wait, look at `Compiler.java` `main`:
+```java
+    public static void main(String[] args) {
+        lexical_Analysis();
+        //lexical_Analysis_output();
+        parse();
+    }
+```
+
+If `parse()` throws an exception (e.g. `IndexOutOfBoundsException` in Parser because `pos` goes out of bounds), the program crashes. If it crashes, no output file is produced.
+The prompt says "Buggy Output: No output file". This usually implies the program terminated without writing the file, possibly due to an exception or logic error preventing the write.
+
+Let's check `Parser.java` for potential out-of-bounds access.
+In `isDeclare` and `isFuncDeclare`, it accesses `tokens.get(pos + 1)` and `tokens.get(pos + 2)`.
+If `pos` is at the last token, this will throw `IndexOutOfBoundsException`.
+
+In `parseCompUnit`:
+```java
+        while(isDeclare(tokens.get(pos).getLexType())) {
+```
+If `tokens` is empty, `tokens.get(0)` throws exception.
+
+Why would `tokens` be empty?
+If `Lexer` fails to tokenize anything.
+
+Let's look at the `Lexer`'s handling of the first character `i` of `int`.
+It goes to `Character.isLetter(c)`.
+It builds `int`.
+`judgeLexType("int")` returns `LexType.INTTK`.
+Token is created.
+`hasNext` returns true.
+`getToken` returns the token.
+It seems fine.
+
+However, there is a subtle bug in `Lexer.java` regarding the `hasNext` recursion and state.
+```java
+    public boolean hasNext() {
+        // ...
+        // if comment is found:
+                    if (token == null && curPos < source.length()) {
+                        hasNext();
+                    }
+        // ...
+        // At the end:
+        if (curPos < source.length() && token == null) {
+            hasNext();
+        } else if (curPos == source.length() && token == null) {
+            return false;
+        }
+        return true;
+    }
+```
+The recursive call `hasNext()` calculates the next token, but the result is ignored? No, `hasNext` returns boolean. But the outer `hasNext` continues to the end and returns `true` regardless of whether the inner `hasNext` found a token or not?
+Actually, if `token` is set by the recursive call, the outer call's `token` field is updated (since `token` is a member variable).
+But wait, if the recursive call returns `false` (end of file), the outer call still executes:
+```java
+        if (curPos < source.length() && token == null) {
+            hasNext(); // returns false
+        } 
+        // ...
+        return true; // <-- Always returns true if it didn't hit the explicit return false above?
+```
+If `curPos < source.length()` and `token == null`, it calls `hasNext()`.
+If that inner `hasNext()` returns `false` (because it hit EOF), `token` might still be null?
+If `token` is still null after the recursive call, the code falls through to `return true`.
+Then `Compiler` calls `lexer.getToken()`, which returns `null`.
+`Compiler`:
+```java
+            Token token = lexer.getToken();
+            if (token.getErrorType() == null && token.getLexType() != null){ // NPE if token is null
+```
+If `token` is null, `token.getErrorType()` throws `NullPointerException`.
+The program crashes. No output file.
+
+This happens if the lexer encounters a situation where it consumes input but doesn't produce a token, and reaches EOF or a state where `token` remains null but `curPos < source.length()` is false or handled incorrectly.
+
+Actually, look at the comment handling again.
+```java
+                if (c == '\n') {
+                    lineNum++;
+                    curPos++;
+                }
+                if (token == null && curPos < source.length()) {
+                    hasNext();
+                }
+```
+If the comment is at the end of the file without a newline?
+`while (c!='\n')` runs until `curPos == source.length()`.
+Then `token = null`.
+`if (token == null && curPos < source.length())` is false.
+Falls through to:
+```java
+        if (curPos < source.length() && token == null) {
+             hasNext();
+        } else if (curPos == source.length() && token == null) {
+             return false;
+        }
+        return true;
+```
+If `curPos == source.length()` and `token == null`, it returns `false`. Correct.
+
+What if there is a character that is not handled?
+The `else` block at the end of `hasNext`?
+There is no final `else` for unrecognized characters.
+If `c` is not digit, letter, or any of the symbols checked, `token` remains `null`.
+Example: `@` or `$`.
+The input doesn't have these.
+
+Let's look at `Parser.java` `isDeclare` again.
+```java
+    public boolean isDeclare(LexType type){
+        boolean b1 = type == LexType.INTTK || type == LexType.CHARTK || type == LexType.CONSTTK;
+        boolean b2 = tokens.get(pos + 1).getLexType() != LexType.MAINTK;
+        boolean b3 = tokens.get(pos + 2).getLexType() != LexType.LPARENT;
+        return  b1 && b2 && b3;
+    }
+```
+If `pos` is `tokens.size() - 1`, `pos + 1` is out of bounds.
+In `parseCompUnit`:
+```java
+        while(isDeclare(tokens.get(pos).getLexType())) {
+```
+If the program starts with `int main`, `isDeclare` is called with `pos=0`.
+`tokens.get(1)` is `main`. `tokens.get(2)` is `(`.
+This is safe if there are at least 3 tokens.
+
+However, if the file is empty or contains only whitespace?
+`tokens` would be empty. `tokens.get(0)` throws Exception.
+
+The input file is valid.
+
+Let's look at the `Stmt` parsing for `printf`.
+```java
+        } else if (first.getLexType() == LexType.PRINTFTK) {
+            pos++;
+            Token l = tokens.get(pos++);
+            Token stringConst = tokens.get(pos++);
+            ArrayList<Exp> expList = new ArrayList<>();
+            while (tokens.get(pos).getLexType() == LexType.COMMA) {
+                pos++;
+                expList.add(parseExp());
+            }
+            Token r = null;
+            Token semi = null;
+            if (tokens.get(pos).getLexType() == LexType.RPARENT) {
+                r = tokens.get(pos++);
+            }
+            else {
+                Token error1 = new Token(ErrorType.LACK_OF_RPARENT,tokens.get(pos - 1).getLineNum(),"");
+                errors.add(error1);
+            }
+            if (tokens.get(pos).getLexType() == LexType.SEMICN) {
+                semi = tokens.get(pos++);
+            }
+            else {
+                Token error1 = new Token(ErrorType.LACK_OF_SEMICN,tokens.get(pos - 1).getLineNum(),"");
+                errors.add(error1);
+            }
+            return new Stmt(first,l,stringConst,expList,r,semi);
+        }
+```
+In the input: `printf("21373119");`
+Tokens: `PRINTFTK`, `LPARENT`, `STRCON`, `RPARENT`, `SEMICN`.
+1. `pos` at `PRINTFTK`. `first` is `PRINTFTK`.
+2. `pos++` -> `LPARENT`. `l` is `LPARENT`.
+3. `pos++` -> `STRCON`. `stringConst` is `STRCON`.
+4. `while` loop: `tokens.get(pos)` is `RPARENT`. Not `COMMA`. Loop skipped.
+5. `if` `RPARENT`: Yes. `r` is `RPARENT`. `pos++`.
+6. `if` `SEMICN`: Yes. `semi` is `SEMICN`. `pos++`.
+7. Returns `Stmt`.
+
+This looks correct.
+
+Why "No output file"?
+
+Check `CompUnit.postorder()` again.
+```java
+    public void postorder() {
+        Path path = Paths.get("parser.txt");
+        for (Decl d : decls) {
+            d.postorder();
+        }
+
+        for (FuncDef f : funcDefs) {
+            f.postorder();
+        }
+        mainFuncDef.postorder();
+        try {
+            Files.write(path, "<CompUnit>".getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+```
+If `mainFuncDef.postorder()` throws an exception, `<CompUnit>` is not written, and previous writes might be flushed or not depending on OS, but usually `Files.write` opens/closes the stream each time.
+
+Look at `MainFuncDef.postorder()`:
+```java
+    public void postorder() {
+        Path path = Paths.get("parser.txt");
+        try {
+            Files.write(path, token_int.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+            Files.write(path, token_main.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+            Files.write(path, lParent.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+            if (rParent != null)
+            {Files.write(path, rParent.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);}
+            block.postorder();
+            Files.write(path, "<MainFuncDef>\n".getBytes(StandardCharsets.UTF_8),StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+```
+
+Look at `Block.postorder()`:
+```java
+    public void postorder() {
+        Path path = Paths.get("parser.txt");
+        try {
+                Files.write(path, lBrace.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+                for (BlockItem b : blockItems) {
+                    b.postorder();
+                }
+            Files.write(path, rBrace.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+            Files.write(path, "<Block>\n".getBytes(StandardCharsets.UTF_8),StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+```
+
+Look at `BlockItem.postorder()`:
+```java
+    public void postorder() {
+        if (type == 1) {
+            decl.postorder();
+        } else {
+            stmt.postorder();
+        }
+    }
+```
+
+Look at `Stmt.postorder()` for Type 8 (printf):
+```java
+                case 8:{
+                    Files.write(path, printf.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+                    Files.write(path, printf_lParent.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+                    Files.write(path, stringConst.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+                    for (Exp exp1 : printf_exp) {
+                        Token t = new Token(LexType.COMMA,1 ,",");
+                        Files.write(path, t.toString().getBytes(StandardCharsets.UTF_8),StandardOpenOption.APPEND);
+                        exp1.postorder();
+                    }
+                    if (printf_rParent != null) {
+                        Files.write(path, printf_rParent.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+                    }
+                    if (printf_semicolon != null) {
+                        Files.write(path, printf_semicolon.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+                    }
+                    break;
+                }
+```
+Note: `printf_exp` is empty for `printf("21373119");`. So the loop doesn't run.
+`printf_rParent` is not null.
+`printf_semicolon` is not null.
+
+Wait! Look at `Stmt` constructor for printf (Type 8 in code, but labeled 10 in comments? No, `type = 8` in constructor):
+```java
+    public Stmt(Token printTk,Token l,Token stringConst1,ArrayList<Exp> printf_exp1,Token r,Token s) {
+        type = 8; // Wait, in the switch case it is case 8.
+        // ...
+    }
+```
+In `parseStmt`:
+```java
+            return new Stmt(first,l,stringConst,expList,r,semi);
+```
+This matches.
+
+Is there a mismatch in `Stmt` types?
+In `Stmt.java`:
+```java
+    //type = 8 'return' ';' // i
+    private Token return_sign;
+    // ...
+    // type = 10 'printf''('StringConst {','Exp}')'';' // i j
+    private Token printf;
+    // ...
+    public Stmt(Token printTk,Token l,Token stringConst1,ArrayList<Exp> printf_exp1,Token r,Token s) {
+        type = 8; // <--- BUG HERE?
+```
+The comment says `type = 10` for printf, but the constructor sets `type = 8`.
+The comment says `type = 8` for `return`.
+Let's check the `return` constructor:
+```java
+    public Stmt(Token returnTk,Exp exp,Token s) {
+        type = 7; // <--- BUG HERE? Comment said 8.
+```
+Let's check the `break/continue` constructor:
+```java
+    public Stmt(Token CBTK,Token semi) {
+        type = 6;
+```
+Comment said 6 and 7.
+
+Let's check the `switch` statement in `postorder`:
+```java
+                case 7:{
+                    Files.write(path, return_sign.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+                    // ...
+                    break;
+                }
+                case 8:{
+                    Files.write(path, printf.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+                    // ...
+                    break;
+                }
+```
+So `return` is handled by case 7?
+Constructor for return sets `type = 7`.
+Constructor for printf sets `type = 8`.
+
+Wait, look at `parseStmt` for `return`:
+```java
+        } else if (first.getLexType() == LexType.RETURNTK) {
+            // ...
+            return new Stmt(first,exp,s);
+        }
+```
+This calls `Stmt(Token returnTk, Exp exp, Token s)`.
+Inside that constructor: `type = 7`.
+
+Look at `parseStmt` for `printf`:
+```java
+        } else if (first.getLexType() == LexType.PRINTFTK) {
+            // ...
+            return new Stmt(first,l,stringConst,expList,r,semi);
+        }
+```
+This calls `Stmt(Token printTk, Token l, Token stringConst1, ArrayList<Exp> printf_exp1, Token r, Token s)`.
+Inside that constructor: `type = 8`.
+
+So `return` is type 7, `printf` is type 8.
+In `postorder`:
+Case 7 handles `return_sign`.
+Case 8 handles `printf`.
+
+This seems consistent internally, even if comments are wrong.
+
+However, look at `Stmt` constructor for `break/continue`:
+```java
+    public Stmt(Token CBTK,Token semi) {
+        type = 6;
+        // ...
+    }
+```
+Case 6 handles `break_continue_sign`.
+
+Look at `Stmt` constructor for `if`:
+```java
+    public Stmt(Token ifTk,Token l ,Cond c,Token r, Stmt s1,Token elseTK,Stmt s2) {
+        type = 4;
+        // ...
+    }
+```
+Case 4 handles `if`.
+
+Look at `Stmt` constructor for `for`:
+```java
+    public Stmt(Token forTK,Token l,ForStmt fs1,Token s1,Cond c,Token s2,ForStmt fs2,Token r,Stmt s) {
+        type = 5;
+        // ...
+    }
+```
+Case 5 handles `for`.
+
+Look at `Stmt` constructor for `LVal = Exp`:
+```java
+    public Stmt(LVal lVal,Token equal,Exp e,Token semi) {
+        type = 1;
+        // ...
+    }
+```
+Case 1 handles assignment.
+
+Look at `Stmt` constructor for `Exp ;`:
+```java
+    public Stmt(Exp e,Token semi) {
+        type = 2;
+        // ...
+    }
+```
+Case 2 handles expression statement.
+
+Look at `Stmt` constructor for `Block`:
+```java
+    public Stmt(Block b) {
+        type = 3;
+        block = b;
+    }
+```
+Case 3 handles block.
+
+Look at `Stmt` constructor for `getint/getchar`:
+```java
+    public Stmt(LVal lVal,Token equal,Token getIntChar,Token l,Token r,Token semi) {
+        type = 9;
+        // ...
+    }
+```
+Case 9 handles getint/getchar.
+
+So the types seem mapped correctly between constructors and switch cases.
+
+What about the "No output file"?
+
+If `parser.txt` is not created, it means `compUnit.postorder()` was never called, OR it threw an exception before writing anything.
+
+If `errorTokens` is not empty, `compUnit.postorder()` is NOT called.
+Why would `errorTokens` not be empty for a correct program?
+
+Check `Lexer` for `&` or `|` handling.
+The input doesn't have them.
+
+Check `Parser` for error generation.
+`parseMainFuncDef`:
+```java
+        if (tokens.get(pos).getLexType() == LexType.RPARENT) {
+            r = tokens.get(pos++);
+        }
+        else {
+            Token error = new Token(ErrorType.LACK_OF_RPARENT,tokens.get(pos - 1).getLineNum(),"");
+            errors.add(error);
+        }
+```
+If `main()` is parsed, `pos` is at `)`. `RPARENT` matches. No error.
+
+`parseBlock`:
+```java
+        while (tokens.get(pos).getLexType() != LexType.RBRACE) {
+            blockItems.add(parseBlockItem());
+        }
+```
+If `parseBlockItem` consumes tokens correctly, it will eventually hit `RBRACE`.
+
+Is it possible that `parseBlockItem` fails to advance `pos`?
+`parseBlockItem`:
+```java
+        if (b1) {
+            return new BlockItem(parseDecl());
+        }
+        else {
+            return new BlockItem(parseStmt());
+        }
+```
+`parseStmt` for `printf`:
+Advances `pos` past `printf`, `(`, `"..."`, `)`, `;`.
+Returns `Stmt`.
+
+`parseStmt` for `int a = 0;`:
+First token `int`. `isDeclare`?
+In `parseBlockItem`, `b1` checks `INTTK`. Yes.
+Calls `parseDecl()`.
+`parseDecl`:
+```java
+        if (tokens.get(pos).getLexType() == LexType.CONSTTK) {
+            return new Decl(parseConstDecl());
+        }
+        else {
+            return new Decl(parseVarDecl());
+        }
+```
+Calls `parseVarDecl()`.
+`parseVarDecl`:
+Consumes `int`, `a`, `=`, `0`, `;`.
+Returns `VarDecl`.
+
+Everything seems to consume tokens.
+
+Wait! Look at `Compiler.java` `parse()` method again.
+```java
+    private static void parse() {
+        Parser parser = new Parser(tokens);
+        CompUnit compUnit = parser.parseCompUnit();
+        errorTokens.addAll(parser.getErrors());
+        errorTokens.sort(Comparator.comparingInt(Token::getLineNum));
+        if (errorTokens.isEmpty()) {
+            compUnit.postorder();
+        }
+        else {
+            String errorFilePath = "error.txt";
+            StringBuilder sb = new StringBuilder();
+            for (Token t : errorTokens) {
+                sb.append(t.getLineNum());
+                sb.append(" ");
+                sb.append(t.getErrorType().getError_type());
+                sb.append("\n");
+            }
+            try {
+                Files.write(Paths.get(errorFilePath), sb.toString().getBytes(StandardCharsets.UTF_8));
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+```
+
+If `parser.getErrors()` returns a list containing errors, `parser.txt` is not written.
+
+Are there any errors generated?
+The input is correct.
+
+Let's look at `Lexer.java` one more time. Is it possible it generates an error token for something valid?
+No obvious candidate.
+
+Let's look at `Token.java` `toString()`.
+```java
+    @Override
+    public String toString() {
+        return this.lexType.getTypeValue() + ' ' + this.tokenValue + '\n';
+    }
+```
+If `lexType` is null, `getTypeValue()` throws NPE.
+When is `lexType` null?
+In `Compiler.java` `lexical_Analysis`:
+```java
+            if (token.getErrorType() == null && token.getLexType() != null){
+                tokens.add(token);
+            }
+```
+Only tokens with non-null `lexType` are added to `tokens`.
+So `tokens` in `Parser` should only contain valid tokens.
+
+However, in `Parser.java`, `parseFuncDef` and others create `ErrorToken`s and add them to `errors`.
+These `ErrorToken`s have `lexType = null` and `errorType != null`.
+
+If NO errors are generated, `errors` is empty.
+
+Is it possible that `compUnit.postorder()` throws an exception?
+If `tokens` were empty, `parseCompUnit` would throw exception during `isDeclare` check `tokens.get(pos)`.
+If `tokens` is NOT empty, parsing proceeds.
+
+What if `parser.txt` cannot be created? Permission denied? Unlikely in this context.
+
+Let's look at the `Block` class `postorder` again.
+```java
+<frontend/AST/Block.java>
+...
+    public void postorder() {
+        Path path = Paths.get("parser.txt");
+        try {
+                Files.write(path, lBrace.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+                for (BlockItem b : blockItems) {
+                    b.postorder();
+                }
+            Files.write(path, rBrace.toString().getBytes(StandardCharsets.UTF_8), StandardOpenOption.APPEND);
+            Files.write(path, "<Block>\n".getBytes(StandardCharsets.UTF_8),StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+...
+```
+
+There is a missing newline in `CompUnit.postorder()` for `<CompUnit>`, but that's it.
+
+Wait! I missed something in `Compiler.java`.
+```java
+    private static void lexical_Analysis() {
+        String sourceFilePath = "testfile.txt";
+        String source;
+        try {
+            source = new String(Files.readAllBytes(Paths.get(sourceFilePath)));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        Lexer lexer = new Lexer(source);
+        while (lexer.hasNext()) {
+            Token token = lexer.getToken();
+            if (token.getErrorType() == null && token.getLexType() != null){
+                tokens.add(token);
+            } else if (token.getErrorType() != null && token.getLexType() == null) {
+                errorTokens.add(token);
+                if (token.getTokenValue() == "&") {
+                    Token correctToken = new Token(LexType.AND, token.getLineNum(),"&&");
+                    tokens.add(correctToken);
+                }
+                else {
+                    Token correctToken = new Token(LexType.OR, token.getLineNum(),"||");
+                    tokens.add(correctToken);
+                }
+            }
+        }
+
+    }
+```
+If `lexer.hasNext()` returns `true`, but `lexer.getToken()` returns `null` (due to the bug identified earlier where `hasNext` returns `true` but `token` is null), then `token.getErrorType()` throws `NullPointerException`.
+
+The bug in `Lexer.hasNext()`:
+```java
+        if (curPos < source.length() && token == null) {
+            hasNext();
+        } else if (curPos == source.length() && token == null) {
+            return false;
+        }
+        return true;
+```
+If `curPos < source.length()` and `token == null`, it calls `hasNext()`.
+If the recursive `hasNext()` finds a token, `this.token` is set.
+If the recursive `hasNext()` does NOT find a token (returns false), `this.token` remains null.
+Then the code falls through to `return true`.
+So `hasNext()` returns `true`, but `token` is `null`.
+Then `getToken()` returns `null`.
+Then `token.getErrorType()` crashes.
+
+When does `hasNext()` fail to find a token but `curPos < source.length()`?
+If there are characters that are skipped or consumed but don't form a token?
+The lexer handles whitespace by skipping it at the beginning.
+It handles comments.
+It handles all standard C symbols.
+If the file ends with whitespace?
+`hasNext` skips

@@ -1,0 +1,138 @@
+Based on the problem description and the test case analysis:
+
+1.  **Test Case Analysis**:
+    *   Line 16: `ch = getchar( ;` -> Missing right parenthesis `)`. Expected error: `16 j`.
+    *   Line 18: `if (f2() & f1())` -> Illegal symbol `&` (should be `&&`). Expected error: `18 a`.
+    *   Line 19: `printf("%c",s[0];` -> Missing right parenthesis `)`. Expected error: `19 j`.
+    *   **Expected Output Order**: `16 j`, `18 a`, `19 j` (sorted by line number).
+    *   **Buggy Output Order**: `18 a`, `16 j`, `19 j`.
+
+2.  **Error Identification**:
+    The buggy output shows that error `18 a` is reported before `16 j`. This implies that the parser encounters the syntax error on line 18 (inside the `if` condition) *before* it finishes processing or reports the error for line 16 (inside the `getchar` call).
+    
+    Looking at the code structure:
+    *   Line 16 is inside a statement: `ch = getchar( ;`. This is parsed in `parseStmtGetChar`.
+    *   Inside `parseStmtGetChar`, it calls `checkRightParen()`.
+    *   Line 18 is inside the next statement: `if (f2() & f1()) ...`. This is parsed in `parseStmtIf`, which calls `parseCond`.
+    *   `parseCond` calls `parseLOrExp`, which eventually parses expressions.
+
+    The issue lies in how `checkRightParen` (and similar check methods) handles the error reporting relative to the parsing flow. Specifically, in `Parser.java`, the method `checkRightParen` adds the error immediately if the token is missing. However, the order of errors depends on when these methods are called.
+
+    Let's trace the execution for the block containing lines 16-19:
+    1.  `parseBlockItem` calls `parseStmt`.
+    2.  `parseStmt` calls `parseStmtEle`.
+    3.  `parseStmtEle` sees `IDENFR` (`ch`) and looks ahead. It identifies it as an assignment/getchar/getint scenario.
+    4.  It backtracks and calls `parseStmtGetChar`.
+    5.  `parseStmtGetChar`:
+        *   Parses `LVal` (`ch`).
+        *   Consumes `=`.
+        *   Consumes `getchar`.
+        *   Consumes `(`.
+        *   Calls `checkRightParen()`.
+        *   Current token `now` is `;` (from line 16). It is NOT `RPARENT`.
+        *   It creates a dummy `)` token and calls `lexer.addError(last.getLineNum(), ErrorType.j)`. `last` was `(`. The line number of `(` is 16. So error `16 j` is added.
+        *   Returns.
+        *   Calls `checkSemicolon()`. `now` is `;`. Consumes it.
+        *   Returns `StmtGetChar`.
+    6.  Back in `parseBlockItem`, it returns.
+    7.  Next `parseBlockItem` is called.
+    8.  `parseStmt` -> `parseStmtEle`.
+    9.  `now` is `if` (Line 18). Calls `parseStmtIf`.
+    10. `parseStmtIf`:
+        *   Consumes `if`.
+        *   Consumes `(`.
+        *   Calls `parseCond()`.
+        *   `parseCond` -> `parseLOrExp` -> `parseLAndExp` -> `parseEqExp` ... -> `parseUnaryExp`.
+        *   Inside `parseUnaryExp` or subsequent expression parsing, it encounters `f2()`.
+        *   Then it encounters `&`.
+        *   The grammar expects `&&` (`AND`) for `LAndExp`.
+        *   In `Lexer.java`, when `&` is encountered alone, it returns `-1` and adds error `a` immediately via `addError`.
+        *   Wait, the Lexer runs *before* the Parser. The `lexicalAnalysis` method in `Lexer.java` processes the entire file and populates `tokens` and `errorList`.
+        
+    Let's re-examine `Lexer.java`.
+    In `getsym`:
+    ```java
+    } else if (this.Char == '&') {
+        getChar();
+        if (this.Char == '&') {
+            catToken();
+            symbol = TokenType.AND;
+        } else {
+            retract();
+            catToken('&');
+            symbol = TokenType.AND; // This seems wrong, should probably be a specific error token or just IDENFR? But it sets type to AND.
+            return -1; // Indicates error
+        }
+    }
+    ```
+    And in `lexicalAnalysis`:
+    ```java
+    while(hasToken()) {
+        int code = getsym();
+        if (code == 0) { continue; }
+        if (code == -1) {
+            this.addError(lineNum, ErrorType.a); // Adds error 'a' immediately
+            right = false;
+        } else {
+             results.add(...);
+        }
+        token.setType(symbol);
+        token.setLineNum(lineNum);
+        tokens.add(token); // The erroneous '&' token is STILL added to the token list!
+    }
+    ```
+    
+    So, the Lexer produces a token stream that includes the erroneous `&` token (with type `AND` presumably, or whatever `symbol` was set to). And it adds error `18 a` to `errorList`.
+    
+    The Parser then consumes this token stream.
+    
+    The `Parser` constructor reads the first few tokens.
+    `syntaxAnalysis` calls `parseCompUnit`.
+    
+    The errors from the Lexer (`18 a`) are stored in `lexer.errorList`.
+    The errors from the Parser (`16 j`, `19 j`) are added via `lexer.addError` inside `checkRightParen` etc.
+    
+    Finally, `lexer.errorOutput()` is called. It iterates through `errorList`.
+    
+    The `errorList` is an `ArrayList<Map.Entry<Integer, ErrorType>>`.
+    Errors are added in the order they are encountered.
+    
+    1.  Lexer runs first. It scans the whole file.
+        *   It encounters `&` on line 18. It adds `18 a` to `errorList`.
+        *   It finishes scanning. `errorList` contains `[18 a]`.
+    2.  Parser runs.
+        *   It parses up to line 16.
+        *   In `parseStmtGetChar`, it calls `checkRightParen`.
+        *   `checkRightParen` detects missing `)`. It calls `lexer.addError(last.getLineNum(), ErrorType.j)`. `last` is `(` on line 16.
+        *   So `16 j` is added to `errorList`. Now `errorList` is `[18 a, 16 j]`.
+        *   Parser continues.
+        *   It parses line 18 `if`. The `&` token is already in the stream. The parser's `parseLAndExp` expects `AND` (`&&`). It sees `AND` (the single `&` token created by lexer). It might accept it or fail depending on implementation. But wait, if the Lexer treated single `&` as `AND` token, the parser might just consume it as a valid logical AND operator if it's not strict about the token value vs type, OR it might fail later.
+        *   Actually, looking at `parseLAndExp`:
+            ```java
+            while (now.getType() == TokenType.AND) { ... }
+            ```
+            Since the Lexer set the type of the single `&` to `TokenType.AND`, the parser will likely consume it as a valid `&&` operator syntactically, even though it's semantically/lexically wrong. This means the parser won't crash here.
+        *   Parser continues to line 19 `printf`.
+        *   `parseStmtPrintf` calls `checkRightParen`.
+        *   Detects missing `)`. Adds `19 j` to `errorList`. Now `errorList` is `[18 a, 16 j, 19 j]`.
+    3.  `lexer.errorOutput()` prints the list in order: `18 a`, `16 j`, `19 j`.
+
+    The expected output is sorted by line number: `16 j`, `18 a`, `19 j`.
+
+    The bug is that the errors are not sorted before output. The `errorOutput` method in `Lexer.java` simply iterates the list. The list order depends on when errors were detected (Lexer phase first, then Parser phase).
+
+    Therefore, the fix should be in `Lexer.java`'s `errorOutput` method to sort the `errorList` by line number before writing.
+
+<frontend/Lexer.java>
+...
+    public void errorOutput() {
+        try (BufferedWriter err = new BufferedWriter(new FileWriter("error.txt"))) {
+            for (Map.Entry<Integer, ErrorType> entry : errorList) {
+                err.write(entry.getKey().toString() + " " + entry.getValue().toString());
+                err.newLine();
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+...

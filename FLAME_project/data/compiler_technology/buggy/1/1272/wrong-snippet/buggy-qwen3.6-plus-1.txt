@@ -1,0 +1,748 @@
+Based on the comparison between the buggy output and the expected output, the program outputs an extra `<Stmt>` tag and an extra `SEMICN ;` line after parsing the `return` statement inside the function `func`.
+
+In the Buggy Output:
+```text
+...
+<Exp>
+SEMICN ;
+<Stmt>       <-- Extra Stmt tag
+SEMICN ;     <-- Extra Semicolon token output
+<Stmt>       <-- Correct Stmt tag for the return statement
+RBRACE }
+<Block>
+...
+```
+
+In the Expected Output:
+```text
+...
+<Exp>
+SEMICN ;
+<Stmt>       <-- Correct Stmt tag for the return statement
+RBRACE }
+<Block>
+...
+```
+
+The issue lies in how `BlockItem` or `Stmt` is being parsed or how the `ReturnStmt` is handled within the `Block`. Looking at `Block.java`, it parses `BlockItem`s. `BlockItem` can be a `Decl` or a `Stmt`.
+
+Let's look at `Stmt.java`. The `parse` method identifies the type of statement. For `return`, it calls `ReturnStmt.parse(list)`.
+
+Let's look at `ReturnStmt.java`.
+```java
+public static ReturnStmt parse(TokenList list) {
+    if (list.now().getType().equals(TokenType.Type.RETURNTK)) {
+        Token r = list.now();
+        list.next();
+        Exp exp = null;
+        Token first = list.now();
+        // ... logic to parse Exp ...
+        // ...
+        return new ReturnStmt(r,exp);
+    } else {
+        System.err.println("Error:ReturnStmt cannot find return");
+        return null;
+    }
+}
+```
+The `ReturnStmt.toString()` method outputs:
+```java
+@Override
+public String toString() {
+    StringBuilder sb = new StringBuilder();
+    sb.append(Return.toString());
+    if (exp != null) {
+        sb.append(exp.toString());
+    }
+    sb.append(semicn); // Outputs the semicolon
+    return sb.toString();
+}
+```
+Note that `ReturnStmt` does **not** output `<Stmt>`. The `<Stmt>` tag is added by `Stmt.toString()`:
+```java
+@Override
+public String toString() {
+    StringBuilder sb = new StringBuilder();
+    // ... appends specific stmt toString ...
+    sb.append(name); // name is "<Stmt>\n"
+    return sb.toString();
+}
+```
+
+So, `Stmt` wraps `ReturnStmt`. `Stmt.toString()` calls `returnStmt.toString()` which outputs the tokens and the semicolon, then `Stmt.toString()` appends `<Stmt>\n`. This seems correct for a single statement.
+
+Why is there an extra `SEMICN ;` and `<Stmt>`?
+
+Let's look closely at the Buggy Output again.
+```text
+RETURNTK return
+...
+<Exp>
+SEMICN ;
+<Stmt>
+SEMICN ;
+<Stmt>
+```
+
+It looks like the semicolon is being printed twice, and `<Stmt>` is printed twice.
+
+Wait, looking at `AssignStmt.java`:
+```java
+@Override
+public String toString() {
+    StringBuilder sb = new StringBuilder();
+    sb.append(lVal.toString());
+    sb.append(assign);
+    sb.append(exp.toString());
+    sb.append(semicn);
+    return sb.toString();
+}
+```
+It does not print `<Stmt>`.
+
+Looking at `ExpStmt.java`:
+```java
+@Override
+public String toString() {
+    StringBuilder stringBuilder = new StringBuilder();
+    if (exp != null) {
+        stringBuilder.append(exp.toString());
+    }
+    stringBuilder.append(semicn);
+    return stringBuilder.toString();
+}
+```
+It does not print `<Stmt>`.
+
+The `<Stmt>` tag is only printed in `Stmt.toString()`.
+
+If `Stmt.parse` correctly identifies a `ReturnStmt`, it creates a `Stmt` object with `type = 8`.
+`Stmt.toString()` for `type == 8` does:
+```java
+} else if (type == 8) {
+    sb.append(returnStmt.toString());
+}
+// ...
+sb.append(name); // <Stmt>\n
+```
+
+So for a correct return statement, we expect:
+`return ... ; <Stmt>\n`
+
+The buggy output has:
+`... ; <Stmt>\n ; <Stmt>\n`
+
+This implies that somehow the semicolon is consumed/printed, then another semicolon is printed, and another Stmt tag is printed.
+
+Let's look at `Block.java` again.
+```java
+public static Block parse(TokenList list) {
+    if (list.now().getType().equals(TokenType.Type.LBRACE)) {
+        list.next();
+        ArrayList<BlockItem> items = new ArrayList<>();
+        if (list.now().getType().equals(TokenType.Type.RBRACE)) {
+            list.next();
+        } else {
+            while (!list.now().getType().equals(TokenType.Type.RBRACE)) {
+                items.add(BlockItem.parse(list));
+            }
+            list.next();
+        }
+        return new Block(items);
+    } else {
+        System.err.println("Error:Block cannot find {");
+        return null;
+    }
+}
+```
+
+And `BlockItem.java`:
+```java
+public static BlockItem parse(TokenList list) {
+    if (list.now().getType().equals(TokenType.Type.CONSTTK)
+            ||list.now().getType().equals(TokenType.Type.INTTK)
+            ||list.now().getType().equals(TokenType.Type.CHARTK) ) {
+        return new BlockItem(Decl.parse(list));
+    } else {
+        return new BlockItem(Stmt.parse(list));
+    }
+}
+```
+
+If `Stmt.parse` consumes the `return` statement including the semicolon, the next token should be `}`. The loop in `Block.parse` checks `!list.now().getType().equals(TokenType.Type.RBRACE)`. If the semicolon was consumed, the current token is `}`, so the loop terminates.
+
+However, if `Stmt.parse` did NOT consume the semicolon, or if it parsed something incorrectly...
+
+Let's look at `ReturnStmt.parse` again.
+```java
+if (list.now().getType().equals(TokenType.Type.SEMICN)) {
+    list.next();
+} else {
+    ErrorList.addError(list.before().getLine(),'i');
+}
+```
+It consumes the semicolon.
+
+Is it possible that `Stmt.parse` is called twice? Or that `BlockItem` is parsing something else?
+
+Let's look at the structure of the input:
+```c
+int func()
+{
+    int a[5] = {1,2,3,4,5};
+    return a[1]+a[2]/a[3]*a[3]%a[4];
+}
+```
+
+1. `int a[5] = ...;` is a `VarDecl`.
+2. `return ...;` is a `Stmt`.
+
+In `Block.parse`, it parses `BlockItem`s.
+First iteration: `BlockItem.parse` sees `INTTK`, so it parses `Decl` (VarDecl). This consumes up to the semicolon after `5}`.
+Second iteration: `BlockItem.parse` sees `RETURNTK`. It goes to `else` branch and calls `Stmt.parse(list)`.
+
+Inside `Stmt.parse`:
+`first` is `RETURNTK`.
+It matches `else if (first.getType().equals(TokenType.Type.RETURNTK))`.
+Calls `ReturnStmt.parse(list)`.
+
+Inside `ReturnStmt.parse`:
+Consumes `return`.
+Parses `Exp`.
+Consumes `;`.
+Returns `ReturnStmt`.
+
+Back in `Stmt.parse`:
+Creates `Stmt` with `returnStmt`.
+Returns `Stmt`.
+
+Back in `BlockItem.parse`:
+Creates `BlockItem` with `Stmt`.
+Returns `BlockItem`.
+
+Back in `Block.parse`:
+Adds `BlockItem` to list.
+Loop condition: `list.now()` is now `RBRACE` (`}`). Loop terminates.
+Consumes `}`.
+
+This logic seems correct and should produce only one `<Stmt>`.
+
+Why does the output show double?
+
+Let's look at `CompUnit.java` or `FuncDef.java`.
+
+`FuncDef.parse`:
+```java
+block = Block.parse(list);
+return new FuncDef(type,ident,funcFParams,block);
+```
+
+`FuncDef.toString`:
+```java
+sb.append(block.toString());
+sb.append(name); // <FuncDef>\n
+```
+
+`Block.toString`:
+```java
+sb.append(leftBrace);
+for (BlockItem item : items) {
+    sb.append(item.toString());
+}
+sb.append(rightBrace);
+sb.append(name); // <Block>\n
+```
+
+`BlockItem.toString`:
+```java
+if (type == 1) {
+    return decl.toString();
+} else {
+    return stmt.toString();
+}
+```
+
+`Stmt.toString`:
+```java
+// ... appends returnStmt.toString() ...
+sb.append(name); // <Stmt>\n
+```
+
+There is no obvious recursion or double call here.
+
+Let's look closely at the Buggy Output again.
+```text
+SEMICN ;
+<Stmt>
+SEMICN ;
+<Stmt>
+```
+
+The first `SEMICN ;` and `<Stmt>` correspond to the `return` statement.
+The second `SEMICN ;` and `<Stmt>` are spurious.
+
+Could it be that the `VarDecl` is not consuming its semicolon correctly?
+`VarDecl.parse`:
+```java
+if (!list.now().getType().equals(TokenType.Type.SEMICN)) {
+    ErrorList.addError(list.before().getLine(),'i');
+} else {
+    list.next();
+}
+```
+It consumes the semicolon.
+
+Let's look at `InitVal` or `ConstInitVal`.
+The array initialization is `{1,2,3,4,5}`.
+`InitVal.parse` handles `{ ... }`.
+Inside `InitVal.parse`:
+```java
+while (!list.now().getType().equals(TokenType.Type.RBRACE)) {
+    exps.add(Exp.parse(list));
+    if (list.now().getType().equals(TokenType.Type.COMMA)) {
+        list.next();
+    }
+}
+list.next(); // Consumes RBRACE
+```
+This looks correct.
+
+Is it possible that `Stmt.parse` is misidentifying the `return` statement?
+
+Let's look at `Stmt.parse`'s handling of `IDENFR`.
+```java
+} else {
+    //assignStmt, expStmt, getIntCharStmt
+    if (first.getType().equals(TokenType.Type.SEMICN) ||
+            // ...
+            ) {
+        expStmt = ExpStmt.parse(list);
+    } else {
+        int pos = list.getPos();
+        LVal lVal = LVal.parse(list);
+        if (!list.now().getType().equals(TokenType.Type.ASSIGN)) {
+            // ...
+            expStmt = ExpStmt.parse(list);
+        } else {
+             // ...
+        }
+    }
+}
+```
+`RETURNTK` is handled explicitly before this `else` block. So this path is not taken for `return`.
+
+Wait, look at `ReturnStmt.parse` again.
+```java
+Token first = list.now();
+//System.out.println("Return first: " + first.toString());
+if (list.now().getType().equals(TokenType.Type.SEMICN)) {
+    list.next();
+} else if (first.getType().equals(TokenType.Type.LPARENT) ||
+        // ...
+        ){
+    //exp打头不是LVal的情况
+    exp = Exp.parse(list);
+    if (list.now().getType().equals(TokenType.Type.SEMICN)) {
+        list.next();
+    } else {
+        ErrorList.addError(list.before().getLine(),'i');
+    }
+} else if (first.getType().equals(TokenType.Type.IDENFR)) {
+    //可能是LVal
+    //防止是assignStmt或者getIntCharStmt
+    int pos = list.getPos();
+    LVal tmp = LVal.parse(list);
+    if (!list.now().getType().equals(TokenType.Type.ASSIGN)) {
+        //说明肯定不是assignStmt或者getIntCharStmt
+        list.setPos(pos);
+        exp = Exp.parse(list);
+    } else {
+        //说明不是exp,属于exp和;都缺少
+        list.setPos(pos);
+        ErrorList.addError(list.before().getLine(),'i');
+    }
+} else {
+    //Exp和;均不存在
+    ErrorList.addError(list.before().getLine(),'i');
+}
+```
+
+The expression is `a[1]+a[2]/a[3]*a[3]%a[4]`.
+The first token of the expression is `a` (`IDENFR`).
+So `first.getType()` is `IDENFR`.
+It enters the `else if (first.getType().equals(TokenType.Type.IDENFR))` block.
+It saves `pos`.
+It calls `LVal.parse(list)`.
+`LVal.parse` consumes `a`, `[`, `1`, `]`.
+Now `list.now()` is `PLUS` (`+`).
+`PLUS` is not `ASSIGN`.
+So it enters `if (!list.now().getType().equals(TokenType.Type.ASSIGN))`.
+It resets position to `pos` (before `a`).
+It calls `Exp.parse(list)`.
+`Exp.parse` parses the whole expression `a[1]+...`.
+After `Exp.parse`, `list.now()` should be `SEMICN`.
+It checks `if (list.now().getType().equals(TokenType.Type.SEMICN))`.
+It consumes `SEMICN`.
+
+This also looks correct.
+
+Let's look at the `VarDecl` parsing again.
+`int a[5] = {1,2,3,4,5};`
+
+`VarDecl.parse`:
+1. `BType.parse` consumes `int`.
+2. `VarDef.parse` is called.
+
+`VarDef.parse`:
+1. Consumes `a`.
+2. Sees `[`. Consumes `[`.
+3. `ConstExp.parse` (which calls `AddExp.parse` etc) consumes `5`.
+4. Sees `]`. Consumes `]`.
+5. Sees `=`. Consumes `=`.
+6. `InitVal.parse` is called.
+
+`InitVal.parse`:
+1. Sees `{`. Consumes `{`.
+2. Loop parses `1`, `,`, `2`, `,`, `3`, `,`, `4`, `,`, `5`.
+3. Sees `}`. Consumes `}`.
+4. Returns `InitVal`.
+
+Back in `VarDef.parse`:
+Returns `VarDef`.
+
+Back in `VarDecl.parse`:
+Loop for comma: `list.now()` is `;`. Not comma. Loop ends.
+Check for `;`. `list.now()` is `;`. Consumes `;`.
+Returns `VarDecl`.
+
+This also looks correct.
+
+Is there any chance that `BlockItem` is parsing the `return` statement, and then `Block` is parsing it again? No, `Block` uses a while loop based on `RBRACE`.
+
+Let's look at the output order again.
+```text
+<VarDecl>
+RETURNTK return
+...
+<Stmt>
+SEMICN ;
+<Stmt>
+```
+
+The `<VarDecl>` is printed. Then `RETURNTK`.
+This means the `VarDecl` printing finished, and then the `Stmt` printing started.
+
+If `Stmt` was parsed correctly, it would print:
+`RETURNTK return ... SEMICN ; <Stmt>\n`
+
+The buggy output has:
+`... <Exp>\n SEMICN ; \n <Stmt>\n SEMICN ; \n <Stmt>\n`
+
+It seems like the semicolon and `<Stmt>` are duplicated.
+
+Could it be that `ReturnStmt.toString` prints the semicolon, and `Stmt.toString` prints the semicolon again?
+`ReturnStmt.toString`:
+```java
+sb.append(semicn);
+```
+`Stmt.toString`:
+```java
+sb.append(returnStmt.toString());
+// ...
+sb.append(name);
+```
+`Stmt` does NOT print semicolon itself. It relies on the inner statement to print it.
+
+Wait! Look at `ExpStmt.toString`:
+```java
+stringBuilder.append(semicn);
+```
+Look at `AssignStmt.toString`:
+```java
+sb.append(semicn);
+```
+Look at `BreakStmt.toString`:
+```java
+return Break.toString() + semicn;
+```
+Look at `ContinueStmt.toString`:
+```java
+return Continue.toString() + semicn;
+```
+Look at `PrintfStmt.toString`:
+```java
+sb.append(semicn);
+```
+Look at `GetIntCharStmt.toString`:
+```java
+sb.append(semicn);
+```
+
+All specific statement types print their own semicolon.
+
+Now look at `IfStmt.toString`:
+```java
+sb.append(stmt.toString());
+if (Else != null) {
+    sb.append(Else.toString());
+    sb.append(elseStmt.toString());
+}
+```
+It relies on inner `stmt` to print semicolon if it's a simple statement.
+
+Now look at `ForStatement.toString`:
+```java
+sb.append(mainStmt);
+```
+Relies on inner stmt.
+
+Now look at `ReturnStmt.toString`:
+```java
+sb.append(semicn);
+```
+
+So `ReturnStmt` prints the semicolon. `Stmt` prints `<Stmt>`.
+
+Where does the extra `SEMICN ;` and `<Stmt>` come from?
+
+Hypothesis: The `ReturnStmt` is being parsed as TWO statements?
+Or `BlockItem` is parsing two items?
+
+If `ReturnStmt.parse` failed to consume the semicolon, then `list.now()` would be `;`.
+Then `Block.parse` loop continues.
+Next `BlockItem.parse` is called.
+`list.now()` is `;`.
+`Stmt.parse` is called.
+`first` is `;`.
+`Stmt.parse` checks:
+```java
+if (first.getType().equals(TokenType.Type.SEMICN) || ... ) {
+    expStmt = ExpStmt.parse(list);
+}
+```
+`ExpStmt.parse`:
+```java
+if (list.now().getType().equals(TokenType.Type.SEMICN)) {
+    list.next();
+} else {
+    // ...
+}
+```
+So `ExpStmt` consumes `;`.
+`ExpStmt.toString` prints `semicn`.
+`Stmt.toString` prints `<Stmt>`.
+
+So if `ReturnStmt` fails to consume the semicolon, we get:
+1. `ReturnStmt` prints `return ... exp ...` (NO semicolon printed by ReturnStmt? No, `ReturnStmt.toString` ALWAYS prints `semicn`).
+
+Wait, `ReturnStmt.toString` prints `semicn` regardless of whether it was consumed during parsing?
+Yes:
+```java
+@Override
+public String toString() {
+    StringBuilder sb = new StringBuilder();
+    sb.append(Return.toString());
+    if (exp != null) {
+        sb.append(exp.toString());
+    }
+    sb.append(semicn); // Always prints semicolon token representation
+    return sb.toString();
+}
+```
+
+But `ReturnStmt.parse` DOES consume the semicolon from the token list.
+```java
+if (list.now().getType().equals(TokenType.Type.SEMICN)) {
+    list.next(); // Consumes it
+}
+```
+
+So if parsing succeeds, the token is consumed. The `toString` just prints the string representation of a static `semicn` token.
+
+If parsing FAILED to consume the semicolon (e.g. error path), but still returned a `ReturnStmt` object?
+In `ReturnStmt.parse`:
+```java
+} else {
+    ErrorList.addError(list.before().getLine(),'i');
+}
+```
+It adds error but doesn't consume. But it returns `new ReturnStmt(r,exp)`.
+If this happens, `toString` prints semicolon. Token list still has semicolon.
+Next `BlockItem` parses `;` as `ExpStmt`.
+`ExpStmt` consumes `;`. `ExpStmt.toString` prints semicolon.
+Result: Double semicolon, Double `<Stmt>`.
+
+Why would `ReturnStmt.parse` fail to consume the semicolon?
+Only if `list.now()` is NOT `SEMICN` after parsing `Exp`.
+
+In our case, `Exp` is `a[1]+...`.
+After `Exp.parse`, `list.now()` SHOULD be `SEMICN`.
+
+Is it possible that `Exp.parse` is consuming the semicolon?
+`Exp` -> `AddExp`.
+`AddExp` -> `MulExp` ...
+None of these consume `SEMICN`.
+
+Is it possible that `LVal` inside `Exp` is consuming too much?
+No.
+
+Let's look at `ReturnStmt.parse` logic for `IDENFR` again.
+```java
+} else if (first.getType().equals(TokenType.Type.IDENFR)) {
+    //可能是LVal
+    //防止是assignStmt或者getIntCharStmt
+    int pos = list.getPos();
+    LVal tmp = LVal.parse(list);
+    if (!list.now().getType().equals(TokenType.Type.ASSIGN)) {
+        //说明肯定不是assignStmt或者getIntCharStmt
+        list.setPos(pos);
+        exp = Exp.parse(list);
+    } else {
+        //说明不是exp,属于exp和;都缺少
+        list.setPos(pos);
+        ErrorList.addError(list.before().getLine(),'i');
+    }
+}
+```
+
+If `LVal.parse` consumes `a[1]`, `list.now()` is `+`.
+`+` is not `ASSIGN`.
+So it resets to `pos` (start of `a`).
+Calls `Exp.parse(list)`.
+`Exp.parse` parses `a[1]+...`.
+After `Exp.parse`, `list.now()` is `;`.
+
+Then:
+```java
+if (list.now().getType().equals(TokenType.Type.SEMICN)) {
+    list.next();
+} else {
+    ErrorList.addError(list.before().getLine(),'i');
+}
+```
+It should consume `;`.
+
+Is there any other path?
+What if `first` was NOT `IDENFR`?
+`first` is `a` (`IDENFR`).
+
+What if `ReturnStmt.parse` is NOT called?
+In `Stmt.parse`:
+```java
+} else if (first.getType().equals(TokenType.Type.RETURNTK)) {
+    returnStmt = ReturnStmt.parse(list);
+}
+```
+It is called.
+
+Let's check `Stmt.parse` again. Is it possible that `Stmt.parse` is called, returns, and then `Stmt.parse` is called AGAIN?
+
+Look at `BlockItem.parse`.
+```java
+} else {
+    //System.out.println("BlockItem : Stmt  " + list.now() + list.getAheadOne(1) + list.getAheadOne(2));
+    return new BlockItem(Stmt.parse(list));
+}
+```
+Only called once per item.
+
+Look at `Block.parse`.
+```java
+while (!list.now().getType().equals(TokenType.Type.RBRACE)) {
+    items.add(BlockItem.parse(list));
+}
+```
+
+If `ReturnStmt` consumed `;`, `list.now()` is `}`. Loop ends.
+If `ReturnStmt` DID NOT consume `;`, `list.now()` is `;`. Loop continues.
+Next `BlockItem.parse` sees `;`.
+`Stmt.parse` sees `;`.
+`ExpStmt.parse` consumes `;`.
+`ExpStmt` creates empty exp.
+`ExpStmt.toString` prints `;`.
+`Stmt.toString` prints `<Stmt>`.
+
+So the bug is definitely that `ReturnStmt.parse` is NOT consuming the semicolon.
+
+Why?
+
+Let's look at `ReturnStmt.parse` very carefully.
+
+```java
+public static ReturnStmt parse(TokenList list) {
+    if (list.now().getType().equals(TokenType.Type.RETURNTK)) {
+        Token r = list.now();
+        list.next();
+        Exp exp = null;
+        Token first = list.now();
+        //System.out.println("Return first: " + first.toString());
+        if (list.now().getType().equals(TokenType.Type.SEMICN)) {
+            list.next();
+        } else if (first.getType().equals(TokenType.Type.LPARENT) ||
+                first.getType().equals(TokenType.Type.INTCON) ||
+                first.getType().equals(TokenType.Type.CHRCON) ||
+                (first.getType().equals(TokenType.Type.IDENFR) && list.hasAhead(1)
+                        && list.getAheadOne(1).getType().equals(TokenType.Type.LPARENT)) ||
+                first.getType().equals(TokenType.Type.PLUS) ||
+                first.getType().equals(TokenType.Type.MINU) ||
+                first.getType().equals(TokenType.Type.NOT)){
+            //exp打头不是LVal的情况
+            exp = Exp.parse(list);
+            if (list.now().getType().equals(TokenType.Type.SEMICN)) {
+                list.next();
+            } else {
+                ErrorList.addError(list.before().getLine(),'i');
+            }
+        } else if (first.getType().equals(TokenType.Type.IDENFR)) {
+            //可能是LVal
+            //防止是assignStmt或者getIntCharStmt
+            int pos = list.getPos();
+            LVal tmp = LVal.parse(list);
+            if (!list.now().getType().equals(TokenType.Type.ASSIGN)) {
+                //说明肯定不是assignStmt或者getIntCharStmt
+                list.setPos(pos);
+                exp = Exp.parse(list);
+            } else {
+                //说明不是exp,属于exp和;都缺少
+                list.setPos(pos);
+                ErrorList.addError(list.before().getLine(),'i');
+            }
+        } else {
+            //Exp和;均不存在
+            ErrorList.addError(list.before().getLine(),'i');
+        }
+        return new ReturnStmt(r,exp);
+    } else {
+        System.err.println("Error:ReturnStmt cannot find return");
+        return null;
+    }
+}
+```
+
+The logic for `IDENFR` (which `a` is) does NOT consume the semicolon!
+Look at the `else if (first.getType().equals(TokenType.Type.IDENFR))` block.
+It parses `Exp`.
+But it DOES NOT have code to consume the semicolon afterwards!
+
+The `if (list.now().getType().equals(TokenType.Type.SEMICN))` check is ONLY in the first `if` (empty return) and the first `else if` (non-LVal exp).
+
+The `IDENFR` block (LVal exp) parses `Exp` but forgets to consume the trailing semicolon.
+
+<fronted/parser/statement/ReturnStmt.java>
+...
+        } else if (first.getType().equals(TokenType.Type.IDENFR)) {
+            //可能是LVal
+            //防止是assignStmt或者getIntCharStmt
+            int pos = list.getPos();
+            LVal tmp = LVal.parse(list);
+            if (!list.now().getType().equals(TokenType.Type.ASSIGN)) {
+                //说明肯定不是assignStmt或者getIntCharStmt
+                list.setPos(pos);
+                exp = Exp.parse(list);
+            } else {
+                //说明不是exp,属于exp和;都缺少
+                list.setPos(pos);
+                ErrorList.addError(list.before().getLine(),'i');
+            }
+        } else {
+...

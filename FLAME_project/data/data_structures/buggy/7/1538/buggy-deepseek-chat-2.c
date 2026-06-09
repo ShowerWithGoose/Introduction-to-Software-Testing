@@ -1,0 +1,43 @@
+#include<stdio.h>
+#include<stdlib.h>
+typedef struct bst
+{
+    int data;
+    struct bst *left,*right;
+}tree;
+typedef tree *treenode;
+treenode insert(treenode p,int data){
+    if(p==NULL){
+        p=(treenode)malloc(sizeof(tree));
+        p->data=data;
+        p->left=NULL;
+        p->right=NULL;
+    }
+    else if(data<p->data){
+        p->left=insert(p->left,data);
+    }
+    else if(data>=p->data){
+        p->right=insert(p->right,data);
+    }
+    return p;
+}
+void search(treenode p,int height){
+    if(p->left==NULL&&p->right==NULL){
+        printf("%d %d\n",p->data,height);
+    }
+    else{
+        search(p->left,height+1); // @@ [When p->left is NULL, this will cause a segmentation fault because it tries to access NULL->left in the next recursive call]
+        search(p->right,height+1); // @@ [When p->right is NULL, this will cause a segmentation fault because it tries to access NULL->right in the next recursive call]
+    }
+}
+int main(){
+    treenode root=NULL;
+    int n,m;
+    scanf("%d",&n);
+    for(int i=0;i<n;i++){
+        scanf("%d",&m);
+        root=insert(root,m);
+    }
+    int h=1;
+    search(root,h);
+}

@@ -1,0 +1,280 @@
+**Summary of Analysis:**
+
+1.  **Problem**: The program encounters a "Time Limit Exceeded" error. This typically indicates an infinite loop in the parsing logic, especially when handling erroneous input where the parser fails to consume tokens or advance correctly.
+2.  **Test Case**: The input contains syntax errors, specifically missing right parentheses `)` in expressions and statements (e.g., `int i = (1 + ... );`, `if (3 > 0 {`, `i = (((((f(str)))));`).
+3.  **Expected Output**: The parser should detect these missing `)` errors (error code `j`) at lines 13, 15, and 20.
+4.  **Code Analysis**:
+    *   In `Parser.java`, the `PrimaryExp()` method handles parenthesized expressions `( Exp )`.
+    *   When a closing `)` is missing, it sets an error but crucially **does not call `next()`** to advance the lexer position past the expected `)`. It returns immediately.
+    *   The caller, often `UnaryExp()` or indirectly `Exp()`, continues. Since the token stream hasn't advanced past the point where `)` was expected (likely staying on an operator or identifier that caused the confusion or just stuck), and subsequent parsing rules might not consume the current token if they don't match, the parser can get stuck in a loop or fail to progress through the token list, leading to TLE or incorrect behavior.
+    *   Specifically, look at `PrimaryExp()`:
+        ```java
+        if (now() == Lexer.Type.LPARENT) {
+            // ...
+            primaryExp.add(Exp()); // Exp
+            if (now() == Lexer.Type.RPARENT) {
+                primaryExp.add(new Leaf(now(), nowContent())); // )
+            } else {
+                isError = true;
+                back(); // This backs up one token from where Exp() left off.
+                errorLine.add(lineNum());
+                errorType.add('j');
+            }
+            next(); // This advances only if RPARENT was found? No, next() is outside the if-else.
+            return primaryExp;
+        }
+        ```
+        Wait, `next()` is called regardless. Let's trace carefully.
+        If `RPARENT` is missing:
+        1. `Exp()` parses as much as it can.
+        2. `now()` is not `RPARENT`.
+        3. `isError = true`.
+        4. `back()` is called. This moves the lexer position back by one.
+        5. Error recorded.
+        6. `next()` is called. This moves the lexer position forward by one.
+        
+        So effectively, the position stays where `Exp()` left off. If `Exp()` consumed tokens up to the end of the valid expression, the parser is now positioned at the first token that *wasn't* part of the expression (e.g., `;` or `}`).
+        
+        However, let's look at `UnaryExp()`:
+        ```java
+        public Branch UnaryExp() {
+            Branch unaryExp = new Branch("UnaryExp");
+            if (now() == Lexer.Type.IDENFR && preRead() == Lexer.Type.LPARENT) {
+                 // Function call handling
+                 // ...
+                 if (now() == Lexer.Type.RPARENT) {
+                     unaryExp.add(new Leaf(now(), nowContent()));
+                 } else {
+                     isError = true;
+                     back();
+                     errorLine.add(lineNum());
+                     errorType.add('j');
+                 }
+                 next();
+                 return unaryExp;
+            }
+            // ...
+        }
+        ```
+        
+        The real issue often lies in how `Exp()` and its sub-components handle errors and whether they consume tokens appropriately to allow the parent rule to recover.
+        
+        Let's look at the specific error case: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);`
+        The inner `(4-5)` is fine. The outer `(1 + ... + 7` is missing `)`.
+        `PrimaryExp` sees `(`. Calls `Exp()`. `Exp()` parses `1 + ... + 7`. Next token is `;`.
+        `PrimaryExp` checks for `)`. It's `;`. Error `j`. `back()`. `next()`. Position is at `;`.
+        Returns to `UnaryExp` (which called `PrimaryExp`). `UnaryExp` returns.
+        Returns to `MulExp`/`AddExp`. They finish.
+        Returns to `Exp`.
+        Returns to `Stmt` (assignment).
+        `Stmt` expects `;`. It sees `;`. Consumes it.
+        This seems okay for the first error.
+        
+        Why TLE?
+        Look at `CompUnit`:
+        ```java
+        while (true) {
+            while (now() == Lexer.Type.INTTK) {
+               // ...
+            }
+            // ...
+        }
+        ```
+        If the parser gets into a state where `now()` is not consumed and doesn't match any expected token in the loops, it might spin.
+        
+        However, a common cause for TLE in recursive descent parsers with error recovery is **left recursion** or **failure to advance** in a `while` loop when an error occurs.
+        
+        Let's look at `Block()`:
+        ```java
+        while (now() != Lexer.Type.RBRACE) {
+            if (now() == Lexer.Type.CONSTTK) {
+                block.add(ConstDecl());
+            } else if (now() == Lexer.Type.INTTK || now() == Lexer.Type.CHARTK) {
+                block.add(VarDecl());
+            } else {
+                block.add(Stmt());
+            }
+        }
+        ```
+        If `Stmt()` encounters an error and fails to consume any tokens (or consumes fewer than expected such that the state repeats), this loop will run forever.
+        
+        Consider the `if` statement error: `if (3 > 0 {`
+        1. `Stmt` sees `IFTK`.
+        2. Consumes `if`, `(`.
+        3. Calls `Cond()`. `Cond` parses `3 > 0`. Next token is `{`.
+        4. Back in `Stmt`: checks for `)`. It is `{`.
+        5. Error `j`. `back()`. `next()`. Position is at `{`.
+        6. Calls `Stmt()` recursively for the body.
+        7. Inner `Stmt` sees `{`. Calls `Block()`.
+        8. `Block` consumes `{`.
+        9. Inside `Block`, `now()` is `g` (IDENFR).
+        10. `Stmt()` is called. Parses `g(...);`.
+        11. `Block` loop continues. `now()` is `}`. Loop ends.
+        12. `Block` consumes `}`.
+        13. Returns to outer `Stmt`.
+        14. Outer `Stmt` finishes.
+        
+        This also seems to proceed.
+        
+        Let's look closely at `PrimaryExp` again.
+        ```java
+        if (now() == Lexer.Type.LPARENT) {
+            primaryExp.add(new Leaf(now(), nowContent())); // (
+            next(); // Exp
+            primaryExp.add(Exp()); // Exp
+            if (now() == Lexer.Type.RPARENT) {
+                primaryExp.add(new Leaf(now(), nowContent())); // )
+            } else {
+                isError = true;
+                back();
+                errorLine.add(lineNum());
+                errorType.add('j');
+            }
+            next();
+            return primaryExp;
+        }
+        ```
+        If `Exp()` fails to parse anything (e.g. empty parens `()` which is invalid for `Exp` but valid for some other constructs? No, `Exp` is required).
+        
+        Actually, look at `UnaryExp`:
+        ```java
+        if (now() == Lexer.Type.IDENFR && preRead() == Lexer.Type.LPARENT) {
+             // ...
+             next(); // (
+             unaryExp.add(new Leaf(now(), nowContent())); // (
+             next(); // FuncRParams or ) or error
+             if (now() == Lexer.Type.IDENFR || ...) {
+                 unaryExp.add(FuncRParams());
+             }
+             if (now() == Lexer.Type.RPARENT) {
+                 unaryExp.add(new Leaf(now(), nowContent()));
+             } else {
+                 isError = true;
+                 back();
+                 errorLine.add(lineNum());
+                 errorType.add('j');
+             }
+             next();
+             return unaryExp;
+        }
+        ```
+        
+        There is a subtle bug in `PrimaryExp` and `UnaryExp` regarding `back()` and `next()`.
+        If `Exp()` inside `PrimaryExp` consumes tokens and stops at `;` (because `)` is missing), `back()` moves to the last token of `Exp`, then `next()` moves back to `;`. The parser is now at `;`.
+        
+        However, if `Exp()` encounters an error internally and doesn't advance properly, or if the structure of the code leads to a situation where `now()` doesn't change across iterations in a loop, TLE occurs.
+        
+        Let's look at `CompUnit` again.
+        ```java
+        while (true) {
+            while (now() == Lexer.Type.INTTK) {
+                if (preRead() == Lexer.Type.MAINTK) {
+                    compUnit.add(MainFuncDef());
+                    return compUnit;
+                }
+                if (preRead() == Lexer.Type.IDENFR) {
+                    if (prePreRead() == Lexer.Type.LPARENT) {
+                        compUnit.add(FuncDef());
+                    } else {
+                        compUnit.add(VarDecl());
+                    }
+                }
+            }
+            // ...
+        }
+        ```
+        If `FuncDef()` or `VarDecl()` encounters an error and does not consume the `INTTK` or subsequent tokens correctly, the inner `while (now() == Lexer.Type.INTTK)` might terminate, but the outer `while(true)` might restart. If the token pointer hasn't moved past the problematic area, and it doesn't match `INTTK`, `CHARTK`, `CONSTTK`, or `VOIDTK`, it will loop infinitely doing nothing.
+        
+        In the test case, after `main` function, there are no more global declarations. The file ends. `now()` will likely be null or throw an exception if not handled. But `Lexer` usually handles EOF. If `now()` returns null or a specific EOF type, none of the `while` conditions match. The loop `while(true)` continues indefinitely.
+        
+        **The Fix**: The `CompUnit` loop needs a break condition when EOF is reached or when no progress is made.
+        
+        However, the prompt asks for the location of the error causing the failure on the specific test case. The test case has errors inside `main`.
+        
+        Let's re-read the `PrimaryExp` code.
+        If `Exp()` is called and it parses successfully, `now()` is the token after the expression.
+        If `)` is missing, we record error.
+        
+        Is it possible that `Exp()` itself enters an infinite loop?
+        `Exp` -> `AddExp` -> `MulExp` -> `UnaryExp` -> `PrimaryExp`.
+        
+        Let's look at `MulExp`:
+        ```java
+        while (now() == Lexer.Type.MULT || now() == Lexer.Type.DIV || now() == Lexer.Type.MOD) {
+            // ...
+        }
+        ```
+        If `UnaryExp` doesn't consume tokens, this loops.
+        
+        Let's look at `UnaryExp` again.
+        If `now()` is `IDENFR` and `preRead()` is `LPARENT`, it treats it as a function call.
+        What if `now()` is `IDENFR` and `preRead()` is NOT `LPARENT`? It goes to `PrimaryExp`.
+        `PrimaryExp` sees `IDENFR`, calls `LVal()`.
+        `LVal()` consumes `IDENFR`.
+        So tokens are consumed.
+        
+        The most likely candidate for TLE in student parsers is **missing EOF check in the main compilation unit loop**.
+        
+        In `CompUnit()`:
+        ```java
+        while (true) {
+            while (now() == Lexer.Type.INTTK) { ... }
+            while (now() == Lexer.Type.CHARTK) { ... }
+            while (now() == Lexer.Type.CONSTTK) { ... }
+            while (now() == Lexer.Type.VOIDTK) { ... }
+            // If none of these match, the loop repeats forever.
+        }
+        ```
+        After parsing `MainFuncDef`, the parser returns to `CompUnit`.
+        `MainFuncDef` is called from inside the `INTTK` loop.
+        `MainFuncDef` parses `int main() { ... }`.
+        Inside `main`, there are errors.
+        If the errors are handled locally (recording error but advancing), `MainFuncDef` returns.
+        The `INTTK` loop condition `now() == Lexer.Type.INTTK` is checked.
+        If we are at EOF, `now()` might not be `INTTK`.
+        The loop exits.
+        The next `while` loops check for `CHAR`, `CONST`, `VOID`.
+        If at EOF, they don't match.
+        The outer `while(true)` repeats.
+        Infinite loop.
+
+        Therefore, the error is in `CompUnit` lacking a termination condition.
+
+<frontend/Parser.java>
+...
+    public Branch CompUnit() {
+        Branch compUnit = new Branch("CompUnit");
+        while (true) {
+            while (now() == Lexer.Type.INTTK) {
+                if (preRead() == Lexer.Type.MAINTK) {
+                    compUnit.add(MainFuncDef());
+                    return compUnit;
+                }
+                if (preRead() == Lexer.Type.IDENFR) {
+                    if (prePreRead() == Lexer.Type.LPARENT) {
+                        compUnit.add(FuncDef());
+                    } else {
+                        compUnit.add(VarDecl());
+                    }
+                }
+            }
+            while (now() == Lexer.Type.CHARTK) {
+                if (preRead() == Lexer.Type.IDENFR) {
+                    if (prePreRead() == Lexer.Type.LPARENT) {
+                        compUnit.add(FuncDef());
+                    } else {
+                        compUnit.add(VarDecl());
+                    }
+                }
+            }
+            while (now() == Lexer.Type.CONSTTK) {
+                compUnit.add(ConstDecl());
+                
+            }
+            while (now() == Lexer.Type.VOIDTK) {
+                compUnit.add(FuncDef());
+            }
+            // Missing break or EOF check here causes infinite loop if no tokens match
+        }
+    }
+...

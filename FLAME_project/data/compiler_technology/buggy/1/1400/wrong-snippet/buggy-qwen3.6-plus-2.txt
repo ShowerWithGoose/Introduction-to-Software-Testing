@@ -1,0 +1,844 @@
+Based on the problem description and the test case analysis:
+
+1.  **Test Case Analysis**:
+    *   **Error 1**: `printf("Hello SysY!\n")` is on line 2. It is missing a semicolon. The expected error is `2 i`. The buggy output reports `4 i`.
+    *   **Error 2**: `int a` is on line 9 (counting blank lines and comments as per typical compiler line counting, or specifically looking at the source provided: Line 1 `int main...`, Line 2 `printf...`, Line 3 empty/comment, Line 4 `if...`, Line 5 empty, Line 6 empty, Line 7 `/******/`, Line 8 `;`, Line 9 `int a`). The expected error is `9 i`. The buggy output reports `11 i`.
+    *   **Error 3**: `return 0` is on line 13. Missing semicolon. Expected `13 i`. Buggy output `13 i`. This one is correct.
+
+2.  **Root Cause Identification**:
+    The discrepancy in line numbers for the first two errors suggests that the **Lexer** is incorrectly calculating the `lineNum` for tokens. Specifically, it seems to be skipping lines or incrementing the line counter incorrectly when handling comments or blank lines.
+
+    Let's look at `TokenLexer.java`:
+    *   The `paresToken` method iterates through `source` (lines read from file).
+    *   It has logic to handle multi-line comments (`/* ... */`) and single-line comments (`//`).
+    *   Inside the loop `for (String line : source)`, it increments `lineNum` at the end of the loop iteration: `lineNum++;`.
+    *   However, there are `continue` statements inside the loop that skip the rest of the processing but *do not* skip the final `lineNum++`? No, `continue` jumps to the next iteration, so `lineNum++` at the bottom is executed.
+    *   Let's trace the logic for blank lines and comments carefully.
+
+    ```java
+    public void paresToken() {
+        readLines(); 
+        lineNum = 1;
+        boolean flag = false; 
+        for (String line : source) {
+            if (!flag) { 
+                if (line.contains("/*")) {
+                    flag = !line.contains("*/");
+                    if (!flag) { 
+                        line = removeDoubleComment(line); 
+                    } else {
+                        line = removeOnceComment(line); 
+                    }
+                } else { 
+                    if (line.contains("//")) {
+                        line = removeSingleComment(line);
+                    }
+                }
+                if (isBlank(line)) {
+                    lineNum++; // Increment here
+                    continue;  // Skip to next line, skipping the bottom lineNum++
+                }
+            } else if (line.contains("*/")) {
+                flag = false;
+                line = removeEndComment(line); 
+                if (isBlank(line)) {
+                    lineNum++; // Increment here
+                    continue;  // Skip to next line, skipping the bottom lineNum++
+                }
+            } else {
+                lineNum++; // Increment here
+                continue;  // Skip to next line, skipping the bottom lineNum++
+            }
+            // ... tokenization logic ...
+            lineNum++; // Increment at the end of successful processing
+        }
+    }
+    ```
+
+    The issue lies in how `lineNum` is managed.
+    - If a line is blank or fully commented out, `lineNum` is incremented inside the `if/else` blocks, and then `continue` is called. This means the `lineNum++` at the very end of the loop is **skipped**. This part seems correct for those cases (increment once per line).
+    - However, look at the `else` block for `flag == true` (inside multi-line comment):
+      ```java
+      } else {
+          lineNum++;
+          continue;
+      }
+      ```
+      This handles lines strictly inside a multi-line comment that do *not* contain `*/`. It increments `lineNum` and continues. Correct.
+
+    Let's look at the `if (!flag)` block again.
+    If `line.contains("/*")` is true, and it does NOT contain `*/` (so `flag` becomes true), it calls `removeOnceComment(line)`.
+    `removeOnceComment` returns the substring before `/*`.
+    Then it checks `if (isBlank(line))`. If the part before `/*` is blank, it increments `lineNum` and continues.
+    If the part before `/*` is NOT blank, it proceeds to tokenize the remaining part. Then it hits the final `lineNum++`.
+    
+    Wait, let's look at `removeOnceComment`:
+    ```java
+    public String removeOnceComment(String line) {
+        int commentStart = line.indexOf("/*");
+        return line.substring(0, commentStart);
+    }
+    ```
+    
+    And `removeDoubleComment`:
+    ```java
+    public String removeDoubleComment(String line) {
+        int commentStart = line.indexOf("/*");
+        int commentEnd = line.indexOf("*/");
+        return line.substring(0, commentStart) + line.substring(commentEnd + 2);
+    }
+    ```
+
+    The logic seems generally okay for line counting *if* every line in `source` corresponds to exactly one line in the file. `readLines` reads line by line.
+
+    Let's re-read the input file structure provided in the prompt:
+    ```text
+    int main() {
+        printf("Hello SysY!\n") // error 1
+
+        if (1)
+
+
+        /*********/
+        ;
+        int a // error 2
+
+        for (;;) {}
+
+        return 0 // error 3
+    }
+    ```
+    
+    Line 1: `int main() {`
+    Line 2: `    printf("Hello SysY!\n") // error 1`
+    Line 3: `` (empty)
+    Line 4: `    if (1)`
+    Line 5: `` (empty)
+    Line 6: `` (empty)
+    Line 7: `    /*********/`
+    Line 8: `    ;`
+    Line 9: `    int a // error 2`
+    Line 10: `` (empty)
+    Line 11: `    for (;;) {}`
+    Line 12: `` (empty)
+    Line 13: `    return 0 // error 3`
+    Line 14: `}`
+
+    Expected Errors:
+    - Line 2: missing `;` after printf.
+    - Line 9: missing `;` after `int a`.
+    - Line 13: missing `;` after `return 0`.
+
+    Buggy Output:
+    - `4 i`
+    - `11 i`
+    - `13 i`
+
+    The errors are shifted.
+    Error 1: Expected 2, Got 4. Shift +2.
+    Error 2: Expected 9, Got 11. Shift +2.
+    Error 3: Expected 13, Got 13. Shift 0.
+
+    Why would the first two errors be shifted by +2, but the last one not?
+    
+    Let's look at the `parsePrintfStmt` and `parseVarDecl` vs `parseReturnStmt`.
+    
+    In `parsePrintfStmt`:
+    ```java
+    public Node parsePrintfStmt() {
+        // ...
+        if (curToken.getType() == TokenType.SEMICN) {
+            children.add(new Node(curToken));
+            curToken = tokens.read();
+        } else {
+            Printer.addError("i", tokens.lastToken().getLine());
+        }
+        // ...
+    }
+    ```
+    It uses `tokens.lastToken().getLine()`.
+
+    In `parseVarDecl`:
+    ```java
+    public Node parseVarDecl() {
+        // ...
+        if (curToken.getValue().equals(";")) {
+             // ...
+        } else {
+            Printer.addError("i", tokens.lastToken().getLine());
+        }
+        // ...
+    }
+    ```
+    
+    In `parseReturnStmt`:
+    ```java
+    public Node parseReturnStmt() {
+        // ...
+        if (curToken.getType() == TokenType.SEMICN) {
+            // ...
+        } else {
+            Printer.addError("i", tokens.lastToken().getLine());
+        }
+        // ...
+    }
+    ```
+
+    All use `tokens.lastToken().getLine()`. So the issue is definitely in the Token's line number assignment in the Lexer.
+
+    Let's trace the Lexer's `lineNum` for the first few lines.
+    
+    Initialization: `lineNum = 1`.
+    
+    **Iteration 1 (Line 1: `int main() {`)**:
+    - `flag` is false.
+    - No `/*`, no `//`.
+    - `isBlank` is false.
+    - Tokenizes `int`, `main`, `(`, `)`, `{`. Tokens get `lineNum = 1`.
+    - End of loop: `lineNum++` -> `lineNum` becomes 2.
+
+    **Iteration 2 (Line 2: `    printf("Hello SysY!\n") // error 1`)**:
+    - `flag` is false.
+    - No `/*`.
+    - Contains `//`. `line = removeSingleComment(line)`. `line` becomes `    printf("Hello SysY!\n") `.
+    - `isBlank` is false.
+    - Tokenizes `printf`, `(`, `"..."`, `)`. Tokens get `lineNum = 2`.
+    - End of loop: `lineNum++` -> `lineNum` becomes 3.
+    
+    **Iteration 3 (Line 3: ``)**:
+    - `flag` is false.
+    - No `/*`, no `//`.
+    - `isBlank` is true.
+    - `lineNum++` -> `lineNum` becomes 4.
+    - `continue`.
+
+    **Iteration 4 (Line 4: `    if (1)`)**:
+    - `flag` is false.
+    - ...
+    - Tokenizes `if`, `(`, `1`, `)`. Tokens get `lineNum = 4`.
+    - End of loop: `lineNum++` -> `lineNum` becomes 5.
+
+    Wait, the buggy output says Error 1 is at line 4. But `printf` tokens were assigned line 2.
+    Why would `tokens.lastToken()` return a token with line 4?
+    
+    Ah, look at `parseStmt` in `Parser.java`.
+    
+    ```java
+    public Node parseStmt() {
+        if (curToken.getValue().equals("if")) {
+            return parseIfStmt();
+        } 
+        // ...
+        else if (curToken.getValue().equals("printf")) {
+            return parsePrintfStmt();
+        } 
+        // ...
+    }
+    ```
+    
+    If the parser fails to recognize `printf` as a statement start correctly, or if it consumes tokens incorrectly...
+    
+    Let's look at `parseBlockItem`.
+    ```java
+    public Node parseBlockItem() {
+        ArrayList<Node> children = new ArrayList<>();
+        if (curToken.getValue().equals("int") ||
+                curToken.getValue().equals("char")) {
+            children.add(parseVarDecl());
+        } else if (curToken.getValue().equals("const")) {
+            children.add(parseConstDecl());
+        } else {
+            children.add(parseStmt());
+        }
+        return new Node(children, SyntaxType.BlockItem);
+    }
+    ```
+    
+    In `parseCompUnit`:
+    ```java
+    while (true) {
+        if (curToken == null) break;
+        if (tokens.preRead(1).getType() == TokenType.MAINTK) {
+             node = parseMainFunDef();
+        } 
+        // ...
+    }
+    ```
+    
+    `parseMainFunDef`:
+    ```java
+    public Node parseMainFunDef() {
+        ArrayList<Node> children = new ArrayList<>();
+        //把int main()创建好节点
+        for (int i = 0; i < 3; i++) {
+            children.add(new Node(curToken));
+            curToken = tokens.read();
+        }
+        // curToken is now ')'
+        if (!curToken.getValue().equals(")")) {
+             Printer.addError("j", tokens.lastToken().getLine());
+        } else {
+            children.add(new Node(curToken));
+            curToken = tokens.read(); // curToken is now '{'
+        }
+        Node node = parseBlock(); // Parses the block
+        children.add(node);
+        return new Node(children, SyntaxType.MainFuncDef);
+    }
+    ```
+    
+    `parseBlock`:
+    ```java
+    public Node parseBlock() {
+        ArrayList<Node> children = new ArrayList<>();
+        //{
+        children.add(new Node(curToken)); // Adds '{'
+        curToken = tokens.read(); // curToken is now 'printf'
+        //{BlockItems}
+        while (!curToken.getValue().equals("}")) {
+            children.add(parseBlockItem());
+        }
+        //}
+        children.add(new Node(curToken));
+        curToken = tokens.read();
+        return new Node(children, SyntaxType.Block);
+    }
+    ```
+    
+    So, inside `parseBlockItem`, `curToken` is `printf`.
+    It goes to `else { children.add(parseStmt()); }`.
+    `parseStmt` sees `printf` and calls `parsePrintfStmt`.
+    
+    `parsePrintfStmt`:
+    ```java
+    public Node parsePrintfStmt() {
+        ArrayList<Node> children = new ArrayList<>();
+        children.add(new Node(curToken)); // printf
+        curToken = tokens.read(); // (
+        children.add(new Node(curToken)); // (
+        curToken = tokens.read(); // "..."
+        children.add(new Node(curToken)); // "..."
+        curToken = tokens.read(); // )
+        while (curToken.getType() == TokenType.COMMA) { ... }
+        if (curToken.getType() == TokenType.RPARENT) {
+            children.add(new Node(curToken)); // )
+            curToken = tokens.read(); // Next token after )
+        } else {
+             Printer.addError("j", tokens.lastToken().getLine());
+        }
+        if (curToken.getType() == TokenType.SEMICN) {
+            children.add(new Node(curToken));
+            curToken = tokens.read();
+        } else {
+            Printer.addError("i", tokens.lastToken().getLine());
+        }
+        return new Node(children, SyntaxType.Stmt);
+    }
+    ```
+    
+    After parsing `printf(...)`, `curToken` is read. The next token is likely the newline or the next statement's first token.
+    In the input:
+    `printf("Hello SysY!\n") // error 1`
+    ` ` (empty line)
+    `if (1)`
+    
+    The tokens generated for line 2 are: `PRINTFTK`, `LPARENT`, `STRCON`, `RPARENT`.
+    The next token is `IFTK` from line 4.
+    
+    So when `parsePrintfStmt` checks for `SEMICN`, `curToken` is `IFTK`.
+    It triggers `Printer.addError("i", tokens.lastToken().getLine())`.
+    `tokens.lastToken()` returns the token *before* `curToken` was read?
+    
+    Let's check `TokenList.lastToken()`:
+    ```java
+    public Token lastToken() {
+        if (curPos == tokens.size()) {
+            return tokens.get(curPos - 2);
+        } else {
+            return tokens.get(curPos - 1);
+        }
+    }
+    ```
+    
+    When `parsePrintfStmt` starts:
+    `curToken` is `PRINTFTK`. `curPos` points to the next token (`LPARENT`).
+    
+    1. `children.add(new Node(curToken));` -> Prints `PRINTFTK`.
+    2. `curToken = tokens.read();` -> `curToken` becomes `LPARENT`. `curPos` increments.
+    3. `children.add(new Node(curToken));` -> Prints `LPARENT`.
+    4. `curToken = tokens.read();` -> `curToken` becomes `STRCON`.
+    5. `children.add(new Node(curToken));` -> Prints `STRCON`.
+    6. `curToken = tokens.read();` -> `curToken` becomes `RPARENT`.
+    7. Loop `while (COMMA)` skipped.
+    8. `if (curToken.getType() == TokenType.RPARENT)` is true.
+       `children.add(new Node(curToken));` -> Prints `RPARENT`.
+       `curToken = tokens.read();` -> `curToken` becomes `IFTK` (from line 4).
+    9. `if (curToken.getType() == TokenType.SEMICN)` is false.
+       `Printer.addError("i", tokens.lastToken().getLine());`
+       
+       At this point, `curToken` is `IFTK`. `curPos` has been incremented by the last `read()`.
+       `lastToken()` returns `tokens.get(curPos - 1)`.
+       The token at `curPos - 1` is `RPARENT`.
+       
+       What is the line number of `RPARENT`?
+       It was tokenized in Iteration 2 (Line 2). So its line number should be 2.
+       
+       So why does the output say 4?
+       
+       Let's re-examine the Lexer's line number assignment.
+       
+       Is it possible that `removeSingleComment` or the blank line handling is messing up the `lineNum` variable used during tokenization?
+       
+       In Iteration 2:
+       `lineNum` is 2.
+       Tokens `printf`, `(`, `"..."`, `)` are created with `lineNum = 2`.
+       
+       In Iteration 3 (Empty Line):
+       `lineNum` is 3 at start of loop? No.
+       End of Iteration 2: `lineNum++` makes it 3.
+       Start of Iteration 3: `line` is empty.
+       `!flag` is true.
+       No `/*`, no `//`.
+       `isBlank(line)` is true.
+       `lineNum++` makes it 4.
+       `continue`.
+       
+       Start of Iteration 4 (`if (1)`):
+       `lineNum` is 4.
+       Tokens `if`, `(`, `1`, `)` are created with `lineNum = 4`.
+       
+       So `RPARENT` from `printf` has line 2. `IFTK` has line 4.
+       `lastToken()` returns `RPARENT` (line 2).
+       Error should be 2.
+       
+       BUT the buggy output is 4.
+       
+       This implies that `tokens.lastToken()` is returning `IFTK` or something with line 4?
+       Or `RPARENT` has line 4?
+       
+       If `RPARENT` had line 4, then the Lexer assigned line 4 to tokens on line 2.
+       How could that happen?
+       
+       Look at `paresToken` again.
+       
+       ```java
+       public void paresToken() {
+           readLines(); 
+           lineNum = 1;
+           boolean flag = false; 
+           for (String line : source) {
+               if (!flag) { 
+                   // ...
+                   if (isBlank(line)) {
+                       lineNum++;
+                       continue;
+                   }
+               } 
+               // ...
+               // Tokenization happens here using current lineNum
+               // ...
+               lineNum++;
+           }
+       }
+       ```
+       
+       If `lineNum` is 1 at start.
+       Line 1 processed. `lineNum` becomes 2 at end.
+       Line 2 processed. `lineNum` is 2. Tokens get 2. `lineNum` becomes 3 at end.
+       Line 3 (blank). `lineNum` becomes 4. Continue.
+       Line 4 processed. `lineNum` is 4. Tokens get 4.
+       
+       This logic seems correct for assigning line numbers.
+       
+       So why is the error reported as 4?
+       
+       Maybe `tokens.lastToken()` is not returning what I think it is?
+       
+       Let's look at `parseStmt` again.
+       
+       ```java
+       public Node parseStmt() {
+           // ...
+           else {
+               //保存pos，关掉printer的报错
+               tokens.savePos();
+               Printer.setOff();
+               parseExp();
+               Printer.setOn();
+               //此时如果是LVal那些赋值语句，此时curtOKEN =
+               if (curToken.getValue().equals("=")) {
+                   // ...
+               } else {
+                   curToken = tokens.backSavedPos();
+                   return parseExpStmt();
+               }
+           }
+       }
+       ```
+       
+       Wait! `parseStmt` has a fallback `else` block that tries to parse an `Exp`.
+       
+       Does `printf` match the `if/else if` chain in `parseStmt`?
+       ```java
+       if (curToken.getValue().equals("if")) { ... }
+       else if (curToken.getValue().equals("for")) { ... }
+       else if (curToken.getValue().equals("break")) { ... }
+       else if (curToken.getValue().equals("continue")) { ... }
+       else if (curToken.getValue().equals("return")) { ... }
+       else if (curToken.getValue().equals("printf")) { 
+           return parsePrintfStmt();
+       }
+       else if (curToken.getValue().equals("{")) { ... }
+       else {
+           // Fallback
+       }
+       ```
+       
+       Yes, `printf` is explicitly handled. So it should call `parsePrintfStmt`.
+       
+       Is it possible that `curToken.getValue()` for `printf` is not `"printf"`?
+       `Token` constructor:
+       ```java
+       public Token(String type, String value, int line) {
+           this.type = reserveToTokenType(type);
+           this.value = value;
+           this.line = line;
+       }
+       ```
+       `reserveToTokenType` returns `TokenType.PRINTFTK`.
+       `value` is `"printf"`.
+       
+       So `curToken.getValue().equals("printf")` should be true.
+       
+       Let's look at `parseExpStmt`.
+       
+       ```java
+       public Node parseExpStmt() {
+           ArrayList<Node> children = new ArrayList<>();
+           if (curToken.getType() == TokenType.IDENFR || ... ) {
+               children.add(parseExp());
+           }
+           if (curToken.getValue().equals(";")) {
+               children.add(new Node(curToken));
+               curToken = tokens.read();
+           } else {
+               Printer.addError("i", tokens.lastToken().getLine());
+           }
+           return new Node(children, SyntaxType.Stmt);
+       }
+       ```
+       
+       If `parsePrintfStmt` was NOT called, and instead the `else` block in `parseStmt` was executed:
+       1. `tokens.savePos()` saves position.
+       2. `parseExp()` is called.
+          `parseExp` calls `parseAddExp`, etc.
+          `printf` is an identifier? No, it's `PRINTFTK`.
+          `parsePrimaryExp`:
+          ```java
+          if (curToken.getType() == TokenType.LPARENT) { ... }
+          else if (curToken.getType() == TokenType.INTCON) { ... }
+          else if (curToken.getType() == TokenType.IDENFR) { ... }
+          else if (curToken.getType() == TokenType.CHRCON) { ... }
+          ```
+          `PRINTFTK` is not handled in `parsePrimaryExp`!
+          So `parsePrimaryExp` would likely fail or return an empty node?
+          If `parsePrimaryExp` doesn't consume `printf`, `parseExp` might stall or crash?
+          
+          Actually, if `parseExp` is called on `PRINTFTK`, and `PRINTFTK` is not a valid start of an `Exp` (which starts with `UnaryExp` -> `PrimaryExp`), then `parsePrimaryExp` will likely not consume any token or throw an error?
+          
+          If `parseExp` returns without consuming `printf`, `curToken` is still `printf`.
+          Then `parseStmt` checks `if (curToken.getValue().equals("="))`. False.
+          Else: `curToken = tokens.backSavedPos();`
+          `return parseExpStmt();`
+          
+          `parseExpStmt` checks if `curToken` is start of Exp. `PRINTFTK` is not.
+          So `parseExp()` is NOT called inside `parseExpStmt`.
+          Then it checks `if (curToken.getValue().equals(";"))`. False.
+          Else: `Printer.addError("i", tokens.lastToken().getLine());`
+          
+          `tokens.lastToken()` at this point:
+          `savePos` was called. `backSavedPos` restored `curPos`.
+          `lastToken()` returns `tokens.get(curPos - 1)`.
+          
+          If `curPos` was restored to point to `printf`, then `curPos - 1` is the token BEFORE `printf`.
+          The token before `printf` is `{` (from `main`).
+          `{` is on Line 1.
+          
+          This doesn't explain line 4.
+          
+       Let's reconsider the `parsePrintfStmt` execution.
+       
+       Is it possible that `printf` is being treated as an `IDENFR`?
+       In `TokenLexer`:
+       ```java
+       if (isReservedWord()) {
+           token = new Token(curStr, curStr, lineNum);
+       } else {
+           token = new Token(TokenType.IDENFR, curStr, lineNum);
+       }
+       ```
+       `reserveWords` contains `"printf"`.
+       So `isReservedWord()` is true.
+       `token = new Token("printf", "printf", lineNum)`.
+       Constructor:
+       ```java
+       public Token(String type, String value, int line) {
+           this.type = reserveToTokenType(type); // Returns PRINTFTK
+           this.value = value;
+           this.line = line;
+       }
+       ```
+       So type is `PRINTFTK`. Value is `"printf"`.
+       
+       So `parseStmt` SHOULD enter `parsePrintfStmt`.
+       
+       Why would the error line be 4?
+       
+       Let's look at the `parseIfStmt` which is on Line 4.
+       
+       Input:
+       Line 4: `if (1)`
+       Line 5: empty
+       Line 6: empty
+       Line 7: `/******/`
+       Line 8: `;`
+       
+       `parseIfStmt`:
+       ```java
+       public Node parseIfStmt() {
+           // ...
+           children.add(parseCond());
+           if (curToken.getValue().equals(")")) {
+               children.add(new Node(curToken));
+               curToken = tokens.read();
+           } else {
+               Printer.addError("j", tokens.lastToken().getLine());
+           }
+           children.add(parseStmt()); // Recursive call
+           // ...
+       }
+       ```
+       
+       After parsing `if (1)`, `curToken` is read. Next token is `;` on Line 8?
+       No, wait.
+       Line 4: `if (1)`
+       Tokens: `IFTK`, `LPARENT`, `INTCON(1)`, `RPARENT`.
+       
+       After `parseCond` (which parses `1`), `curToken` is `RPARENT`.
+       `if (curToken.getValue().equals(")"))` is true.
+       `curToken = tokens.read()`. Next token is...
+       
+       What is the next token after `)` on Line 4?
+       Line 5 is empty.
+       Line 6 is empty.
+       Line 7 is `/******/`. This is a comment.
+       Line 8 is `;`.
+       
+       So the next token is `SEMICN` from Line 8.
+       
+       `children.add(parseStmt())`.
+       `parseStmt` sees `;`.
+       None of the `if/else if` match `;`.
+       Goes to `else`.
+       `tokens.savePos()`.
+       `parseExp()`.
+       `;` is not a valid start of Exp.
+       `parseExp` returns.
+       `curToken` is still `;`.
+       `if (curToken.getValue().equals("="))` False.
+       `curToken = tokens.backSavedPos()`.
+       `return parseExpStmt()`.
+       
+       `parseExpStmt`:
+       `curToken` is `;`.
+       Start of Exp check fails.
+       `if (curToken.getValue().equals(";"))` True.
+       Consumes `;`.
+       
+       So `if (1)` is followed by an empty statement `;`.
+       
+       Where is the error `4 i` coming from?
+       
+       The buggy output says `4 i`.
+       Expected `2 i`.
+       
+       If the error for `printf` was reported as 4, it means `tokens.lastToken().getLine()` returned 4.
+       This implies `lastToken()` returned a token from Line 4.
+       
+       In `parsePrintfStmt`, `lastToken()` is called when `;` is missing.
+       `curToken` is `IFTK` (Line 4).
+       `lastToken()` returns `RPARENT` (Line 2).
+       
+       UNLESS `RPARENT` has line number 4.
+       
+       How can `RPARENT` have line number 4?
+       
+       If the Lexer assigned line number 4 to tokens on Line 2.
+       
+       Let's look at the Lexer's `lineNum` initialization and increment again.
+       
+       ```java
+       lineNum = 1;
+       for (String line : source) {
+           // ...
+           lineNum++;
+       }
+       ```
+       
+       If `source` contains fewer lines than expected?
+       Or if `readLines` skips lines?
+       
+       `readLines`:
+       ```java
+       while ((line = reader.readLine()) != null) {
+           source.add(line);
+       }
+       ```
+       Reads all lines.
+       
+       Is it possible that `lineNum` is incremented TWICE for some lines?
+       
+       Look at the `if (!flag)` block.
+       
+       ```java
+       if (!flag) { 
+           if (line.contains("/*")) {
+               // ...
+           } else { 
+               if (line.contains("//")) {
+                   line = removeSingleComment(line);
+               }
+           }
+           if (isBlank(line)) {
+               lineNum++;
+               continue;
+           }
+       }
+       ```
+       
+       If a line is NOT blank, it proceeds to tokenize.
+       Then `lineNum++` at the end.
+       
+       If a line IS blank, `lineNum++` inside, then `continue`.
+       
+       This seems correct. One increment per line.
+       
+       Wait! Look at `removeSingleComment`.
+       
+       ```java
+       public String removeSingleComment(String line) {
+           for (int i = 0; i < line.length(); i++) {
+               if (line.charAt(i) == '/' && line.charAt(i + 1) == '/') {
+                   line = line.substring(0, i);
+                   break;
+               }
+           }
+           return line;
+       }
+       ```
+       
+       If `line` is `    printf("Hello SysY!\n") // error 1`, it returns `    printf("Hello SysY!\n") `.
+       
+       Is it possible that `isBlank` is returning true for Line 2?
+       `    printf("Hello SysY!\n") `. Trimmed is `printf("Hello SysY!\n")`. Not blank.
+       
+       Let's look at the `else` block for `flag == true`.
+       
+       ```java
+       } else if (line.contains("*/")) {
+           flag = false;
+           line = removeEndComment(line); 
+           if (isBlank(line)) {
+               lineNum++;
+               continue;
+           }
+       } else {
+           lineNum++;
+           continue;
+       }
+       ```
+       
+       This handles multi-line comments.
+       
+       Line 7: `    /*********/`
+       `flag` is false.
+       Contains `/*`.
+       `flag = !line.contains("*/")`. Line contains `*/`, so `flag` remains false.
+       `removeDoubleComment(line)`.
+       `commentStart` = index of `/*`.
+       `commentEnd` = index of `*/`.
+       Returns `substring(0, start) + substring(end + 2)`.
+       Result is `    ` (spaces).
+       `isBlank(line)` is true.
+       `lineNum++`.
+       `continue`.
+       
+       So Line 7 increments `lineNum` once.
+       
+       Everything seems correct.
+       
+       Let's look at `TokenList.lastToken()` again.
+       
+       ```java
+       public Token lastToken() {
+           if (curPos == tokens.size()) {
+               return tokens.get(curPos - 2);
+           } else {
+               return tokens.get(curPos - 1);
+           }
+       }
+       ```
+       
+       In `parsePrintfStmt`:
+       `curToken` is `IFTK`.
+       `curPos` is index of `IFTK` + 1?
+       `read()` returns token at `curPos` and increments `curPos`.
+       So if `curToken` is `IFTK`, `curPos` points to the token AFTER `IFTK`.
+       
+       `lastToken()` returns `tokens.get(curPos - 1)`, which is `IFTK`.
+       
+       AH!
+       
+       `tokens.read()` returns `tokens.get(curPos++)`.
+       So if `curToken` holds the result of `read()`, `curPos` has already been incremented past that token.
+       
+       So `curPos - 1` is the index of `curToken` itself!
+       
+       So `tokens.lastToken()` returns `curToken` (the current token), NOT the previous one!
+       
+       In `parsePrintfStmt`:
+       `curToken` is `IFTK` (Line 4).
+       `tokens.lastToken()` returns `IFTK`.
+       `IFTK.getLine()` is 4.
+       
+       So the error is reported as 4.
+       
+       The intention of `lastToken()` in the context of `addError("i", ...)` is to report the line of the token *before* the missing semicolon.
+       The token before the missing semicolon is `RPARENT` (Line 2).
+       
+       But `lastToken()` is implemented to return the *current* token (the one that caused the mismatch), because `curPos` is already past it.
+       
+       Wait, `curToken` is `IFTK`.
+       `curPos` points to the token after `IFTK`.
+       `tokens.get(curPos - 1)` is `IFTK`.
+       
+       So `lastToken()` returns `IFTK`.
+       
+       The code expects `lastToken()` to return the token *before* `curToken`.
+       
+       To get the token before `curToken`, it should be `tokens.get(curPos - 2)`.
+       
+       Let's check the `if (curPos == tokens.size())` branch.
+       If we are at the end, `curPos` is `size`.
+       `curToken` is `null`? No, `read()` returns `null` if `curPos == size`.
+       
+       If `curToken` is not null, `curPos < size`.
+       
+       So `lastToken()` should return `tokens.get(curPos - 2)` to get the previous token.
+       
+       But the implementation returns `tokens.get(curPos - 1)`.
+       
+       This explains why the line number is that of the *next* token (the one that caused the failure to find `;`), rather than the last successfully parsed token.
+       
+       For `printf`, the next token is `if` (Line 4). So error is 4.
+       For `

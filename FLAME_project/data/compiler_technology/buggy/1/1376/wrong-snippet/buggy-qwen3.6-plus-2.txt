@@ -1,0 +1,592 @@
+Based on the problem description, the test case input, and the expected output, the program is failing to correctly identify syntax errors (specifically missing semicolons) and is instead crashing with a Runtime Error.
+
+The core issue lies in how the parser handles error recovery and token consumption when an expected token (like `SEMICN`, `RPARENT`, or `RBRACK`) is missing.
+
+1.  **Error Location Logic**: The `expect` method in `Parser.java` attempts to report errors by looking up the line number of the *previous* token (`current - 1`). However, if `match` fails, `current` has not advanced. If the parser gets stuck in a loop or tries to parse further without consuming the erroneous state, it may lead to infinite recursion or index out of bounds, causing a Runtime Error.
+2.  **Specific Failure in `parseStmt`**: In the `IDENFR` case of `parseStmt`, if an identifier is found but it's not followed by `ASSIGN` (e.g., it's an expression statement like `printf(...)` which starts with an identifier `printf`), the code calls `parseLVal()`. `parseLVal` consumes the identifier. Then, back in `parseStmt`, it checks for `ASSIGN`. If it's not `ASSIGN` (it's `LPARENT` for a function call disguised as an expression statement start, or just an expression), it resets `peekReset(index)`. Wait, `parseLVal` *consumes* the token via `expect(TokenType.IDENFR)`. So `peekReset(index)` restores `current` to before `parseLVal` was called. Then it calls `parseExp()`.
+    *   Let's trace `printf("Hello SysY!\n") // error 1`.
+    *   `parseStmt` sees `PRINTFTK`? No, `printf` is an identifier `IDENFR` in the lexer?
+    *   Looking at `Lexer.java`: `printf` is mapped to `PRINTFTK`.
+    *   So `parseStmt` goes to `case PRINTFTK`.
+    *   It matches `PRINTFTK`, expects `LPARENT`, expects `STRCON`, matches commas/exps, expects `RPARENT`, expects `SEMICN`.
+    *   The input is `printf("Hello SysY!\n")`. There is no semicolon.
+    *   `expect(TokenType.SEMICN)` is called. `match` returns false.
+    *   Inside `expect`: `ErrorTackle.addError(...)` is called. It calculates line number using `ErrorTackle.transTokenPosToLine(current-1)`.
+    *   Crucially, `expect` returns `false`.
+    *   Back in `parseStmt` (case `PRINTFTK`), the code continues execution after `expect(TokenType.SEMICN)`. It does **not** stop or throw an exception. It returns the ASTNode.
+    *   The parser then continues to the next statement.
+    *   The next token is `if`. `parseBlockItem` calls `parseStmt`.
+    *   `parseStmt` sees `IFTK`. Parses `if (1)`.
+    *   Inside `if` parsing: `expect(TokenType.RPARENT)` succeeds. `parseStmt()` is called recursively for the body.
+    *   The next token is `;` (from the line `;` after `if (1)`).
+    *   `parseStmt` sees `SEMICN`. Matches it. Returns empty stmt.
+    *   Back in `if` parsing. Checks for `else`. No else. Returns `IfStmt`.
+    *   Back in `parseBlockItem`. Returns.
+    *   Next token is `int`. `parseBlockItem` calls `parseDecl`.
+    *   `parseVarDecl`. Parses `int a`.
+    *   `parseVarDef`. Parses `a`.
+    *   Back in `parseVarDecl`. Loop for comma? No.
+    *   `expect(TokenType.SEMICN)`. Current token is `for` (FORTK). Match fails.
+    *   Error `i` added. Line number calculated.
+    *   Returns `VarDecl`.
+    *   Next token is `for`. `parseBlockItem` calls `parseStmt`.
+    *   `parseStmt` sees `FORTK`. Parses `for (;;) {}`.
+    *   Next token is `return`. `parseBlockItem` calls `parseStmt`.
+    *   `parseStmt` sees `RETURNTK`. Parses `return 0`.
+    *   `expect(TokenType.SEMICN)`. Current token is `}`. Match fails.
+    *   Error `i` added.
+    *   Returns `ReturnStmt`.
+    *   Next token is `}`. `parseBlock` expects `RBRACE`. Matches.
+    *   `parseMainFuncDef` returns.
+    *   `parseCompUnit` expects `EOF`. Current token is likely EOF if `}` was consumed?
+    *   Wait, the `Driver` calls `parser.parseCompUnit()`.
+    *   If `expect` doesn't halt parsing, the parser might proceed incorrectly or crash later if it tries to access tokens beyond bounds or if the AST construction fails due to nulls/unexpected states.
+
+However, the prompt says "Runtime Error". This usually implies an unhandled exception, like `IndexOutOfBoundsException` or `NullPointerException`.
+
+Let's look at `ErrorTackle.transTokenPosToLine(current-1)`.
+If `current` is 0, `current-1` is -1. `tokenPosToLine` might not have -1. It returns -1.
+If `current` advances beyond `tokens.size()`, `peekType` returns `EOF`.
+
+The most likely cause of a **Runtime Error** in this specific structure, given that `expect` does not throw an exception but merely records an error and returns false, is that the parser continues to parse invalid structures, potentially leading to infinite recursion or accessing invalid indices in `peekAt` or `tokens.get`.
+
+But there is a more subtle bug in `Parser.java`'s `expect` method and how it interacts with the control flow. If `expect` fails, the parser *continues*. This means the current token is *not consumed*. The next parsing rule will see the same unexpected token. This often leads to infinite loops or repeated error reporting, but eventually, if the parser logic assumes a token was consumed, it might desynchronize.
+
+However, looking closely at `parseAddExp`, `parseMulExp`, etc., they use `peekDisable` and `peekEnable` which modify the `tokens` list in place. This is highly dangerous and non-standard. If an error occurs and parsing continues, the state of `tokens` might be corrupted (some tokens set to `EOF` temporarily). If an exception occurs during this process (e.g., `ConcurrentModificationException` if iterating, or just logical corruption leading to NPE), it crashes.
+
+But the most immediate suspect for "Runtime Error" vs "Wrong Output" is often an uncaught exception.
+In `Driver.java`:
+```java
+String ans = ASTVisitor.astToString(parser.parseCompUnit());
+```
+If `parseCompUnit` throws an exception (e.g. from `expect` if it were designed to throw, but it isn't), or if `astToString` crashes.
+
+Let's look at `ASTVisitor.astToString`.
+It recursively traverses the AST.
+If the parser created a malformed AST (e.g. null children where not expected, or cycles), this could crash.
+
+However, there is a specific issue in `Parser.java` in the `expect` method:
+```java
+    private boolean expect(TokenType type)  {
+        boolean ans = match(type);
+        if (!ans && type == TokenType.RPARENT) {
+            ErrorTackle.addError(new CompilerError(ErrorTackle.transTokenPosToLine(current-1), "j"));
+        }
+        // ...
+        return ans;
+    }
+```
+If `match` fails, `current` is NOT incremented.
+The error line is `transTokenPosToLine(current-1)`.
+If `current` is 0, this is -1.
+If `current` is valid, it points to the token *before* the expected one. This seems correct per spec ("line number corresponds to the line where the last non-terminal before the semicolon is located").
+
+Why Runtime Error?
+Look at `Lexer.java` handling of comments.
+`/* ... */`
+```java
+                    if (c == '*') {
+                        c = next();
+                        while (c != '\0') {
+                            if (c == '*') {
+                                c = next();
+                                if (c == '/') {
+                                    break;
+                                }
+                            }
+                            c = next();
+                        }
+                        return null;
+                    }
+```
+If the comment is not closed properly, `next()` goes past end, returns `\0`. Loop terminates. Returns null. Correct.
+
+Let's look at `Driver.java` again.
+```java
+        String ans = ASTVisitor.astToString(parser.parseCompUnit());
+        // delete the last '\n'
+        ans = ans.substring(0, ans.length() - 1);
+        output(ans);
+```
+If `parseCompUnit` encounters a fatal error and returns `null` or throws, this crashes.
+But `parseCompUnit` doesn't throw.
+
+Is it possible `astToString` crashes?
+If `node` is null.
+In `parsePrimaryExp`:
+```java
+        } else {
+            return new ASTNode(TokenType.VOIDTK, "");
+//            return null;
+            //throw error("Unexpected primary expression: " + peekType());
+        }
+```
+It returns a dummy node.
+
+Let's look at `parseCompUnit`:
+```java
+        while ((peek(TokenType.CONSTTK) || peek(TokenType.INTTK) || peek(TokenType.CHARTK))
+                && peekNext().getType() != TokenType.MAINTK
+                && peekAt(current+2).getType() != TokenType.LPARENT) {
+            decls.add(parseDecl());
+        }
+```
+`peekAt(current+2)` can throw `IndexOutOfBoundsException` if `current + 2 >= tokens.size()`.
+`peekAt` implementation:
+```java
+    private Token peekAt(int index) {
+        if (index < tokens.size()) {
+            return tokens.get(index);
+        }
+        return tokens.get(tokens.size() -1);
+    }
+```
+It handles out of bounds by returning the last token. So no crash there.
+
+Let's look at the `Runtime Error` context. Usually, in these assignments, if the parser doesn't handle errors by stopping or skipping, it might enter an infinite loop, causing a StackOverflowError (which is a Runtime Error) or Time Limit Exceeded. Or it might throw an uncaught exception.
+
+Consider the `parseStmt` case `IDENFR`.
+```java
+            case IDENFR:
+                int index = current;
+                nodes.add(parseLVal());
+                if (peek(TokenType.ASSIGN)) {
+                   // ...
+                }
+                else {
+                    peekReset(index);
+                    ASTNode exprStmt = new ASTNode(NodeType.Stmt,List.of(parseExp(),TokenType.SEMICN));
+                    expect(TokenType.SEMICN);
+                    return exprStmt;
+                }
+```
+If `parseLVal` consumes `Ident`, and it's not an assignment, we reset.
+Then `parseExp()` is called.
+If `parseExp` parses successfully, `expect(SEMICN)` is called.
+If `SEMICN` is missing, error is recorded, `expect` returns false.
+The function returns `exprStmt`.
+The parser continues.
+
+The problem is likely that the program is **not outputting anything to `error.txt`** or crashing before it gets there because `Driver.run` crashes.
+
+Wait, look at `Driver.run`:
+```java
+        String ans = ASTVisitor.astToString(parser.parseCompUnit());
+        // delete the last '\n'
+        ans = ans.substring(0, ans.length() - 1);
+        output(ans);
+//        ASTVisitor visitor = new ASTVisitor(parser.parseCompUnit(), "ASTToString");
+//        visitor.run();
+        ErrorTackle.printErrors(Config.err_path);
+```
+If `ans` is empty or null, `substring` crashes.
+If `parseCompUnit` returns an AST that results in an empty string from `astToString`, `ans.length() - 1` is -1. `substring(0, -1)` throws `StringIndexOutOfBoundsException`.
+
+Why would `astToString` return an empty string?
+If the AST is empty or only contains suppressed nodes (`BlockItem`, `Decl`, `BType`).
+`CompUnit` is not suppressed.
+So `astToString` should output `<CompUnit>\n` at least.
+
+However, if `parseCompUnit` fails to parse anything meaningful due to errors, it might still return a `CompUnit` node.
+
+Let's look closer at `Lexer` and `Parser` interaction with the specific input.
+Input:
+```
+int main() {
+    printf("Hello SysY!\n") // error 1
+
+    if (1)
+
+
+    /*********/
+    ;
+    int a // error 2
+
+    for (;;) {}
+
+    return 0 // error 3
+}
+```
+
+Tokens:
+1. `int` (INTTK)
+2. `main` (MAINTK)
+3. `(` (LPARENT)
+4. `)` (RPARENT)
+5. `{` (LBRACE)
+6. `printf` (PRINTFTK)
+7. `"`...`"` (STRCON)
+8. `)` (RPARENT)
+9. `if` (IFTK)
+10. `(` (LPARENT)
+11. `1` (INTCON)
+12. `)` (RPARENT)
+13. `;` (SEMICN)
+14. `int` (INTTK)
+15. `a` (IDENFR)
+16. `for` (FORTK)
+...
+
+Parsing `MainFuncDef`:
+`expect(INTTK)` -> OK.
+`expect(MAINTK)` -> OK.
+`expect(LPARENT)` -> OK.
+`expect(RPARENT)` -> OK.
+`parseBlock()`:
+  `expect(LBRACE)` -> OK.
+  `while (!peek(RBRACE))`:
+    `parseBlockItem()`:
+      `peek(CONSTTK/INTTK/CHARTK)`? No, it's `PRINTFTK`.
+      `parseStmt()`:
+        `case PRINTFTK`:
+          `match(PRINTFTK)` -> OK.
+          `expect(LPARENT)` -> OK.
+          `expect(STRCON)` -> OK.
+          `match(COMMA)`? No.
+          `expect(RPARENT)` -> OK.
+          `expect(SEMICN)` -> Fail. Token is `IFTK`.
+          Error `i` added. Line of `current-1` (STRCON). Line 2.
+          Returns Stmt.
+    `parseBlockItem()`:
+      `peek(CONSTTK/INTTK/CHARTK)`? No, `IFTK`.
+      `parseStmt()`:
+        `case IFTK`:
+          `match(IFTK)` -> OK.
+          `expect(LPARENT)` -> OK.
+          `parseCond()` -> `parseLOrExp`... parses `1`.
+          `expect(RPARENT)` -> OK.
+          `parseStmt()`:
+             Next token is `;` (SEMICN).
+             `case SEMICN`:
+               `match(SEMICN)` -> OK.
+               Returns Stmt.
+          `match(ELSETK)`? No.
+          Returns Stmt.
+    `parseBlockItem()`:
+      `peek(CONSTTK/INTTK/CHARTK)`? Yes, `INTTK`.
+      `parseDecl()`:
+        `parseVarDecl()`:
+          `parseBType()` -> `INTTK`.
+          `parseVarDef()`:
+             `expect(IDENFR)` -> `a`. OK.
+             `match(LBRACK)`? No.
+             `match(ASSIGN)`? No.
+             Returns VarDef.
+          `match(COMMA)`? No.
+          `expect(SEMICN)` -> Fail. Token is `FORTK`.
+          Error `i` added. Line of `current-1` (IDENFR `a`). Line 9.
+          Returns VarDecl.
+    `parseBlockItem()`:
+      `peek(CONSTTK/INTTK/CHARTK)`? No, `FORTK`.
+      `parseStmt()`:
+        `case FORTK`:
+           ... parses `for (;;) {}`.
+           `expect(RPARENT)` -> OK.
+           `parseStmt()`:
+              `case LBRACE`:
+                 `parseBlock()`:
+                    `expect(LBRACE)` -> OK.
+                    `while (!peek(RBRACE))`: Empty.
+                    `expect(RBRACE)` -> OK.
+                    Returns Block.
+           Returns Stmt.
+    `parseBlockItem()`:
+      `peek(CONSTTK/INTTK/CHARTK)`? No, `RETURNTK`.
+      `parseStmt()`:
+        `case RETURNTK`:
+           `match(RETURNTK)` -> OK.
+           `peek(SEMICN)`? No, `INTCON` (`0`).
+           `parseExp()` -> parses `0`.
+           `expect(SEMICN)` -> Fail. Token is `RBRACE`.
+           Error `i` added. Line of `current-1` (INTCON `0`). Line 13.
+           Returns Stmt.
+    `parseBlockItem()`:
+      `peek(RBRACE)`? Yes.
+      Loop ends.
+  `expect(RBRACE)` -> OK.
+  Returns Block.
+Returns MainFuncDef.
+
+`parseCompUnit` finishes.
+`expect(EOF)`?
+Current token is `EOF`. OK.
+
+So parsing completes without crashing. Errors are recorded.
+`Driver` calls `ASTVisitor.astToString`.
+Then `ans.substring(0, ans.length() - 1)`.
+Then `output(ans)`.
+Then `ErrorTackle.printErrors`.
+
+If the program outputs nothing to `error.txt` or crashes, it might be because `ErrorTackle.printErrors` writes to `Config.err_path`, but `Driver` writes to `Config.out_path`.
+The problem asks for `error.txt` for errors.
+The `Driver` code:
+```java
+        output(ans); // writes to Config.out_path (parser.txt)
+        ErrorTackle.printErrors(Config.err_path); // writes to Config.err_path (error.txt)
+```
+This looks correct.
+
+Why Runtime Error?
+Perhaps `ans` is empty?
+If `astToString` returns `""`, `substring` crashes.
+`astToString` for `CompUnit`:
+```java
+        StringBuilder sb = new StringBuilder();
+        for (Object child : node.getChildren()) {
+            if (child instanceof ASTNode) {
+                sb.append(astToString((ASTNode) child));
+            }
+            else {
+                sb.append(child.toString()).append(" ").append(getWordName((TokenType) child)).append("\n");
+            }
+        }
+        if (node.getType() == NodeType.BlockItem || node.getType() == NodeType.Decl || node.getType() == NodeType.BType) {
+            return sb.toString();
+        }
+        sb.append("<").append(node.getType().toString()).append(">").append("\n");
+        return sb.toString();
+```
+`CompUnit` is not suppressed. It appends `<CompUnit>\n`.
+So `ans` is at least `<CompUnit>\n`. Length > 1. Substring works.
+
+Is it possible `getWordName` returns null or causes issue? No, it returns `""` for default.
+
+Let's look at `Lexer` again.
+`tokenPosToLine` map.
+`ErrorTackle.transTokenPosToLine` uses this map.
+If `current-1` is not in the map, it returns -1.
+`CompilerError` takes -1.
+`printErrors` sorts and prints.
+`-1 i`?
+The expected output is `2 i`, `9 i`, `13 i`.
+
+If the program crashes, it's likely in `astToString` if the AST contains something unexpected.
+Or, is it possible `parseCompUnit` throws an exception?
+No, `expect` catches failures.
+
+Wait! Look at `parseStmt` case `IDENFR` again.
+```java
+            case IDENFR:
+                int index = current;
+                nodes.add(parseLVal());
+                if (peek(TokenType.ASSIGN)) {
+                    // ...
+                }
+                else {
+                    peekReset(index);
+                    ASTNode exprStmt = new ASTNode(NodeType.Stmt,List.of(parseExp(),TokenType.SEMICN));
+                    expect(TokenType.SEMICN);
+                    return exprStmt;
+                }
+```
+If `parseLVal` is called, it consumes `IDENFR`.
+If it's `printf`, `parseLVal` consumes `printf`.
+Then `peek(ASSIGN)` is false.
+`peekReset(index)` resets `current` to before `printf`.
+`parseExp()` is called.
+`parseExp` -> `parseAddExp` -> ... -> `parseUnaryExp`.
+`parseUnaryExp` sees `IDENFR` (`printf`).
+Checks `peekNext()` is `LPARENT`.
+Yes.
+So it treats it as a function call `UnaryExp`.
+`match(IDENFR)`. Consumes `printf`.
+`expect(LPARENT)`. Consumes `(`.
+`parseFuncRParams`. Parses `"Hello..."`.
+`expect(RPARENT)`. Consumes `)`.
+Returns `UnaryExp`.
+Back in `parseExp`. Returns `Exp`.
+Back in `parseStmt`.
+`expect(SEMICN)`. Fails.
+Error recorded.
+Returns `Stmt`.
+
+This path works.
+
+What if the Runtime Error is due to **Stack Overflow**?
+Recursive descent parsers can stack overflow on deeply nested expressions or if there's left recursion.
+The grammar provided is right-recursive or iterative.
+`AddExp -> MulExp | AddExp ('+' | '-') MulExp`.
+The implementation:
+```java
+    private ASTNode parseAddExp()  {
+        int index1=current;
+        ASTNode mulExp = parseMulExp();
+        if (peek(TokenType.PLUS) || peek(TokenType.MINU)) {
+            // ... complex lookahead/backtracking logic ...
+            ASTNode addExp = parseAddExp(); // Recursive call
+            // ...
+        }
+        // ...
+    }
+```
+This implementation uses **left recursion** simulation via backtracking?
+`parseAddExp` calls `parseAddExp` recursively.
+If the input is long or malformed, this could stack overflow.
+However, the input is small.
+
+Let's look at the `peekDisable` logic.
+```java
+    private void peekDisable(int index) {
+        tokens.get(index).setType(TokenType.EOF);
+    }
+```
+This modifies the original `tokens` list.
+`tokensCopy` is used to restore.
+If an error occurs and `expect` returns false, does it restore?
+No. `peekDisable` is only used inside `parseAddExp`, `parseMulExp`, etc.
+If an exception occurs *during* these parsing methods (e.g. `IndexOutOfBounds` in `peekAt` or `tokens.get`), it crashes.
+
+But the most likely candidate for a simple "Runtime Error" in a student submission that otherwise looks logically structured for error recording is that **the program crashes when trying to write the output or errors because of a null pointer or index issue**.
+
+Check `ErrorTackle.printErrors`:
+```java
+        errors.sort((o1, o2) -> {
+            if (o1.getIndex() == o2.getIndex()) {
+                return 0;
+            }
+            return o1.getIndex() < o2.getIndex() ? -1 : 1;
+        });
+```
+If `errors` is null? No, initialized.
+
+Check `Driver.output`:
+```java
+        Files.write(Paths.get(Config.out_path), content.getBytes());
+```
+If `content` is null? `ans` is not null.
+
+Is it possible `Config.err_path` is not set correctly?
+`Compiler.java` sets it if `-e` is passed.
+If not passed, it defaults to `error.txt`.
+
+Let's assume the Runtime Error is caused by `astToString` encountering a `null` node.
+In `parsePrimaryExp`:
+```java
+        } else {
+            return new ASTNode(TokenType.VOIDTK, "");
+        }
+```
+Not null.
+
+In `parseUnaryOp`:
+```java
+        return new ASTNode(NodeType.UnaryOp,List.of(TokenType.PLUS));
+```
+Not null.
+
+There is one suspicious thing in `Parser.java`.
+`parseCompUnit`:
+```java
+        while ((peek(TokenType.CONSTTK) || peek(TokenType.INTTK) || peek(TokenType.CHARTK))
+                && peekNext().getType() != TokenType.MAINTK
+                && peekAt(current+2).getType() != TokenType.LPARENT) {
+            decls.add(parseDecl());
+        }
+```
+If `tokens` is empty? `peek` returns `EOF`. Loop doesn't run.
+`isFuncDefStart`?
+`parseMainFuncDef`?
+If `MainFuncDef` is missing? `expect` will fail repeatedly?
+
+Actually, look at `parseMainFuncDef`.
+```java
+    private ASTNode parseMainFuncDef()  {
+        ArrayList<Object> nodes = new ArrayList<>();
+        expect(TokenType.INTTK);
+        expect(TokenType.MAINTK);
+        expect(TokenType.LPARENT);
+        expect(TokenType.RPARENT);
+        nodes.add(TokenType.INTTK);
+        nodes.add(TokenType.MAINTK);
+        nodes.add(TokenType.LPARENT);
+        nodes.add(TokenType.RPARENT);
+        nodes.add(parseBlock());
+        return new ASTNode(NodeType.MainFuncDef,nodes);
+    }
+```
+It adds `TokenType.INTTK` etc to `nodes`.
+`astToString`:
+```java
+            else {
+                sb.append(child.toString()).append(" ").append(getWordName((TokenType) child)).append("\n");
+            }
+```
+`child.toString()` for `TokenType.INTTK`?
+`TokenType` enum doesn't override `toString` to return the keyword. It returns the enum name `INTTK`.
+`getWordName` returns `int`.
+Output: `INTTK int`.
+This matches expected format?
+Expected output for correct programs: `word category code word's character/string form`.
+`INTTK` is the category code? No, `INTTK` is the enum. The problem says "word category code".
+In `Lexer`, `TokenType` IS the category code essentially.
+So `INTTK int` is likely correct for lexical output.
+
+The error is likely in the **error reporting line number calculation** or **crash due to missing error handling in `expect` leading to bad AST**.
+
+However, since I must identify the location of the error based on "Runtime Error", and the code seems to handle errors gracefully by recording them, the crash is likely in `Driver` or `ASTVisitor`.
+
+One common runtime error: `StringIndexOutOfBoundsException` in `Driver.run`:
+```java
+        ans = ans.substring(0, ans.length() - 1);
+```
+If `ans` is empty.
+
+Why would `ans` be empty?
+If `parser.parseCompUnit()` returns an AST that `astToString` converts to `""`.
+This happens if `CompUnit` has no children?
+`decls` has `MainFuncDef`.
+`MainFuncDef` has children.
+`astToString` appends `<CompUnit>\n`.
+So `ans` is not empty.
+
+Unless... `parseCompUnit` throws an exception.
+If `expect(TokenType.EOF)` fails?
+It adds an error. Returns `compUnit`.
+
+I will bet on the `expect` method not halting parsing, leading to a corrupted state or infinite loop in specific edge cases, OR the `substring` crash if `ans` is somehow empty (e.g. if `CompUnit` output is suppressed? No, it's not in the exclusion list).
+
+Actually, look at `ASTVisitor.astToString` exclusion list:
+```java
+        if (node.getType() == NodeType.BlockItem || node.getType() == NodeType.Decl || node.getType() == NodeType.BType) {
+            return sb.toString();
+        }
+```
+`CompUnit` is NOT excluded.
+
+I will highlight the `expect` method in `Parser.java` as the likely source of logical errors leading to runtime issues (by not stopping parsing), and the `Driver.java` substring operation as the crash point if the output is empty.
+
+<front_end/parser/Parser.java>
+...
+    // 辅助方法：期望当前Token匹配指定类型，否则抛出异常
+    private boolean expect(TokenType type)  {
+        boolean ans = match(type);
+        if (!ans && type == TokenType.RPARENT) {
+            ErrorTackle.addError(new CompilerError(ErrorTackle.transTokenPosToLine(current-1), "j"));
+        }
+        if (!ans && type == TokenType.SEMICN) {
+            ErrorTackle.addError(new CompilerError(ErrorTackle.transTokenPosToLine(current-1), "i"));
+        }
+        if (!ans && type == TokenType.RBRACK) {
+            ErrorTackle.addError(new CompilerError(ErrorTackle.transTokenPosToLine(current-1), "k"));
+        }
+        return ans;
+        //throw error("Expected token " + type + " but found " + peekType());
+    }
+...
+
+<Start/Driver.java>
+...
+    public void run() {
+        String input = input(Config.in_path);
+        Lexer lexer = new Lexer(input);
+//        output(lexer.toString());
+        Parser parser = new Parser(lexer);
+        String ans = ASTVisitor.astToString(parser.parseCompUnit());
+        // delete the last '\n'
+        ans = ans.substring(0, ans.length() - 1);
+        output(ans);
+//        ASTVisitor visitor = new ASTVisitor(parser.parseCompUnit(), "ASTToString");
+//        visitor.run();
+        ErrorTackle.printErrors(Config.err_path);
+    }
+...

@@ -1,0 +1,643 @@
+Based on the test case and expected vs actual output, the program is missing two error reports:
+1. Line 16: missing ')' in `ch = getchar( ;`
+2. Line 19: missing ')' in `printf("%c",s[0];`
+
+The actual output only shows line 18 error 'a' (for `&` instead of `&&`).
+
+Looking at the code, the issue is in the `StmtLValGetchar.analyse()` method which handles `getchar()` calls. It uses `tryReadnext(1, ")", Errortype.j)` to check for closing parenthesis, but this method doesn't properly handle the case where the parenthesis is missing AND there's a syntax error on the same line.
+
+Similarly, the `StmtPrintf.analyse()` method has the same issue with missing closing parenthesis.
+
+However, the core problem appears to be in the `Utils.tryReadnext()` method. When it detects a missing token, it adds an error but returns null without advancing the cursor. This can cause subsequent parsing to fail or skip error detection.
+
+But looking more carefully at the test case:
+- Line 16: `ch = getchar( ;` - missing ')'
+- Line 18: `if (f2() & f1())` - has '&' instead of '&&' 
+- Line 19: `printf("%c",s[0];` - missing ')'
+
+The lexer should have already caught the '&' error (which it did), but the parser is not catching the missing ')' errors.
+
+Looking at the `StmtLValGetchar.analyse()` method:
+
+<src/AST/STMT/StmtLValGetchar.java>
+...
+    public StmtLValGetchar analyse() {
+        this.lVal = new LVal().analyse();
+        this.assign = utils.read("=");
+        this.wordGetchar = utils.read("getchar");
+        this.lParent = utils.read("(");
+        this.rParent = utils.tryReadnext(1, ")", Errortype.j);
+        this.semicolon = utils.tryReadnext(1, ";", Errortype.i);
+        return this;
+    }
+...
+
+The issue is that `tryReadnext(1, ")", Errortype.j)` checks if the next token is ")", but in the input `ch = getchar( ;`, after reading "(" the next token is ";" not ")". So it should detect the missing ")" and report error 'j'.
+
+Similarly for `StmtPrintf`:
+
+<src/AST/STMT/StmtPrintf.java>
+...
+    public StmtPrintf analyse() {
+        this.printf = utils.read("printf");
+        this.lParent = utils.read("(");
+        this.StringConst = utils.read("StringConst");
+        if (utils.preRead(1) == WordType.COMMA) {
+            this.haveExp = true;
+            while (utils.preRead(1) == WordType.COMMA) {
+                this.commaList.add(utils.read(","));
+                this.expList.add(new Exp().analyse());
+            }
+        }
+        this.rParent = utils.tryReadnext(1, ")", Errortype.j);
+        this.semicolon = utils.tryReadnext(1, ";", Errortype.i);
+        return this;
+    }
+...
+
+In `printf("%c",s[0];`, after parsing the StringConst and the Exp `s[0]`, the next token is ";" not ")", so it should report error 'j'.
+
+The problem seems to be in the `Utils.tryReadnext()` method implementation:
+
+<src/fronted/SyntaxAnalysis/Utils/Utils.java>
+...
+    public Word tryReadnext(int next, String s, Errortype errortype) {
+        if (!WordList.get(Syntaxcur + next).getWordName().equals(s)) {
+            ErrorList.add(new BaseError(WordList.get(Syntaxcur).getRow(), errortype));
+            //
+            return null;
+        } else {
+            return read(s);
+        }
+    }
+...
+
+This method assumes that `Syntaxcur + next` is always valid, but it doesn't check bounds. More importantly, when it adds an error, it uses `WordList.get(Syntaxcur).getRow()` as the error line, but according to the problem description, for error type 'j' (missing right parenthesis), "the error line number corresponds to the line where the last non-terminal before the right parenthesis is located."
+
+In the case of `getchar(`, the last token before the expected ')' is '(', which is on line 16. But the current implementation uses `WordList.get(Syntaxcur).getRow()` which would be the row of the current token (which might be the ';' on line 16).
+
+Actually, looking at the test input:
+```
+    ch = getchar( ; // error 1
+```
+
+The tokens would be:
+- ch (line 16)
+- = (line 16) 
+- getchar (line 16)
+- ( (line 16)
+- ; (line 16)
+
+When parsing `getchar(`, after reading '(', Syntaxcur points to the '(' token (line 16). Then `tryReadnext(1, ")", Errortype.j)` checks if the next token (which is ';') equals ")". It doesn't, so it adds an error with row = `WordList.get(Syntaxcur).getRow()` = line 16, which is correct.
+
+So why isn't this error being reported?
+
+Looking at the actual buggy output: only "18 a" is reported, meaning the lexer caught the '&' error on line 18, but the parser didn't catch the missing ')' errors.
+
+Wait, but the problem says this is a "Wrong Answer" error, meaning the program produced some output but it was incorrect. The buggy output shows "18 a" but expected "16 j", "18 a", "19 j".
+
+This suggests that the parser IS running (not terminated by lexer errors), but it's not detecting the missing ')' errors.
+
+Looking more carefully at the `Utils.tryReadnext()` method, there's a critical bug: it doesn't check if `Syntaxcur + next` is within bounds before accessing `WordList.get(Syntaxcur + next)`. If we're at the end of the token list, this would throw an exception.
+
+But more importantly, the logic is flawed. The method should be checking the immediate next token (next=1), but the way it's written assumes that the token at `Syntaxcur + next` exists.
+
+However, the real issue might be in the control flow. Let's trace through the `getchar(` case:
+
+1. Parse `ch` as LVal
+2. Read '=' 
+3. Read 'getchar'
+4. Read '(' - now Syntaxcur points to '(' token
+5. Call `tryReadnext(1, ")", Errortype.j)` - this checks if token at Syntaxcur+1 (which is ';') equals ")"
+6. It doesn't, so add error with row = Syntaxcur.getRow() = line 16
+7. Return null
+
+This should work. So why isn't it reporting the error?
+
+Wait, looking at the `LexicAnalysis.OperatorOrAnnotation()` method, I see that single '&' and '|' are handled:
+
+<src/fronted/LexicAnalysis/LexicAnalysis.java>
+...
+        } else if (curChar == '&') {
+            if (nextChar(false) == '&') {
+                curChar = nextChar(true);
+                wordname = wordname + curChar;
+                AddtoWordList(wordname, WordType.AND);
+            } else {
+                AddtoErrorList(Errortype.a);
+            }
+        } else if (curChar == '|') {
+            if (nextChar(false) == '|') {
+                curChar = nextChar(true);
+                wordname = wordname + curChar;
+                AddtoWordList(wordname, WordType.OR);
+            } else {
+                AddtoErrorList(Errortype.a);
+            }
+...
+
+So the lexer catches the single '&' and reports error 'a'. According to the problem, if there are ANY lexical errors, the program should output to error.txt and NOT do syntax analysis.
+
+Ah! That's the key issue. The lexer finds the '&' error and adds it to ErrorList. Then in `LexicAnalysis.output()`, since ErrorList is not empty, it writes to error.txt and doesn't write lexer.txt.
+
+But then in `Compiler.main()`, it still proceeds to run syntax analysis:
+
+```java
+public static void main(String[] args) throws IOException {
+    ArrayList<String> CodeString = read("testfile.txt");
+    LexicAnalysis lexicAnalysis = LexicAnalysis.getInstance(CodeString);
+    lexicAnalysis.excute();
+    lexicAnalysis.output();  // This writes error.txt if lexer has errors
+    SyntaxAnalysis syntaxAnalysis = new SyntaxAnalysis();
+    syntaxAnalysis.analyse();  // But this still runs!
+    syntaxAnalysis.output();
+}
+```
+
+The problem is that even when the lexer finds errors, the syntax analysis still runs. But according to the problem description, for erroneous source programs, we should only output the errors (to error.txt), not proceed with syntax analysis.
+
+However, looking more carefully at the problem statement: "For an erroneous source program, the program should identify the errors and output the line number of the error and the error category code."
+
+It doesn't specify whether lexical errors should prevent syntax analysis. In fact, the error types 'i', 'j', 'k' are syntax errors, while error type 'a' is detected during lexical analysis.
+
+But the expected output includes both lexical error 'a' AND syntax errors 'j', which suggests that the program should detect ALL errors, both lexical and syntax.
+
+This means the current design is correct - it should collect all errors from both phases.
+
+But then why aren't the syntax errors being detected?
+
+Looking back at the `Utils.tryReadnext()` method:
+
+```java
+public Word tryReadnext(int next, String s, Errortype errortype) {
+    if (!WordList.get(Syntaxcur + next).getWordName().equals(s)) {
+        ErrorList.add(new BaseError(WordList.get(Syntaxcur).getRow(), errortype));
+        //
+        return null;
+    } else {
+        return read(s);
+    }
+}
+```
+
+The issue is that this method assumes `Syntaxcur + next` is always a valid index. But what if we're at the end of the file? It would throw an IndexOutOfBoundsException.
+
+But more critically, in the case where there's a lexical error, the WordList might be incomplete or malformed.
+
+Wait, no - the lexer continues processing even after finding errors. Looking at `LexicAnalysis.AddtoErrorList()`:
+
+```java
+private void AddtoErrorList(Errortype e) {
+    BaseError baseError = new BaseError(curRow + 1, curCol + 1, e);
+    ErrorList.add(baseError);
+    curChar = nextChar(true);
+    //这里必须往后读一位
+}
+```
+
+So it adds the error but continues processing. So WordList should be complete.
+
+Let me re-examine the test case input:
+
+```
+const char Ch='c', s[20] = "hello world"; 
+int global;
+
+int f1() {
+    global = 1;
+    return 1;
+}
+
+int f2() {
+    global = global + 1;
+    return 0;
+}
+
+int main() { 
+    char ch;
+    ch = getchar( ; // error 1
+
+    if (f2() & f1()) { // error 2
+        printf("%c",s[0]; // error 3
+    }
+    return 0;
+}
+```
+
+The errors are:
+1. Line 16: `ch = getchar( ;` - missing ')'
+2. Line 18: `if (f2() & f1())` - '&' should be '&&'
+3. Line 19: `printf("%c",s[0];` - missing ')'
+
+The lexer will catch error 2 (single '&') and add it to ErrorList.
+
+During syntax analysis:
+- When parsing line 16: `ch = getchar( ;`
+  - After reading '(', the next token is ';' 
+  - `tryReadnext(1, ")", Errortype.j)` should detect that ';' != ')' and add error 'j' for line 16
+  
+- When parsing line 19: `printf("%c",s[0];`
+  - After reading the StringConst "%c" and parsing s[0] as Exp, the next token is ';'
+  - `tryReadnext(1, ")", Errortype.j)` should detect that ';' != ')' and add error 'j' for line 19
+
+So the syntax errors should be detected.
+
+But the actual output only shows "18 a", which suggests that syntax analysis either:
+1. Is not running at all, or
+2. Is terminating early due to the lexical error
+
+Looking at `Compiler.main()` again:
+
+```java
+public static void main(String[] args) throws IOException {
+    ArrayList<String> CodeString = read("testfile.txt");
+    LexicAnalysis lexicAnalysis = LexicAnalysis.getInstance(CodeString);
+    lexicAnalysis.excute();
+    lexicAnalysis.output();  // This outputs lexer.txt OR error.txt
+    SyntaxAnalysis syntaxAnalysis = new SyntaxAnalysis();
+    syntaxAnalysis.analyse();
+    syntaxAnalysis.output(); // This outputs parser.txt OR error.txt (appending to existing?)
+}
+```
+
+The issue is that `lexicAnalysis.output()` writes to error.txt if there are lexical errors, and then `syntaxAnalysis.output()` also writes to error.txt, potentially overwriting the previous content.
+
+Looking at the output methods:
+
+`LexicAnalysis.output()`:
+```java
+public void output() throws IOException {
+    if (!ErrorList.isEmpty()) {
+        BufferedWriter errorWriter = new BufferedWriter(new FileWriter("error.txt"));
+        // ... write errors
+    } else {
+        // write lexer.txt
+    }
+}
+```
+
+`SyntaxAnalysis.output()`:
+```java
+public void output() throws IOException {
+    if (!ErrorList.isEmpty()) {
+        // sort errors
+        BufferedWriter errorWriter = new BufferedWriter(new FileWriter("error.txt"));
+        // ... write errors
+    } else {
+        // write parser.txt
+    }
+}
+```
+
+Both are writing to "error.txt" with `new FileWriter("error.txt")`, which **overwrites** the file, not appends!
+
+So the sequence is:
+1. Lexer finds error 'a' on line 18, writes "18 a" to error.txt
+2. Syntax analysis finds errors 'j' on lines 16 and 19, and when it outputs, it overwrites error.txt with just "16 j", "18 a", "19 j"
+
+Wait, but the buggy output is "18 a", which suggests that syntax analysis didn't find any errors, so ErrorList only contains the lexical error.
+
+This means the syntax analysis is not detecting the missing ')' errors.
+
+Let me look more carefully at the `tryReadnext` method. The problem might be that when there's a lexical error, the token stream is corrupted, but that doesn't seem right.
+
+Another possibility: the `Utils.read()` method is failing silently.
+
+Looking at `Utils.read()`:
+
+```java
+public Word read(String s) {
+    if (Syntaxcur + 1 < LexicSize) {
+        if (s.equals(WordList.get(Syntaxcur + 1).getWordName())
+                || (s.equals("Ident") && preRead(1) == WordType.IDENFR)
+                || (s.equals("IntConst") && preRead(1) == WordType.INTCON)
+                || (s.equals("StringConst") && preRead(1) == WordType.STRCON)
+                || (s.equals("CharConst") && preRead(1) == WordType.CHRCON)) {
+            syntaxList.add(WordList.get(Syntaxcur + 1).getWordType() + " " + WordList.get(Syntaxcur + 1).getWordName());
+            Syntaxcur += 1;
+            return WordList.get(Syntaxcur);
+        } else {
+            //方便DeBug
+            System.out.println("cur+1 is :" + (Syntaxcur + 1));
+            System.out.println("s is :" + s);
+            System.out.println("WordList is :" + WordList.get(Syntaxcur + 1).getWordName());
+            System.out.println("Read Wrong");
+            return null;
+        }
+    }
+    return null;
+}
+```
+
+If `read()` returns null, the calling code might not handle it properly and could crash or skip further parsing.
+
+But in `StmtLValGetchar.analyse()`:
+
+```java
+public StmtLValGetchar analyse() {
+    this.lVal = new LVal().analyse();
+    this.assign = utils.read("=");
+    this.wordGetchar = utils.read("getchar");
+    this.lParent = utils.read("(");
+    this.rParent = utils.tryReadnext(1, ")", Errortype.j);
+    this.semicolon = utils.tryReadnext(1, ";", Errortype.i);
+    return this;
+}
+```
+
+If any of the `read()` calls return null, it would cause a NullPointerException when trying to access fields, but the code doesn't show any null checks.
+
+However, in the test case, the tokens "=", "getchar", "(" should all be present and correctly parsed, so `read()` should succeed.
+
+The real issue might be in the `tryReadnext` method's logic. Let's trace through the `getchar(` case:
+
+- After `utils.read("(")`, Syntaxcur points to the "(" token (line 16)
+- `utils.tryReadnext(1, ")", Errortype.j)` is called
+- This checks if `WordList.get(Syntaxcur + 1).getWordName().equals(")")`
+- `Syntaxcur + 1` points to the ";" token
+- ";" != ")", so it adds `new BaseError(WordList.get(Syntaxcur).getRow(), Errortype.j)`
+- `WordList.get(Syntaxcur).getRow()` is the row of "(", which is line 16 ✓
+
+This should work.
+
+But wait! Looking at the `BaseError` constructor in `Utils.tryReadnext()`:
+
+```java
+ErrorList.add(new BaseError(WordList.get(Syntaxcur).getRow(), errortype));
+```
+
+But the `BaseError` class has two constructors:
+
+```java
+public BaseError(int row, int col, Errortype errortype) {
+    this.row = row;
+    this.col = col;
+    this.errortype = errortype;
+}
+
+public BaseError(int row, Errortype errortype) {
+    this.row = row;
+    this.col = -1;
+    this.errortype = errortype;
+}
+```
+
+So this should create a BaseError with the correct row.
+
+I think the issue might be elsewhere. Let me check the `StmtLValGetchar` parsing logic.
+
+Actually, looking at the test input again:
+```
+    ch = getchar( ; // error 1
+```
+
+The issue is that after the "(", there's a ";" immediately. But the parser expects either ")" or possibly some parameters.
+
+However, `getchar()` takes no parameters, so after "(", it should immediately see ")".
+
+The parsing should be:
+1. Read "ch" as Ident
+2. Read "="  
+3. Read "getchar"
+4. Read "("
+5. Expect ")" next, but find ";" instead → error 'j'
+
+This seems correct.
+
+Now for the printf case:
+```
+        printf("%c",s[0]; // error 3
+```
+
+Parsing:
+1. Read "printf"
+2. Read "("
+3. Read StringConst "%c"
+4. See "," so parse Exp: s[0]
+   - Read "s" as Ident
+   - Read "[" 
+   - Parse Exp for array index: "0"
+   - Expect "]" but... wait, in this case, is there a missing "]" too?
+
+Looking at the input: `s[0];` - this actually has the "]"! The input shows `s[0];`, so it should be:
+- s (Ident)
+- [ (LBRACK)  
+- 0 (INTCON)
+- ] (RBRACK)
+- ; (SEMICN)
+
+So the tokens for the printf line would be:
+printf, (, "%c", ,, s, [, 0, ], ;
+
+So after parsing the Exp `s[0]`, the next token is ";", but we expect ")" for the printf call.
+
+So `tryReadnext(1, ")", Errortype.j)` should detect that ";" != ")" and report error 'j'.
+
+This should work.
+
+Given that the expected output includes both the lexical error and the syntax errors, but the actual output only shows the lexical error, I suspect the issue is that when the lexer finds an error, the syntax analysis either doesn't run or terminates early.
+
+But looking at the `Compiler.main()` method, syntax analysis does run regardless.
+
+Wait, another possibility: the `Utils.preRead()` method returns null when out of bounds, and this null is not handled properly in the parsing logic, causing early termination.
+
+For example, in `StmtLValGetchar.analyse()`, when it calls `utils.read("(")`, if that succeeds, then `tryReadnext(1, ")", ...)` is called. But if the file ends right after "(", then `Syntaxcur + 1` would be out of bounds.
+
+But in our case, there is a ";" after "(", so it should be in bounds.
+
+I think the most likely issue is in the `Utils.tryReadnext()` method's bounds checking. It doesn't verify that `Syntaxcur + next` is within the valid range before accessing the WordList.
+
+Let's fix that:
+
+But wait, the problem asks me to identify the location of the errors, not fix them.
+
+Given the evidence, the most likely location of the bug is in the `Utils.tryReadnext()` method, because it's responsible for detecting missing tokens like ')' and reporting error 'j'.
+
+However, there's another possibility. Looking at the `StmtPrintf.analyse()` method:
+
+```java
+public StmtPrintf analyse() {
+    this.printf = utils.read("printf");
+    this.lParent = utils.read("(");
+    this.StringConst = utils.read("StringConst");
+    if (utils.preRead(1) == WordType.COMMA) {
+        this.haveExp = true;
+        while (utils.preRead(1) == WordType.COMMA) {
+            this.commaList.add(utils.read(","));
+            this.expList.add(new Exp().analyse());
+        }
+    }
+    this.rParent = utils.tryReadnext(1, ")", Errortype.j);
+    this.semicolon = utils.tryReadnext(1, ";", Errortype.i);
+    return this;
+}
+```
+
+The issue here is that after reading the StringConst, it checks if the next token is COMMA. In our test case, it is (because we have `"%c",s[0]`), so it enters the loop.
+
+But the loop condition is `while (utils.preRead(1) == WordType.COMMA)`, which means it will read a comma, then parse an Exp, then check again for comma.
+
+In our case:
+- After StringConst, preRead(1) = COMMA ✓
+- Read comma
+- Parse Exp `s[0]` 
+- Now preRead(1) = SEMICN (not COMMA), so loop exits
+- Then tryReadnext(1, ")", ...) checks if next token is ")" 
+
+But the next token is SEMICN (";"), not ")", so it should report error 'j'.
+
+This seems correct.
+
+Given all this, I believe the issue is that the `Utils.tryReadnext()` method is not properly handling the case where the expected token is missing, possibly due to bounds checking or error reporting logic.
+
+But looking at the actual expected vs actual output, the program is missing two 'j' errors. Since both involve missing ')', and both are handled by `tryReadnext(1, ")", Errortype.j)`, the bug must be in that method.
+
+The specific issue in `tryReadnext` is that it uses `WordList.get(Syntaxcur + next).getWordName().equals(s)` without ensuring that `Syntaxcur + next` is a valid index. If it's not valid (e.g., at end of file), this would throw an exception and terminate parsing early.
+
+But in our test case, we're not at the end of file.
+
+Another possibility: the error list is being overwritten. But the buggy output shows "18 a", which is the lexical error, suggesting that syntax errors weren't added to the error list at all.
+
+Wait, I think I found the real issue. In the `Utils.tryReadnext()` method:
+
+```java
+public Word tryReadnext(int next, String s, Errortype errortype) {
+    if (!WordList.get(Syntaxcur + next).getWordName().equals(s)) {
+        ErrorList.add(new BaseError(WordList.get(Syntaxcur).getRow(), errortype));
+        //
+        return null;
+    } else {
+        return read(s);
+    }
+}
+```
+
+The problem is that it's comparing `WordList.get(Syntaxcur + next).getWordName()` with `s`, but `s` is the string representation like ")", while `getWordName()` returns the actual token string.
+
+For punctuation tokens like ")", this should work because the WordName is ")".
+
+But what if the token is something else? No, for RPARENT, the WordName should be ")".
+
+Actually, looking at `LexicAnalysis.OperatorOrAnnotation()`:
+
+```java
+} else if (curChar == ')') {
+    AddtoWordList(wordname, WordType.RPARENT);
+}
+```
+
+So the WordName for RPARENT is ")", which matches.
+
+I think the issue might be more subtle. Let's look at the order of operations.
+
+When the lexer encounters the single '&' on line 18, it adds error 'a' to ErrorList.
+
+Then syntax analysis proceeds. When it gets to line 16 (`ch = getchar( ;`), it should detect the missing ')'.
+
+But what if the syntax analysis crashes or skips this part due to some other issue?
+
+Looking at the `CompUnit.analyse()` method:
+
+```java
+public CompUnit analyse() {
+    while (utils.preRead(1) == WordType.CONSTTK
+            || (utils.isBType(utils.preRead(1))
+            && utils.preRead(2) == WordType.IDENFR
+            && utils.preRead(3) != WordType.LPARENT)) {
+        this.declList.add(new Decl().analyse());
+    }
+    while (utils.preRead(1) == WordType.VOIDTK
+            || (utils.isBType(utils.preRead(1))
+            && utils.preRead(2) == WordType.IDENFR
+            && utils.preRead(3) == WordType.LPARENT)) {
+        this.funcDefList.add(new FuncDef().analyse());
+    }
+    this.mainFuncDef = new MainFuncDef().analyse();
+    syntaxList.add("<" + SyntaxType.CompUnit + ">");
+    return this;
+}
+```
+
+This should parse the const decl, var decl, func defs, and main func def.
+
+The main function contains the problematic lines, so it should be parsed.
+
+I think the most likely explanation is that the `Utils.tryReadnext()` method has a bounds checking issue that causes an exception when trying to access tokens beyond the current position, which terminates the syntax analysis early before it can reach all the errors.
+
+But since the expected output includes line 19 error, it must have gotten past line 16.
+
+Given the time, I'll go with the `Utils.tryReadnext()` method as the most likely location of the bug, specifically its lack of bounds checking and error handling.
+
+But wait, there's another clue. The expected output has errors on lines 16, 18, 19, but the buggy output only has line 18. This suggests that syntax analysis is not running at all, or is terminating immediately when it encounters the first issue.
+
+Looking back at the `Compiler.main()` method, after lexing, it calls `lexicAnalysis.output()`, which if there are lexical errors, writes to error.txt. Then it proceeds to syntax analysis.
+
+But what if the syntax analysis code has a bug that causes it to crash when there are lexical errors in the token stream?
+
+Actually, no—the token stream should be fine; the lexical errors are just flagged but the tokens are still generated.
+
+I think I need to focus on the specific methods that handle the missing ')' cases.
+
+Given that both missing ')' errors are in function calls (`getchar()` and `printf()`), and both are handled by similar code patterns using `tryReadnext(1, ")", Errortype.j)`, the bug is likely in the `tryReadnext` method.
+
+But let's look at one more thing. In the `StmtLValGetchar.analyse()` method, after reporting the missing ')', it then tries to read the semicolon:
+
+```java
+this.semicolon = utils.tryReadnext(1, ";", Errortype.i);
+```
+
+But if the ')' is missing, the current token after '(' is ';', so when it tries to read ';', it would be looking at token position Syntaxcur+1, which might be out of sync.
+
+However, `tryReadnext` doesn't advance the cursor when it fails, so after reporting missing ')', the cursor is still at '(', and then `tryReadnext(1, ";", ...)` would check if the next token (';') is ';', which it is, so it would read it successfully.
+
+This should work.
+
+I'm going to conclude that the issue is in the `Utils.tryReadnext()` method's error reporting logic. Specifically, it should be using the row of the token that should have been there, not the current token.
+
+But according to the problem description for error 'j': "The error line number corresponds to the line where the last non-terminal before the right parenthesis is located."
+
+In the case of `getchar(`, the last non-terminal before the expected ')' is the '(', which is what the current code uses.
+
+So that should be correct.
+
+Given all this, I think the most probable location of the bug is in the control flow of the syntax analysis—specifically, that when a `read()` call fails (returns null), the parsing stops or skips sections.
+
+Looking at `Utils.read()`:
+
+```java
+} else {
+    //方便DeBug
+    System.out.println("cur+1 is :" + (Syntaxcur + 1));
+    System.out.println("s is :" + s);
+    System.out.println("WordList is :" + WordList.get(Syntaxcur + 1).getWordName());
+    System.out.println("Read Wrong");
+    return null;
+}
+```
+
+If `read()` returns null, and the calling code doesn't handle it, it could cause a NullPointerException.
+
+For example, in `StmtLValGetchar.analyse()`:
+
+```java
+this.lParent = utils.read("(");
+```
+
+If this returns null (which it shouldn't in our case), then later code might NPE.
+
+But in our test case, "(" should be there.
+
+I think I have to go with the `Utils.tryReadnext()` method as the location, since it's directly responsible for detecting the missing ')' errors.
+
+<src/fronted/SyntaxAnalysis/Utils/Utils.java>
+...
+    public Word tryReadnext(int next, String s, Errortype errortype) {
+        if (!WordList.get(Syntaxcur + next).getWordName().equals(s)) {
+            ErrorList.add(new BaseError(WordList.get(Syntaxcur).getRow(), errortype));
+            //
+            return null;
+        } else {
+            return read(s);
+        }
+    }
+...

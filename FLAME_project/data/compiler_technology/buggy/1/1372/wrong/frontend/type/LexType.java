@@ -1,0 +1,57 @@
+package frontend.type;
+
+public enum LexType {
+    IDENFR("Ident"),
+    INTCON("IntConst"),
+    STRCON("StringConst"),
+    CHRCON("CharConst"),
+    MAINTK("main"),
+    CONSTTK("const"),
+    INTTK("int"),
+    CHARTK("char"),
+    BREAKTK("break"),
+    CONTINUETK("continue"),
+    IFTK("if"),
+    ELSETK("else"),
+    NOT("!"),
+    AND("&&"),
+    OR("||"),
+    FORTK("for"),
+    GETINTTK("getint"),
+    GETCHARTK("getchar"),
+    PRINTFTK("printf"),
+    RETURNTK("return"),
+    PLUS("+"),
+    MINU("-"),
+    VOIDTK("void"),
+    MULT("*"),
+    DIV("/"),
+    MOD("%"),
+    LSS("<"),
+    LEQ("<="),
+    GRE(">"),
+    GEQ(">="),
+    EQL("=="),
+    NEQ("!="),
+    ASSIGN("="),
+    SEMICN(";"),
+    COMMA(","),
+    LPARENT("("),
+    RPARENT(")"),
+    LBRACK("["),
+    RBRACK("]"),
+    LBRACE("{"),
+    RBRACE("}"),
+    ERR_SINGLE_AND("&"),
+    ERR_SINGLE_OR("|");
+
+    private final String tokenName;
+
+    LexType(String tokenName) {
+        this.tokenName = tokenName;
+    }
+
+    public String toString() {
+        return tokenName;
+    }
+}

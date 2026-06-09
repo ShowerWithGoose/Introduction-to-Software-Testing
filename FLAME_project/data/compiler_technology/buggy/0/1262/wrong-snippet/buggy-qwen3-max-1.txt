@@ -1,0 +1,181 @@
+<frontend/LexType.java>
+...
+    STRCON("\\\"([^\\\"\\n]|\\n)*\\\"", false),
+    CHRCON("'(?:\\\\a|\\\\v|\\\\\\\\|\\\\b|\\\\f|\\\\0|\\\\t|\\\\\"|\\\\n|\\\\'|\\s)'", false),
+...
+    a("[&\\|]", false);
+...
+
+The error is likely in the **`STRCON`** and/or **`CHRCON`** regular expressions in `LexType.java`. Specifically:
+
+- The `STRCON` regex `"\\\"([^\\\"\\n]|\\n)*\\\""` allows newlines inside string literals (`\\n`), but according to standard lexical rules (and implied by the problem's expected output), string literals should **not** span multiple lines. The presence of `\n` inside a string literal should either be disallowed or handled as an error, but more critically, the current regex may cause the lexer to hang or behave incorrectly when encountering unterminated strings or complex escape sequences.
+
+- The `CHRCON` regex only matches very specific escape sequences and whitespace, but it **does not match general printable characters** like `'a'`, `'b'`, etc., because it uses `(?: ... |\\s)` which includes only whitespace as non-escape character. This would fail to recognize simple character constants like `'a'`.
+
+However, looking at the **test input**, we have:
+```c
+char a1 = 'a';
+```
+and the expected output includes:
+```
+CHRCON 'a'
+```
+
+But the current `CHRCON` pattern:
+```java
+"'(?:\\\\a|\\\\v|\\\\\\\\|\\\\b|\\\\f|\\\\0|\\\\t|\\\\\"|\\\\n|\\\\'|\\s)'"
+```
+does **not** match `'a'` because `'a'` is not in the list of allowed contents (it's not an escape sequence nor whitespace).
+
+Thus, the **main bug** is in the `CHRCON` regex — it fails to accept ordinary single characters like `'a'`, `'z'`, etc.
+
+Additionally, the order of token matching matters. Since `IDENFR` comes before `CHRCON` in the enum, and `'a'` starts with `'`, it won't be matched as identifier, but the real issue is that `CHRCON` doesn't match it at all.
+
+But wait: the program didn't output any error, yet produced no output (Time Limit Exceeded). That suggests an infinite loop.
+
+Looking again: the `STRCON` regex is:
+```regex
+\"([^\"\n]|\n)*\"
+```
+This allows `\n` inside the string, but if a string is **not terminated**, e.g., `"abc`, then `([^\"\n]|\n)*` will match until end of line, but since `\n` is allowed, it could try to continue? Actually, no — because `getSubString()` returns only the current line. So an unterminated string would just match up to end of line, and then next tokens would start from next line, possibly causing mislexing.
+
+But the given test case has **no unterminated strings**. All strings are properly terminated: `"abcde"`, `"%d\n"`, etc.
+
+However, note this string in the input:
+```c
+printf("%d\n", tmp);
+```
+The string is `"%d\n"` — which contains `\n` as two characters: backslash and 'n'. But in the source file, it's written as **two characters**: `\` and `n`. So the actual content in `testfile.txt` is:
+```
+"%d\\n"
+```
+Wait, no! In C source code, `"\n"` is written as two characters in the file: a backslash and an 'n'. So the file contains: `"`, `%`, `d`, `\`, `n`, `"`.
+
+But the current `STRCON` regex: `\"([^\"\n]|\\n)*\"` — note that `\\n` in the regex means match a backslash followed by 'n'? No! Because in Java string literals, `"\\n"` becomes the regex `\n`, which is newline.
+
+Ah! Here's the critical mistake:
+
+In `STRCON`:
+```java
+STRCON("\\\"([^\\\"\\n]|\\n)*\\\"", false),
+```
+
+Breaking down:
+- `\\\"` → `\"` in regex → matches a double quote.
+- `[^\\\"\\n]` → `[^\"\n]` → any char except `"` and newline.
+- `|\\n` → **or a newline character** (because `\\n` in Java string → `\n` in regex → newline).
+
+But in the source file, the string literal `"%d\n"` is stored as the characters: `"`, `%`, `d`, `\`, `n`, `"` — i.e., **backslash and 'n'**, not a newline character.
+
+So the regex should allow **escaped characters**, including `\\n` meaning the two-character sequence backslash + n.
+
+But the current regex interprets `\\n` as a newline, which does **not** appear in the file. Therefore, when the lexer sees `\n` in the file (as two chars), it sees `\` followed by `n`. The `\` is not `"` or newline, so it matches `[^\"\n]`, and `n` also matches `[^\"\n]`. So it works by accident?
+
+But then why Time Limit Exceeded?
+
+Look at `skipNote()` in `TokenLexer.java`:
+
+```java
+private boolean skipNote() {
+    String note1 = "//";
+    String note2_st = "/*";
+    String note2_ed = "*/";
+    if (note1.equals(this.sourceLexer.getSubString(2))) {
+        this.sourceLexer.next();
+        return true;
+    } else if (note2_st.equals(this.sourceLexer.getSubString(2))) {
+        sourceLexer.move();
+        sourceLexer.move();
+        while (!this.sourceLexer.fileIsEnd() &&
+                !note2_ed.equals(this.sourceLexer.getSubString(2))) {
+            this.sourceLexer.move();
+        }
+        if (note2_ed.equals(this.sourceLexer.getSubString(2))) {
+            this.sourceLexer.move();
+            this.sourceLexer.move();
+            return true;
+        }
+    }
+    return false;
+}
+```
+
+If there's an **unterminated block comment** (`/* ...` without `*/`), the `while` loop will run until `fileIsEnd()`, which is fine. But what if the file ends without `*/`? Then it exits, returns `false`, and then `addToken()` is called at the end of file — which may fail to match anything, and since no token is consumed, the lexer gets stuck in an infinite loop.
+
+But the test input has **no comments**.
+
+So why Time Limit Exceeded?
+
+Now look at `addToken()`:
+
+```java
+private void addToken() {
+    Matcher matcher;
+    for (LexType lexType : LexType.values()) {
+        Pattern pattern = lexType.getPattern();
+        String tokenStr = this.sourceLexer.matchSubStr(pattern);
+        if (tokenStr != null) {
+            Token token = new Token(lexType, sourceLexer.getLineNum(), tokenStr);
+            if (token.getType() != LexType.a) {
+                this.tokenList.addToken(token);
+            } else {
+                this.errorList.addToken(token);
+            }
+            for (int i = 0;i < tokenStr.length();i++) {
+                this.sourceLexer.move();
+            }
+            break;
+        }
+        if (sourceLexer.fileIsEnd()) {
+            break;
+        }
+    }
+}
+```
+
+If **no pattern matches**, then the loop ends without consuming any character. Then the outer `Lexing()` loop calls `addToken()` again at the same position → infinite loop.
+
+So the real issue: **some input character is not matched by any token pattern**, causing infinite loop.
+
+What character could that be?
+
+Look at the `CHRCON` pattern again. It does **not** match `'a'`, because the inner part is:
+```regex
+(?:\\\\a|\\\\v|\\\\\\\\|\\\\b|\\\\f|\\\\0|\\\\t|\\\\\"|\\\\n|\\\\'|\\s)
+```
+This matches:
+- `\\a`, `\\v`, etc. (escape sequences)
+- or `\\s` (whitespace)
+
+But `'a'` is a single letter `a`, which is **not whitespace** and **not an escape sequence**. So `'a'` is **not matched** by `CHRCON`.
+
+Then, what matches `'a'`?
+
+- `LPARENT` is `\(` → no
+- Other symbols: no
+- `IDENFR` is `[_A-Za-z][_A-Za-z0-9]*` → but `'a'` starts with `'`, so no.
+
+So **nothing matches `'a'`**.
+
+Therefore, when the lexer encounters `'a'`, no pattern matches → infinite loop → Time Limit Exceeded.
+
+Thus, the bug is in the **`CHRCON` regex**, which fails to match ordinary characters like `'a'`.
+
+The correct `CHRCON` should allow:
+- Any single character except `'` and newline, **or**
+- Valid escape sequences.
+
+A better regex would be:
+```regex
+'([^'\\\n]|\\[abfnrtv\\'"]|\n)'
+```
+But according to the problem, the example includes `'\0'`, `'a'`, `'b'`, `'c'`, `'z'`.
+
+So the current `CHRCON` is missing the case for **non-escape, non-whitespace characters**.
+
+Hence, the error is in:
+
+<frontend/LexType.java>
+...
+    CHRCON("'(?:\\\\a|\\\\v|\\\\\\\\|\\\\b|\\\\f|\\\\0|\\\\t|\\\\\"|\\\\n|\\\\'|\\s)'", false),
+...

@@ -1,0 +1,34 @@
+#include <stdio.h>
+
+int MARK[11];
+int permutation[11];
+
+void full_permutation(int num,int NUM){
+    //printf("Ooops\n");
+    if (num == 0){
+        for (int i=1; i<=NUM; i++) {
+            printf("%d",permutation[i]); // @@ [Missing space between numbers as required by output format; should print "%d " instead of "%d"]
+        }
+        printf("\n");
+        return;
+    }
+    for (int i=1; i<=NUM; i++){
+        if (MARK[i] == 0){
+            MARK[i] = 1;
+            permutation[NUM - num + 1] = i;
+            full_permutation(num-1,NUM);
+            MARK[i] = 0;
+        }
+    }
+}
+
+int main()
+{
+    int num;
+    scanf ("%d",&num);
+    for (int i=0; i<num; i++) MARK[i] = 0; // @@ [Loop initializes MARK[0] to MARK[num-1], but should initialize MARK[1] to MARK[num]; indices 1..num are used in logic, so MARK[0] is unused and MARK[num] remains uninitialized]
+
+    full_permutation(num,num);
+    
+    return 0;
+}

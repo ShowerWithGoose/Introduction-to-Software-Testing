@@ -1,0 +1,786 @@
+The program is experiencing a **Time Limit Exceeded (TLE)** error. This typically indicates an infinite loop or a recursion that never terminates.
+
+Looking at the `Parser.java` code, specifically the `parseUnaryExp` method, there is a logic flaw in how it handles function calls versus primary expressions when errors occur or when lookahead fails.
+
+However, the most critical issue leading to TLE in recursive descent parsers with error recovery often lies in the **lack of progress** in the token index (`nextIndex`) when an error is encountered or when a parsing rule fails to match but doesn't advance the pointer correctly before returning or retrying.
+
+Let's look closely at `parseUnaryExp`:
+
+```java
+    private void parseUnaryExp() {
+        if (nextmatch(nextIndex, TokenType.IDENFR)) {
+            int tempIndex = nextIndex;
+            nextIndex++;
+            if (nextmatch(nextIndex, TokenType.LPARENT)) {
+                // ... handles function call ...
+            } else {
+                nextIndex = tempIndex;
+                parsePrimaryExp();  // Left value or basic expression
+            }
+        } else if (isUnaryOp(nextIndex)) {
+            parseUnaryOp();  // Parse unary operator
+            parseUnaryExp();  // Recursively parse
+        } else {
+            parsePrimaryExp();  // Basic expression
+        }
+        writeOutput("UnaryExp");
+    }
+```
+
+And `parsePrimaryExp`:
+
+```java
+    private void parsePrimaryExp() {
+        if (nextmatch(nextIndex, TokenType.LPARENT)) {
+            // ...
+        } else if (nextmatch(nextIndex, TokenType.IDENFR)) {
+            parseLVal();  // Left value expression
+        } else if (nextmatch(nextIndex, TokenType.INTCON)) {
+            parseNumber();  // Numeric constant
+        } else if (nextmatch(nextIndex, TokenType.CHRCON)) {
+            parseCharacter();  // Character constant
+        } else {
+            addError(currentToken.lineNum, "j");  // Illegal basic expression
+        }
+        writeOutput("PrimaryExp");
+    }
+```
+
+If `parsePrimaryExp` hits the `else` block (error), it adds an error but **does not advance `nextIndex`**. It then returns. The caller `parseUnaryExp` then writes "UnaryExp" and returns. If this `UnaryExp` was called from a loop or a higher-level expression parser that expects consumption of tokens, and no tokens were consumed, the parser might get stuck if the error recovery isn't handled globally by skipping tokens. However, this specific parser seems to rely on strict matching.
+
+Let's look at the test case input:
+`ch = getchar( ; // error 1`
+
+1. `parseStmt` sees `IDENFR` ("ch"). `isLVal` is true.
+2. `parseLVal` consumes "ch".
+3. `parseStmt` sees `ASSIGN`. Consumes it.
+4. `parseStmt` sees `GETCHARTK` ("getchar").
+5. It enters the `else if (nextmatch(nextIndex, TokenType.GETCHARTK))` block inside `parseStmt`.
+6. It consumes `GETCHARTK`.
+7. It expects `LPARENT`. It sees `LPARENT` (`(`). Consumes it.
+8. It expects `RPARENT`. It sees `SEMICN` (`;`).
+9. `nextmatch(nextIndex, TokenType.RPARENT)` is false.
+10. It executes `addError(tokens.get(nextIndex - 1).lineNum, "j");`. Note: `nextIndex - 1` is the `LPARENT`.
+11. It does **not** consume the `SEMICN`.
+12. It exits the `getchar` handling block.
+13. It expects `SEMICN`. `nextmatch(nextIndex, TokenType.SEMICN)` is **true**.
+14. It consumes `SEMICN`.
+15. It writes `<Stmt>`.
+
+This path seems fine for Error 1.
+
+Let's look at Error 2: `if (f2() & f1()) {`
+1. `parseStmt` sees `IFTK`.
+2. Consumes `IFTK`.
+3. Expects `LPARENT`. Sees `LPARENT`. Consumes it.
+4. Calls `parseCond()`.
+5. `parseCond` calls `parseLOrExp()`.
+6. `parseLOrExp` calls `parseLAndExp()`.
+7. `parseLAndExp` calls `parseEqExp()`.
+... eventually down to `parsePrimaryExp`.
+8. Inside `f2()`: `parseUnaryExp` sees `IDENFR` ("f2").
+9. It checks next token `LPARENT`. Yes.
+10. It processes function call. Consumes `f2`, `(`, `)`.
+11. Returns to `parseEqExp`/`parseRelExp` etc.
+12. Now `nextIndex` points to `&` (single ampersand).
+13. `parseLAndExp` checks `nextmatch(nextIndex, TokenType.AND)`. `AND` is `&&`. The token is `&` (which lexer likely flagged as error 'a' or didn't tokenize as AND).
+    *   In `Lexer.java`, single `&` adds error 'a' but **does not create a token**. Wait, let's check `Lexer.java`.
+    *   `else if (ch == '&')`: checks next char. If not `&`, `addError`. It does **not** add a token to `tokens` list.
+    *   This means the `tokens` list **skips** the invalid `&`.
+    *   So after `f2()`, the next token in `tokens` is `f1`? No, `f2()` consumes `f2`, `(`, `)`. The next character in source is ` & `. Lexer sees `&`, adds error, skips it. Next is `f1`.
+    *   So `tokens` list has: `... f2, (, ), f1, (, ) ...`
+    *   Back in `parseLAndExp`: `nextmatch` checks for `AND`. The current token is `f1` (`IDENFR`). Match fails.
+    *   `parseLAndExp` returns.
+    *   `parseLOrExp` returns.
+    *   `parseCond` returns.
+    *   Back in `parseStmt` (if branch): expects `RPARENT`. Current token is `f1`. Match fails.
+    *   `addError(tokens.get(nextIndex - 1).lineNum, "j");`. `nextIndex - 1` is `)`. Line 18. Correct error location for missing `)`? No, the error is `&` vs `&&`. But the parser sees `f1` where it expected `)` or `&&`.
+    *   Actually, the grammar says `Cond` inside `if`. `Cond` -> `LOrExp`. `LOrExp` parses `f2()`. Then it stops. The parser expects `)` for the `if`. It sees `f1`. It reports error `j` (missing `)`).
+    *   Crucially, **it does not advance `nextIndex`**.
+    *   Then `parseStmt` continues? No, the `if` block structure:
+        ```java
+        if (nextmatch(nextIndex, TokenType.RPARENT)) {
+             writeOutputWord();
+             nextIndex++;
+             parseStmt();
+             // ...
+        } else {
+             addError(...);
+        }
+        ```
+    *   It adds error, then exits the `if` parsing block.
+    *   Then `writeOutput("Stmt")`.
+    *   Control returns to `parseBlockItem` or wherever `parseStmt` was called.
+    *   The token `f1` is still at `nextIndex`.
+    *   If the caller tries to parse the next item, it might see `f1` again.
+
+However, the TLE usually comes from infinite recursion. Let's look at `parseCompUnit`:
+
+```java
+    public void parseCompUnit() {
+        // 解析声明
+        while (currentToken != null && (isFuncType(currentToken) || match(TokenType.CONSTTK))) {
+            nextIndex = currentIndex;
+            if (match(TokenType.CONSTTK)){
+                parseDecl();
+            }
+            else {
+                if (nextmatch(currentIndex + 1, TokenType.MAINTK)){
+                    parseMainFuncDef();
+                } else if (nextmatch(currentIndex + 2, TokenType.LPARENT)) {
+                    parseFuncDef();
+                } else {
+                    parseDecl();
+                }
+            }
+        }
+        // ...
+    }
+```
+
+Inside `parseDecl`, `parseConstDecl`, `parseVarDecl`, etc., `nextIndex` is updated. At the end of these methods, `currentIndex` is updated to `nextIndex`.
+
+But look at `parseFuncDef` and `parseMainFuncDef`. They update `currentIndex` at the end.
+
+What if `parseDecl` is called but fails to advance `nextIndex` significantly?
+In `parseDecl`:
+```java
+    private void parseDecl() {
+        if (nextmatch(nextIndex, TokenType.CONSTTK)) {
+            // ...
+            parseConstDecl();
+            currentIndex = nextIndex;
+            // ...
+        } else if (isBType(tokens.get(nextIndex))) {
+            // ...
+            parseVarDecl();
+            currentIndex = nextIndex;
+            // ...
+        }
+    }
+```
+If neither matches, `parseDecl` does nothing? No, the `while` condition in `parseCompUnit` checks `currentToken`. `currentToken` is only updated if `currentIndex` changes. If `parseDecl` is entered but doesn't match `CONSTTK` or `BType` at `nextIndex` (which equals `currentIndex` initially), it returns without changing `currentIndex`.
+Then the `while` loop checks `currentToken` again. It's the same token. Infinite loop.
+
+Does `parseDecl` handle the case where it's not a declaration?
+The `while` loop condition is `isFuncType(currentToken) || match(TokenType.CONSTTK)`.
+If `currentToken` is `int` (FuncType), it enters the loop.
+Inside `else`:
+`nextmatch(currentIndex + 1, TokenType.MAINTK)`? If next is `main`, `parseMainFuncDef`.
+`nextmatch(currentIndex + 2, TokenType.LPARENT)`? If next+2 is `(`, `parseFuncDef`.
+`else`: `parseDecl()`.
+
+If we have `int f1()`, `currentIndex` points to `int`.
+`nextmatch(currentIndex + 1, MAINTK)`? `f1` != `main`. False.
+`nextmatch(currentIndex + 2, LPARENT)`? `f1` is index+1. `(` is index+2. True.
+Calls `parseFuncDef`.
+
+If we have `int global;`, `currentIndex` points to `int`.
+`nextmatch(currentIndex + 1, MAINTK)`? `global` != `main`. False.
+`nextmatch(currentIndex + 2, LPARENT)`? `global` is index+1. `;` is index+2. `;` != `(`. False.
+Else: `parseDecl()`.
+Inside `parseDecl`: `nextIndex` is `currentIndex`. `tokens.get(nextIndex)` is `int`. `isBType` is true.
+Calls `parseVarDecl`. Advances `nextIndex`. Updates `currentIndex`. Loop continues.
+
+What if there is an error in `parseFuncDef` that causes it to return without advancing `currentIndex` properly?
+In `parseFuncDef`:
+```java
+    private void parseFuncDef() {
+        parseFuncType(); 
+        // ... checks IDENFR ...
+        // ... checks LPARENT ...
+        // ... checks RPARENT ...
+        parseBlock(); 
+        
+        currentIndex = nextIndex;
+        // ...
+    }
+```
+If `parseBlock` encounters an error and doesn't advance `nextIndex` past the problematic token, `currentIndex` gets stuck.
+
+Let's look at `parseBlock`:
+```java
+    private void parseBlock() {
+        if (nextmatch(nextIndex, TokenType.LBRACE)) {
+            writeOutputWord();
+            nextIndex++;
+        } else {
+            addError(currentToken.lineNum, "j"); 
+            return; // <--- STUCK HERE IF LBRACE MISSING
+        }
+
+        while (!nextmatch(nextIndex, TokenType.RBRACE)) {
+            parseBlockItem(); 
+        }
+        // ...
+    }
+```
+If `LBRACE` is missing, it adds error and returns. `nextIndex` is NOT advanced. `currentIndex` in caller `parseFuncDef` will be set to this stuck `nextIndex`.
+Back in `parseCompUnit`, `currentIndex` has advanced to the stuck position.
+The `while` loop checks `currentToken` (which is now the token where block started, e.g., `int` or `char` or whatever followed the function signature).
+If that token is `isFuncType` or `CONSTTK`, the loop continues.
+It calls `parseDecl` or `parseFuncDef` again on the **same token**.
+If `parseDecl` or `parseFuncDef` also fails to advance, **Infinite Loop**.
+
+In the test case:
+`ch = getchar( ; // error 1`
+`if (f2() & f1()) { // error 2`
+`printf("%c",s[0]; // error 3`
+
+The errors are inside `main`.
+`main` parsing:
+`parseMainFuncDef` consumes `int`, `main`, `(`, `)`.
+Calls `parseBlock`.
+`parseBlock` consumes `{`.
+Enters `while` loop.
+`parseBlockItem`.
+Sees `char`. `parseDecl`.
+`parseVarDecl`. Consumes `char`, `ch`, `;`.
+Back to `parseBlock` while loop.
+`parseBlockItem`.
+Sees `ch` (IDENFR). `parseStmt`.
+`parseStmt` handles assignment `ch = getchar(...)`.
+As analyzed before, this handles Error 1 and advances past `;`.
+Back to `parseBlock` while loop.
+`parseBlockItem`.
+Sees `if`. `parseStmt`.
+`parseStmt` handles `if`.
+Inside `if`, `parseCond` parses `f2()`.
+Lexer skipped `&`. Next token is `f1`.
+`parseCond` returns.
+`parseStmt` expects `)`. Sees `f1`. Adds Error `j` (line 18).
+Does NOT advance `nextIndex`.
+Exits `if` handling.
+Writes `<Stmt>`.
+Returns to `parseBlockItem`.
+Returns to `parseBlock` while loop.
+Check `!nextmatch(nextIndex, RBRACE)`. Current token is `f1`. Not `}`. Loop continues.
+`parseBlockItem`.
+Sees `f1` (IDENFR).
+`isLVal`? `isLVal` looks for `ASSIGN`.
+`f1` is followed by `(`. `isLVal` scans forward. `f1`, `(`, `)`, `{`... No `ASSIGN` found before `;` or `}`?
+Actually `isLVal` implementation:
+```java
+    private boolean isLVal(int index) {
+        boolean flag = false;
+        while(tokens.get(index).type != TokenType.ASSIGN){
+            if(tokens.get(index).type == TokenType.SEMICN){
+                break;
+            }
+            index++;
+        }
+        return tokens.get(index).type == TokenType.ASSIGN;
+    }
+```
+If it hits `SEMICN` or end of list, it returns false.
+For `f1() { ...`, `isLVal` will scan `f1`, `(`, `)`, `{`... It might go out of bounds or hit `SEMICN` much later. Assuming it returns false.
+Then `parseStmt` goes to `else`:
+```java
+            } else {
+                if (!nextmatch(nextIndex, TokenType.SEMICN)) {
+                    parseExp();  // Optional expression
+                }
+                // ...
+            }
+```
+Calls `parseExp()`.
+`parseExp` -> `parseAddExp` -> ... -> `parseUnaryExp`.
+`parseUnaryExp` sees `IDENFR` (`f1`).
+Checks next token `LPARENT` (`(`). Yes.
+Enters function call logic.
+Consumes `f1`.
+Consumes `(`.
+Expects `RPARENT`. Sees `)`. Consumes `)`.
+Expects `RPARENT` again? No, logic:
+```java
+                if (nextmatch(nextIndex, TokenType.RPARENT)) {
+                    writeOutputWord();
+                    nextIndex++;
+                } else {
+                    addError(tokens.get(nextIndex - 1).lineNum, "j");
+                }
+```
+Wait, inside `parseUnaryExp` function call logic:
+```java
+            if (nextmatch(nextIndex, TokenType.LPARENT)) {
+                int temp = nextIndex;
+                nextIndex = tempIndex; // Reset to f1
+                writeOutputWord(); // Write f1
+                nextIndex = temp; // Set to (
+                writeOutputWord(); // Write (
+                nextIndex++; // Advance past (
+                // ... lookahead for ) ...
+                if (!nextmatch(nextIndex, TokenType.RPARENT) && flag) {
+                    parseFuncRParams(); 
+                }
+                if (nextmatch(nextIndex, TokenType.RPARENT)) {
+                    writeOutputWord();
+                    nextIndex++;
+                } else {
+                    addError(tokens.get(nextIndex - 1).lineNum, "j");
+                }
+            }
+```
+So `f1()` is consumed. `nextIndex` is now at `{`.
+Back in `parseExp` -> `writeOutput("Exp")`.
+Back in `parseStmt` else block:
+```java
+                if (nextmatch(nextIndex, TokenType.SEMICN)) {
+                    writeOutputWord();
+                    nextIndex++;
+                } else {
+                    addError(tokens.get(nextIndex - 1).lineNum, "i");//缺少分号
+                }
+```
+Current token is `{`. Not `SEMICN`.
+Adds Error `i` (missing semicolon). Line number of `)` (previous token).
+Does NOT advance `nextIndex`.
+Writes `<Stmt>`.
+Returns to `parseBlock` while loop.
+Current token is `{`.
+`!nextmatch(nextIndex, RBRACE)`. True.
+`parseBlockItem`.
+Sees `{`. `parseStmt` (Block case).
+`parseBlock` called recursively.
+This inner `parseBlock` consumes `{`.
+Parses `printf...`.
+Error 3: `printf("%c",s[0];`.
+Missing `)`.
+`parseStmt` for printf:
+Expects `)`. Sees `;`.
+Adds Error `j`.
+Does NOT advance.
+Expects `;`. Sees `;`.
+Consumes `;`.
+Writes `<Stmt>`.
+Inner `parseBlock` continues while loop.
+Next token is `}`.
+Exits while loop.
+Consumes `}`.
+Writes `<Block>`.
+Returns to outer `parseStmt` (the one that parsed `f1()` as an expression statement).
+Outer `parseStmt` finishes.
+Returns to outer `parseBlock` while loop.
+Next token is `}` (from `if` block? No, `if` body was `{ printf... }`).
+Wait, the structure is:
+`if (cond) { printf... }`
+The `if` statement parsing in `parseStmt`:
+```java
+            if (nextmatch(nextIndex, TokenType.LPARENT)) {
+                // ... parse cond ...
+                if (nextmatch(nextIndex, TokenType.RPARENT)) {
+                    writeOutputWord();
+                    nextIndex++;
+                    parseStmt();  // <--- This parses the block { printf... }
+                    // ...
+                } else {
+                     addError(...);
+                }
+            }
+```
+When parsing the `if` condition failed (missing `)` error added, but index not advanced), the code went to `else { addError... }`.
+It did **not** call `parseStmt()` for the body.
+So the `{` of the `if` body is still at `nextIndex`.
+The `if` parsing finishes. Writes `<Stmt>`.
+Returns to `parseBlock` (main body).
+Next token is `{`.
+`parseBlockItem`.
+`parseStmt`.
+Sees `{`. Calls `parseBlock`.
+This parses the `if` body as a standalone block!
+It consumes `{`.
+Parses `printf`.
+Error 3 detected.
+Consumes `}`.
+Returns.
+Back to main `parseBlock`.
+Next token is `return`.
+Parses `return 0;`.
+Next token is `}`.
+Exits main `parseBlock`.
+
+So where is the TLE?
+
+Let's re-examine `parseCompUnit` loop.
+If `parseFuncDef` or `parseMainFuncDef` gets stuck.
+
+In `parseMainFuncDef`:
+```java
+    private void parseMainFuncDef() {
+        // ... consumes int, main, (, ) ...
+        parseBlock(); 
+        
+        currentIndex = nextIndex;
+        // ...
+    }
+```
+If `parseBlock` gets stuck in an infinite loop internally, that's the cause.
+
+Inside `parseBlock`:
+```java
+        while (!nextmatch(nextIndex, TokenType.RBRACE)) {
+            parseBlockItem(); 
+        }
+```
+If `parseBlockItem` does not advance `nextIndex`, infinite loop.
+
+`parseBlockItem`:
+```java
+    private void parseBlockItem() {
+        if (nextmatch(nextIndex, TokenType.CONSTTK) || nextmatch(nextIndex, TokenType.INTTK) || nextmatch(nextIndex, TokenType.CHARTK)) {
+            parseDecl(); 
+        } else {
+            parseStmt(); 
+        }
+    }
+```
+
+If `parseStmt` does not advance `nextIndex`, infinite loop.
+
+We saw that `parseStmt` for `if` with error:
+1. Parses `if`.
+2. Parses `(`.
+3. Parses `Cond`. `Cond` parses `f2()`. Stops at `f1`.
+4. Expects `)`. Fails. Adds Error. **Does not advance**.
+5. Exits `if` parsing logic.
+6. Writes `<Stmt>`.
+7. Returns.
+
+So `nextIndex` is still at `f1`.
+`parseBlockItem` returns.
+`parseBlock` loop checks `!nextmatch(RBRACE)`. `f1` is not `}`.
+Loop continues.
+`parseBlockItem`.
+Sees `f1`. Not `const/int/char`.
+Calls `parseStmt`.
+`parseStmt`:
+Not `{`, `if`, `for`, etc.
+Goes to `else` (LVal or Exp).
+`isLVal(nextIndex)`?
+`isLVal` scans from `f1`.
+Tokens: `f1`, `(`, `)`, `{`, `printf`, ...
+Does it find `ASSIGN`? No.
+Returns false.
+`parseStmt` else block:
+`if (!nextmatch(SEMICN)) parseExp()`.
+`parseExp()` parses `f1()`.
+Advances past `f1`, `(`, `)`.
+Now `nextIndex` is at `{`.
+Back in `parseStmt` else block:
+`if (nextmatch(SEMICN))`? No, it's `{`.
+Adds Error `i`. **Does not advance**.
+Writes `<Stmt>`.
+Returns.
+
+`nextIndex` is now at `{`.
+`parseBlock` loop continues.
+`parseBlockItem`.
+Sees `{`.
+Calls `parseStmt`.
+`parseStmt` sees `{`.
+Calls `parseBlock`.
+Recursive `parseBlock`.
+Consumes `{`.
+Parses `printf`.
+Error 3.
+Consumes `}`.
+Returns.
+
+`nextIndex` is now at `return`.
+`parseBlock` loop continues.
+Parses `return`.
+Advances.
+`nextIndex` is at `}`.
+Loop ends.
+
+So `main` parses successfully despite errors.
+
+Where is the TLE?
+
+Look at `parseUnaryExp` again.
+```java
+    private void parseUnaryExp() {
+        if (nextmatch(nextIndex, TokenType.IDENFR)) {
+            int tempIndex = nextIndex;
+            nextIndex++;
+            if (nextmatch(nextIndex, TokenType.LPARENT)) {
+                 // ...
+            } else {
+                nextIndex = tempIndex;
+                parsePrimaryExp(); 
+            }
+        } 
+        // ...
+    }
+```
+If `parsePrimaryExp` is called and fails to advance (e.g. unexpected token), it returns.
+`parseUnaryExp` writes output and returns.
+
+Is there a case where `nextIndex` is NOT advanced in `parsePrimaryExp`?
+```java
+    private void parsePrimaryExp() {
+        // ...
+        } else {
+            addError(currentToken.lineNum, "j"); 
+        }
+        writeOutput("PrimaryExp");
+    }
+```
+Yes. If none of the conditions match, it adds error and returns without advancing.
+
+Who calls `parsePrimaryExp`?
+`parseUnaryExp`, `parseNumber`, `parseCharacter`.
+
+If `parseUnaryExp` calls `parsePrimaryExp` and it doesn't advance, `parseUnaryExp` returns without advancing (other than the temp reset).
+If `parseUnaryExp` was called from `parseMulExp` -> `parseUnaryExp`.
+`parseMulExp`:
+```java
+    private void parseMulExp() {
+        parseUnaryExp(); 
+        while (nextmatch(nextIndex, TokenType.MULT) || ...) {
+             // ...
+        }
+        writeOutput("MulExp");
+    }
+```
+If `parseUnaryExp` doesn't advance, `parseMulExp` doesn't advance.
+Chain reaction up to `parseExp`, `parseStmt`.
+
+If `parseStmt` calls `parseExp` and it doesn't advance, `parseStmt` adds "missing semicolon" error (if `;` not found) and returns.
+If `parseStmt` returns without advancing, `parseBlock` loops infinitely.
+
+When does `parsePrimaryExp` fail to match?
+If current token is not `(`, `IDENFR`, `INTCON`, `CHRCON`.
+E.g., if current token is `}` or `;` or `else`.
+
+In the `if` error scenario:
+`parseCond` stopped at `f1`.
+`parseStmt` (if) failed to match `)`.
+Did NOT advance.
+Returned.
+`parseBlock` called `parseBlockItem` again.
+`parseStmt` called `parseExp`.
+`parseExp` called `parseUnaryExp`.
+`parseUnaryExp` saw `f1`. Matched `IDENFR`.
+Advanced to `(`.
+Matched `LPARENT`.
+Processed function call.
+Advanced past `)`.
+Returned.
+So `parseExp` DID advance.
+
+What if the input has a token that `parsePrimaryExp` cannot handle, and it's inside an expression context?
+
+Consider the error `a` in lexer.
+`if (f2() & f1())`
+Lexer sees `&`. Adds error `a`. Does NOT add token.
+So `tokens` list is contiguous without `&`.
+
+What if there is a token that causes `parsePrimaryExp` to fail, and it's NOT consumed by any other part?
+
+Let's look at `parseCompUnit` again.
+```java
+        while (currentToken != null && (isFuncType(currentToken) || match(TokenType.CONSTTK))) {
+            nextIndex = currentIndex;
+            if (match(TokenType.CONSTTK)){
+                parseDecl();
+            }
+            else {
+                if (nextmatch(currentIndex + 1, TokenType.MAINTK)){
+                    parseMainFuncDef();
+                } else if (nextmatch(currentIndex + 2, TokenType.LPARENT)) {
+                    parseFuncDef();
+                } else {
+                    parseDecl();
+                }
+            }
+        }
+```
+
+If `parseDecl()` is called in the `else` branch, and it doesn't match `CONSTTK` or `BType` at `nextIndex` (which is `currentIndex`), it returns immediately.
+`currentIndex` is NOT updated.
+Loop repeats with same `currentToken`.
+**Infinite Loop.**
+
+Does `parseDecl` guarantee progress?
+```java
+    private void parseDecl() {
+        if (nextmatch(nextIndex, TokenType.CONSTTK)) {
+             // ...
+        } else if (isBType(tokens.get(nextIndex))) {
+             // ...
+        }
+    }
+```
+If `currentToken` is `int` (FuncType), `isFuncType` is true. Loop enters.
+`match(CONSTTK)` is false.
+Else branch:
+`nextmatch(currentIndex + 1, MAINTK)`?
+If next is NOT `main` AND next+2 is NOT `(`, it calls `parseDecl()`.
+Inside `parseDecl()`: `nextIndex` is `currentIndex`. Token is `int`. `isBType` is true.
+It calls `parseVarDecl()`.
+`parseVarDecl` SHOULD advance.
+
+What if `parseVarDecl` fails to advance?
+```java
+    private void parseVarDecl() {
+        parseBType(); // Advances if BType
+        parseVarDef(); 
+        // ...
+    }
+```
+`parseBType`:
+```java
+    private void parseBType() {
+        if (isBType(tokens.get(nextIndex))){
+            writeOutputWord();
+            nextIndex++;
+        }
+    }
+```
+If `isBType` is true, it advances.
+
+So `parseDecl` should advance.
+
+Is there any case where `isFuncType(currentToken)` is true, but `parseDecl` doesn't match?
+Only if `currentToken` is `void`.
+`isFuncType` includes `VOIDTK`.
+`parseDecl` checks `CONSTTK` or `BType` (`int`/`char`).
+If `currentToken` is `void`:
+`match(CONSTTK)` false.
+Else:
+`nextmatch(currentIndex + 1, MAINTK)`? Unlikely.
+`nextmatch(currentIndex + 2, LPARENT)`?
+If it's `void func()`, `currentIndex` is `void`. `currentIndex+1` is `func`. `currentIndex+2` is `(`.
+So `nextmatch(currentIndex + 2, LPARENT)` is TRUE.
+Calls `parseFuncDef()`.
+
+If it's just `void` alone? Syntax error.
+`parseFuncDef` called.
+`parseFuncType` consumes `void`.
+`nextmatch(IDENFR)`? Fails. Adds Error. Returns.
+`parseFuncDef` returns.
+`currentIndex` updated to `nextIndex` (which is still at `void`? No, `parseFuncType` advanced `nextIndex`).
+`parseFuncType`:
+```java
+    private void parseFuncType() {
+        if (nextmatch(nextIndex, TokenType.VOIDTK) || ...) {
+            writeOutputWord();
+            nextIndex++;
+        } else {
+            addError(...);
+        }
+        writeOutput("FuncType");
+    }
+```
+So `nextIndex` advances past `void`.
+Then `parseFuncDef` checks `IDENFR`. Fails. Adds Error. Returns.
+`currentIndex` updates to `nextIndex` (past `void`).
+Loop continues.
+
+So `parseCompUnit` seems safe.
+
+Let's look at `parseStmt` -> `parseExp` -> `parsePrimaryExp` failure case again.
+If `parsePrimaryExp` fails, it doesn't advance.
+`parseUnaryExp` returns.
+`parseMulExp` returns.
+`parseAddExp` returns.
+`parseExp` returns.
+`parseStmt` (else block) checks `SEMICN`.
+If `SEMICN` is not there, adds Error `i`.
+Does NOT advance.
+Returns.
+`parseBlock` loops infinitely.
+
+So, if we have a statement like `x y;` where `x` is IDENFR and `y` is IDENFR.
+`parseStmt`:
+`isLVal`? Scans for `=`. Finds `;`. Returns false.
+Else block.
+`parseExp()`.
+`parseUnaryExp()` sees `x`.
+`parsePrimaryExp()` sees `x`. Matches `IDENFR`. Calls `parseLVal()`.
+`parseLVal()` consumes `x`.
+Returns.
+`parseUnaryExp` returns.
+`parseExp` returns.
+Back in `parseStmt`:
+`nextmatch(SEMICN)`? Current token is `y`. False.
+Adds Error `i`.
+Does NOT advance.
+Returns.
+Infinite Loop.
+
+The test case doesn't seem to have this exact pattern, but `if (f2() & f1())` resulted in `f1` being parsed as an expression statement.
+`f1()` consumed `f1`, `(`, `)`.
+Next token `{`.
+`parseStmt` checked `SEMICN`. Found `{`. Added Error `i`. Did NOT advance.
+Returned.
+`parseBlock` saw `{`. Called `parseStmt`.
+`parseStmt` saw `{`. Called `parseBlock`.
+This advanced.
+
+So the TLE might not be triggered by the provided test case inputs in the way I traced, OR there is a subtle case.
+
+Wait, look at `parseUnaryExp` again.
+```java
+        } else if (isUnaryOp(nextIndex)) {
+            parseUnaryOp(); 
+            parseUnaryExp(); 
+        }
+```
+If `parseUnaryOp` advances, and `parseUnaryExp` recurses.
+
+What if `parsePrimaryExp` is called on a token that IS `IDENFR`, but `parseLVal` fails?
+`parseLVal`:
+```java
+    private void parseLVal() {
+        if (nextmatch(nextIndex, TokenType.IDENFR)) {
+            writeOutputWord();
+            nextIndex++;
+        } else {
+            addError(currentToken.lineNum, "k"); 
+            return;
+        }
+        // ...
+    }
+```
+If it matches, it advances.
+
+The likely culprit for TLE in student code is usually **failure to advance index on error paths in loops**.
+
+In `parseBlock`:
+```java
+        while (!nextmatch(nextIndex, TokenType.RBRACE)) {
+            parseBlockItem(); 
+        }
+```
+If `parseBlockItem` (and thus `parseStmt` or `parseDecl`) fails to advance `nextIndex`, this loop is infinite.
+
+We identified that `parseStmt` can fail to advance if `parseExp` fails to advance or if the final semicolon check fails.
+
+Specifically, if `parseExp` is called and `parsePrimaryExp` encounters an unexpected token (not `(`, `IDENFR`, `INTCON`, `CHRCON`), it adds error and returns without advancing.
+Then `parseStmt` adds "missing semicolon" error and returns without advancing.
+Infinite loop.
+
+Example: `if (1) { $ }`
+`$` is not a valid token? Lexer might skip it or error. If Lexer skips it, it's gone. If Lexer creates an error token? The lexer code doesn't create error tokens, it just adds to error list and skips?
+No, `Lexer.getNextToken`:
+`else { token.curPos++; token.word += ch; token.type = keymap.get(token.word); ... }`
+If `ch` is `$`, `keymap.get` returns `null`. `token.type` is `null`.
+`tokens.add(onetoken)`.
+So `tokens` contains a token with `type = null`.
+
+In `Parser`:
+`nextmatch` checks `target.type == expectedType`.
+If `type` is `null`, it returns false.
+
+So if we have a `$` token.
+`parsePrimaryExp` checks `LPARENT`, `IDENFR`, `INTCON`, `CHRCON`. All false.
+Else: `addError`. Returns.
+`parseStmt` adds `missing semicolon`. Returns.
+`parseBlock` loops infinitely on `$`.
+
+Does the test case have such a token?
+`ch = getchar( ;`
+`if (f2() & f1()) {`
+`printf("%

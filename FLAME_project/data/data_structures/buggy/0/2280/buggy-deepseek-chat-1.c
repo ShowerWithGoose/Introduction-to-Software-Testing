@@ -1,0 +1,28 @@
+#include<stdio.h>
+#include<string.h>
+char str[10086];
+int main(){
+    gets(str);
+    int leng=strlen(str);
+    for(int i=0;i<leng-2;i++){
+        if(str[i+1]!='-')
+        printf("%c",str[i]);
+        else{
+            if(((str[i]>='0'&&str[i+2]<='9')||(str[i]>='A'&&str[i+2]<='Z')||(str[i]>='a'&&str[i+2]<='z'))&&str[i]<str[i+2])
+            {
+                int flag=str[i+2]-str[i];
+                    for(int j=0;j<flag;j++){
+                        printf("%c",str[i]+j);
+                    }
+                    i++;
+            }
+            else{
+                printf("%c",str[i]);
+                printf("-");
+                i++;
+            }
+        }
+    }
+    printf("%c%c",str[leng-2],str[leng-1]); // @@ The loop condition i < leng-2 causes the last two characters to be printed separately, but when the last '-' is processed, the loop ends before handling the character after it, leading to incorrect output for cases like "a-uB-F" where the last expansion is missed.
+
+}

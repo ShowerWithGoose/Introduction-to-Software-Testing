@@ -1,0 +1,143 @@
+Based on the problem description, test case, and code analysis:
+
+**Summary:**
+The test case input contains three errors:
+1. `void f(int a {}` : Missing right parenthesis `)` before `{`. Expected error `j` at line 1.
+2. `int main( {` : Missing right parenthesis `)` before `{`. Expected error `j` at line 3 (based on token stream logic, though visually line 3 in file). The buggy output correctly identifies this as `3 j`.
+3. `f(a + 10;` : Inside `main`, this is a function call statement. It is missing the right parenthesis `)` for the function call `f(...)`. The expected error is `j` (missing right parenthesis) at line 5. The buggy output reports `5 i` (missing semicolon).
+
+**Analysis of the Bug:**
+The error lies in how the parser handles function calls within expressions/statements.
+In `UnaryExpParser.java`, when parsing a function call (`Ident '(' ... ')'`), it checks for the closing `)`. If missing, it reports error `j`.
+However, look at `StmtParser.java` -> `caseIdenfr`. It looks ahead to determine if the statement is an assignment, input, or expression.
+If it's determined to be an expression statement (`StmtExp`), `StmtExpParser` is called.
+`StmtExpParser` parses an `Exp`. `Exp` -> `AddExp` -> ... -> `UnaryExp`.
+In `UnaryExpParser.unaryExpParse()`:
+```java
+if(first.getType().equals("IDENFR")&&second.getValue().equals("("))
+{
+    // ...
+    next=iterator.readNextToken();
+    if(next.getValue().equals(")"))
+    {
+        this.rightParenthesis=next;
+    }else if(...){
+       // parse params
+       next=iterator.readNextToken();
+       this.rightParenthesis=next; // Assumes next is )
+    }else {
+        iterator.unReadToken(1);
+        ErrorP errorP=new ErrorP("j",this.errorLine); // Reports j
+        ErrorPList errorPList=ErrorPList.getInstance();
+        errorPList.addErrorP(errorP);
+    }
+}
+```
+If `f(a + 10;` is parsed:
+1. `f` is IDENFR, `(` is next. Enters block.
+2. `a` is read. It matches the `else if` condition for parameters.
+3. `unReadToken(1)` puts `a` back.
+4. `FuncRParamsParser` parses `a + 10`. It consumes `a`, `+`, `10`. The next token is `;`.
+5. `FuncRParamsParser` finishes, `unReadToken(1)` puts `;` back? No, `FuncRParamsParser` reads until non-comma. It reads `;`. Then `unReadToken(1)` puts `;` back.
+6. Back in `UnaryExpParser`, `next=iterator.readNextToken()` reads `;`.
+7. `next.getValue().equals(")")` is false.
+8. The `else if` chain checks for start of expressions. `;` does not match.
+9. Goes to `else`. Reports error `j`.
+
+So `UnaryExpParser` *does* report `j`. Why does the output say `i`?
+
+Let's look at `StmtAssignParser`.
+`caseIdenfr` in `StmtParser` determines the mode.
+It scans ahead. `f`, `(`, `a`, `+`, `10`, `;`.
+It sees `ASSIGN`? No. `GETINTTK`? No. `GETCHARTK`? No.
+So `flag` is false. Mode is 0.
+It calls `StmtExpParser`.
+
+Wait, let's look at `StmtAssignParser.parseStmtAssign()` just in case `caseIdenfr` logic is flawed.
+If `caseIdenfr` incorrectly identified it as an assignment?
+`token.getType().equals("ASSIGN")` -> false.
+`flag` remains false.
+Calls `StmtExpParser`.
+
+Let's look at `StmtExpParser.parseStmtExp()`.
+```java
+public StmtExp parseStmtExp() {
+    Token first=iterator.readNextToken();
+    iterator.unReadToken(1);
+    this.errorLine= first.getLine(); // Line 5
+    ExpParser expParser = new ExpParser(this.iterator);
+    this.exp = expParser.expParse(); // Parses f(a+10
+    Token token=iterator.readNextToken(); // Reads ;
+    if(token.getValue().equals(";"))
+    {
+        this.semicn=token;
+    }else {
+        iterator.unReadToken(1);
+        ErrorP errorP=new ErrorP("i",this.errorLine); // Reports i if ; is missing
+        ...
+    }
+    ...
+}
+```
+If `UnaryExpParser` reported `j`, the error list has `j`.
+Then `StmtExpParser` continues. It expects `;`. It finds `;`. So it does NOT report `i`.
+
+Why did the buggy output get `5 i`?
+Perhaps `UnaryExpParser` did NOT report `j`?
+Or perhaps `StmtAssignParser` WAS called?
+
+Let's re-read `caseIdenfr`.
+```java
+while (!token.getType().equals("SEMICN")) {
+    token = this.iterator.readNextToken();
+    ...
+    if (token.getType().equals("ASSIGN")) {
+        flag = true;
+    }
+    ...
+}
+```
+For `f(a + 10;`, it reads `f`, `(`, `a`, `+`, `10`, `;`. Loop ends.
+`flag` is false.
+`mode` is 0.
+Calls `StmtExpParser`.
+
+Is it possible `UnaryExpParser` failed to detect the error?
+In `UnaryExpParser`:
+```java
+}else if(next.getValue().equals("(")||next.getType().equals("IDENFR")||...){
+    iterator.unReadToken(1);
+    FuncRParamsParser funcRParamsParser=new FuncRParamsParser(iterator);
+    this.funcRParams=funcRParamsParser.funcRParamsParse();
+    next=iterator.readNextToken();
+    this.rightParenthesis=next; // <--- BUG HERE
+}
+```
+If `FuncRParamsParser` parses `a + 10`, it stops at `;`. `unReadToken(1)` pushes `;` back.
+Then `next=iterator.readNextToken()` reads `;`.
+`this.rightParenthesis=next` sets rightParenthesis to `;`.
+It does **not** check if `next` is actually `)`.
+It assumes it is `)` because it came from the `else if` branch which implies parameters were present.
+It does **not** report error `j` here.
+
+So `UnaryExp` completes without error.
+Control returns to `StmtExpParser`.
+`StmtExpParser` reads next token. Since `UnaryExp` consumed `;` as the right parenthesis, the iterator is now past `;`.
+The next token is likely `return` or whatever follows.
+`StmtExpParser` checks if current token is `;`. It is not.
+So it reports error `i` (missing semicolon).
+
+**Conclusion:**
+The error is in `UnaryExpParser.java`. When parsing function arguments, after parsing `FuncRParams`, it blindly assigns the next token to `rightParenthesis` without verifying it is `)`. If it is not `)`, it should report error `j`.
+
+<Parser/Exp/UnaryExpParser.java>
+...
+            }else if(next.getValue().equals("(")||next.getType().equals("IDENFR")||next.getType().equals("INTCON")||next.getType().equals("CHRCON")||next.getValue().equals("+")||next.getValue().equals("!")||next.getValue().equals("-")){
+                iterator.unReadToken(1);
+                FuncRParamsParser funcRParamsParser=new FuncRParamsParser(iterator);
+                this.funcRParams=funcRParamsParser.funcRParamsParse();
+                //System.out.println("吴安邦变猪"+funcRParams.print_tree());
+                next=iterator.readNextToken();
+                this.rightParenthesis=next;
+            }else {
+...

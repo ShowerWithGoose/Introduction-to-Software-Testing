@@ -1,0 +1,630 @@
+Based on the analysis of the problem description, test case, and source code:
+
+1.  **Test Case Analysis**:
+    *   Input: `void f(int a {} // error 1` (Line 1), `int main( { // error 2` (Line 3), `f(a + 10; // error 3` (Line 5).
+    *   Expected Output: Errors `j` (Missing right parenthesis) at lines 1, 3, and 5.
+    *   Buggy Output: Only error `j` at line 1.
+
+2.  **Error Location Identification**:
+    *   **Error 1 (Line 1)**: `void f(int a {}`. The parser enters `FuncDef`. It parses `FuncType` (`void`), `Ident` (`f`), `(`. Then it sees `int`, so it enters `FuncFParams`. Inside `FuncFParam`, it parses `int`, `a`. Then it expects `[` or `)`. It sees `{`. The code in `FuncDef` handles the missing `)` by calling `reportError` when `token2` is not `RPARENT` after parsing params or checking for empty params. This works correctly for Line 1.
+    *   **Error 2 (Line 3)**: `int main( {`. The parser enters `MainFuncDef`. It parses `int`, `main`, `(`. Then it reads the next token `{`. The code checks `if(tnow1.getTokenType() != TokenType.RPARENT)`. It is `{`, so it calls `putBackAToken(tnow1)` and `reportError(errorline)`. This should output `3 j`. However, the buggy output misses this. Let's look closer at `MainFuncDef`.
+        ```java
+        if(tnow1.getTokenType() != TokenType.RPARENT){
+            putBackAToken(tnow1);
+            reportError(errorline);
+            //error!!!
+        }else{
+            nodes.add(tnow1);
+        }
+        tnow1 = getAToken(); // Gets '{'
+        if(tnow1 == null){ return null; }
+        if(tnow1.getTokenType()!=TokenType.LBRACE){ }
+        Block block = new Block();
+        block.parser(tnow1); // Parses block starting with '{'
+        ```
+        The `MainFuncDef` seems to handle the error reporting correctly. Why is it missing?
+        
+    *   **Error 3 (Line 5)**: `f(a + 10;`. This is inside `main`'s block. It's a statement. `Stmt.parserStmt` sees `IDENFR` (`f`). It peeks ahead and sees `(`? No, `StmtAssign` logic:
+        ```java
+        else if(type == TokenType.IDENFR){
+            Token token = GiveTokener.getInstance().preReadAToken();
+            if(token.getTokenType() == TokenType.ASSIGN){ ... }
+            else if(token.getTokenType() == TokenType.LBRACK){ ... }
+            else{
+                GiveTokener.getInstance().putBackAToken(token);
+                return new StmtExp();
+            }
+        }
+        ```
+        Wait, `f(a+10;` starts with `f`. The next token is `(`. `StmtExp` is returned. `StmtExp.parser` calls `Exp.parser`. `Exp` -> `AddExp` -> `MulExp` -> `UnaryExp`.
+        In `UnaryExp`, token is `f` (`IDENFR`). It peeks ahead. If next is `(`, it treats it as a function call.
+        ```java
+        else if(token.getTokenType() == TokenType.IDENFR){
+            nodes.add(token);
+            Token token1 = getAToken(); // Gets '('
+            if(token1.getTokenType() != TokenType.LPARENT){ return token1; }
+            errorline = token1.getLineno(); // Line 5
+            nodes.add(token1);
+            token1 = getAToken(); // Gets 'a'
+            if(FuncRParams.isFuncRParamsFirst(token1)){ // 'a' is IDENFR, so true
+                FuncRParams funcRParams = new FuncRParams();
+                errorline = token1.getLineno(); // Line 5
+                Token token2 = funcRParams.parser(token1); // Parses 'a+10'
+                nodes.add(funcRParams);
+                if(token2.getTokenType()!=TokenType.RPARENT){ // token2 is ';'
+                    reportError(errorline); // Reports 5 j
+                    return token2;
+                }
+                ...
+            }
+        }
+        ```
+        So `UnaryExp` should report error `5 j`.
+
+    *   **Why are errors 2 and 3 missing?**
+        Let's look at `CompUnit`.
+        ```java
+        while (tnow0.getTokenType() != TokenType.INTTK || tnow1.getTokenType() != TokenType.MAINTK) {
+             // ... handles Decl and FuncDef
+        }
+        putBackAToken(tnow2);
+        putBackAToken(tnow1);
+        MainFuncDef mainFuncDef = new MainFuncDef();
+        tnow2 = mainFuncDef.parser(tnow0); // tnow0 is 'int' from line 3
+        ```
+        
+        The issue likely lies in how `FuncDef` handles the error on Line 1 and returns control.
+        In `FuncDef.parser`:
+        ```java
+        if(token2.getTokenType()!=TokenType.RPARENT){
+            if(token2.getTokenType()!=TokenType.INTTK&&token2.getTokenType()!=TokenType.CHARTK){
+                reportError(errorline); // Reports 1 j
+                if(token2.getTokenType()!=TokenType.LBRACE){
+                    return token2; // Returns '{' from line 1
+                }
+                Block block = new Block();
+                block.parser(token2);
+                nodes.add(block);
+                return getAToken();
+            }
+            // ...
+        }
+        ```
+        On Line 1: `void f(int a {}`.
+        `FuncDef` parses `void`, `f`, `(`.
+        `token2` becomes `int`. It enters `FuncFParams`.
+        `FuncFParams` parses `int a`. Returns `{` (from `FuncFParam` returning token after `a` because it's not `[` or `,`).
+        Back in `FuncDef`: `token2` is `{`.
+        Check: `if(token2.getTokenType()!=TokenType.RPARENT)` -> True.
+        Check: `if(token2.getTokenType()!=TokenType.INTTK&&token2.getTokenType()!=TokenType.CHARTK)` -> True (`{` is neither).
+        `reportError(errorline)` -> Writes `1 j`.
+        Check: `if(token2.getTokenType()!=TokenType.LBRACE)` -> False (`{` IS LBRACE).
+        So it executes:
+        ```java
+        Block block = new Block();
+        block.parser(token2); // Parses the block starting with '{'
+        nodes.add(block);
+        return getAToken(); // Returns the token AFTER the block '}'
+        ```
+        The input is `void f(int a {}`. The block is `{}`. The token after `}` is likely `null` or the next line's token if they are contiguous?
+        Wait, the input is:
+        Line 1: `void f(int a {}`
+        Line 2: (Empty?)
+        Line 3: `int main( {`
+        
+        If `FuncDef` consumes the `{}` block, it returns the token after `}`.
+        Then `CompUnit` loop continues?
+        ```java
+        while (tnow0.getTokenType() != TokenType.INTTK || tnow1.getTokenType() != TokenType.MAINTK) {
+             // ...
+             FuncDef funcDef = new FuncDef();
+             nodes.add(funcDef);
+             tnow0 = funcDef.parser(tnow0); // tnow0 was 'void'. funcDef returns token after '}'.
+             
+             tnow1 = GiveTokener.getInstance().preReadAToken();
+             tnow2 = GiveTokener.getInstance().preReadAToken();
+        }
+        ```
+        If `funcDef.parser` returns the token after `}`, `tnow0` becomes that token.
+        If the input is `void f(int a {}` followed by `int main...`, the token after `}` is `int` (from line 3).
+        So `tnow0` becomes `int` (Line 3). `tnow1` becomes `main`. `tnow2` becomes `(`.
+        The loop condition `tnow0 != INTTK || tnow1 != MAINTK` becomes `false || false` -> `false`. Loop terminates.
+        Then `MainFuncDef` is called with `tnow0` (`int`).
+        
+        So far so good. `MainFuncDef` should parse `int main( {`.
+        Inside `MainFuncDef`:
+        ```java
+        public Token parser(Token token){ // token is 'int'
+            nodes.add(token); // 'int'
+            Token tnow1 = getAToken(); // 'main'
+            // ...
+            nodes.add(tnow1); // 'main'
+            tnow1 = getAToken(); // '('
+            // ...
+            errorline = tnow1.getLineno(); // Line 3
+            nodes.add(tnow1); // '('
+            tnow1 = getAToken(); // '{'
+            // ...
+            if(tnow1.getTokenType() != TokenType.RPARENT){ // '{' != ')' -> True
+                putBackAToken(tnow1); // Put '{' back
+                reportError(errorline); // Report 3 j
+                //error!!!
+            }else{
+                nodes.add(tnow1);
+            }
+            tnow1 = getAToken(); // Gets '{' again
+            // ...
+            Block block = new Block();
+            block.parser(tnow1); // Parses block
+            return getAToken();
+        }
+        ```
+        This logic *should* report `3 j`. Why didn't it?
+        
+        Let's check `WriteIntoF`. It appends to file.
+        Let's check `GiveTokener`.
+        
+        Is it possible that `FuncDef` on Line 1 consumed more than it should have, or messed up the token stream?
+        In `FuncDef`, when it encounters `{` instead of `)`, it assumes a block follows immediately.
+        `block.parser(token2)` is called with `{`.
+        Inside `Block.parser`:
+        ```java
+        public Token parser(Token token){ // token is '{'
+            nodes.add(token);
+            Token tnow0 = getAToken(); // Next token inside block
+            // ... loops until RBRACE
+        }
+        ```
+        For `void f(int a {}`, the block is empty. `tnow0` will be `}`.
+        Loop `while(type!=TokenType.RBRACE)` doesn't execute.
+        `nodes.add(tnow0)` adds `}`.
+        `return null;` ???
+        
+        **Wait!** Look at `Block.parser`:
+        ```java
+        public Token parser(Token token){
+            // ...
+            while(type!=TokenType.RBRACE){
+               // ...
+            }
+            nodes.add(tnow0);
+            return null; // <--- HERE IS THE PROBLEM
+        }
+        ```
+        `Block.parser` returns `null`!
+        
+        Now look at `FuncDef.parser`:
+        ```java
+        Block block = new Block();
+        block.parser(token2); // Returns null
+        nodes.add(block);
+        return getAToken(); // Gets NEXT token after '}'
+        ```
+        This part seems okay for `FuncDef` itself, as it explicitly calls `getAToken()` after `block.parser`.
+        
+        Now look at `MainFuncDef.parser`:
+        ```java
+        Block block = new Block();
+        block.parser(tnow1); // Returns null
+        nodes.add(block);
+        return getAToken(); // Gets NEXT token after '}'
+        ```
+        This also seems okay.
+        
+        Now look at `StmtBlock.parser`:
+        ```java
+        public Token parser(Token token){
+            Block block = new Block();
+            block.parser(token); // Returns null
+            nodes.add(block);
+            return getAToken(); // Gets NEXT token
+        }
+        ```
+        
+        Now look at `CompUnit.parser`:
+        ```java
+        tnow0 = funcDef.parser(tnow0);
+        // if funcDef returns null?
+        ```
+        In `FuncDef`, if `block.parser` is called, it returns `getAToken()`.
+        
+        Let's re-read `FuncDef` carefully.
+        ```java
+        if(token2.getTokenType()!=TokenType.LBRACE){
+            return token2;
+        }
+        Block block = new Block();
+        block.parser(token2);
+        nodes.add(block);
+        return getAToken();
+        ```
+        If `token2` is `{`, it parses block, then returns next token.
+        
+        What if `block.parser` encounters an error or unexpected token and returns `null`?
+        In `Block.parser`:
+        ```java
+        Token tnow0 = getAToken();
+        if(tnow0 == null){
+            System.out.println("error!:in Block.parserBlock in line 10");
+            return null;
+        }
+        // ...
+        while(type!=TokenType.RBRACE){
+           // ...
+           else{
+               tnow0 = getAToken();
+               if(tnow0 == null){
+                   return null; // <--- Returns null if EOF reached inside block without closing brace?
+               }
+               // ...
+           }
+        }
+        nodes.add(tnow0);
+        return null; // <--- ALWAYS RETURNS NULL
+        ```
+        
+        **Crucial Finding**: `Block.parser` **always returns `null`** upon successful completion (finding `}`).
+        
+        Now trace `MainFuncDef` again:
+        ```java
+        Block block = new Block();
+        block.parser(tnow1); // Returns null
+        nodes.add(block);
+        return getAToken(); // This line is executed.
+        ```
+        So `MainFuncDef` returns the token after the block.
+        
+        Trace `FuncDef` again:
+        ```java
+        Block block = new Block();
+        block.parser(token2); // Returns null
+        nodes.add(block);
+        return getAToken(); // This line is executed.
+        ```
+        
+        So why are errors 2 and 3 missing?
+        
+        Let's look at `StmtBlock` which is used inside `Block` for `{ ... }` statements? No, `BlockItem` can be `Stmt`. `Stmt` can be `Block`.
+        In `Block.parser`:
+        ```java
+        else if(type == ... || type == TokenType.LBRACE ...){
+             Node node= Stmt.parserStmt(tnow0);
+             tnow0 = node.parser(tnow0); // <--- HERE
+             if(tnow0 == null){
+                 System.out.println("error!:in Block.parserBlock in line 29");
+                 return null;
+             }
+             nodes.add(node);
+             type = tnow0.getTokenType();
+        }
+        ```
+        If `Stmt` is a `StmtBlock` (which wraps a `Block`), `node.parser(tnow0)` calls `StmtBlock.parser`.
+        `StmtBlock.parser`:
+        ```java
+        public Token parser(Token token){
+            Block block = new Block();
+            block.parser(token); // Returns null
+            nodes.add(block);
+            return getAToken(); // Returns next token
+        }
+        ```
+        So `StmtBlock` returns the next token. This is fine.
+        
+        However, look at `MainFuncDef` and `FuncDef` again. They call `block.parser` directly, not via `Stmt`.
+        
+        Is it possible that `CompUnit` fails to proceed?
+        
+        Let's look at `Lexer` or `GiveTokener`.
+        
+        Actually, there is a subtle bug in `Block.parser`.
+        ```java
+        while(type!=TokenType.RBRACE){
+            // ...
+            else{
+                tnow0 = getAToken();
+                if(tnow0 == null){
+                    return null;
+                }
+                type = tnow0.getTokenType();
+                System.out.println("error!:in Block.parserBlock in line 40"+GiveTokener.getInstance().getMaxlineno()+"with token "+tnow0.toString());
+            }
+        }
+        nodes.add(tnow0);
+        return null;
+        ```
+        
+        If `Block` is empty `{}`, `tnow0` is `}`. Loop doesn't run. `nodes.add(tnow0)`. `return null`.
+        
+        Let's look at `MainFuncDef` again.
+        ```java
+        if(tnow1.getTokenType() != TokenType.RPARENT){
+            putBackAToken(tnow1);
+            reportError(errorline);
+            //error!!!
+        }else{
+            nodes.add(tnow1);
+        }
+        tnow1 = getAToken(); // Gets '{'
+        if(tnow1 == null){ return null; }
+        if(tnow1.getTokenType()!=TokenType.LBRACE){ }
+        Block block = new Block();
+        block.parser(tnow1);
+        nodes.add(block);
+        return getAToken();
+        ```
+        
+        If `reportError` is called, execution continues. `tnow1` is put back. Then `getAToken()` retrieves it again (`{`). `block.parser` is called.
+        
+        Wait, look at `FuncDef` logic for Error 1 again.
+        ```java
+        if(token2.getTokenType()!=TokenType.RPARENT){
+            if(token2.getTokenType()!=TokenType.INTTK&&token2.getTokenType()!=TokenType.CHARTK){
+                reportError(errorline);
+                if(token2.getTokenType()!=TokenType.LBRACE){
+                    return token2;
+                }
+                Block block = new Block();
+                block.parser(token2);
+                nodes.add(block);
+                return getAToken();
+            }
+            // ...
+        }
+        ```
+        If `token2` is `{`, it reports error, parses block, returns next token.
+        
+        What if the issue is in `StmtExp` or `UnaryExp` for Error 3?
+        
+        Let's look at `UnaryExp.reportError`.
+        ```java
+        public void reportError(int lineno){
+            WriteIntoF.getInstance().writeToFile(false,lineno+" "+ErrorType.j+"\n");
+        }
+        ```
+        
+        Let's look at `StmtAssign.reportErrorj`.
+        ```java
+        public void reportErrorj(int lineno){
+            WriteIntoF.getInstance().writeToFile(false,lineno+" "+ErrorType.j+"\n");
+        }
+        ```
+        
+        Let's look at `PrimaryExp.reportError`.
+        ```java
+        public void reportError(int lineno){
+            WriteIntoF.getInstance().writeToFile(false,lineno+" "+ErrorType.j+"\n");
+        }
+        ```
+        
+        All seem correct.
+        
+        Is it possible that `CompUnit` crashes or stops?
+        
+        Let's look at `CompUnit.parser` loop condition again.
+        ```java
+        while (tnow0.getTokenType() != TokenType.INTTK || tnow1.getTokenType() != TokenType.MAINTK) {
+        ```
+        If `FuncDef` returns `null`?
+        In `FuncDef`, if `block.parser` returns `null` (which it always does), `FuncDef` continues to `return getAToken()`.
+        
+        However, if `FuncDef` encounters an error where it returns `token2` (e.g. missing `{` after error), it returns a token.
+        
+        Let's look at `Block.parser` return value usage in `CompUnit`? No, `CompUnit` uses `FuncDef`.
+        
+        There is a known issue in recursive descent parsers where if a lower-level parser returns `null` to indicate error, the upper-level parser might crash if it doesn't check for `null`.
+        
+        In `MainFuncDef`:
+        ```java
+        block.parser(tnow1); // Returns null
+        nodes.add(block);
+        return getAToken();
+        ```
+        It ignores the return value of `block.parser`. This is risky but consistent with `FuncDef`.
+        
+        In `Block.parser` (called from `StmtBlock` or `FuncDef` or `MainFuncDef`):
+        If `Block` contains items, it loops.
+        
+        Let's look at `StmtExp` for Error 3 (`f(a+10;`).
+        `StmtExp` calls `Exp.parser`.
+        `Exp` -> `AddExp` -> `MulExp` -> `UnaryExp`.
+        `UnaryExp` sees `f`, `(`. Calls `FuncRParams`.
+        `FuncRParams` parses `a+10`. Returns `;`.
+        `UnaryExp` checks `if(token2.getTokenType()!=TokenType.RPARENT)`. `;` != `)`.
+        Calls `reportError(errorline)`.
+        Returns `token2` (`;`).
+        
+        Back in `MulExp`:
+        ```java
+        Token token1 = unaryExp.parser(token);
+        nodes.add(unaryExp);
+        while(token1.getTokenType() == TokenType.DIV ...){ // ; is not DIV
+        }
+        return token1; // Returns ;
+        ```
+        Back in `AddExp`:
+        Returns `;`.
+        Back in `Exp`:
+        Returns `;`.
+        Back in `StmtExp`:
+        ```java
+        Token token = exp.parser(firstToken);
+        nodes.add(exp);
+        if(token.getTokenType() != TokenType.SEMICN){ // ; == SEMICN
+             reportErrori(errorline);
+             return token;
+        }
+        nodes.add(token);
+        return getAToken();
+        ```
+        So `StmtExp` consumes the `;` and returns the next token.
+        NO ERROR REPORTED FOR MISSING `)`?
+        
+        Wait, `UnaryExp` DID report the error `5 j`.
+        ```java
+        if(token2.getTokenType()!=TokenType.RPARENT){
+            reportError(errorline);
+            return token2;
+        }
+        ```
+        So `5 j` SHOULD be in the output.
+        
+        Why is it missing?
+        
+        Maybe `WriteIntoF` is not flushing? Or `error.txt` is being overwritten?
+        `WriteIntoF`:
+        ```java
+        public void writeToFile(boolean ifnormal, String content) {
+            try (BufferedWriter writer = new BufferedWriter(new FileWriter(ifnormal ? filePathn : filePathe, true))) {
+                writer.write(content);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+        ```
+        `true` means append. This is correct.
+        
+        Let's look at `Lexer.sendError`.
+        ```java
+        public void sendError(ErrorType errorType,int errorline){
+            String errorm = "" + getChar.getLineno() + ' ' +errorType.toString() +  '\n';
+            WriteIntoF.getInstance().writeToFile(false,errorm);
+        }
+        ```
+        
+        Is it possible that `CompUnit` or `Parser` clears the file? No.
+        
+        Let's look at `Block.parser` again.
+        
+        If `Block.parser` returns `null`, and the caller expects a token...
+        
+        In `FuncDef`:
+        ```java
+        block.parser(token2);
+        nodes.add(block);
+        return getAToken();
+        ```
+        
+        In `MainFuncDef`:
+        ```java
+        block.parser(tnow1);
+        nodes.add(block);
+        return getAToken();
+        ```
+        
+        In `StmtBlock`:
+        ```java
+        block.parser(token);
+        nodes.add(block);
+        return getAToken();
+        ```
+        
+        In `Block` itself (parsing items):
+        ```java
+        Node node= Stmt.parserStmt(tnow0);
+        tnow0 = node.parser(tnow0);
+        if(tnow0 == null){
+             System.out.println("error!:in Block.parserBlock in line 29");
+             return null;
+        }
+        ```
+        If `Stmt` is `StmtBlock`, `node.parser` returns `getAToken()` (next token). Not null.
+        
+        However, if `Stmt` is `StmtExp`, `node.parser` returns `getAToken()` (next token).
+        
+        What if `UnaryExp` returns `null`?
+        ```java
+        if(token1 == null){ return null; }
+        ```
+        
+        If `UnaryExp` returns `null`, `MulExp` crashes (`token1.getTokenType()`).
+        
+        But `UnaryExp` only returns `null` if `getAToken` returns `null` inside it.
+        
+        Let's look at the specific error in `Block.java` line 29 debug print.
+        
+        Actually, I suspect the issue is in **`Block.parser` returning `null`**.
+        
+        When `MainFuncDef` calls `block.parser(tnow1)`, it returns `null`.
+        Then `MainFuncDef` calls `return getAToken()`.
+        
+        When `FuncDef` calls `block.parser(token2)`, it returns `null`.
+        Then `FuncDef` calls `return getAToken()`.
+        
+        This seems consistent.
+        
+        Let's look at **`StmtIf`**, **`StmtFor`**.
+        
+        Wait, look at **`StmtAssign`**.
+        
+        And **`StmtExp`**.
+        
+        Is it possible that the program **crashes** before reporting errors 2 and 3?
+        
+        If `FuncDef` on Line 1 returns the token after `}`, which is `int` (Line 3).
+        `CompUnit` loop checks `tnow0` (`int`) and `tnow1` (`main`). Loop ends.
+        `MainFuncDef` is called.
+        
+        If `MainFuncDef` reports error 2, it writes to file.
+        Then it parses block.
+        Inside block, it parses `int a = 10;`.
+        Then it parses `f(a + 10;`.
+        
+        If `UnaryExp` reports error 3, it writes to file.
+        
+        Why would they be missing?
+        
+        One possibility: **`Block.parser` consumes the `}` and returns `null`.**
+        
+        Another possibility: **`GiveTokener` state.**
+        
+        Let's look at `Lexer` handling of `&` and `|`.
+        
+        Actually, look at `Block.java` line 40:
+        ```java
+        System.out.println("error!:in Block.parserBlock in line 40"+GiveTokener.getInstance().getMaxlineno()+"with token "+tnow0.toString());
+        ```
+        This prints to STDOUT, not file.
+        
+        I will bet on the fact that `Block.parser` returns `null`, and some caller **does not handle it correctly**, causing a crash or silent failure, OR `MainFuncDef` / `FuncDef` logic for error recovery is flawed such that it doesn't proceed to parse the rest of the file correctly.
+        
+        However, the most obvious discrepancy is that `Block.parser` returns `null` while other parsers return the next token. This inconsistency often leads to bugs. But here, the callers (`FuncDef`, `MainFuncDef`, `StmtBlock`) explicitly call `getAToken()` afterwards, ignoring the return value. So this might be intentional design.
+        
+        Let's look at `Stmt.java` `parserStmt`.
+        
+        If `StmtExp` is chosen for `f(a+10;`, it calls `Exp`.
+        
+        I will highlight `Block.java` as the likely source of structural error due to returning `null`, and `MainFuncDef.java` / `FuncDef.java` for potentially not handling the flow correctly if `block.parser` behaves unexpectedly.
+        
+        But wait, if `Block.parser` returns `null`, and `StmtBlock` returns `getAToken()`, that's fine.
+        
+        Let's look at `CompUnit.java` again.
+        
+        If `FuncDef` returns `null`?
+        ```java
+        if (tnow2 == null) {
+            return null;
+        } else {
+            System.out.println("error!:in Parser.parserCompUnit() in line 55");
+            return tnow2;
+        }
+        ```
+        `MainFuncDef` returns `getAToken()`. If EOF, `getAToken()` returns `null`.
+        So `CompUnit` returns `null`.
+        
+        I will provide `Block.java` and `MainFuncDef.java` as the snippets.
+
+<frontend/Block.java>
+...
+        nodes.add(tnow0);
+        return null;
+    }
+...
+
+<frontend/MainFuncDef.java>
+...
+        Block block = new Block();
+        block.parser(tnow1);
+        nodes.add(block);
+        return getAToken();
+    }
+...

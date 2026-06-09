@@ -1,0 +1,13 @@
+import frontend.Lexer;
+
+public class Compiler {
+    public static void main(String[] args) {
+        String inputFile = "testfile.txt";
+        String outputFile = "lexer.txt";
+        String errorFile = "error.txt";
+
+        Lexer lexer = Lexer.getInstance();
+        lexer.initialize(inputFile, outputFile, errorFile);
+        lexer.tokenize();
+    }
+}

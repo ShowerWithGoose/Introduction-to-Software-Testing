@@ -1,0 +1,113 @@
+package frontend;
+import java.util.ArrayList;
+import java.util.regex.Pattern;
+public class Lexer {
+    private final SrcReader srcReader;
+    private final TokenList tokenList;
+    private final ArrayList<String> errorList; // 小驼峰命名
+    private final String lineComment = "//";
+    private final String blockCommentSt = "/*";
+    private final String blockCommentEd = "*/";
+
+    public Lexer(SrcReader srcReader) {
+        this.srcReader = srcReader;
+        this.tokenList = new TokenList();
+        this.errorList = new ArrayList<>();
+        tokenize();
+    }
+
+    private void tokenize() {
+        while (!this.srcReader.isEndOfFile()) {
+            skipWhiteSpace();
+            if (skipComment()) {
+                continue;
+            }
+            addToken();
+        }
+    }
+
+    private void skipWhiteSpace() {
+        this.srcReader.skipWhitespace();
+    }
+
+    private boolean skipComment() {
+        if (lineComment.equals(this.srcReader.peekNextSubstring(2))) {
+            this.srcReader.moveToNextLine();
+            return true;
+        } else if (blockCommentSt.equals(this.srcReader.peekNextSubstring(2))) {
+            srcReader.advancePosition(blockCommentSt.length());
+            while (!this.srcReader.isEndOfFile() &&
+                    !blockCommentEd.equals(this.srcReader.peekNextSubstring(2))) {
+                this.srcReader.advancePosition(1);
+            }
+            if (blockCommentEd.equals(this.srcReader.peekNextSubstring(2))) {
+                this.srcReader.advancePosition(blockCommentEd.length());
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void addToken() {
+        String nextTwoChars = this.srcReader.peekNextSubstring(2);  // 预览下两个字符
+
+        // 如果 nextTwoChars 的长度不够，直接返回，避免错误
+        if (nextTwoChars.length() < 1) {
+            return; // 文件可能已经结束或者遇到了空行，直接返回
+        }
+
+        if (nextTwoChars.length() == 2) {  // 当有至少两个字符时
+            // 处理逻辑运算符
+            if (nextTwoChars.equals("&&")) {
+                this.tokenList.addToken(new Token(TokenType.AND, srcReader.getCurrentLineNumber(), "&&"));
+                this.srcReader.advancePosition(2); // 跳过两个字符
+                return;
+            } else if (nextTwoChars.equals("||")) {
+                this.tokenList.addToken(new Token(TokenType.OR, srcReader.getCurrentLineNumber(), "||"));
+                this.srcReader.advancePosition(2); // 跳过两个字符
+                return;
+            }
+        }
+
+        // 如果只剩下一个字符，或前两个字符不是逻辑运算符
+        String currentChar = nextTwoChars.substring(0, 1); // 获取第一个字符
+        if (currentChar.equals("&") || currentChar.equals("|")) {
+            handleLogicalOperatorError(currentChar); // 处理单个符号的错误
+            return;
+        }
+
+        for (TokenType tokenType : TokenType.values()) {
+            Pattern pattern = tokenType.getPattern();
+            String tokenStr = this.srcReader.matchPattern(pattern);
+            if (tokenStr != null) {
+                Token token = new Token(tokenType, srcReader.getCurrentLineNumber(), tokenStr);
+                this.srcReader.advancePosition(tokenStr.length());
+                this.tokenList.addToken(token);
+                break;
+            }
+        }
+    }
+
+    private void handleLogicalOperatorError(String operator) {
+        int currentLine = srcReader.getCurrentLineNumber();
+
+        if (operator.equals("&") || operator.equals("|")) {
+            // 记录行号和类别码 "a"
+            this.errorList.add(currentLine + " a");
+        }
+
+        this.srcReader.advancePosition(1); // 移动位置以避免无限循环
+    }
+
+    public String getTokenList() {
+        return this.tokenList.toString();
+    }
+
+    public String getErrorList() {
+        StringBuilder errors = new StringBuilder();
+        for (String error : this.errorList) {
+            errors.append(error).append("\n"); // 每条错误信息换行
+        }
+        return errors.toString().trim(); // 去除末尾的多余换行符
+    }
+}

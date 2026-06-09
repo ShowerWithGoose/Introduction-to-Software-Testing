@@ -1,0 +1,601 @@
+<frontend/Lexer.java>
+...
+    private Token handleSymbol() {
+        StringBuilder sb = new StringBuilder();
+        String tmp = String.format("%c%c", currentChar, peekNextChar());
+        if (!Character.isWhitespace(currentChar) && !Character.isLetter(currentChar) && !Character.isDigit(currentChar)) {
+            sb.append(currentChar);
+            advance();
+        }
+        if (tmp.equals("!=") || tmp.equals("&&") || tmp.equals("||") || tmp.equals("==") || tmp.equals(">=") || tmp.equals("<=")) { @@ The variable `tmp` was calculated before the first `advance()` call, so it contains the old character at `pos` and the character at `pos+1`. After `advance()`, `currentChar` is now the character that was at `pos+1`. Appending `currentChar` again results in duplicating the second character of the operator (e.g., "==" becomes "===" or "<=" becomes "<=="). The check should use the updated state or `tmp` should be recalculated, and typically one would append the specific next character or rely on the fact that `currentChar` is now the second part of the operator, but the logic here is flawed because `tmp` is stale. More critically, if the operator is valid, we want to append the *next* character relative to the start. Since we already advanced once, `currentChar` holds the second character. So `sb.append(currentChar)` is actually correct for the second character *if* `tmp` indicated a multi-char operator. However, the condition `tmp.equals(...)` checks the *old* state. If `tmp` matches, we append `currentChar` (which is the 2nd char) and advance again. This seems logically okay for forming the string "==" from "=" + "=", BUT wait: `tmp` is formed by `currentChar` (at pos i) and `peekNextChar()` (at pos i+1). Then we append `currentChar` (char at i) and advance. Now `currentChar` is char at i+1. Then we check `tmp`. If `tmp` is "==", we append `currentChar` (char at i+1, which is '=') and advance. This forms "==". This logic actually works for forming the token string. 
+        Let's re-read carefully.
+        Initial: `currentChar` = 'a'. `tmp` = "ab".
+        Append 'a'. Advance. `currentChar` = 'b'.
+        Check `tmp` ("ab"). If it matches a 2-char op, append 'b'. Advance.
+        This creates "ab".
+        
+        So why is it failing?
+        Look at `handleComment`.
+        `if (currentChar == '/') { ... }`
+        In `getOneToken`:
+        `else if (currentChar == '/') { if (!handleComment()) break; }`
+        
+        If it's not a comment, it breaks out of the while loop.
+        Then:
+        `if (currentChar == '\0') ...`
+        `else if (Character.isDigit...)`
+        `else if (Character.isLetter...)`
+        `else { if (currentChar == '"' || currentChar == '\'') ... else return handleSymbol(); }`
+        
+        So `/` that is not a comment goes to `handleSymbol`.
+        
+        Let's look at `handleSymbol` again.
+        `String tmp = String.format("%c%c", currentChar, peekNextChar());`
+        If `currentChar` is `/`, `tmp` could be `//` or `/*` or `/ ` etc.
+        The `if` condition for 2-char operators does NOT include `//` or `/*`.
+        So it appends `/`, advances.
+        
+        Is there an issue with `peekNextChar`?
+        `if (pos >= text.length()) return '\0';`
+        
+        Let's look at the error output: "No output file".
+        This suggests an exception or infinite loop or empty token list.
+        
+        In `Compiler.java`:
+        `Lexer lexer = new Lexer(text);`
+        `lexer.printTokens();`
+        
+        In `Lexer` constructor:
+        `while (currentChar != '\0') { token = getOneToken(); tokens.add(token); }`
+        
+        If `getOneToken` returns `null`, `tokens.add(null)` happens.
+        In `printTokens`:
+        `if (token == null) continue;`
+        
+        So `null` tokens are skipped.
+        
+        Why "No output file"?
+        Maybe `Files.readAllBytes` fails? No, usually that throws exception.
+        Maybe `FileOutputStream` fails?
+        
+        Let's look at `handleStringOrChar`.
+        `while (currentChar != '\0' && currentChar != quoteType)`
+        Inside:
+        `if (currentChar == '\\') { sb.append(currentChar); advance(); }`
+        `sb.append(currentChar); advance();`
+        
+        If `currentChar` is `\`, it appends `\`, advances. Now `currentChar` is the escaped char.
+        Then it appends the escaped char, advances.
+        This seems okay for basic escaping, though it doesn't handle `\n` as a single newline char in value, but preserves source form.
+        
+        Wait, look at `handleComment` for block comments:
+        `while (currentChar != '\0' && !(peekPrevChar() == '*' && currentChar == '/')) { advance(); }`
+        `advance();`
+        
+        If the comment is `/* ... */`, it advances until `*/`.
+        When `currentChar` is `/` (the closing one), `peekPrevChar` is `*`. Loop terminates.
+        Then `advance()` consumes the `/`.
+        This seems correct.
+        
+        Let's look at `handleSymbol` again.
+        `String tmp = String.format("%c%c", currentChar, peekNextChar());`
+        
+        If `currentChar` is the last character in the file, `peekNextChar` returns `\0`.
+        `tmp` becomes "c\0".
+        
+        If `currentChar` is `=`, and next is `\0`. `tmp` is "=\0".
+        Not in list.
+        Append `=`, advance. `currentChar` becomes `\0`.
+        Return `SymbolToken("=")`.
+        
+        What if `currentChar` is `\0` when entering `handleSymbol`?
+        `getOneToken` checks `if (currentChar == '\0') return null;` at the start?
+        No, it checks inside the `while(true)` loop for whitespace/comments.
+        `while (true) { if (currentChar == '\0') break; ... }`
+        Then `if (currentChar == '\0') return null;`
+        
+        So `handleSymbol` is never called with `\0`.
+        
+        Let's look at the `IdentToken` or `NumberToken` or `SymbolToken` constructors.
+        
+        Is it possible `line` is not static? It is `private static int line;`.
+        
+        Let's look at the `testfile.txt` content provided in the prompt.
+        It contains `// 输出 1`.
+        
+        When `getOneToken` encounters `/`:
+        Calls `handleComment()`.
+        `currentChar` is `/`. `peekNextChar` is `/`.
+        Enters `if (peekNextChar() == '/')`.
+        `advance()` -> pos moves to 2nd `/`.
+        `advance()` -> pos moves to space after `//`.
+        `while (currentChar != '\0' && currentChar != '\n') { advance(); }`
+        It advances until `\n` or end.
+        If it hits `\n`, `currentChar` is `\n`.
+        Returns `true`.
+        
+        Back in `getOneToken`: `if (!handleComment()) break;` -> `if (!true) break;` -> continues loop.
+        Loop continues, sees `\n` (whitespace), advances.
+        
+        This seems correct.
+        
+        Why "No output file"?
+        
+        Check `printTokens`.
+        `OutputStreamWriter writer1 = new OutputStreamWriter(new FileOutputStream("lexer.txt"));`
+        
+        If `tokens` is empty, it writes nothing, but files are created.
+        "No output file" usually means the file `lexer.txt` does not exist or is empty when it shouldn't be, OR the program crashed before creating it.
+        
+        If the program crashed, there would be an exception trace. The prompt says "Buggy Output: No output file". This often implies the files were not generated at all, or the system checking for output found nothing.
+        
+        Let's look at `Compiler.java`.
+        `String text = new String(Files.readAllBytes(Paths.get("testfile.txt")));`
+        
+        If `testfile.txt` has Windows line endings `\r\n`, `text` contains `\r`.
+        `Character.isWhitespace('\r')` is true.
+        
+        If `testfile.txt` is empty? No, it has content.
+        
+        Let's look closely at `handleSymbol` logic again.
+        
+        `String tmp = String.format("%c%c", currentChar, peekNextChar());`
+        
+        If `currentChar` is `&` and `peekNextChar` is `&`. `tmp` is "&&".
+        Append `&`. Advance. `currentChar` is `&`.
+        Check `tmp` ("&&"). Matches.
+        Append `&`. Advance.
+        Token "&&". Correct.
+        
+        If `currentChar` is `&` and `peekNextChar` is ` ` (space). `tmp` is "& ".
+        Append `&`. Advance. `currentChar` is ` `.
+        Check `tmp` ("& "). No match.
+        Token "&".
+        `SymbolToken("&")` constructor:
+        `default:` branch.
+        `assert value.equals("|") || value.equals("&");`
+        `this.type = Type.ERROR;`
+        `this.errorCode = 'a';`
+        
+        This handles error type 'a'.
+        
+        So where is the bug?
+        
+        Let's look at `peekNextChar`.
+        `if (pos >= text.length()) return '\0';`
+        `return text.charAt(pos + 1);`
+        
+        In `handleSymbol`, `tmp` is calculated using `pos` and `pos+1`.
+        Then `advance()` is called. `pos` becomes `pos+1`.
+        
+        If `pos` was `text.length() - 1` (last char).
+        `peekNextChar` returns `\0`.
+        `tmp` is "lastChar\0".
+        Append `lastChar`. Advance. `pos` becomes `text.length()`. `currentChar` becomes `\0`.
+        Check `tmp`. No match.
+        Return token.
+        
+        This seems fine.
+        
+        Wait! Look at `handleComment` block comment logic.
+        `while (currentChar != '\0' && !(peekPrevChar() == '*' && currentChar == '/')) { advance(); }`
+        
+        If the file ends with `/*` without closing?
+        `currentChar` becomes `\0`. Loop terminates.
+        `advance()` is called.
+        `pos` increments. `currentChar` stays `\0`.
+        Returns `true`.
+        
+        Back in `getOneToken`. Loop continues.
+        `currentChar` is `\0`. Breaks.
+        Returns `null`.
+        
+        This seems fine.
+        
+        Let's look at `IdentToken` switch.
+        `case "main": this.type = Type.MAINTK; break;`
+        
+        Let's look at `SymbolToken` switch.
+        `case "printf":` -> Wait, `printf` is an identifier, not a symbol.
+        `handleIdentifier` handles `printf`.
+        
+        Is it possible `handleIdentifier` is broken?
+        `while (currentChar == '_' || Character.isLetter(currentChar) || Character.isDigit(currentChar))`
+        
+        If `currentChar` is `p`, it appends, advances.
+        
+        Let's look at the `Lexer` constructor loop.
+        `while (currentChar != '\0') { token = getOneToken(); tokens.add(token); }`
+        
+        If `getOneToken` returns `null` (when `\0` is reached), `null` is added.
+        
+        In `printTokens`, `if (token == null) continue;`
+        
+        So `lexer.txt` should be written.
+        
+        Why "No output file"?
+        
+        Maybe an exception is thrown in `printTokens`?
+        `writer1.close();`
+        
+        If an exception occurs during `writer1.write`, it might crash.
+        
+        Let's look at `Token.toString()`.
+        `String.format("%s %s\n", type, value);`
+        
+        `type` is an Enum. `toString()` on Enum returns the name.
+        
+        Is it possible `value` is null?
+        In `IdentToken`, `value` is passed in.
+        In `handleIdentifier`, `sb.toString()` is passed. `sb` is never empty because `getOneToken` checks `isLetter` before calling.
+        
+        Wait, look at `handleSymbol`.
+        `StringBuilder sb = new StringBuilder();`
+        `if (!Character.isWhitespace... ) { sb.append(currentChar); advance(); }`
+        
+        If `currentChar` IS whitespace?
+        `getOneToken` skips whitespace in the `while(true)` loop.
+        So `handleSymbol` is only called if `currentChar` is not whitespace, not letter, not digit, not quote.
+        
+        So `sb` will have at least one char.
+        
+        Let's look at `handleStringOrChar`.
+        `StringBuilder sb = new StringBuilder();`
+        `char quoteType = currentChar;`
+        `sb.append(currentChar);`
+        `advance();`
+        
+        `while (currentChar != '\0' && currentChar != quoteType)`
+        
+        If `currentChar` is `\0` immediately?
+        Loop doesn't run.
+        `sb.append(currentChar);` -> Appends `\0`.
+        `advance();`
+        
+        Token value is `"\0"`? Or `"\"`?
+        `quoteType` was `"`.
+        Value is `"` + `\0` + `"`? No.
+        `sb` initially has `"`.
+        Loop skipped.
+        `sb.append(currentChar)` -> `sb` is `""\0`.
+        `advance()`.
+        
+        `SymbolToken` constructor.
+        `value.charAt(0)` is `"`.
+        `value.charAt(value.length()-1)` is `\0`.
+        Does not match `"` at end.
+        Goes to default.
+        `assert value.equals("|") || value.equals("&");` -> Fails assertion!
+        
+        `AssertionError` is a `Error`, not `Exception`.
+        The `catch (RuntimeException e)` in `handleSymbol` does NOT catch `AssertionError` (which is an `Error`).
+        Also, `handleStringOrChar` returns `new SymbolToken(sb.toString())`. It does NOT have a try-catch.
+        
+        So if there is an unterminated string, `AssertionError` is thrown.
+        The program crashes.
+        `printTokens` is never called (or crashes if called later? No, crash is in Constructor).
+        
+        But the test case input is valid:
+        `printf("21373119");`
+        
+        String is terminated.
+        
+        Let's trace `printf("21373119");`
+        
+        1. `printf` -> `handleIdentifier` -> `IdentToken("printf")` -> `PRINTFTK`.
+        2. `(` -> `handleSymbol` -> `SymbolToken("(")` -> `LPARENT`.
+        3. `"` -> `handleStringOrChar`.
+           `quoteType` = `"`.
+           `sb` = `"`.
+           `advance()` -> `2`.
+           Loop: `2` != `"`.
+           `sb` append `2`. `advance()` -> `1`.
+           ...
+           `9` != `"`.
+           `sb` append `9`. `advance()` -> `"`.
+           Loop condition: `"` != `"` is false. Loop ends.
+           `sb.append(currentChar)` -> `sb` appends `"`.
+           `advance()` -> `)`.
+           Return `SymbolToken("\"21373119\"")`.
+           
+           `SymbolToken` constructor:
+           `value` is `"21373119"`.
+           `value.charAt(0)` is `"`.
+           `value.charAt(last)` is `"`.
+           `type` = `STRCON`.
+           
+        4. `)` -> `handleSymbol` -> `RPARENT`.
+        5. `;` -> `handleSymbol` -> `SEMICN`.
+        
+        This seems correct.
+        
+        So why "No output file"?
+        
+        Let's look at `Compiler.java` again.
+        `String text = new String(Files.readAllBytes(Paths.get("testfile.txt")));`
+        
+        If `testfile.txt` contains BOM?
+        
+        Let's look at `handleComment` again.
+        
+        `if (currentChar == '/') { // 去除注释`
+        `if (peekNextChar() == '/') {`
+        `advance();`
+        `advance();`
+        
+        If the line is `// comment`.
+        Pos 0: `/`. Pos 1: `/`.
+        Advance -> Pos 1 (`/`).
+        Advance -> Pos 2 (` `).
+        Loop while not `\n`.
+        
+        This is correct.
+        
+        Is it possible the error is in `peekPrevChar`?
+        
+        `private char peekPrevChar() { if (pos == 0) return '\0'; return text.charAt(pos - 1); }`
+        
+        Used in block comment.
+        
+        Let's look at the `handleSymbol` code snippet provided in the solution box.
+        
+        `String tmp = String.format("%c%c", currentChar, peekNextChar());`
+        
+        If `currentChar` is high surrogate? `String.format` might behave weirdly? Unlikely for C-like source.
+        
+        Wait, look at this line in `handleSymbol`:
+        `if (tmp.equals("!=") || tmp.equals("&&") || tmp.equals("||") || tmp.equals("==") || tmp.equals(">=") || tmp.equals("<=")) {`
+        
+        And the lines before:
+        `sb.append(currentChar);`
+        `advance();`
+        
+        If `tmp` matches, we do:
+        `sb.append(currentChar);`
+        `advance();`
+        
+        This assumes `currentChar` is now the SECOND character of the operator.
+        
+        Example: `<=`
+        Start: `currentChar` = `<`. `peekNextChar` = `=`. `tmp` = `<=".
+        Append `<`. Advance. `currentChar` = `=`.
+        Check `tmp` (`<=`). Match.
+        Append `=`. Advance.
+        Result `<=`. Correct.
+        
+        Example: `==`
+        Start: `currentChar` = `=`. `peekNextChar` = `=`. `tmp` = `==`.
+        Append `=`. Advance. `currentChar` = `=`.
+        Check `tmp` (`==`). Match.
+        Append `=`. Advance.
+        Result `==`. Correct.
+        
+        So `handleSymbol` logic for valid 2-char operators is correct.
+        
+        What about `!=`?
+        Start: `!`. Next `=`. `tmp` = `!=`.
+        Append `!`. Advance. `currentChar` = `=`.
+        Match. Append `=`. Advance.
+        Result `!=`. Correct.
+        
+        What about `&&`?
+        Start: `&`. Next `&`. `tmp` = `&&`.
+        Append `&`. Advance. `currentChar` = `&`.
+        Match. Append `&`. Advance.
+        Result `&&`. Correct.
+        
+        So `handleSymbol` is likely correct for valid inputs.
+        
+        Let's look at `handleIdentifier`.
+        `while (currentChar == '_' || Character.isLetter(currentChar) || Character.isDigit(currentChar))`
+        
+        This allows identifiers starting with digits?
+        `getOneToken` checks `Character.isDigit` FIRST.
+        `else if (Character.isDigit(currentChar)) { return handleNumber(); }`
+        `else if (Character.isLetter(currentChar)) { return handleIdentifier(); }`
+        
+        So if it starts with digit, it goes to `handleNumber`.
+        `handleNumber` consumes digits.
+        If `123abc`, `handleNumber` consumes `123`. Returns `INTCON 123`.
+        Next token `abc` -> `IDENFR`.
+        
+        This is standard behavior for many lexers (maximal munch).
+        
+        So where is the error?
+        
+        Let's look at `Compiler.java` imports.
+        `import frontend.Lexer;`
+        
+        Package `frontend`.
+        
+        Is it possible `Lexer.java` is not in `frontend` folder?
+        The prompt says `<frontend/Lexer.java>`.
+        
+        Let's look at `printTokens`.
+        `OutputStreamWriter writer1 = new OutputStreamWriter(new FileOutputStream("lexer.txt"));`
+        
+        If the working directory is not where expected?
+        
+        But "No output file" usually implies crash.
+        
+        Let's look at `handleComment` again.
+        
+        `while (currentChar != '\0' && !(peekPrevChar() == '*' && currentChar == '/')) { advance(); }`
+        
+        If we have `/* comment */`.
+        When `currentChar` is `/` (closing), `peekPrevChar` is `*`.
+        Condition `!(true && true)` is `false`.
+        Loop terminates.
+        `advance()` consumes `/`.
+        
+        Correct.
+        
+        What if `/*` is at end of file?
+        Loop runs until `\0`.
+        `currentChar` is `\0`.
+        `peekPrevChar` is `*` (if `*` was before `\0`? No, `*` is at `pos-1`).
+        If file is `/*`.
+        Pos 0: `/`. Pos 1: `*`.
+        `handleComment` enters `/*` branch.
+        Advance -> Pos 1 (`*`).
+        Advance -> Pos 2 (`\0`? No, `pos` increments. If length is 2, `pos` becomes 2. `currentChar` becomes `\0`).
+        Loop: `currentChar` is `\0`. Condition `currentChar != '\0'` is false. Loop terminates.
+        `advance()`. `pos` becomes 3. `currentChar` remains `\0`.
+        Returns `true`.
+        
+        Correct.
+        
+        I suspect the issue is in `handleSymbol` when `tmp` is calculated.
+        
+        `String tmp = String.format("%c%c", currentChar, peekNextChar());`
+        
+        If `peekNextChar` returns `\0`, `tmp` contains `\0`.
+        
+        If `currentChar` is `&` and `peekNextChar` is `\0`.
+        `tmp` is "&\0".
+        Append `&`. Advance. `currentChar` is `\0`.
+        Check `tmp`. No match.
+        Return `SymbolToken("&")`.
+        Error 'a'.
+        
+        This is correct behavior for error detection.
+        
+        Wait! Look at `handleStringOrChar` again.
+        
+        `if (currentChar == '\\') {`
+        `// TODO: 处理转义字符`
+        `sb.append(currentChar);`
+        `advance();`
+        `}`
+        `sb.append(currentChar);`
+        `advance();`
+        
+        If we have `"\n"`.
+        `"` -> `sb` `"`. Advance.
+        `\` -> `currentChar` is `\`.
+        `if` matches.
+        `sb` append `\`. Advance. `currentChar` is `n`.
+        `sb` append `n`. Advance. `currentChar` is `"`.
+        Loop ends.
+        `sb` append `"`. Advance.
+        Token `"\n"`.
+        
+        This preserves the escape sequence in the source code, which is required ("preserve exactly as it appears").
+        
+        So this is correct.
+        
+        Let's look at the `IdentToken` enum.
+        `MAINTK, GETINTTK, GETCHARTK, PRINTFTK,`
+        
+        `case "main": this.type = Type.MAINTK; break;`
+        
+        Everything looks correct.
+        
+        Is it possible `line` is not initialized?
+        `private static int line;`
+        `line = 1;` in constructor.
+        
+        Okay, look at `handleSymbol` again.
+        
+        `String tmp = String.format("%c%c", currentChar, peekNextChar());`
+        
+        If `currentChar` is `\`?
+        `getOneToken` sends `\` to `handleSymbol`?
+        No, `\` is not whitespace, letter, digit, quote.
+        So yes, `\` goes to `handleSymbol`.
+        
+        `tmp` = `\` + next.
+        Append `\`. Advance.
+        Check `tmp`.
+        If `\` is not part of a 2-char operator, it returns `\`.
+        `SymbolToken("\")`.
+        Switch default.
+        `assert value.equals("|") || value.equals("&");`
+        Assertion fails. Crash.
+        
+        But `\` is not in the test case.
+        
+        Test case:
+        `int main() {`
+        `printf("21373119");`
+        `int a = 0;`
+        `{`
+        `int a = 1;`
+        `printf("%d",a); // 输出 1`
+        `}`
+        `return 0;`
+        `}`
+        
+        Characters:
+        `i`, `n`, `t`, ` `, `m`, `a`, `i`, `n`, `(`, `)`, `{`, `\n`
+        `p`, `r`, `i`, `n`, `t`, `f`, `(`, `"`, `2`, ..., `"`, `)`, `;`, `\n`
+        `i`, `n`, `t`, ` `, `a`, ` `, `=`, ` `, `0`, `;`, `\n`
+        `{`, `\n`
+        `i`, `n`, `t`, ` `, `a`, ` `, `=`, ` `, `1`, `;`, `\n`
+        `p`, `r`, `i`, `n`, `t`, `f`, `(`, `"`, `%`, `d`, `"`, `,`, `a`, `)`, `;`, ` `, `/`, `/`, ` `, `输`, `出`, ` `, `1`, `\n`
+        
+        Wait! `// 输出 1` contains Chinese characters.
+        
+        `Character.isLetter('输')` is TRUE.
+        
+        So `getOneToken`:
+        Skips spaces.
+        Sees `/`.
+        Calls `handleComment`.
+        `peekNextChar` is `/`.
+        Enters `//` branch.
+        Advances past `//`.
+        Loop while not `\n`.
+        Advances past ` `, `输`, `出`, ` `, `1`.
+        Stops at `\n`.
+        Returns `true`.
+        
+        This handles Chinese comments correctly.
+        
+        So what is wrong?
+        
+        Let's look at `peekNextChar` again.
+        `return text.charAt(pos + 1);`
+        
+        If `pos` is `text.length() - 1`, `pos + 1` is `text.length()`.
+        `charAt` throws `StringIndexOutOfBoundsException`.
+        
+        `peekNextChar` HAS a check:
+        `if (pos >= text.length()) { return '\0'; }`
+        
+        But `pos` is the CURRENT position.
+        We want to peek at `pos + 1`.
+        
+        If `pos == text.length() - 1`, `pos < text.length()` is true.
+        It proceeds to `return text.charAt(pos + 1);`.
+        `pos + 1 == text.length()`.
+        `charAt(length)` throws Exception.
+        
+        The check should be `if (pos + 1 >= text.length())`.
+        
+        This is the bug!
+        
+        When `handleSymbol` or `handleComment` calls `peekNextChar` on the LAST character of the file, it crashes.
+        
+        In the test case, does any token end at the last character?
+        The file ends with `}\n`? Or just `}`?
+        
+        `return 0;`
+        `}`
+        
+        If the file ends with `}`, `currentChar` is `}`.
+        `getOneToken` calls `handleSymbol`.
+        `peekNextChar` is called.
+        `pos` is index of `}`.
+        If `}` is the last char, `pos == length - 1`.
+        `peekNextChar` crashes.
+
+<frontend/Lexer.java>
+...
+    private char peekNextChar() {
+        if (pos >= text.length()) { @@ The check `pos >= text.length()` is insufficient because `charAt(pos + 1)` is called subsequently. If `pos` is `text.length() - 1`, `pos + 1` equals `text.length()`, causing an IndexOutOfBoundsException. The condition should be `pos + 1 >= text.length()`.
+            return '\0';
+        }
+        return text.charAt(pos + 1);
+    }
+...

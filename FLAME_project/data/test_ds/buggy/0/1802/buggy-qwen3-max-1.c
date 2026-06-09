@@ -1,0 +1,27 @@
+#include <stdio.h>
+#include <string.h>
+char a[100000],b[100000];
+int main()
+{
+int i=0,n,i1=1,flag=0;
+gets(a);
+n=strlen(a);
+while(i<n)
+{
+if(a[i]=='-'&&((a[i-1]<='z'&&a[i-1]>='a'&&a[i+1]<='z'&&a[i+1]>='a')||(a[i-1]<='Z'&&a[i-1]>='A'&&a[i+1]<='Z'&&a[i+1]>='A')||(a[i-1]<='9'&&a[i-1]>='0'&&a[i+1]<='9'&&a[i+1]>='0')))
+flag=1; // @@ [This flag is set globally and affects all future characters, not just the current expansion. It causes non-expansion characters after a valid '-' to be skipped incorrectly.]
+if(flag!=1)
+printf("%c",a[i]);  // @@ [When flag==1 (i.e., current char is part of an expansion pattern), this skips printing the character before '-', but also incorrectly skips other non-expansion characters later due to persistent flag.]
+if(a[i]=='-'&&((a[i-1]<='z'&&a[i-1]>='a'&&a[i+1]<='z'&&a[i+1]>='a')||(a[i-1]<='Z'&&a[i-1]>='A'&&a[i+1]<='Z'&&a[i+1]>='A')||(a[i-1]<='9'&&a[i-1]>='0'&&a[i+1]<='9'&&a[i+1]>='0')))
+{
+while(i1<(a[i+1]-a[i-1]))
+{
+printf("%c",a[i-1]+i1);
+i1++;
+}
+i1=1;    
+}
+i++;    
+}
+return 0;
+}

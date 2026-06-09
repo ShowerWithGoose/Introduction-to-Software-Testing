@@ -1,0 +1,263 @@
+Based on the problem description and the test case, the program fails to detect syntax errors (missing semicolons) in the input file. The expected output indicates three "missing semicolon" errors (code `i`) at lines 2, 9, and 13. However, the buggy output is empty, meaning no errors were recorded.
+
+The root cause lies in how the parser handles statements that start with an identifier (`IDENFR`). In the `parseStmt` method, when the current token is `IDENFR`, it calls `dealIdentCase()`. This method attempts to parse an expression to determine if it's an assignment or a simple expression statement.
+
+Inside `dealIdentCase()`:
+1. It calls `parseExp()`.
+2. If the next token is `=`, it backtracks and parses specific assignment/getint/getchar statements.
+3. If the next token is **not** `=`, it backtracks and calls `parseExpStmt()`.
+
+The issue is in `parseExpStmt()`:
+```java
+public ExpStmt parseExpStmt() {
+    Exp exp = parseExp();
+    Token semicolon = handleIError();
+    return new ExpStmt(exp, semicolon);
+}
+```
+And `parseExp()`:
+```java
+public Exp parseExp() {
+    return new Exp(parseAddExp());
+}
+```
+
+When `dealIdentCase()` calls `parseExp()`, it consumes tokens for the expression. If the expression is valid but followed by something other than `=` (like a newline or another keyword), `parseExp()` returns successfully. Then `dealIdentCase()` checks `curEquals(TokenType.ASSIGN)`. If false, it backtracks.
+
+However, the backtracking mechanism in `TokenStream` resets `curPos` to `backPoint`. The `backPoint` was set at the beginning of `dealIdentCase()`. So, after backtracking, the parser is positioned at the `IDENFR` again. Then it calls `parseExpStmt()`.
+
+`parseExpStmt()` calls `parseExp()` again. This re-parses the expression. After `parseExp()` finishes, the current token should be the one following the expression. Then `handleIError()` is called to check for a semicolon.
+
+Let's look at the test input:
+```c
+printf("Hello SysY!\n") // error 1
+```
+Here, `printf` is `PRINTFTK`, not `IDENFR`. So `dealIdentCase` is NOT called. Instead, `parsePrintfStmt()` is called.
+
+In `parsePrintfStmt()`:
+```java
+public PrintfStmt parsePrintfStmt() {
+    // ... reads printf, (, string ...
+    Token rightParent = handleJError(); // Checks for )
+    Token semicolon = handleIError();   // Checks for ;
+    // ...
+}
+```
+For `printf("Hello SysY!\n")`, there is no `)`. Wait, the input is `printf("Hello SysY!\n")`. There IS a `)`. But there is NO `;`.
+So `handleJError()` finds `)`, consumes it.
+Then `handleIError()` checks for `;`. The next token is likely `if` (from the next line) or whitespace/newline which was skipped by lexer. The lexer skips whitespace and comments. So after `)`, the next token is `IFTK`.
+`handleIError()` sees `IFTK` != `SEMICN`. It records an error `i` at the line number of the previous token (`)`). The `)` is on line 2. So error `2 i` should be generated.
+
+Why is it not generated?
+Let's check `Compiler.java`.
+```java
+if (errorTable.isEmpty()) {
+    outputStream.write(compUnit.syntaxInfoOutput().getBytes());
+} else {
+    errStream.write(errorTable.toString().getBytes());
+}
+```
+If errors are found, it writes to `error.txt`. The output is "No output file", which usually means the program crashed or produced no output files at all, or perhaps the `error.txt` is empty? The prompt says "Buggy Output: No output file". This might imply an exception occurred, or the files weren't created.
+
+However, looking closely at `Lexer.java`:
+```java
+private boolean skipComment() throws IOException {
+    // ...
+    if (curChar == '/') { // type of //
+        read();
+        while (fileNotEnd() && !endOfLine()) {
+            read();
+        }
+        if (endOfLine()) {
+            lineno++;
+            read();
+        }
+        return true;
+    }
+    // ...
+}
+```
+And `analyse()`:
+```java
+while (fileNotEnd()) {
+    skipWhiteSpace();
+    if (skipComment()) {
+        continue;
+    }
+    Token token = getToken();
+    if (token != null) {
+        tokenStream.addToken(token);
+    }
+}
+```
+
+Let's look at `Parser.java`'s `parseCompUnit`.
+```java
+while (true) {
+    if (curToken == null) {
+        break;
+    } else if (movedTkEquals(1, TokenType.MAINTK)) {
+        mainFuncDef = parseMainFuncDef();
+        break;
+    } else if (movedTkEquals(2, TokenType.LPARENT)) {
+        funcDefs.add(parseFuncDef());
+    } else if (curEquals(TokenType.CONSTTK) ||
+            curEquals(TokenType.INTTK) ||
+            curEquals(TokenType.CHARTK)) {
+        decls.add(parseDecl());
+    } else {
+        break; // <--- HERE
+    }
+}
+```
+The input starts with `int main() { ... }`.
+`curToken` is `INTTK`.
+`movedTkEquals(1, TokenType.MAINTK)` checks if the next token is `main`. Yes.
+So it calls `parseMainFuncDef()`.
+
+Inside `parseMainFuncDef()`:
+```java
+public MainFuncDef parseMainFuncDef() {
+    Token intTk = getCurToken(); // int
+    read();
+    Token mainTk = getCurToken(); // main
+    read();
+    Token leftParent = getCurToken(); // (
+    read();
+    Token rightParent = handleJError(); // )
+    Block block = parseBlock(); // { ... }
+    return new MainFuncDef(...);
+}
+```
+`parseBlock()` parses the content inside `{}`.
+Inside the block, `parseBlockItem()` is called repeatedly.
+First item: `printf("Hello SysY!\n")`.
+`parseBlockItem()` sees `PRINTFTK`, so it calls `parseStmt()`.
+`parseStmt()` switches on `PRINTFTK` -> `parsePrintfStmt()`.
+`parsePrintfStmt()` parses `printf`, `(`, `StringConst`, `)`.
+Then `handleJError()` checks for `)`. It is present. Consumes it.
+Then `handleIError()` checks for `;`. The next token is `IFTK` (from `if (1)`).
+`handleIError()` adds error `i` at line 2.
+Returns a dummy semicolon token.
+`parsePrintfStmt()` returns.
+`parseStmt()` returns.
+`parseBlockItem()` returns.
+
+Next item in block: `if (1)`.
+`parseBlockItem()` sees `IFTK`, calls `parseStmt()`.
+`parseStmt()` switches on `IFTK` -> `parseIfStmt()`.
+`parseIfStmt()` parses `if`, `(`, `Cond` (which parses `1`), `)`.
+`handleJError()` checks for `)`. It is present.
+Then `parseStmt()` is called for the body of the if.
+The next token is `;` (from the line `;` after `if (1)` and comment).
+Wait, the input is:
+```c
+    if (1)
+
+
+    /*********/
+    ;
+```
+After `if (1)`, the next non-whitespace/non-comment token is `;`.
+So `parseStmt()` is called.
+`parseStmt()` sees `SEMICN`.
+Switches to `parseNullStmt()`.
+`parseNullStmt()` consumes `;`.
+Returns.
+`parseIfStmt()` returns.
+
+Next item: `int a`.
+`parseBlockItem()` sees `INTTK`.
+Calls `parseDecl()`.
+`parseDecl()` sees `INTTK` (not `CONSTTK`), so calls `parseVarDecl()`.
+`parseVarDecl()` parses `BType` (`int`), then `parseVarDef()`.
+`parseVarDef()` parses `Ident` (`a`).
+No `[`, no `=`.
+Returns `VarDef`.
+Back in `parseVarDecl()`, loop for `,` doesn't run.
+Then `handleIError()` is called.
+Current token is `FORTK` (from `for (;;) {}`).
+`handleIError()` sees `FORTK` != `SEMICN`.
+Adds error `i` at line number of `a` (line 9).
+Returns dummy semicolon.
+`parseVarDecl()` returns.
+
+Next item: `for (;;) {}`.
+`parseBlockItem()` sees `FORTK`.
+Calls `parseStmt()`.
+`parseStmt()` switches to `parseForLoopStmt()`.
+Parses `for`, `(`, `;`, `;`, `)`, `{}`, etc.
+No errors here.
+
+Next item: `return 0`.
+`parseBlockItem()` sees `RETURNTK`.
+Calls `parseStmt()`.
+`parseStmt()` switches to `parseReturnStmt()`.
+`parseReturnStmt()` parses `return`, `Exp` (`0`).
+Then it checks for `;`.
+```java
+    public ReturnStmt parseReturnStmt() {
+        Token returnTk = getCurToken();
+        read();
+
+        if (curInExpFirstSet()) {
+            Exp exp = parseExp();
+            Token semicolon = getCurToken(); // <--- BUG HERE
+            read();
+            return new ReturnStmt(returnTk, exp, semicolon);
+        }
+        Token semicolon = handleIError();
+        return new ReturnStmt(returnTk, semicolon);
+    }
+```
+In the case where an expression is present, it does `getCurToken()` and `read()` for the semicolon, instead of calling `handleIError()`.
+If the semicolon is missing, `getCurToken()` returns the next token (e.g., `RBRACE` `}`).
+It assigns this `}` token as the semicolon.
+It reads it, advancing the stream.
+It returns the statement.
+NO ERROR IS RECORDED for the missing semicolon after `return 0`.
+
+So, error 3 (line 13) is missed because `parseReturnStmt` doesn't use `handleIError` when an expression is present.
+
+What about errors 1 and 2?
+The analysis above suggested they *should* be caught.
+Error 1: `printf` statement. `handleIError` is used.
+Error 2: `int a` declaration. `handleIError` is used.
+
+Why is the output "No output file"?
+Perhaps an exception is thrown?
+Or maybe `compUnit.syntaxInfoOutput()` throws an exception?
+If `errorTable` is NOT empty, it writes to `error.txt`.
+If `errorTable` IS empty, it writes to `parser.txt`.
+
+If the program crashes, no files might be written, or partial files.
+Let's check if there's a crash.
+In `parseReturnStmt`, if `;` is missing, it consumes `}`.
+Then `parseBlock()` in `MainFuncDef` continues.
+`parseBlock()` loops while `!curEquals(TokenType.RBRACE)`.
+But we just consumed the `}` in `parseReturnStmt`!
+So `curToken` is now `null` (end of stream) or the next token if any.
+The loop condition `!curEquals(TokenType.RBRACE)` will be true (since cur is null or not RBRACE).
+It calls `parseBlockItem()`.
+`parseBlockItem()` checks `curToken`. If `curToken` is `null`, `curEquals` might throw NPE or return false.
+If `curToken` is `null`, `curEquals` calls `curToken.getType()`. NPE.
+
+So the program crashes with a NullPointerException because `parseReturnStmt` incorrectly consumes the closing brace `}` thinking it's a semicolon, leaving the parser in an invalid state where it tries to parse more block items but encounters end-of-stream or unexpected tokens, leading to a crash before writing output.
+
+The fix is to use `handleIError()` in `parseReturnStmt` even when an expression is parsed.
+
+<frontend/parser/Parser.java>
+...
+    public ReturnStmt parseReturnStmt() {
+        Token returnTk = getCurToken();
+        read();
+
+        if (curInExpFirstSet()) {
+            Exp exp = parseExp();
+            Token semicolon = handleIError();
+            return new ReturnStmt(returnTk, exp, semicolon);
+        }
+        Token semicolon = handleIError();
+        return new ReturnStmt(returnTk, semicolon);
+    }
+...

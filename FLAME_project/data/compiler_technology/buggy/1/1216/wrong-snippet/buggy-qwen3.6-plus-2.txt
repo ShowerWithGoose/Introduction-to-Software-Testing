@@ -1,0 +1,222 @@
+Based on the comparison between the buggy output and the expected output, the program is producing duplicate output. The entire content of `parser.txt` appears twice in the buggy output, whereas it should only appear once.
+
+Looking at `Compiler.java`, the `main` method performs the following steps:
+1.  Runs lexical analysis and prints to `lexer.txt`.
+2.  Runs syntax analysis (`Parser.parseCompUnit`) and prints the result to `parser.txt`.
+3.  Prints errors to `error.txt`.
+
+The `Test.java` file also contains a `testSingle` method that performs similar steps. However, the entry point is `Compiler.main`.
+
+Let's look closely at `Compiler.java`:
+
+```java
+public class Compiler {
+    public static void main(String[] args) {
+        ErrorList errorList = new ErrorList();
+
+        Lexer lexer = Lexer.getLexer("testfile.txt");
+        TokenList tokenList = lexer.getTokenList();
+        new Output<>(tokenList).printToFile("lexer.txt", false); // 打印lexer词法分析的结果
+        errorList.appendErrorList(lexer.getErrorList());
+
+        TokenHandler handler = new TokenHandler(lexer.getCorrectedTokenList());
+//        lexer.getCorrectedTokenList().printInfo(); // 测试词法分析
+
+        CompUnit compUnit = Parser.parseCompUnit(handler);
+        new Output<>(compUnit).printToFile("parser.txt", false);
+        errorList.appendErrorList(handler.getErrorList());
+
+        // ... symbol table code commented out ...
+
+        new Output<>(errorList.sortUpOrder()).printToFile("error.txt", false);
+    }
+}
+```
+
+This looks correct for a single run. Why is the output duplicated?
+
+Let's look at `CompUnit.toString()`:
+
+```java
+<frontend/parser/CompUnit.java>
+...
+    @Override
+    public String toString() {
+        StringBuilder res = new StringBuilder();
+        for (Decl decl: globalDecls) {
+            res.append(decl);
+        }
+        for (FuncDef func: functions) {
+            res.append(func);
+        }
+        res.append(mainFuncDef);
+        res.append("<CompUnit>\n");
+        return res.toString();
+    }
+...
+```
+
+And `FuncDef.toString()`:
+
+```java
+<frontend/parser/func/types/FuncDef.java>
+...
+    @Override
+    public String toString() {
+        StringBuilder res = new StringBuilder();
+        res.append(funcType);
+        if (!isMain()) {
+            res.append("<FuncType>\n");
+        }
+        res.append(ident).append(lParent);
+        if (funcFParams != null) res.append(funcFParams);
+        if (rParent != null) res.append(rParent);
+        res.append(block);
+        res.append(isMain()?"<MainFuncDef>\n":"<FuncDef>\n");
+        return res.toString();
+    }
+...
+```
+
+The structure seems fine. The duplication suggests that `parseCompUnit` might be called twice, or the output is written twice.
+
+Wait, looking at the Buggy Output again:
+It starts with:
+```
+INTTK int
+MAINTK main
+...
+<CompUnit>
+```
+Then it repeats:
+```
+INTTK int
+MAINTK main
+...
+<CompUnit>
+```
+
+In `Compiler.java`, `Parser.parseCompUnit(handler)` is called once.
+However, let's look at `Parser.parseCompUnit`:
+
+```java
+<frontend/parser/Parser.java>
+...
+    public static CompUnit parseCompUnit(TokenHandler handler) {
+        setHandler(handler);
+        CompUnit compUnit = new CompUnit();
+        while (!handler.reachEnd()) {
+            switch (handler.getNext().getType()) {
+                case INTTK -> {
+                    if (handler.getByOffset(1).getType() == TokenType.MAINTK) {
+                        compUnit.setMainFunc(FuncParser.parseFuncDef());
+                    } else if (handler.getByOffset(2).getType() == TokenType.LPARENT) {
+                        compUnit.addFunc(FuncParser.parseFuncDef());
+                    } else {
+                        compUnit.addDecl(DeclParser.parseDecl());
+                    }
+                }
+                case VOIDTK -> compUnit.addFunc(FuncParser.parseFuncDef());
+                case CONSTTK -> compUnit.addDecl(DeclParser.parseDecl());
+                case CHARTK -> {
+                    if (handler.getByOffset(2).getType() == TokenType.LPARENT) {
+                        compUnit.addFunc(FuncParser.parseFuncDef());
+                    } else {
+                        compUnit.addDecl(DeclParser.parseDecl());
+                    }
+                }
+                default -> System.err.println("error: unhandled token " + handler.getNext() + " at line " + handler.getNextAndMove().getLine());
+            }
+        }
+        return compUnit;
+    }
+...
+```
+
+The logic in `parseCompUnit` consumes tokens until `reachEnd()`. It should only run once.
+
+Let's re-examine `Compiler.java`. Is it possible that `Test.java` is being run? No, `Compiler` is the main class specified.
+
+Is it possible that `CompUnit.toString()` is iterating over `functions` AND `mainFuncDef` separately, and `mainFuncDef` is also inside `functions`?
+
+In `CompUnit`:
+```java
+    public void setMainFunc(FuncDef mainFunc) {
+        this.functions.add(mainFunc); // Adds to functions list
+        this.mainFuncDef = mainFunc;  // Sets mainFuncDef reference
+    }
+```
+
+In `toString()`:
+```java
+        for (FuncDef func: functions) {
+            res.append(func);
+        }
+        res.append(mainFuncDef); // Appends mainFuncDef AGAIN
+```
+
+Since `setMainFunc` adds the main function to the `functions` list, the loop `for (FuncDef func: functions)` will print the main function. Then `res.append(mainFuncDef)` prints it **again**. This causes the duplication of the main function's output. Since the test case only has `main`, the entire output is effectively duplicated (plus the `<CompUnit>` tag appearing twice if the structure implies it, but here `<CompUnit>` is appended at the very end).
+
+Actually, looking at the expected output:
+```
+...
+<Block>
+<MainFuncDef>
+<CompUnit>
+```
+
+Buggy output:
+```
+...
+<Block>
+<MainFuncDef>
+INTTK int   <-- Start of MainFuncDef again
+...
+<Block>
+<MainFuncDef>
+<CompUnit>
+```
+
+Yes, the `MainFuncDef` is printed twice. Once in the loop over `functions`, and once explicitly via `mainFuncDef`.
+
+The error is in `CompUnit.toString()`. It should not append `mainFuncDef` separately if it's already included in the `functions` list, OR `setMainFunc` should not add it to `functions` if it's handled separately. Given the grammar `CompUnit → {Decl} {FuncDef} MainFuncDef`, it distinguishes between regular `FuncDef`s and `MainFuncDef`.
+
+If the intention is to print all functions in the list and then the main function, `setMainFunc` should probably NOT add it to `functions`, or `toString` should exclude `mainFuncDef` from the `functions` loop.
+
+However, usually `functions` holds non-main functions and `mainFuncDef` holds the main one.
+In `Parser.parseCompUnit`:
+```java
+                        compUnit.setMainFunc(FuncParser.parseFuncDef());
+```
+vs
+```java
+                        compUnit.addFunc(FuncParser.parseFuncDef());
+```
+
+If `setMainFunc` adds it to `functions`, then `functions` contains the main function.
+The `toString` iterates `functions` (printing main) and then appends `mainFuncDef` (printing main again).
+
+To fix this, we should either:
+1. Change `setMainFunc` to NOT add to `functions`.
+2. Change `toString` to not append `mainFuncDef` if it's already in `functions` (but this breaks ordering if `main` isn't last in `functions`).
+3. Change `toString` to iterate only non-main functions in the loop, or handle the separation correctly.
+
+Given the grammar structure `{FuncDef} MainFuncDef`, it's cleaner if `functions` list contains only non-main functions, and `mainFuncDef` is separate.
+
+Let's look at `setMainFunc`:
+```java
+    public void setMainFunc(FuncDef mainFunc) {
+        this.functions.add(mainFunc);
+        this.mainFuncDef = mainFunc;
+    }
+```
+
+If we remove `this.functions.add(mainFunc);`, then the loop `for (FuncDef func: functions)` will only print non-main functions, and `res.append(mainFuncDef)` will print the main function. This matches the expected structure.
+
+<frontend/parser/CompUnit.java>
+...
+    public void setMainFunc(FuncDef mainFunc) {
+        this.functions.add(mainFunc);
+        this.mainFuncDef = mainFunc;
+    }
+...

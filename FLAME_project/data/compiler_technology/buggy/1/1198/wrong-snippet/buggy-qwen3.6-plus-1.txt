@@ -1,0 +1,181 @@
+Based on the analysis of the problem description, test case, and source code:
+
+1.  **Problem Analysis**: The program needs to report syntax errors with their corresponding line numbers. The error type `i` indicates a missing semicolon. The line number reported should be the line where the last non-terminal symbol before the expected semicolon appears.
+2.  **Test Case Analysis**:
+    *   Input Line 2: `printf("Hello SysY!\n")` is missing a semicolon. The last token is `)` on line 2. Expected error: `2 i`.
+    *   Input Line 9: `int a` is missing a semicolon. The last token is `a` (IDENFR) on line 9. Expected error: `9 i`.
+    *   Input Line 13: `return 0` is missing a semicolon. The last token is `0` (INTCON) on line 13. Expected error: `13 i`.
+    *   Buggy Output: `2 i`, `8 i`, `12 i`.
+    *   Discrepancy: The errors for lines 9 and 13 are reported as 8 and 12 respectively. This suggests an off-by-one error in line number tracking, likely caused by the Lexer consuming the newline character `\n` immediately after the token and incrementing `line_num` before the Parser records the error. When the Parser detects the missing semicolon, it looks at `Lexer.outs.get(i - 1)`, but if the Lexer has already advanced past the newline associated with that token, the stored line number might be incorrect or the index `i-1` refers to a token whose line number was updated incorrectly.
+3.  **Code Analysis**:
+    *   In `frontend/Lexer.java`, after processing identifiers/keywords (lines ~230-250) and numbers (lines ~210-220), there is a check: `if ((char) ch == '\n') { line_num++; }`. This increments the global `line_num` counter *before* the next token is processed. However, the `Lexer_out` object for the current token is created *before* this increment. So the token itself has the correct line number.
+    *   Let's look closer at `frontend/Parser.java`. The error reporting uses `Lexer.outs.get(i - 1).getLine_num()`.
+    *   Let's trace `VarDecl` (for `int a`).
+        *   `VarDecl` calls `BType()` which consumes `int`. `i` advances.
+        *   `VarDecl` calls `VarDef()`.
+        *   `VarDef` sees `IDENFR` ("a"). It adds the node and advances `i` (`now = Lexer.outs.get(++i)`).
+        *   Now `now` points to the next token. If the next token is not `[` or `=`, `VarDef` returns.
+        *   Back in `VarDecl`, it checks for `,` or `;`.
+        *   If `;` is missing, it executes: `w.add(cnt, new WrongExample(Lexer.outs.get(i - 1).getLine_num(), "i"));`.
+        *   At this point, `i` points to the token *after* `a`. If the input is `int a \n int b...`, the token after `a` might be the `int` on the next line, or if `a` is at the end of the block, it might be `}`.
+        *   Wait, let's look at the Lexer logic again.
+        *   In `Lexer.java`, when reading an identifier:
+            ```java
+            if ((char) ch == '_' || ...) {
+                // ... read identifier ...
+                outs.add(cnt,new Lexer_out("IDENFR", str.toString(), line_num));
+                cnt++;
+                if ((char) ch == '\n') { // <--- HERE
+                    line_num++;
+                }
+                continue;
+            }
+            ```
+            The `line_num` is incremented if the character *following* the identifier is a newline. This `line_num` is the global state. The `Lexer_out` object stores the `line_num` *at the time of creation*, which is correct.
+        *   However, consider the case where the error is detected. The parser uses `Lexer.outs.get(i - 1)`. This retrieves the `Lexer_out` object for the last successfully parsed token. This object's `line_num` field should be correct.
+        *   Why then is the output 8 instead of 9?
+        *   Let's look at the input again:
+            ```
+            7:     /*********/
+            8:     ;
+            9:     int a // error 2
+            ```
+            Line 8 is `;`. Line 9 is `int a`.
+            The buggy output says `8 i`. This implies the error is attributed to line 8.
+            Line 8 contains `;`. This `;` belongs to the previous empty statement or block item?
+            Actually, looking at the input:
+            ```
+            5:     if (1)
+            6: 
+            7: 
+            8:     /*********/
+            9:     ;
+            10:    int a // error 2
+            ```
+            Wait, the comment `/*********/` is on line 7 in the provided input text?
+            ```
+            int main() {
+                printf("Hello SysY!\n") // error 1
+
+                if (1)
+
+
+                /*********/
+                ;
+                int a // error 2
+
+                for (;;) {}
+
+                return 0 // error 3
+            }
+            ```
+            Line 1: `int main() {`
+            Line 2: `printf...`
+            Line 3: empty
+            Line 4: `if (1)`
+            Line 5: empty
+            Line 6: empty
+            Line 7: `/*********/`
+            Line 8: `;`
+            Line 9: `int a`
+            
+            If the expected output is `9 i`, then `int a` is on line 9.
+            The buggy output is `8 i`.
+            
+            Let's re-read the Lexer's handling of comments.
+            ```java
+            if ((char) ch == '/') {
+                ch = f.read();
+                if ((char) ch == '/') { //单行注释
+                    while ((char) ch != '\n') {
+                        ch = f.read();
+                        if(ch == -1) return;
+                    }
+                    line_num = line_num + 1; // Increments line_num AFTER consuming newline
+                } else if ((char) ch == '*') { //多行注释
+                     // ...
+                }
+            }
+            ```
+            And whitespace:
+            ```java
+            if (Character.isWhitespace((char) ch)) {
+                ch = f.read();
+                if ((char) ch == '\n') {
+                    line_num++;
+                }
+                continue;
+            }
+            ```
+            
+            The issue likely lies in how `line_num` is tracked relative to the tokens.
+            
+            Let's look at `VarDecl` error reporting again:
+            ```java
+            } else {
+                //错误处理
+                w.add(cnt, new WrongExample(Lexer.outs.get(i - 1).getLine_num(), "i"));
+                cnt++;
+            }
+            ```
+            
+            If `Lexer.outs.get(i-1)` is the token `a`, its line number should be 9.
+            Why would it be 8?
+            
+            Perhaps the token `a` is being assigned line number 8?
+            This would happen if `line_num` was 8 when `a` was processed, and it wasn't incremented to 9 until *after* `a` was fully processed and the newline was consumed.
+            
+            In the Lexer:
+            When `int` is processed (start of line 9), `line_num` is 9?
+            Previous line was 8 (`;`). After `;`, `line_num` is still 8. Then whitespace/newline is consumed.
+            ```java
+            if ((char) ch == ';') {
+                // ...
+                outs.add(..., line_num); // line_num is 8
+                // ...
+            }
+            // Loop continues. ch is now '\n' (end of line 8).
+            // Next iteration:
+            // Whitespace check:
+            if (Character.isWhitespace((char) ch)) { // ch is '\n'
+                 ch = f.read(); // ch becomes ' ' or 'i' of next line? No, read one char.
+                 if ((char) ch == '\n') { // If the char AFTER newline is also newline?
+                     line_num++;
+                 }
+                 continue;
+            }
+            ```
+            Wait, the whitespace logic is flawed.
+            ```java
+            if (Character.isWhitespace((char) ch)) {
+                ch = f.read();
+                if ((char) ch == '\n') {
+                    line_num++;
+                }
+                continue;
+            }
+            ```
+            If `ch` is `\n` (end of line 8):
+            1. `Character.isWhitespace('\n')` is true.
+            2. `ch = f.read()` reads the first character of line 9 (e.g., space or 'i').
+            3. Checks if *that* character is `\n`. It is not.
+            4. `line_num` is NOT incremented.
+            5. Loop continues with `ch` being the first char of line 9.
+            6. `line_num` is still 8.
+            7. The token `int` on line 9 is processed with `line_num = 8`.
+            
+            This explains why `int` and `a` on line 9 are recorded with line number 8.
+            Similarly, `return 0` on line 13 would be recorded with line number 12 if the previous line ended with a newline that was consumed by this flawed whitespace logic without incrementing `line_num`.
+
+            The fix should be in `frontend/Lexer.java` in the whitespace handling block. It should increment `line_num` if the current character `ch` is `\n`, before reading the next character, or handle newlines specifically.
+
+<frontend/Lexer.java>
+...
+                if (/*(char) ch == '\n' || (char) ch == '\t' || (char) ch == ' '*/Character.isWhitespace((char) ch)) {
+                    ch = f.read();
+                    if ((char) ch == '\n') {
+                        line_num++;
+                    }
+                    continue;
+                }
+...

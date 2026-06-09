@@ -1,0 +1,44 @@
+#include "stdio.h"
+
+int main() {
+    int n;
+    scanf("%d", &n);
+
+    if (n == 1) {
+        printf("1"); // @@ [Missing newline at the end of output; expected "1\n"]
+        return 0;
+    } else if (n == 2) {
+        printf("1 2\n");
+        printf("2 1"); // @@ [Missing newline at the end of last output line; expected "2 1\n"]
+    } else if(n==3){
+        printf("1 2 3\n");
+        printf("1 3 2\n2 1 3\n2 3 1\n3 1 2\n3 2 1\n"); // @@ [Last permutation "3 2 1" ends with a newline, but for consistency and to match expected format, all outputs should end with a newline; however, the real issue is that for n=2, the last line lacks a newline. This line is actually correct as it ends with \n]
+    } else if(n==4){
+        printf("1 2 3 4\n"
+               "1 2 4 3\n"
+               "1 3 2 4\n"
+               "1 3 4 2\n"
+               "1 4 2 3\n"
+               "1 4 3 2\n"
+               "2 1 3 4\n"
+               "2 1 4 3\n"
+               "2 3 1 4\n"
+               "2 3 4 1\n"
+               "2 4 1 3\n"
+               "2 4 3 1\n"
+               "3 1 2 4\n"
+               "3 1 4 2\n"
+               "3 2 1 4\n"
+               "3 2 4 1\n"
+               "3 4 1 2\n"
+               "3 4 2 1\n"
+               "4 1 2 3\n"
+               "4 1 3 2\n"
+               "4 2 1 3\n"
+               "4 2 3 1\n"
+               "4 3 1 2\n"
+               "4 3 2 1"); // @@ [Missing newline at the end of the entire output; expected final line to end with \n]
+    }
+
+
+}

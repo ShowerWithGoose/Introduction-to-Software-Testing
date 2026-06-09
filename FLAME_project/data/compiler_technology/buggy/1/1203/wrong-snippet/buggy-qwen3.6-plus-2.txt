@@ -1,0 +1,922 @@
+Based on the comparison between the buggy output and the expected output, the error occurs in the parsing of the statement `x[i]=i;`.
+
+**Analysis:**
+1.  **Expected Output:**
+    ```text
+    IDENFR x
+    LBRACK [
+    IDENFR i
+    <LVal>
+    ...
+    RBRACK ]
+    <LVal>
+    ASSIGN =
+    ...
+    ```
+    This indicates that `x[i]` is correctly parsed as an `<LVal>` (Left Value), which includes the identifier `x`, the bracket `[`, the index expression `i` (parsed as Exp/LVal etc.), and the closing bracket `]`. The `<LVal>` tag is printed after the `]`.
+
+2.  **Buggy Output:**
+    ```text
+    IDENFR ]   <-- Error: The token value is "]" but type is IDENFR? Or just misaligned tokens.
+    <LVal>
+    ASSIGN =
+    ...
+    ```
+    Looking closely at the buggy output around that area:
+    ```text
+    <Stmt>
+    <Stmt>
+    IDENFR ]   <-- This line is suspicious. In the input `x[i]=i;`, after `continue;}` block, the next token is `x`.
+    <LVal>
+    ASSIGN =
+    IDENFR i
+    ...
+    ```
+    Actually, let's look at the tokens preceding the error in the buggy output:
+    ```text
+    CONTINUETK continue
+    SEMICN ;
+    <Stmt>
+    RBRACE }
+    <Block>
+    <Stmt>
+    <Stmt>
+    IDENFR ]   <-- This suggests the parser consumed `x`, `[`, `i` but failed to consume `]` correctly or misidentified tokens.
+    ```
+    
+    Let's trace `parseStmt` when it encounters `x[i]=i;`.
+    It sees `IDENFR` (`x`). It calls `parseLVal()`.
+    
+    Inside `parseLVal()`:
+    ```java
+    public Node parseLVal() {
+        // ...
+        //Ident
+        lVal.addChildNode(new LeafNode(Token.Type.IDENFR,
+                getCur().getValue(), getCur().getLineNo(), '\0'));
+        cur++; // Consumes 'x'
+        
+        //特殊：解析到Ident '(' [FuncRParams] ')'返回空指针，用于stmt解析时区分不同分支
+        if (getCur().getType() == Token.Type.LPARENT) {
+            return null;
+        }
+        
+        //['['Exp']']
+        if (getCur().getType() == Token.Type.LBRACK) {
+            lVal.addChildNode(new LeafNode(Token.Type.LBRACK,
+                    "[", getCur().getLineNo(), '\0'));
+            cur++; // Consumes '['
+            lVal.addChildNode(parseExp()); // Parses 'i'
+            
+            if (getCur().getType() != Token.Type.RBRACK) {
+                // Error handling for missing ']'
+                lVal.addChildNode(new LeafNode(Token.Type.RBRACK,
+                        "]", doPeek(cur-1).getLineNo(), 'k'));
+                hasError = true;
+                errorList.add(doPeek(cur-1).getLineNo()+" "+'k');
+            } else {
+                lVal.addChildNode(new LeafNode(Token.Type.RBRACK,
+                        "]", getCur().getLineNo(), '\0'));
+                cur++; // Consumes ']'
+            }
+        }
+        lVal.setEndLine(doPeek(cur-1).getLineNo());
+        return lVal;
+    }
+    ```
+
+    The issue lies in how `parseStmt` handles the return value of `parseLVal` and subsequent logic.
+    
+    In `parseStmt`:
+    ```java
+    } else if (getCur().getType() == Token.Type.IDENFR) {
+        peek = cur;
+        LVal lVal = (LVal)parseLVal();
+        //特殊设计: 解析到Ident '(' [FuncRParams] ')'返回空指针
+        if (lVal == null) {
+            cur = peek;
+            stmt.addChildNode(parseExpStmt());
+        } else { //cur现在指向'='
+            if (doPeek(cur+1).getType() == Token.Type.GETINTTK) {
+                cur = peek;
+                stmt.addChildNode(parseGetIntStmt());
+            } else if (doPeek(cur+1).getType() == Token.Type.GETCHARTK) {
+                cur = peek;
+                stmt.addChildNode(parseGetCharStmt());
+            } else {
+                cur = peek; // <--- ERROR HERE
+                stmt.addChildNode(parseAssignStmt());
+            }
+        }
+    }
+    ```
+    
+    When `parseLVal()` is called for `x[i]`, it consumes `x`, `[`, `i`, and `]`. So `cur` is now pointing at `=`.
+    However, the code executes `cur = peek;`. `peek` was set to the original position of `x`.
+    So `cur` is reset to point to `x` again.
+    Then `parseAssignStmt()` is called.
+    
+    Inside `parseAssignStmt()`:
+    ```java
+    public Node parseAssignStmt() {
+        // ...
+        //LVal
+        assignStmt.addChildNode(parseLVal()); // Parses x[i] again, consuming x, [, i, ]
+        //'='
+        assignStmt.addChildNode(new LeafNode(Token.Type.ASSIGN,
+                "=", getCur().getLineNo(), '\0'));
+        cur++; // Consumes =
+        // ...
+    }
+    ```
+    
+    Wait, if `parseLVal` is called again inside `parseAssignStmt`, it should work correctly. Why is the output wrong?
+    
+    Let's look at the buggy output again:
+    ```text
+    IDENFR ]
+    <LVal>
+    ASSIGN =
+    ```
+    The token printed is `IDENFR ]`. This implies that a token with type `IDENFR` and value `]` was printed. But `]` is `RBRACK`.
+    
+    Let's look at the `LeafNode` creation in `parseLVal`:
+    ```java
+    lVal.addChildNode(new LeafNode(Token.Type.IDENFR,
+            getCur().getValue(), getCur().getLineNo(), '\0'));
+    ```
+    If `getCur()` is `]`, then `Token.Type.IDENFR` is hardcoded. This would happen if the parser thinks `]` is an identifier.
+    
+    However, the real issue is likely in the `parseStmt` logic resetting `cur`.
+    
+    If `cur` is reset to `peek` (start of `x`), and `parseAssignStmt` calls `parseLVal`, `parseLVal` will parse `x[i]` correctly.
+    
+    Let's re-examine the Buggy Output sequence carefully:
+    ```text
+    <Stmt>  (from continue;)
+    <Stmt>  (from if block end?)
+    IDENFR ] 
+    <LVal>
+    ASSIGN =
+    ```
+    
+    The line `IDENFR ]` is extremely strange. `]` is not an identifier.
+    
+    Let's look at `parseRecStmt` (for loop).
+    The input is `for(;i<=10;) { ... }`.
+    Inside the block:
+    `if(i==2) { i=4; continue; }`
+    `x[i]=i;`
+    
+    After `continue;`, we have `}`.
+    `parseBlock` handles `}`.
+    Then `parseStmt` (the one for the `if` statement inside the for loop body) finishes.
+    Then `parseRecStmt` continues? No, `parseRecStmt` parses the `Stmt` at the end of the for loop.
+    
+    The structure is:
+    `for(...) Stmt`
+    The `Stmt` is a `Block` `{ ... }`.
+    Inside the block, we have a list of `BlockItem`s.
+    1. `if(...) { ... }` -> Parsed as `Stmt` (IfStmt).
+    2. `x[i]=i;` -> Should be parsed as `Stmt` (AssignStmt).
+    
+    In `parseBlock`:
+    ```java
+    while (!endFlag) {
+        // ... checks for decls ...
+        else if (...) { // FIRST(Stmt)
+             block.addChildNode(parseStmt());
+        }
+    }
+    ```
+    
+    So `parseStmt` is called for `x[i]=i;`.
+    
+    In `parseStmt`:
+    ```java
+    } else if (getCur().getType() == Token.Type.IDENFR) {
+        peek = cur;
+        LVal lVal = (LVal)parseLVal();
+        if (lVal == null) {
+           // ...
+        } else {
+           // ...
+           cur = peek; 
+           stmt.addChildNode(parseAssignStmt());
+        }
+    }
+    ```
+    
+    If `parseLVal` successfully parses `x[i]`, it returns an `LVal` node.
+    `cur` is now at `=`.
+    `cur = peek` resets `cur` to `x`.
+    `parseAssignStmt` is called.
+    `parseAssignStmt` calls `parseLVal()`.
+    `parseLVal` parses `x`, `[`, `i`, `]`.
+    Returns `LVal`.
+    `parseAssignStmt` adds `=`.
+    
+    This logic seems correct for `x[i]=i;`.
+    
+    Why does the output show `IDENFR ]`?
+    
+    Let's look at the previous statements in the buggy output:
+    ```text
+    CONTINUETK continue
+    SEMICN ;
+    <Stmt>
+    RBRACE }
+    <Block>
+    <Stmt>
+    <Stmt>
+    ```
+    The `<Stmt>` tags correspond to the `if` statement and its inner block.
+    
+    Is it possible that `parseLVal` is NOT consuming the `]`?
+    
+    In `parseLVal`:
+    ```java
+    if (getCur().getType() == Token.Type.LBRACK) {
+        // ...
+        lVal.addChildNode(parseExp());
+        if (getCur().getType() != Token.Type.RBRACK) {
+             // Error
+        } else {
+             lVal.addChildNode(new LeafNode(Token.Type.RBRACK, "]", ...));
+             cur++;
+        }
+    }
+    ```
+    
+    If `parseExp()` consumes too much?
+    `parseExp` -> `parseAddExp` -> ... -> `parsePrimaryExp`.
+    `parsePrimaryExp` for `i` (IDENFR):
+    ```java
+    } else if (getCur().getType() == Token.Type.IDENFR) {
+        primaryExp.addChildNode(parseLVal());
+    }
+    ```
+    Here is the recursion!
+    When parsing `x[i]`, `parseLVal` is called.
+    It sees `x`. Consumes `x`.
+    Sees `[`.
+    Calls `parseExp()`.
+    `parseExp` eventually calls `parsePrimaryExp`.
+    `parsePrimaryExp` sees `i` (IDENFR).
+    It calls `parseLVal()` again!
+    
+    Inside this nested `parseLVal()` for `i`:
+    It consumes `i`.
+    Checks for `(`. No.
+    Checks for `[`. No (current token is `]`).
+    Returns `LVal` for `i`.
+    
+    Back in `parseExp`/`parsePrimaryExp`, it returns.
+    Back in the outer `parseLVal` (for `x`):
+    Current token is `]`.
+    It checks `if (getCur().getType() != Token.Type.RBRACK)`.
+    It IS `RBRACK`.
+    So it adds `]` leaf and increments `cur`.
+    
+    This seems correct.
+    
+    Let's look at the Buggy Output again very carefully.
+    
+    ```text
+    IDENFR ]
+    <LVal>
+    ASSIGN =
+    IDENFR i
+    <LVal>
+    ```
+    
+    The line `IDENFR ]` suggests that a LeafNode was created with Type `IDENFR` and Value `]`.
+    Where can this happen?
+    
+    In `parseLVal`:
+    ```java
+    lVal.addChildNode(new LeafNode(Token.Type.IDENFR,
+            getCur().getValue(), getCur().getLineNo(), '\0'));
+    ```
+    This line creates an IDENFR leaf using the current token's value.
+    If `getCur()` is `]`, and this line is executed, we get `IDENFR ]`.
+    
+    This happens at the beginning of `parseLVal`.
+    So `parseLVal` was called when the current token was `]`.
+    
+    Why would `parseLVal` be called when the current token is `]`?
+    
+    Look at `parsePrimaryExp`:
+    ```java
+    } else if (getCur().getType() == Token.Type.IDENFR) {
+        primaryExp.addChildNode(parseLVal());
+    }
+    ```
+    It only calls `parseLVal` if the current token is `IDENFR`.
+    
+    Look at `parseUnaryExp`:
+    ```java
+    } else if (temTp == Token.Type.IDENFR) {
+        peek = cur + 1;
+        if (doPeek(peek).getType() == Token.Type.LPARENT) {
+            // Function call logic
+        } else {
+            unaryExp.addChildNode(parsePrimaryExp());
+        }
+    }
+    ```
+    
+    Look at `parseStmt` again.
+    
+    Maybe the issue is in `parseRecStmt` (the for loop)?
+    
+    ```java
+    //[ForStmt]')'
+    if (getCur().getType() == Token.Type.RPARENT) {
+       // ...
+    } else {
+       recStmt.addChildNode(parseForStmt());
+       recStmt.addChildNode(new LeafNode(Token.Type.RPARENT,
+               ")", getCur().getLineNo(), '\0'));
+       cur++;
+    }
+    ```
+    
+    `parseForStmt`:
+    ```java
+    public Node parseForStmt() {
+        // ...
+        //LVal
+        forStmt.addChildNode(parseLVal());
+        //'='
+        // ...
+    }
+    ```
+    
+    The for loop is `for(;i<=10;)`.
+    1. `;` (empty init)
+    2. `i<=10` (Cond)
+    3. `)` (empty increment)
+    
+    When parsing the 3rd part (increment):
+    `getCur()` is `)`.
+    The code goes to `if (getCur().getType() == Token.Type.RPARENT)`.
+    So `parseForStmt` is NOT called.
+    
+    So where does the extra `parseLVal` come from?
+    
+    Let's look at the `if` statement parsing.
+    `if(i==5) break;`
+    
+    After `break;`, we have `}`.
+    
+    Wait, look at the input:
+    ```c
+    if(i==5)
+    break;}
+    ```
+    There is no newline between `break;` and `}`.
+    
+    The `if` statement parses `break;` as its body.
+    Then `parseIfStmt` returns.
+    The `Block` parser sees `}`.
+    
+    Let's look at the Buggy Output around the error again.
+    
+    ```text
+    BREAKTK break
+    SEMICN ;
+    <Stmt>
+    <Stmt>
+    RBRACE }
+    <Block>
+    <Stmt>
+    <Stmt>
+    IDENFR ]
+    <LVal>
+    ASSIGN =
+    ```
+    
+    The `<Stmt>` tags:
+    1. `<Stmt>` for `break;`
+    2. `<Stmt>` for the `if` statement containing `break;`
+    
+    Then `RBRACE }`.
+    Then `<Block>` for the block containing `if...` and `x[i]=i;`?
+    No, the block started after `for(...)`.
+    
+    The structure is:
+    `for(...) {`
+      `if(...) { ... }`
+      `x[i]=i;`
+      `i=i+1;`
+      `if(...) break;`
+    `}`
+    
+    The `Block` parser loops.
+    1. Parses `if(...) { ... }` (the first if).
+    2. Parses `x[i]=i;`.
+    3. Parses `i=i+1;`.
+    4. Parses `if(...) break;`.
+    
+    The error appears AFTER the second `if` statement (`if(i==5) break;`).
+    
+    In the buggy output:
+    ```text
+    IFTK if
+    ...
+    BREAKTK break
+    SEMICN ;
+    <Stmt>
+    <Stmt>
+    RBRACE }
+    <Block>
+    <Stmt>
+    <Stmt>
+    IDENFR ]
+    ```
+    
+    It seems `x[i]=i;` and `i=i+1;` are MISSING from the output before the second `if`?
+    No, looking at the full buggy output provided in the prompt:
+    
+    ```text
+    ...
+    <Stmt> (from continue)
+    RBRACE }
+    <Block>
+    <Stmt> (from if block)
+    <Stmt> (from if stmt)
+    IDENFR ]
+    <LVal>
+    ASSIGN =
+    IDENFR i
+    <LVal>
+    ...
+    <Stmt> (from x[i]=i;)
+    IDENFR i
+    ...
+    <Stmt> (from i=i+1;)
+    IFTK if
+    ...
+    ```
+    
+    Ah, the `IDENFR ]` appears BEFORE `x[i]=i;` is fully parsed?
+    
+    Let's look at the sequence:
+    1. `continue;` ends.
+    2. `}` of inner block `i=4; continue;` ends.
+    3. `<Block>` printed.
+    4. `<Stmt>` printed (for the block statement).
+    5. `<Stmt>` printed (for the `if` statement `if(i==2)...`).
+    
+    Now we are back in the outer block (body of for loop).
+    Next item: `x[i]=i;`.
+    
+    The output shows:
+    ```text
+    IDENFR ]
+    <LVal>
+    ASSIGN =
+    ```
+    
+    This implies that when parsing `x[i]=i;`, the parser output `IDENFR ]`.
+    
+    If `parseStmt` is called for `x[i]=i;`:
+    It sees `x` (IDENFR).
+    Calls `parseLVal`.
+    
+    If `parseLVal` is working correctly, it should output:
+    `IDENFR x`
+    `LBRACK [`
+    `IDENFR i`
+    ...
+    `RBRACK ]`
+    `<LVal>`
+    
+    But the output is `IDENFR ]`.
+    
+    This specific output `IDENFR ]` can ONLY be generated by:
+    ```java
+    new LeafNode(Token.Type.IDENFR, getCur().getValue(), ...)
+    ```
+    when `getCur().getValue()` is `]`.
+    
+    This happens in `parseLVal` at the very beginning:
+    ```java
+    lVal.addChildNode(new LeafNode(Token.Type.IDENFR,
+            getCur().getValue(), getCur().getLineNo(), '\0'));
+    cur++;
+    ```
+    
+    So, `parseLVal` was called when the current token was `]`.
+    
+    Why?
+    
+    Look at `parsePrimaryExp`:
+    ```java
+    } else if (getCur().getType() == Token.Type.IDENFR) {
+        primaryExp.addChildNode(parseLVal());
+    }
+    ```
+    
+    Look at `parseUnaryExp`:
+    ```java
+    } else if (temTp == Token.Type.IDENFR) {
+        // ...
+        unaryExp.addChildNode(parsePrimaryExp());
+    }
+    ```
+    
+    Look at `parseMulExp`, `parseAddExp`, etc. They call `parseUnaryExp`.
+    
+    Is it possible that `parseExp` (called inside `parseLVal` for the index `i`) consumed the `]`?
+    
+    `parseExp` -> `parseAddExp` -> `parseMulExp` -> `parseUnaryExp` -> `parsePrimaryExp`.
+    `parsePrimaryExp` sees `i` (IDENFR).
+    It calls `parseLVal()`.
+    This inner `parseLVal` consumes `i`.
+    It checks for `[`. No.
+    It returns.
+    
+    So `parsePrimaryExp` returns.
+    `parseUnaryExp` returns.
+    `parseMulExp` returns.
+    `parseAddExp` returns.
+    `parseExp` returns.
+    
+    The current token should still be `]`.
+    
+    So the outer `parseLVal` (for `x`) should see `]` and handle it correctly.
+    
+    Unless... `parseLVal` for `x` was NOT called, or `cur` was messed up.
+    
+    Let's look at `parseStmt` again.
+    
+    ```java
+    } else if (getCur().getType() == Token.Type.IDENFR) {
+        peek = cur;
+        LVal lVal = (LVal)parseLVal();
+        // ...
+        if (lVal == null) {
+           // ...
+        } else {
+           // ...
+           cur = peek;
+           stmt.addChildNode(parseAssignStmt());
+        }
+    }
+    ```
+    
+    If `parseLVal` throws an exception or behaves unexpectedly?
+    
+    Wait, look at `parseLVal` implementation again.
+    
+    ```java
+    public Node parseLVal() {
+        // ...
+        //Ident
+        lVal.addChildNode(new LeafNode(Token.Type.IDENFR,
+                getCur().getValue(), getCur().getLineNo(), '\0'));
+        cur++;
+        // ...
+    }
+    ```
+    
+    If `parseLVal` is called when `getCur()` is `]`, it adds `IDENFR ]` and increments `cur`.
+    
+    So the question is: Why is `parseLVal` called when `getCur()` is `]`?
+    
+    This must happen inside `parseExp` or similar.
+    
+    Consider `i<=10` in the for loop condition.
+    `parseCond` -> `parseLOrExp` -> ... -> `parseRelExp`.
+    `parseRelExp` parses `i`, then `<=`, then `10`.
+    
+    Consider `x[i]`.
+    `parseLVal` (for x) calls `parseExp`.
+    `parseExp` parses `i`.
+    
+    Is it possible that `parseExp` parses `i]`?
+    No, `]` is not part of an expression.
+    
+    Let's look at the `parseRecStmt` again.
+    
+    ```java
+    //[ForStmt]')'
+    if (getCur().getType() == Token.Type.RPARENT) {
+        // ...
+    } else {
+        recStmt.addChildNode(parseForStmt());
+        // ...
+    }
+    ```
+    
+    If the for loop was `for(...;...;i++)`, `parseForStmt` would be called.
+    `parseForStmt` calls `parseLVal`.
+    
+    But our loop is `for(...;...;)`.
+    
+    Let's look at the `if` statement: `if(i==5)`.
+    `parseCond` parses `i==5`.
+    
+    What if the error is in `parsePrimaryExp`?
+    
+    ```java
+    } else if (getCur().getType() == Token.Type.IDENFR) {
+        primaryExp.addChildNode(parseLVal());
+    }
+    ```
+    
+    If `getCur()` is `]`, this branch is NOT taken.
+    
+    What if `getCur()` is `IDENFR` but the value is `]`? Impossible.
+    
+    Let's look at the Buggy Output lines immediately preceding the error:
+    
+    ```text
+    <Stmt>
+    <Stmt>
+    IDENFR ]
+    ```
+    
+    The two `<Stmt>` tags correspond to the `if(i==5) break;` statement.
+    1. Inner `<Stmt>` for `break;`.
+    2. Outer `<Stmt>` for `if(...) break;`.
+    
+    After `parseStmt` returns for the `if` statement, control returns to `parseBlock`.
+    `parseBlock` loops.
+    It checks `getCur()`.
+    The next token is `}`.
+    
+    ```java
+    if (getCur().getType() == Token.Type.RBRACE) {
+         // ...
+    } else {
+         // ...
+         if (temTp == ... || temTp == Token.Type.IDENFR ...) {
+              block.addChildNode(parseStmt());
+         }
+    }
+    ```
+    
+    If `getCur()` is `}`, the loop ends.
+    
+    So `x[i]=i;` and `i=i+1;` MUST have been parsed BEFORE `if(i==5)`.
+    
+    Let's check the Buggy Output for `x[i]=i;` and `i=i+1;`.
+    
+    ```text
+    ...
+    <Stmt> (from continue)
+    RBRACE }
+    <Block>
+    <Stmt>
+    <Stmt>
+    IDENFR ]
+    <LVal>
+    ASSIGN =
+    IDENFR i
+    <LVal>
+    <PrimaryExp>
+    ...
+    <Exp>
+    SEMICN ;
+    <Stmt>
+    IDENFR i
+    <LVal>
+    ...
+    <Stmt>
+    IFTK if
+    ```
+    
+    The segment:
+    ```text
+    IDENFR ]
+    <LVal>
+    ASSIGN =
+    IDENFR i
+    <LVal>
+    ...
+    <Stmt>
+    ```
+    This corresponds to `x[i]=i;`.
+    
+    But it starts with `IDENFR ]`.
+    And then `<LVal>`.
+    And then `ASSIGN =`.
+    And then `IDENFR i` ... `<Stmt>`.
+    
+    This looks like `x[i]` was parsed incorrectly.
+    Specifically, `x` and `[` and `i` are MISSING from the output.
+    Only `]` is present, but labeled as `IDENFR`.
+    
+    This implies that `parseLVal` was called, and the first thing it did was read `]`.
+    
+    Why would `parseLVal` read `]`?
+    
+    Because `cur` was pointing to `]`.
+    
+    Why was `cur` pointing to `]`?
+    
+    Because the previous parsing step consumed `x`, `[`, and `i`, but stopped before `]`.
+    
+    Who consumes `x`, `[`, `i`?
+    
+    `parseStmt` calls `parseLVal` (peeking).
+    `parseLVal` consumes `x`, `[`, `i`.
+    
+    If `parseExp` (inside `parseLVal`) consumed `i` AND `]`?
+    
+    `parseExp` -> `parseAddExp` -> ... -> `parsePrimaryExp`.
+    `parsePrimaryExp` sees `i`.
+    Calls `parseLVal`.
+    Inner `parseLVal` consumes `i`.
+    Returns.
+    
+    So `parseExp` returns. `cur` is at `]`.
+    
+    Outer `parseLVal` resumes.
+    It checks `if (getCur().getType() != Token.Type.RBRACK)`.
+    It is `RBRACK`.
+    It adds `RBRACK ]` leaf.
+    Increments `cur`.
+    
+    So `x[i]` is fully consumed.
+    
+    Then `parseStmt` resets `cur = peek` (to `x`).
+    Calls `parseAssignStmt`.
+    `parseAssignStmt` calls `parseLVal`.
+    `parseLVal` consumes `x`, `[`, `i`, `]`.
+    
+    This should produce correct output.
+    
+    UNLESS `parseLVal` is NOT being called correctly.
+    
+    Look at `parseStmt` again.
+    
+    ```java
+    } else if (getCur().getType() == Token.Type.IDENFR) {
+        peek = cur;
+        LVal lVal = (LVal)parseLVal();
+        // ...
+        if (lVal == null) {
+           // ...
+        } else {
+           // ...
+           cur = peek;
+           stmt.addChildNode(parseAssignStmt());
+        }
+    }
+    ```
+    
+    If `parseLVal` returns `null`?
+    It returns `null` only if `getCur()` is `(` after the identifier.
+    For `x`, next is `[`. So it returns an `LVal` object.
+    
+    So `parseAssignStmt` is called.
+    
+    Is it possible that `parseAssignStmt` is NOT calling `parseLVal`?
+    
+    ```java
+    public Node parseAssignStmt() {
+        // ...
+        //LVal
+        assignStmt.addChildNode(parseLVal());
+        // ...
+    }
+    ```
+    
+    Yes, it does.
+    
+    So why is the output `IDENFR ]`?
+    
+    Hypothesis: The `parseLVal` called by `parseStmt` (the peeking one) advanced `cur` to `]`.
+    Then `cur = peek` reset it to `x`.
+    Then `parseAssignStmt` called `parseLVal`.
+    
+    If `parseLVal` is called correctly, it should output `IDENFR x`.
+    
+    The output `IDENFR ]` means `parseLVal` was called when `cur` pointed to `]`.
+    
+    This implies `cur` was NOT reset to `x`.
+    
+    Why would `cur` not be reset?
+    
+    ```java
+    cur = peek;
+    stmt.addChildNode(parseAssignStmt());
+    ```
+    
+    This line is executed.
+    
+    Unless `peek` was modified?
+    `peek` is a member variable.
+    
+    Inside `parseLVal`, is `peek` modified?
+    No.
+    
+    Inside `parseExp`?
+    No.
+    
+    Inside `parsePrimaryExp`?
+    No.
+    
+    Inside `parseUnaryExp`?
+    ```java
+    peek = cur + 1;
+    ```
+    YES! `parseUnaryExp` modifies `peek`!
+    
+    Trace:
+    1. `parseStmt` sets `peek = cur` (points to `x`).
+    2. `parseStmt` calls `parseLVal()`.
+    3. `parseLVal` consumes `x`.
+    4. `parseLVal` sees `[`.
+    5. `parseLVal` calls `parseExp()`.
+    6. `parseExp` calls `parseAddExp()`.
+    7. `parseAddExp` calls `parseMulExp()`.
+    8. `parseMulExp` calls `parseUnaryExp()`.
+    9. `parseUnaryExp` sees `i` (IDENFR).
+    10. `parseUnaryExp` sets `peek = cur + 1`.
+        At this point, `cur` points to `i`.
+        So `peek` now points to the token AFTER `i`, which is `]`.
+    11. `parseUnaryExp` checks `doPeek(peek)`. It is `]`. Not `(`.
+    12. `parseUnaryExp` calls `parsePrimaryExp()`.
+    13. `parsePrimaryExp` calls `parseLVal()` for `i`.
+    14. `parseLVal` consumes `i`.
+    15. Returns.
+    16. `parseUnaryExp` returns.
+    17. ... `parseExp` returns.
+    18. Back in outer `parseLVal` (for `x`).
+    19. `cur` is at `]`.
+    20. `parseLVal` handles `]`.
+    21. `parseLVal` returns.
+    22. Back in `parseStmt`.
+    23. `cur` is at `=` (because `parseLVal` consumed `]`).
+        WAIT.
+        In step 20, `parseLVal` consumes `]`.
+        So `cur` is now at `=`.
+    24. `parseStmt` executes `cur = peek`.
+        But `peek` was modified by `parseUnaryExp` to point to `]`!
+    25. So `cur` is set to `]`.
+    26. `parseStmt` calls `parseAssignStmt()`.
+    27. `parseAssignStmt` calls `parseLVal()`.
+    28. `parseLVal` sees `]`.
+    29. `parseLVal` creates `LeafNode(IDENFR, "]")`.
+    
+    This matches the bug!
+    
+    The error is that `peek` is a global/member variable, and `parseUnaryExp` modifies it, interfering with the `peek` saved in `parseStmt`.
+
+<frontend/Parser.java>
+...
+    public Node parseUnaryExp() {
+        //可能出现j型错误:缺少右小括号
+        UnaryExp unaryExp = new UnaryExp();
+        unaryExp.setStartLine(getCur().getLineNo());
+        //
+        Token.Type temTp = getCur().getType();
+        if (temTp == Token.Type.PLUS
+            || temTp == Token.Type.MINU
+            || temTp == Token.Type.NOT) {
+            //FIRST(UnaryOp)
+            unaryExp.addChildNode(parseUnaryOp());
+            unaryExp.addChildNode(parseUnaryExp());
+        } else if (temTp == Token.Type.LPARENT
+            || temTp == Token.Type.INTCON
+            || temTp == Token.Type.CHRCON) {
+            //FIRST(PrimaryExp) - Ident
+            unaryExp.addChildNode(parsePrimaryExp());
+        } else if (temTp == Token.Type.IDENFR) {
+            peek = cur + 1;
+            if (doPeek(peek).getType() == Token.Type.LPARENT) {
+                unaryExp.addChildNode(new LeafNode(Token.Type.IDENFR,
+                        getCur().getValue(), getCur().getLineNo(), '\0'));
+                cur++;
+                unaryExp.addChildNode(new LeafNode(Token.Type.LPARENT,
+                        "(", getCur().getLineNo(), '\0'));
+                cur++;
+                //[FuncRParams]')'
+                Token.Type temType = getCur().getType();
+                if (temType == Token.Type.CHRCON || temType == Token.Type.INTCON
+                || temType == Token.Type.LPARENT || temType == Token.Type.IDENFR
+                || temType == Token.Type.PLUS || temType == Token.Type.MINU
+                || temType == Token.Type.NOT) {
+                    //F(FuncRParams) = F(Exp)
+                    unaryExp.addChildNode(parseFuncRParams());
+                }
+                if (getCur().getType() != Token.Type.RPARENT) {
+                    unaryExp.addChildNode(new LeafNode(Token.Type.RPARENT,
+                            ")", doPeek(cur-1).getLineNo(), 'j'));
+                    hasError = true;
+                    errorList.add(doPeek(cur-1).getLineNo()+" "+'j');
+                } else {
+                    unaryExp.addChildNode(new LeafNode(Token.Type.RPARENT,
+                            ")", doPeek(cur-1).getLineNo(), '\0'));
+                    cur++;
+                }
+            } else {
+                unaryExp.addChildNode(parsePrimaryExp());
+            }
+        }
+        unaryExp.setEndLine(doPeek(cur-1).getLineNo());

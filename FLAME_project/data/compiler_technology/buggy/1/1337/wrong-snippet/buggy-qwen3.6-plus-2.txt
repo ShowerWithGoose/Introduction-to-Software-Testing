@@ -1,0 +1,94 @@
+Based on the problem description and the provided code, the primary issue is a **Compilation Error** indicated by `/bin/sh: 1: g++: not found`. This means the C++ compiler (`g++`) is not installed or not in the system's PATH in the environment where the code is being executed.
+
+However, looking at the code itself for logical/semantic errors that would cause issues if it *were* compiled, there is a significant logical error in `Util::printErrorInfo`. The problem states: "For an erroneous source program... output the line number of the error... The error line number corresponds to the line where the last non-terminal before the semicolon/right parenthesis/right square bracket is located."
+
+In `Util::printErrorInfo`, the code uses `Token::tokenList[Token::tokenIndex - 1].lineNum`.
+1. `Token::getNextToken()` increments `tokenIndex` *before* returning the token. So when parsing, `tokenIndex` points to the *current* token being processed (or the one just consumed depending on exact timing).
+2. When an error is detected (e.g., missing `;`), the parser usually has already consumed the token that *should* have been followed by `;` or has looked ahead.
+3. In `ConstDecl::constDeclParser`, `VarDecl::varDeclParser`, etc., when `;` is missing, `token` holds the current token (which is NOT `;`). The code calls `Util::printErrorInfo(token.lineNum, "i")`.
+4. Inside `Util::printErrorInfo`, it ignores the passed `lineNum` argument and instead calculates `Token::tokenList[Token::tokenIndex - 1].lineNum`.
+5. If `getNextToken()` was called to get the current `token` (which is not `;`), `tokenIndex` points to this token. `tokenIndex - 1` points to the *previous* token. This might be incorrect depending on the specific grammar rule and what "last non-terminal" implies. Often, the error line should be the line of the token *currently* being inspected or the last successfully parsed token of the construct.
+6. More critically, in `Lexer.cpp`, there is a potential issue with `isReservedWord`. It writes to `rightFile` and adds to `Token::addToken`. But in `main.cpp`, `Lexer::lexicalAnalysis()` is called, then `Parser::parse()`. The `Token::tokenList` is populated during lexical analysis.
+
+Let's look closer at `CompUnit::compUnitParser`.
+It calls `Token::getNextToken()` to get the first token.
+Then it enters a `while` loop checking `isBType`, `isConst`, `isFuncType`.
+Inside the loop, it calls `Token::lookAhead(2)`.
+`Token::lookAhead` accesses `tokenList[tokenIndex + i]`.
+If `tokenIndex` is at the end of the list, this could crash or behave unexpectedly if bounds checking isn't perfect (though there is a check).
+
+However, the most obvious "error" preventing execution is the missing compiler. If we assume the question asks for bugs in the *logic* assuming it compiles:
+
+In `Lexer.cpp`, `skipMultiLineComment` has a bug.
+```cpp
+void skipMultiLineComment(FILE *fp) {
+    char ch;
+    int nestedCount = 1;
+
+    while ((ch = getChar(fp)) != EOF) {
+        if (ch == '*') {
+            ch = getChar(fp);
+            if (ch == '/') {
+                nestedCount--;
+                if (nestedCount == 0) {
+                    break;
+                }
+            }
+        } else if (ch == '/') {
+            ch = getChar(fp);
+            if (ch == '*') {
+                nestedCount++;
+            } else {
+                ungetc(ch, fp);
+            }
+        }
+        if (ch == '\n') { // <--- BUG: ch might have been overwritten by the inner getChar calls above.
+            line_count++;
+        }
+    }
+}
+```
+If `ch` is `*`, it reads the next char into `ch`. If that next char is NOT `/`, the loop continues. The check `if (ch == '\n')` uses the *second* character read. If the sequence is `*\n`, it reads `\n` into `ch` inside the `if(ch=='*')` block. Then it checks `if (ch == '\n')` which is true. This seems okay for counting newlines inside comments.
+But if the sequence is `/* comment */`, and inside the comment there is a newline.
+Example: `/* \n */`.
+1. `getChar` returns `/`. `ch` is `/`.
+2. `else if (ch == '/')`: `getChar` returns `*`. `ch` becomes `*`. `nestedCount` becomes 2.
+3. Loop continues. `getChar` returns `\n`. `ch` is `\n`.
+4. `if (ch == '*')` false. `else if (ch == '/')` false.
+5. `if (ch == '\n')` true. `line_count++`. Correct.
+6. Loop continues. `getChar` returns `*`. `ch` is `*`.
+7. `if (ch == '*')`: `getChar` returns `/`. `ch` becomes `/`. `nestedCount` becomes 1.
+8. `if (ch == '\n')` false.
+9. Loop continues. `getChar` returns EOF? Or next char.
+
+Wait, standard C comments `/* ... */` do not nest in C/C++. The grammar doesn't specify nested comments, but the code implements nesting (`nestedCount`). Standard C compilers do not support nested comments. If the test cases assume standard C behavior, this might be an issue, but usually, simple comment skipping is fine.
+
+Let's look at `Util::printErrorInfo` again.
+```cpp
+void Util::printErrorInfo(int lineNum, const char *error) {
+    std::ofstream errorFile("error.txt", std::ios::app);
+    errorFile << Token::tokenList[Token::tokenIndex - 1].lineNum << " " << error << std::endl;
+    errorFile.close();
+}
+```
+It completely ignores the `lineNum` parameter passed to it! The callers (e.g., in `ConstDecl.cpp`) pass `token.lineNum`.
+```cpp
+    else{
+        Util::printErrorInfo(token.lineNum, "i");
+    }
+```
+If `tokenIndex` is not correctly pointing to the "last non-terminal" or if `tokenIndex - 1` is out of bounds (e.g., at the very beginning of parsing, though unlikely for syntax errors), this will produce wrong line numbers.
+Specifically, if `getNextToken()` has advanced `tokenIndex` to the token *after* the one causing the error context, `tokenIndex - 1` is the current token.
+In `ConstDecl`, if `;` is missing, `token` is the current token (not `;`). `tokenIndex` points to this `token`. `tokenIndex - 1` points to the previous token.
+The requirement says: "The error line number corresponds to the line where the last non-terminal before the semicolon is located."
+If the input is `int a = 1`, `token` is `1` (INTCON). `tokenIndex` points to `1`. `tokenIndex-1` points to `=`. The last non-terminal before the missing `;` is likely the `Exp` or `ConstInitVal` which ends with `1`. So `token.lineNum` (passed as arg) is correct. But the function uses `tokenList[tokenIndex-1]`, which is `=`. This might be wrong if `=` is considered a terminal separator and not part of the non-terminal's "location". Usually, the location of the error is the last token of the construct.
+So, `Util::printErrorInfo` should use the passed `lineNum`.
+
+<util/Util.cpp>
+...
+void Util::printErrorInfo(int lineNum, const char *error) {
+    std::ofstream errorFile("error.txt", std::ios::app);
+    errorFile << Token::tokenList[Token::tokenIndex - 1].lineNum << " " << error << std::endl;
+    errorFile.close();
+}
+...

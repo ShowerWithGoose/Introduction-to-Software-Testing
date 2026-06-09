@@ -1,0 +1,382 @@
+Based on the comparison between the buggy output and the expected output, the error lies in the parsing of assignment statements involving array access (LVal with index) on the left-hand side.
+
+In the buggy output, for the statement `Dp[cal(0,j)] = j;`, the parser incorrectly identifies `Dp` as an LVal, then treats `[cal(0,j)]` as a separate expression or statement components, failing to recognize `Dp[cal(0,j)]` as a single `LVal`. This suggests that the `stmtParser`'s logic for distinguishing between an assignment statement (`LVal '=' Exp ';'`) and an expression statement (`Exp ';'`) is flawed when the `LVal` contains an array index.
+
+Specifically, in `stmtParser`, under `case IDENFR`:
+1. It calls `lValParser()` in `fakeMode` to look ahead.
+2. It checks if the next token is `ASSIGN`.
+3. If it is `ASSIGN`, it resets the iterator and parses `LVal`, then `ASSIGN`, then `Exp`.
+
+The issue is likely in how `lValParser` behaves or how the lookahead/reset logic interacts with complex LVals (like `Dp[cal(0,j)]`). However, looking closely at the buggy output:
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+It seems `LVal` was parsed as just `Dp` (without the bracket part), or the bracket part was consumed but not attached to the LVal correctly in the assignment path.
+
+Let's look at `stmtParser` again.
+```java
+            case IDENFR: {
+                tokenIterator.getPrevious();
+                switchFake(true);
+                lValParser();
+                if (tokenIterator.getNext().getLexType().equals(LexType.ASSIGN)) {
+                    tokenIterator.getBack(step + 1);
+                    switchFake(false);
+                    LVal lVal = lValParser();
+                    tokenIterator.getNext(); // Consumes ASSIGN
+                    pos1 = tokenIterator.getNext();
+                    if (pos1.getLexType().equals(LexType.GETINTTK)) {
+                       ...
+                    }
+                    else if (pos1.getLexType().equals(LexType.GETCHARTK)) {
+                       ...
+                    }
+                    else {
+                        tokenIterator.getPrevious(); // Backs up from what?
+                        Exp exp = expParser();
+                        if (! tokenIterator.getNext().getLexType().equals(LexType.SEMICN)) {
+                            addErrorI(tokenIterator.getPrevious().getLineNum());//i  error
+                        }
+                        return new Stmt(new AssignStmt(lVal,  exp));
+                    }
+                }
+                else {
+                    tokenIterator.getBack(step + 1);
+                    switchFake(false);
+                    Exp exp = expParser();
+                    if (! tokenIterator.getNext().getLexType().equals(LexType.SEMICN)) {
+                        addErrorI(tokenIterator.getPrevious().getLineNum());//i  error
+                    }
+                    return new Stmt(new ExpStmt(exp));
+                }
+            }
+```
+
+In the `else` branch of the inner `if` (standard assignment):
+1. `LVal lVal = lValParser();` parses `Dp[cal(0,j)]`.
+2. `tokenIterator.getNext();` consumes `=`.
+3. `pos1 = tokenIterator.getNext();` peeks at the next token (likely `j` or `Dp` in other cases).
+4. If it's not `getint`/`getchar`, it goes to `else`.
+5. `tokenIterator.getPrevious();` backs up one step. This backs up from `pos1`. So the current token is now the one after `=`.
+6. `Exp exp = expParser();` parses the RHS.
+
+This logic seems generally correct for simple cases. However, let's look at the `fakeMode` lookahead.
+`lValParser` in `fakeMode` increments `step`.
+If `LVal` is `Dp[cal(0,j)]`, `lValParser` consumes `Dp`, `[`, `cal(...)`, `]`.
+`step` should reflect these tokens.
+Then `tokenIterator.getNext()` gets `=`.
+If `=` is found, `tokenIterator.getBack(step + 1)` is called.
+`step + 1` accounts for the tokens consumed by `lValParser` PLUS the `=` token? No, `getNext()` was called *after* `lValParser` returned.
+Wait, `lValParser` consumes tokens. `step` counts them.
+Then `tokenIterator.getNext()` is called to check for `ASSIGN`. This consumes one more token.
+So to reset to the state *before* `lValParser` was called, we need to go back `step` (for LVal) + 1 (for ASSIGN check).
+The code does `tokenIterator.getBack(step + 1);`. This seems correct.
+
+However, there is a subtle bug in `lValParser` regarding `fakeMode` and `step`.
+In `lValParser`:
+```java
+    private LVal lValParser() {
+        Token pos1 = tokenIterator.getNext();
+        if (fakeMode) step++;
+        Token ident = pos1;
+        if (tokenIterator.getNext().getLexType().equals(LexType.LBRACK)) {
+            if (fakeMode) step++;
+            Exp exp = expParser();
+            if (! tokenIterator.getNext().getLexType().equals(LexType.RBRACK)) {
+                if (fakeMode) {
+                    step--;
+                    tokenIterator.getPrevious();
+                }
+                if (! fakeMode) addErrorK(tokenIterator.getPrevious().getLineNum());//K  error
+            }
+            if (fakeMode) step++;
+            return new LVal(ident, exp);
+        }
+        else {
+            tokenIterator.getPrevious();
+            return new LVal(ident);
+        }
+    }
+```
+If it IS an array access:
+1. `getNext()` (ident), `step++`.
+2. `getNext()` (LBRACK), `step++`.
+3. `expParser()` consumes tokens. `expParser` internally handles `step` if `fakeMode` is true?
+   - `expParser` -> `addExpParser` -> `mulExpParser` -> `unaryExpParser` ...
+   - `unaryExpParser` has `if (fakeMode) step++;` etc.
+   - `primaryExpParser` has `if (fakeMode) step++;` etc.
+   - So `expParser` should correctly increment `step` for all tokens it consumes.
+4. `getNext()` (RBRACK check). If it matches, `step++`.
+   
+The problem might be that `expParser` does NOT handle `step` correctly in all recursive paths, or `lValParser`'s manual `step` management conflicts with `expParser`'s internal `step` management.
+
+Actually, looking at `unaryExpParser`:
+```java
+    private UnaryExp unaryExpParser() {
+        Token pos1 = tokenIterator.getNext();
+        Token pos2 = tokenIterator.getNext();
+        if (pos2.getLexType().equals(LexType.END)) {
+            if (fakeMode)  step -= 1;
+        }
+        if (fakeMode)  step += 2;
+        // ...
+    }
+```
+It manually adds 2 to step. Then if it recurses, the recursive calls also add to step. This double counting or incorrect accounting is highly suspect.
+
+But the most obvious discrepancy in the output is the structure of the parsed statement.
+Buggy:
+```
+LBRACK [
+<LVal>
+ASSIGN =
+...
+```
+Expected:
+```
+IDENFR Dp
+LBRACK [
+...
+RBRACK ]
+<LVal>
+ASSIGN =
+...
+```
+
+The buggy output shows `<LVal>` appearing *after* `LBRACK [`. This implies `LVal` was printed, but it only contained `Dp`? No, `LVal` print includes `LBRACK` if present.
+Wait, look at `LVal.toPrint()`:
+```java
+    public String toPrint() {
+        StringBuilder stringBuilder = new StringBuilder();
+        stringBuilder.append(ident.toPrint());
+        if (exp != null) {
+            stringBuilder.append("LBRACK" + " [" + "\n");
+            stringBuilder.append(exp.toPrint());
+            stringBuilder.append("RBRACK" + " ]" + "\n");
+        }
+        stringBuilder.append("<LVal>\n");
+        return stringBuilder.toString();
+    }
+```
+If `LVal` is parsed correctly, it should print `IDENFR`, `LBRACK`, `Exp`, `RBRACK`, `<LVal>`.
+
+In the buggy output around line 100-110:
+```
+FORTK for
+...
+RPARENT )
+LBRACE {
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+There is no `IDENFR Dp` before `LBRACK [`. And `<LVal>` is printed immediately after `LBRACK [`.
+This looks like `LVal` was parsed as empty or just the bracket part? Or perhaps `Dp` was consumed elsewhere?
+
+Actually, look at the previous lines in Buggy Output:
+```
+SEMICN ;
+<Stmt>
+<Stmt>
+FORTK for
+...
+```
+The `for` loop body starts.
+The first statement in the loop is `Dp[cal(0,j)] = j;`.
+
+If the parser failed to parse `Dp` as part of the LVal in the assignment, where did `Dp` go?
+It's missing from the output entirely in that block.
+
+This suggests that in `stmtParser`, when it detects `IDENFR`, it calls `lValParser()`.
+If `lValParser` fails or behaves incorrectly in `fakeMode`, it might consume tokens incorrectly.
+
+However, there is a known issue in recursive descent parsers with `LVal` vs `Exp` ambiguity.
+The code uses `switchFake(true)` to parse `LVal` lookahead.
+If `lValParser` consumes `Dp`, `[`, `cal...`, `]`, `step` is updated.
+Then `getNext()` gets `=`.
+Then `getBack(step + 1)` resets.
+Then `lValParser()` is called again in normal mode.
+
+If `lValParser` in normal mode works correctly, it should produce the correct `LVal`.
+
+Let's look at `expParser` vs `lValParser` interaction.
+In `stmtParser`, if the lookahead fails (next is not `=`), it goes to `else`:
+```java
+                else {
+                    tokenIterator.getBack(step + 1);
+                    switchFake(false);
+                    Exp exp = expParser();
+                    ...
+                }
+```
+Here, it resets and parses `Exp`.
+
+The error in the output shows that `Dp` is missing, and `LBRACK` is printed, then `<LVal>`.
+This specific pattern `LBRACK [ \n <LVal>` is very strange. `LVal` always prints `ident` first.
+Unless `ident` is null? No, `Token ident` is from `getNext()`.
+
+Is it possible that `Dp` was parsed as an `Exp` (via `PrimaryExp` -> `LVal`) in a previous step?
+
+Let's look at the `ForBlockStmt` parsing.
+`for (j = 0; j <= len2; j = j + 1) { Dp[cal(0,j)] = j; }`
+
+The `for` header is parsed. Then `stmtParser()` is called for the body.
+It sees `Dp` (IDENFR).
+Enters `case IDENFR`.
+`switchFake(true)`.
+`lValParser()`.
+Consumes `Dp`. `step=1`.
+Next is `[`. `step=2`.
+`expParser()` for `cal(0,j)`.
+`cal` is IDENFR. `unaryExpParser` sees `IDENFR` followed by `(`.
+It calls `funcCallParser`.
+`funcCallParser` consumes `cal`, `(`, `0`, `,`, `j`, `)`.
+Inside `funcCallParser`, `step` is incremented manually: `if (fakeMode) step += 3;` at start?
+No:
+```java
+    private FuncCall funcCallParser() {
+        Token ident = tokenIterator.getNext();
+        Token pos1 = tokenIterator.getNext();
+        //pos1.getLexType().equals(LexType.LPARENT)
+        pos1 = tokenIterator.getNext();
+        if (fakeMode) step += 3;
+        ...
+    }
+```
+It adds 3. Then it parses `FuncRParams`.
+`funcRParamsParser`:
+```java
+    private FuncRParams funcRParamsParser() {
+        ArrayList<Exp> exps = new ArrayList<>();
+        Exp exp0 = expParser();
+        exps.add(exp0);
+        while (tokenIterator.getNext().getLexType().equals(LexType.COMMA)) {
+            if (fakeMode) step++;
+            Exp exp = expParser();
+            exps.add(exp);
+        }
+        tokenIterator.getPrevious();
+        if (fakeMode) step--;
+        return new FuncRParams(exps);
+    }
+```
+`expParser` calls `addExpParser` etc., which update `step`.
+Then `funcCallParser` continues.
+If `RPARENT` is found, it returns.
+Back in `unaryExpParser`:
+```java
+        if (pos1.getLexType().equals(LexType.IDENFR)
+                && pos2.getLexType().equals(LexType.LPARENT)) {
+            tokenIterator.getBack(2);
+            if (fakeMode) step -= 2;
+            FuncCall funcCall = funcCallParser();
+            return new UnaryExp(funcCall);
+        }
+```
+It subtracted 2, then `funcCallParser` added 3 + whatever `expParser` added.
+This `step` accounting is extremely fragile and likely incorrect.
+
+However, the most direct cause of the "Wrong Answer" in syntax analysis output is usually the structure of the parsed tree.
+The missing `Dp` and malformed `LVal` suggest that `lValParser` is not correctly parsing the array access in the assignment context, OR the `AssignStmt` printing is wrong.
+
+But `AssignStmt` just prints `lVal.toPrint()`.
+If `lVal` is correct, output is correct.
+So `lVal` is incorrect.
+
+Why would `lVal` be incorrect?
+In `stmtParser`, `LVal lVal = lValParser();` is called.
+If `lValParser` works correctly, `lVal` should be `Dp[cal(0,j)]`.
+
+Let's look at the `else` branch of `stmtParser` for `IDENFR` again.
+If the lookahead determines it's NOT an assignment (e.g. it thinks it's an expression statement), it parses `Exp`.
+`Exp` -> `AddExp` -> ... -> `PrimaryExp` -> `LVal`.
+If it parses as `Exp`, it will print `<Exp>`.
+The buggy output shows `<Stmt>` containing `LBRACK [ <LVal> ASSIGN = ...`.
+This implies it DID enter the assignment branch (`if (tokenIterator.getNext().getLexType().equals(LexType.ASSIGN))`).
+
+So it entered the assignment branch.
+It reset iterators.
+It called `LVal lVal = lValParser();`.
+If this `lVal` was missing `Dp`, then `lValParser` is broken.
+
+In `lValParser`:
+```java
+        Token pos1 = tokenIterator.getNext();
+        if (fakeMode) step++;
+        Token ident = pos1;
+```
+If `pos1` is `Dp`, `ident` is `Dp`.
+Then it checks for `[`.
+If `[` is present, it parses `Exp`.
+Then it returns `new LVal(ident, exp)`.
+This `LVal` should print `Dp`, `[`, `Exp`, `]`, `<LVal>`.
+
+The buggy output is:
+```
+LBRACK [
+<LVal>
+```
+This implies `ident.toPrint()` produced nothing? Or `ident` was `LBRACK`?
+If `ident` was `LBRACK`, then `Dp` was consumed before `lValParser` was called.
+
+Who consumes `Dp`?
+In `stmtParser`:
+```java
+            case IDENFR: {
+                tokenIterator.getPrevious(); // Pushes back IDENFR
+                switchFake(true);
+                lValParser(); // Should consume Dp...
+```
+`tokenIterator.getPrevious()` pushes `Dp` back.
+`lValParser()` calls `getNext()`, which gets `Dp`.
+
+Is it possible `tokenIterator.getPrevious()` is buggy?
+```java
+    public Token getPrevious() {
+        if (iterator.hasPrevious()) {
+            iterator.previous();
+        }
+        if (iterator.hasPrevious()) {
+            iterator.previous();
+        }
+        return getNext();
+    }
+```
+This implementation is weird. It moves back twice, then moves forward once (`getNext`). Net effect: move back 1.
+But `getNext()` sets `cur`.
+If `iterator` is at `Dp` (current), `hasPrevious` is true (points to token before `Dp`).
+1. `iterator.previous()` -> iterator points to token before `Dp`. Next() would return `Dp`.
+2. `iterator.hasPrevious()` -> true (points to token before that).
+3. `iterator.previous()` -> iterator points to token before that.
+4. `getNext()` -> returns token after current iterator position.
+
+This `getPrevious` implementation is definitely suspicious and likely incorrect for a standard ListIterator usage where you want to "peek" or "undo" one token. Standard undo is just `iterator.previous()`. This method seems to try to handle some offset but likely fails, causing `Dp` to be skipped or duplicated.
+
+If `getPrevious()` skips `Dp`, then `lValParser` starts at `[`.
+`pos1` = `[`. `ident` = `[`.
+Next is `cal...`. Not `[`.
+So it goes to `else`: `tokenIterator.getPrevious()`.
+Returns `LVal([)`.
+Prints `[` then `<LVal>`.
+This matches the buggy output! `LBRACK [ \n <LVal>`.
+
+So the error is in `TokenIterator.getPrevious()`.
+
+<frontend/TokenIterator.java>
+    public Token getPrevious() {
+        if (iterator.hasPrevious()) {
+            iterator.previous();
+        }
+        if (iterator.hasPrevious()) {
+            iterator.previous();
+        }
+        return getNext();
+    }

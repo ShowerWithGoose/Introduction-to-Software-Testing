@@ -1,0 +1,4 @@
+这个仓库里面是我们大作业用到的所有代码。
+Flame_original是原始论文本地化后的Flame代码；
+Flame_qwen是实验中作为对照组的qwen3-max单模型错误定位相关代码，主要改动在qwen-experiments.py；
+Flame_project是加上了变量对齐与错误信息结构化两个创新点的方案，主要改动在fault_localization.py, program_runner_ds.py, generate_error_message.py。

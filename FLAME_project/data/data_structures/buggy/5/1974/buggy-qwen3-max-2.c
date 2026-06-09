@@ -1,0 +1,67 @@
+#include <stdio.h>
+#define sf scanf
+#define pf printf
+#define ll long long 
+#include <math.h>
+#include <string.h>
+#include <stdlib.h> 
+#include <ctype.h>
+typedef struct {
+    int num;
+    int xi;
+}number;
+ number cheng[500];
+ number cheng1[500];
+ number result[50000];
+int compare(const void *a,const void *b){
+     number *c=(number *)a;
+     number *d=(number *)b;
+     return c->xi-d->xi;
+    
+}
+
+int main(){
+
+int a,b,c=0,d,i=0,j=0;
+
+
+char k;
+
+while(1){
+    sf("%d%d%c",&cheng[i].num,&cheng[i].xi,&k);
+    i++;
+    if(k=='\n')
+    break;
+
+}
+while(sf("%d%d",&cheng1[j].num,&cheng1[j].xi)!=EOF){
+
+    j++;
+
+}
+for(a=0;a<i;a++){
+    for(b=0;b<j;b++){
+result[c].num=cheng[a].num*cheng1[b].num;
+result[c].xi=cheng[a].xi+cheng1[b].xi;
+c++;
+    }
+}
+qsort(result,c,sizeof(result[0]),compare);
+for(i=c-1;i>=0;i--){ 
+
+    
+   if((result[i].xi==result[i-1].xi)&&i>0){
+        result[i-1].num=result[i].num+result[i-1].num;
+        i--;
+    }
+   
+   if((i!=0)&&(result[i].xi!=result[i-1].xi)){
+        pf("%d %d ",result[i].num,result[i].xi);
+    }    
+ if(i==0){
+     pf("%d %d",result[i].num,result[i].xi);
+ }
+} // @@ [The logic for combining like terms is flawed: it only merges adjacent duplicates after sorting in ascending order, but the loop skips terms and doesn't handle all cases correctly. Also, the sort order is ascending, but output requires descending order; however, the main issue is that merging is done during output traversal instead of before, leading to missed or double-counted merges.]
+
+    return 0;
+}

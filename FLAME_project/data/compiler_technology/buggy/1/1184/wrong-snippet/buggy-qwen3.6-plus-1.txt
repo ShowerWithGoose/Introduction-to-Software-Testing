@@ -1,0 +1,351 @@
+Based on the problem description and the provided code, the issue is that the program produces **no output file** (`parser.txt` or `error.txt`).
+
+Looking at `Compiler.java`:
+1. It reads `testfile.txt`.
+2. It runs the Lexer.
+3. It runs the Parser.
+4. It checks `tokenErrors.isEmpty()`.
+5. If empty, it writes to `parser.txt`. If not, it writes to `error.txt`.
+
+The fact that there is **no output file** suggests that an exception occurred during execution before the file writing logic completed, or the program crashed. However, a more subtle issue in student compilers often lies in the **Parser's logic for distinguishing declarations from function definitions**, specifically the `isDecl` method, which uses lookahead.
+
+Let's examine `Parser.java`:
+
+```java
+public boolean isDecl(Token token) {
+    if (token.getTokenType() == TokenType.CONSTTK) {
+        return true;
+    }
+    Token token1 = tokens.getNext();
+    Token token2 = tokens.getNext();
+    if (token2.getTokenType() == TokenType.LPARENT) {
+        tokens.backLast();
+        tokens.backLast();
+        return false;
+    }
+    /*
+    if (token1.getTokenType() == TokenType.MAINTK) {
+        tokens.backLast();
+        tokens.backLast();
+        return false;
+    }*/
+    tokens.backLast();
+    tokens.backLast();
+    return true;
+}
+```
+
+This method looks ahead 2 tokens.
+- If input is `int main()`, `token` is `int`, `token1` is `main` (MAINTK), `token2` is `(` (LPARENT). It returns `false`. Correct.
+- If input is `int a = 1;`, `token` is `int`, `token1` is `a` (IDENFR), `token2` is `=` (ASSIGN). It returns `true`. Correct.
+- If input is `int f1(int a[], ...)` (FuncDef), `token` is `int`, `token1` is `f1` (IDENFR), `token2` is `(` (LPARENT). It returns `false`. Correct.
+
+However, look at `parseCompUnit`:
+
+```java
+public TreeNode parseCompUnit() {
+    ArrayList<TreeNode> nodes = new ArrayList<>();
+    Token token = tokens.getNext();
+    while (isDecl(token)) {
+        nodes.add(parseDecl(token));
+        token = tokens.getNext();
+    }
+    while (!isMain(token)) {
+        nodes.add(parseFuncDef(token));
+        token = tokens.getNext();
+    }
+    nodes.add(parseMainFuncDef(token));
+    return new CompUnitNode(nodes);
+
+}
+```
+
+And `isMain`:
+
+```java
+public boolean isMain(Token token) {
+    Token t = tokens.getNext();
+    if (token.getTokenType() == TokenType.INTTK && t.getTokenType() == TokenType.MAINTK) {
+        tokens.backLast();
+        return true;
+    }
+    tokens.backLast();
+    return false;
+}
+```
+
+In `parseCompUnit`, after parsing all Decls, it enters the loop `while (!isMain(token))`.
+Inside this loop, it calls `parseFuncDef(token)`.
+`parseFuncDef` expects `token` to be the FuncType (e.g., `int`, `void`, `char`).
+It consumes tokens.
+Then `token = tokens.getNext()` gets the next token for the next iteration.
+
+The critical error likely stems from how `isDecl` and `isMain` interact with the token stream index if an exception occurs or if the logic fails to terminate correctly, but usually "No output" implies a crash.
+
+Let's look closer at `Lexer.java`.
+In `Symbol` method, handling comments:
+```java
+else if (content.charAt(index + 1) == '*'){
+    index++;
+    index++;
+    int pre_index3 = index;
+    index++;
+    while (content.charAt(index) != '/'  || content.charAt(pre_index3) != '*') {
+        if (content.charAt(pre_index3) == '\n') {
+            numLine++;
+        }
+        pre_index3 = index;
+        index++;
+    }
+    index++;
+}
+```
+If the comment is not closed properly or if `index` goes out of bounds inside the `while` loop, it will throw `StringIndexOutOfBoundsException`. The condition `content.charAt(index) != '/'` is checked *before* checking if `index < content.length()`. This is a very common bug. If the file ends without closing the comment `*/`, `index` will exceed length, causing a crash.
+
+However, the test case input provided does not seem to have unclosed comments.
+
+Let's look at `Parser.java` -> `parseUnaryExp`.
+
+```java
+public TreeNode parseUnaryExp(Token token) {
+    ArrayList<TreeNode> nodes = new ArrayList<>();
+    if (token.getTokenType() == TokenType.LPARENT || token.getTokenType() == TokenType.CHRCON||token.getTokenType() == TokenType.INTCON) {
+        nodes.add(parsePrimaryExp(token));
+        return new UnaryExpNode(nodes);
+    }
+    else if (token.getTokenType() == TokenType.IDENFR) {
+        Token t =  tokens.getNext();
+        if (t.getTokenType() == TokenType.LPARENT) {
+            tokens.backLast(); // Backtrack because we want to treat it as PrimaryExp -> LVal? No.
+            nodes.add(token);
+            t = tokens.getNext(); // Get '(' again
+            if (t.getTokenType() == TokenType.LPARENT) {
+                nodes.add(t);
+                t = tokens.getNext();
+                // Check for FuncRParams
+                if (t.getTokenType() == TokenType.LPARENT || t.getTokenType() == TokenType.IDENFR || t.getTokenType() == TokenType.PLUS || t.getTokenType() == TokenType.MINU || t.getTokenType() == TokenType.NOT || t.getTokenType() == TokenType.INTCON || t.getTokenType() == TokenType.CHRCON) {
+                    nodes.add(parseFuncRParams(t));
+                    t = tokens.getNext();
+                }
+                if (t.getTokenType() != TokenType.RPARENT) {
+                     // ... error handling
+                } else {
+                    nodes.add(t);
+                }
+                return new UnaryExpNode(nodes);
+            }
+        }
+        else {
+            tokens.backLast();
+            nodes.add(parsePrimaryExp(token));
+            return new UnaryExpNode(nodes);
+        }
+    } else {
+        // UnaryOp
+        nodes.add(parseUnaryOp(token));
+        nodes.add(parseUnaryExp(tokens.getNext()));
+        return new UnaryExpNode(nodes);
+    }
+    return null;
+}
+```
+
+There is a logical flaw in `parseUnaryExp` for `IDENFR`.
+If `t` (next token) is `LPARENT`, it backtracks (`tokens.backLast()`).
+Then it adds `token` (the ident) to nodes.
+Then it gets `t` again (`tokens.getNext()`), which is `LPARENT`.
+It checks `if (t.getTokenType() == TokenType.LPARENT)`.
+Inside, it parses params.
+BUT, if the identifier is followed by `(`, it is a function call.
+The code structure here is messy.
+If `t` is NOT `LPARENT` initially, it backtracks and parses as `PrimaryExp` (which handles `LVal`). This is correct for `a[i]` or just `a`.
+
+However, consider the case where `t` IS `LPARENT`.
+It backtracks.
+Adds `token`.
+Gets `t` (`LPARENT`).
+Enters `if`.
+Adds `t`.
+Gets next token `t`.
+Checks if it starts params.
+If it does, parses params.
+Then expects `RPARENT`.
+
+What if the function has NO parameters? e.g., `main()`.
+`t` after `(` is `)`.
+The condition `if (t.getTokenType() == TokenType.LPARENT || ... || TokenType.CHRCON)` will be FALSE for `RPARENT`.
+So it skips `parseFuncRParams`.
+Then it checks `if (t.getTokenType() != TokenType.RPARENT)`.
+`t` is `)`. So it adds `t`.
+Returns.
+This seems okay for `main()`.
+
+Let's look at `parsePrimaryExp`:
+```java
+public TreeNode parsePrimaryExp(Token token) {
+    ArrayList<TreeNode> list = new ArrayList<>();
+    if (token.getTokenType() == TokenType.LPARENT) {
+       // ...
+    } else if (token.getTokenType() == TokenType.IDENFR) {
+        list.add(parseLVal(token));
+        return new PrimaryExpNode(list);
+    } 
+    // ...
+}
+```
+
+If `parseUnaryExp` receives an `IDENFR` followed by `(`, it handles it as a function call.
+If it receives an `IDENFR` NOT followed by `(`, it backtracks and calls `parsePrimaryExp(token)`.
+`parsePrimaryExp` calls `parseLVal(token)`.
+`parseLVal` handles `Ident[Exp]`.
+
+This logic seems generally functional for standard cases.
+
+Let's re-read the "No output file" symptom.
+In `Compiler.java`:
+```java
+        } catch (IOException e) {
+            System.out.println("An error occurred.");
+            e.printStackTrace();
+        }
+```
+If an exception happens during `parser.parseCompUnit()`, it is NOT caught. The `main` method will terminate abruptly, and no file will be written.
+
+Where could an uncaught exception occur?
+1. `IndexOutOfBoundsException` in Lexer or Parser.
+2. `NullPointerException`.
+
+In `Parser.java`, `parseCompUnit` calls `isDecl(token)`.
+`isDecl` calls `tokens.getNext()` twice.
+If the file is empty or ends unexpectedly, `tokens.getNext()` might throw exception if `index` >= `tokens.size()`.
+`TokenList.getNext()`:
+```java
+    public Token getNext() {
+        index++;
+        return tokens.get(index-1);
+    }
+```
+If `index` equals `tokens.size()`, `index++` makes it `size+1`, `get(size)` throws `IndexOutOfBoundsException`.
+
+Does `parseCompUnit` check for end of tokens?
+```java
+    Token token = tokens.getNext();
+    while (isDecl(token)) {
+       // ...
+       token = tokens.getNext();
+    }
+```
+If `tokens` is empty, `getNext()` crashes immediately.
+The test case is not empty.
+
+However, inside `isDecl`:
+```java
+    Token token1 = tokens.getNext();
+    Token token2 = tokens.getNext();
+```
+If we are at the last token, `token1` gets it. `token2` crashes.
+
+Example: `int main() {}`
+1. `parseCompUnit` gets `int`.
+2. `isDecl(int)`:
+   - `token1` = `main`
+   - `token2` = `(`
+   - `token2` is `LPARENT`. Returns `false`. Backtracks twice.
+3. Loop `isDecl` ends.
+4. `while (!isMain(token))` where `token` is `int`.
+   - `isMain(int)`:
+     - `t` = `main`.
+     - `int` is INTTK, `main` is MAINTK. Returns `true`. Backtracks once.
+   - Loop condition `!true` is `false`. Loop doesn't run.
+5. `parseMainFuncDef(token)` where `token` is `int`.
+   - Adds `int`.
+   - Gets `main`.
+   - Gets `(`.
+   - Gets `)`.
+   - Parses Block.
+
+This path works.
+
+What if there is a syntax error that causes the parser to consume tokens incorrectly and then run off the end?
+
+Let's look at `Lexer.java` again, specifically the comment handling block which is prone to crashes.
+
+<Lexer.java>
+...
+            case '/':
+                if (content.charAt(index + 1) == '/') {
+                    index++;
+                    index++;
+                    while (index < content.length() && content.charAt(index) != '\n') {
+                        index++;
+                    }
+                    numLine++;
+                    index++;
+                } else if (content.charAt(index + 1) == '*'){
+                    index++;
+                    index++;
+                    int pre_index3 = index;
+                    index++;
+                    while (content.charAt(index) != '/'  || content.charAt(pre_index3) != '*') {
+                        if (content.charAt(pre_index3) == '\n') {
+                            numLine++;
+                        }
+                        pre_index3 = index;
+                        index++;
+                    }
+                    index++;
+                }
+                else {
+                    index++;
+                    tokens.add(new Token("/",TokenType.DIV,numLine));
+
+                }
+                break;
+...
+
+The block comment handling `while (content.charAt(index) != '/' || content.charAt(pre_index3) != '*')` does **not** check `index < content.length()`. If the input file ends without closing the comment `*/`, `index` will increment past the end of the string, causing `StringIndexOutOfBoundsException` when `content.charAt(index)` is called. This would crash the program before any output is generated.
+
+Although the specific test case provided in the prompt doesn't visibly contain an unclosed comment, this is a critical bug that leads to "No output" (crash) on malformed input or even specific valid inputs if the logic is flawed (e.g. if the last character is part of a comment sequence). Given the symptom "No output file", a crash is the most likely cause.
+
+Another possibility:
+In `Compiler.java`, if `parser.parseCompUnit()` throws an exception (e.g. due to running out of tokens in `isDecl` or `isMain` lookahead without bounds checking), the program crashes.
+
+Let's check `isDecl` bounds safety.
+It calls `getNext()` twice unconditionally.
+If the source code is just `int`, `isDecl` will crash.
+The test case is complex, so it shouldn't run out of tokens prematurely unless the parser logic is severely broken.
+
+However, the comment bug in `Lexer.java` is a definitive crash risk.
+
+<Lexer.java>
+...
+            case '/':
+                if (content.charAt(index + 1) == '/') {
+                    index++;
+                    index++;
+                    while (index < content.length() && content.charAt(index) != '\n') {
+                        index++;
+                    }
+                    numLine++;
+                    index++;
+                } else if (content.charAt(index + 1) == '*'){
+                    index++;
+                    index++;
+                    int pre_index3 = index;
+                    index++;
+                    while (content.charAt(index) != '/'  || content.charAt(pre_index3) != '*') {
+                        if (content.charAt(pre_index3) == '\n') {
+                            numLine++;
+                        }
+                        pre_index3 = index;
+                        index++;
+                    }
+                    index++;
+                }
+                else {
+                    index++;
+                    tokens.add(new Token("/",TokenType.DIV,numLine));
+
+                }
+                break;
+...

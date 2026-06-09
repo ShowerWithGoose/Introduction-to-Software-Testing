@@ -1,0 +1,343 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The task is to implement a lexical analyzer. It needs to output tokens for correct programs and error codes for erroneous programs. Specifically, error type 'a' corresponds to standalone `&` or `|` characters (which should be `&&` or `||`).
+2.  **Test Case**: The input is a valid C-like source code without any lexical errors (no standalone `&` or `|`). Therefore, the program should output the sequence of tokens to `lexer.txt` and `errorExists` should remain false.
+3.  **Buggy Output vs Expected Output**:
+    *   The Buggy Output contains an extra token at the very end: `RBRACE }`.
+    *   Looking closely at the end of the Buggy Output:
+        ```text
+        RETURNTK return
+        INTCON 0
+        SEMICN ;
+        RBRACE }
+        RBRACE }  <-- Extra token
+        ```
+    *   The Expected Output ends with just one `RBRACE }`.
+    *   This indicates that the lexer is processing an extra closing brace `}` that shouldn't be there, or it's failing to stop correctly at the end of the file/input.
+4.  **Code Analysis**:
+    *   In `Lexer.java`, the `read()` method drives the tokenization.
+    *   The `checkSign(char p)` method handles symbols like `{`, `}`, `;`, etc.
+    *   Inside `checkSign`, when a single-character sign is found (like `}`), it creates a token.
+    *   However, let's look at the `read()` loop in `Compiler.java`:
+        ```java
+        while(Lexer.read()!=-1){
+            Lexer.putToken();
+        }
+        ```
+    *   The `read()` method returns `1` if a token is successfully identified, and `-1` if EOF is reached.
+    *   Let's trace the end of file handling in `Lexer.readLine()` and `Lexer.read()`.
+    *   In `read()`:
+        ```java
+        if(storage==null){
+            //读到文件结束
+            pos = 0;
+            lineno = 0;
+            return -1;
+        }
+        ```
+    *   If `storage` becomes null (EOF), it returns -1.
+    *   However, there is a logic issue in how `read()` handles the transition or potentially re-reading.
+    *   Let's look at `checkSign` again.
+        ```java
+        static boolean checkSign(char p) throws IOException {
+            String s = String.valueOf(p);
+            if(signMap.containsKey(s) || p=='&' || p=='|'){
+                // ... logic to create token ...
+                return true;
+            }
+            // ...
+            return false;
+        }
+        ```
+    *   The critical issue often lies in how the end of the file or empty lines are handled, causing an extra iteration or token generation.
+    *   Wait, looking at the provided buggy output, the extra `RBRACE }` suggests that the last `}` of the `main` function is being tokenized twice, or there is a phantom `}` being generated.
+    *   Let's look at `readLine()`:
+        ```java
+        static void readLine() throws IOException {
+            pos = 0;
+            lineno++;
+            storage = source.readLine();
+        }
+        ```
+    *   And `read()`:
+        ```java
+        public static int read() throws IOException {
+            pos++;
+            if(storage==null || pos >= storage.length()){
+                readLine();
+            }
+            if(storage==null){
+                // ... return -1
+            }
+            if(storage.isEmpty()){
+                return read(); // Recursively skip empty lines
+            }
+            p = storage.charAt(pos);
+            // ... checks ...
+        }
+        ```
+    *   There is a subtle bug in `read()`. When `readLine()` is called because `pos >= storage.length()`, `pos` is reset to 0 in `readLine()`. But in `read()`, `pos` was incremented *before* the check.
+    *   Example: Line is `"}"`. Length 1. Indices 0.
+    *   1. `read()` called. `pos` becomes 1 (was 0).
+    *   2. `pos >= storage.length()` (1 >= 1) is true.
+    *   3. `readLine()` called. `pos` becomes 0. `storage` becomes next line (or null).
+    *   4. If next line is not null/empty, `p = storage.charAt(0)`. This is correct for the *next* character.
+    *   
+    *   However, consider the very last line.
+    *   Suppose the last line is `}`.
+    *   1. `read()` enters. `pos` increments to 1.
+    *   2. `pos >= storage.length()` is true.
+    *   3. `readLine()` is called. `storage` becomes `null` (EOF). `pos` becomes 0.
+    *   4. `if(storage==null)` checks true. Returns -1.
+    *   So the `}` on the last line was *not* processed in this call?
+    *   No, wait. The previous call to `read()` must have processed the `}`.
+    *   Let's trace the processing of `}`.
+    *   Assume we are at the start of the line containing `}`. `pos` is effectively "before" the char due to the increment logic?
+    *   Actually, `pos` tracks the *current* character index in `storage` *after* increment.
+    *   If `storage` is `"}"`, length 1.
+    *   Call `read()`. `pos` becomes 1.
+    *   Check `pos >= storage.length()` (1 >= 1). True.
+    *   Call `readLine()`. `pos` set to 0. `storage` set to next line.
+    *   This means the character at index 0 of the *previous* line was skipped?
+    *   Yes! The logic `pos++` then `if (pos >= length) readLine()` skips the last character of every line if it triggers the readLine.
+    *   BUT, `checkSign` and others use `storage.charAt(pos)`.
+    *   If `pos` is incremented *before* checking bounds, and then `readLine` resets `pos` to 0 and loads new line, the character at the old `pos` (which was the last char of previous line) is never examined.
+    *   Wait, if `pos` starts at -1? No, `pos` starts at 0 in `readLine`.
+    *   First call to `read()`: `pos` becomes 1. If length is 1, it reads next line. The char at index 0 is ignored.
+    *   This implies the lexer is skipping the first character of every line? Or the last?
+    *   Let's re-read carefully.
+    *   `readLine()` sets `pos = 0`.
+    *   `read()` increments `pos` to 1.
+    *   If `storage` is `"int M;"` (length 6).
+    *   `pos` becomes 1. `1 < 6`.
+    *   `p = storage.charAt(1)` -> `'n'`. It skipped `'i'`!
+    *   So the current implementation skips the first character of every line.
+    *   How did it produce almost correct output then?
+    *   Maybe `pos` is initialized differently?
+    *   `pos = 0` in constructor.
+    *   `readLine()` sets `pos = 0`.
+    *   `read()` increments `pos`.
+    *   So yes, it skips index 0.
+    *   Unless... `checkSign` or other methods adjust `pos`? No, they read `storage.charAt(pos)`.
+    *   
+    *   Let's look at the Buggy Output again.
+    *   `INTTK int` -> `'i'` was read.
+    *   If it skips index 0, it would read `'n'`. `'n'` is not a keyword start usually handled by `checkIdent`? `checkIdent` checks `isIdentifierNondigit`. `'n'` is valid. It would read `nt`. That's not `int`.
+    *   So my theory about skipping index 0 must be wrong, or `pos` management is different.
+    *   
+    *   Let's look at `read()` again.
+    *   ```java
+    *   public static int read() throws IOException {
+    *       pos++;
+    *       if(storage==null || pos >= storage.length()){
+    *           readLine();
+    *       }
+    *       // ...
+    *       p = storage.charAt(pos);
+    *   ```
+    *   If `storage` is `"int"`, length 3. Indices 0,1,2.
+    *   Initial state: `storage` loaded, `pos` = 0?
+    *   If `pos` is 0, `read()` makes it 1. `charAt(1)` is `'n'`.
+    *   This code seems fundamentally broken for the first character.
+    *   
+    *   HOWEVER, look at `checkSign`.
+    *   ```java
+    *   static boolean checkSign(char p) throws IOException {
+    *       // ...
+    *       content[0]=p;
+    *       pos++;
+    *       // ...
+    *   ```
+    *   It increments `pos` again!
+    *   
+    *   Let's look at the `read()` loop structure in `Compiler`.
+    *   `while(Lexer.read()!=-1)`
+    *   `read()` finds a token, sets `currentToken`, returns 1.
+    *   `putToken()` adds it.
+    *   
+    *   Is it possible `pos` is -1 initially?
+    *   Constructor: `pos = 0`.
+    *   `readLine()`: `pos = 0`.
+    *   
+    *   There is a mismatch between standard lexer design (get next char) and this code.
+    *   Usually: `pos` points to current char. `advance()` moves to next.
+    *   Here: `read()` advances `pos` THEN gets char.
+    *   This implies `pos` should be -1 before reading the first char of a line.
+    *   But `readLine()` sets `pos = 0`.
+    *   So the first char (index 0) is skipped.
+    *   
+    *   Why does the output look mostly correct?
+    *   Maybe `storage` includes a newline or something? No, `readLine()` strips it.
+    *   
+    *   Let's look at the specific error: Extra `RBRACE }`.
+    *   And the fact that it *did* output `INTTK int`.
+    *   If index 0 is skipped, `int` becomes `nt`. `nt` is an identifier. Output would be `IDENFR nt`.
+    *   But output is `INTTK int`.
+    *   This implies `i` WAS read.
+    *   How?
+    *   Maybe `pos` is -1?
+    *   If I change `readLine()` to `pos = -1`, then `read()` increments to 0. `charAt(0)` is `'i'`. Correct.
+    *   The code has `pos = 0` in `readLine()`.
+    *   
+    *   Is it possible `read()` is called differently?
+    *   No.
+    *   
+    *   Let's look at `checkSign` again.
+    *   If `p` is `&`, it checks for `&&`.
+    *   
+    *   Let's look at the `errorACheck` logic.
+    *   ```java
+    *   if(errorACheck(p)){
+    *       Compiler.errorExists = true;
+    *       // ...
+    *   }
+    *   currentToken = new Token(..., String.valueOf(p), ...);
+    *   ```
+    *   If `p` is `&`, it creates an error token AND a regular token for `&`?
+    *   The map `signMap` does NOT contain `&`. It contains `&&`.
+    *   `signMap.containsKey("&")` is false.
+    *   So `checkSign` enters the `else` block for single `&`.
+    *   It calls `errorACheck`. Sets error.
+    *   Then `currentToken = new Token(Token.TokenType.fromValue(signMap.get(String.valueOf(p))), ...)`
+    *   `signMap.get("&")` returns `null`.
+    *   `TokenType.fromValue(null)` returns `null`.
+    *   `new Token(null, "&", ...)` -> Likely crashes or creates invalid token.
+    *   BUT the test case doesn't have `&`.
+    *   
+    *   Back to the extra `RBRACE`.
+    *   The input ends with:
+    *   ```
+    *   }
+    *   // zhe shi yi ge hen niu bi de ce shi
+    *   ```
+    *   The comment line.
+    *   `readLine()` reads `}`.
+    *   Tokens generated for `}`.
+    *   Next `read()`. `pos` increments. `pos >= length`. `readLine()` reads comment.
+    *   `checkAnnotation` in `checkSign`?
+    *   `}` is not `/`. So `checkSign` returns false?
+    *   `checkSign` checks `signMap.containsKey("}")`. Yes.
+    *   So `checkSign` processes `}`.
+    *   Inside `checkSign`:
+    *   ```java
+    *   if(signMap.containsKey(s) || p=='&' || p=='|'){
+    *       content[0]=p;
+    *       pos++;
+    *       if(pos>=storage.length()){
+    *           pos--;
+    *           currentToken = new Token(..., String.valueOf(p), lineno);
+    *           Arrays.fill(content,'\u0000');
+    *           return true;
+    *       }
+    *       // ...
+    *   }
+    *   ```
+    *   For `}`, `pos` increments. If it was the last char, `pos--`. Token created. Returns true.
+    *   Next `read()`.
+    *   `pos` increments (was at last index, now out of bounds).
+    *   `readLine()` called. Loads comment line `// ...`.
+    *   `p = storage.charAt(pos)` (pos is 0? No, `readLine` set `pos=0`, `read` incremented to 1? No.)
+    *   Trace:
+    *   End of `}` line. `pos` was decremented to `length-1`.
+    *   Next `read()`: `pos++` -> `length`.
+    *   `pos >= storage.length()` -> True.
+    *   `readLine()`: `pos=0`. `storage` = `// comment`.
+    *   `storage` not null. Not empty.
+    *   `p = storage.charAt(0)` -> `/`.
+    *   `checkSign('/')`:
+    *   `signMap` contains `/`.
+    *   Enters block. `content[0]='/'. pos++` (pos=1).
+    *   `pos < length`.
+    *   `content[1] = storage.charAt(1)` -> `/`.
+    *   `checkSign(content)` checks `//`. Not in `signMap` (only `/` is).
+    *   Wait, `signMap` has `/` as DIV. It does NOT have `//`.
+    *   So `checkSign(char[])` returns false.
+    *   Goes to `else`.
+    *   `pos--` (pos=0).
+    *   `checkAnnotation(content)` where content is `['/', '/', ...]`.
+    *   `checkAnnotation` sees `//`. Calls `readLine()`.
+    *   `readLine()` loads next line (null/EOF).
+    *   Returns true.
+    *   `read()` returns true (1).
+    *   `putToken()` is called!
+    *   What is `currentToken`?
+    *   Inside `checkSign`, if `checkAnnotation` returns true:
+    *   ```java
+    *   if(checkAnnotation(content)){
+    *       read();
+    *       return true;//注释会提前中止以保护递归调用的read()函数创造的token对象
+    *   }
+    *   ```
+    *   It calls `read()` recursively!
+    *   The recursive `read()` will process the next line.
+    *   If next line is EOF, it returns -1?
+    *   If `readLine()` in `checkAnnotation` loads null:
+    *   Recursive `read()`:
+    *   `pos++`.
+    *   `storage==null`.
+    *   Returns -1.
+    *   So `checkAnnotation` returns true.
+    *   `checkSign` returns true.
+    *   `read()` returns true (1).
+    *   `putToken()` adds `currentToken`.
+    *   What is `currentToken` at this point?
+    *   It was set previously?
+    *   In the `checkSign` for `/`:
+    *   `currentToken` was NOT updated before `checkAnnotation` call?
+    *   Let's check the code flow in `checkSign` for `/`:
+    *   1. `content[0]='/'`. `pos++`.
+    *   2. `content[1]='/'.`
+    *   3. `checkSign(content)` false.
+    *   4. `pos--`.
+    *   5. `checkAnnotation(content)` true.
+    *   6. `read()` called recursively.
+    *   7. `return true`.
+    *   
+    *   The `currentToken` variable still holds the value from the PREVIOUS token (the `RBRACE }`).
+    *   Because `currentToken` was set when processing `}`.
+    *   Then `read()` was called again.
+    *   Inside this new `read()`, `checkSign('/')` was called.
+    *   It did NOT update `currentToken` before returning true.
+    *   So `currentToken` is still `RBRACE }`.
+    *   The outer `read()` returns 1.
+    *   `putToken()` adds `RBRACE }` AGAIN.
+    *   
+    *   This explains the duplicate `RBRACE }`.
+
+<Lexer.java>
+...
+    static boolean checkSign(char p) throws IOException {
+        String s = String.valueOf(p);
+        if(signMap.containsKey(s) || p=='&' || p=='|'){
+            content[0]=p;
+            pos++;
+            if(pos>=storage.length()){
+                pos--;
+                currentToken = new Token(Token.TokenType.fromValue(signMap.get(String.valueOf(p))),String.valueOf(p),lineno);
+                Arrays.fill(content,'\u0000');
+                return true;
+            }
+            content[1]=storage.charAt(pos);
+            if(checkSign(content)){
+                currentToken = new Token(Token.TokenType.fromValue(signMap.get(turnString(content))),turnString(content),lineno);
+            }
+            else {
+                pos--;
+                if(checkAnnotation(content)){
+                    read();
+                    return true;//注释会提前中止以保护递归调用的read()函数创造的token对象
+                }
+                if(errorACheck(p)){
+                    Compiler.errorExists = true;
+                    currentErrorToken = new ErrorToken(ErrorToken.ErrorTokenType.IllegalSign,String.valueOf(p),lineno);
+                    errorTokens.add(currentErrorToken);
+                }
+                currentToken = new Token(Token.TokenType.fromValue(signMap.get(String.valueOf(p))),String.valueOf(p),lineno);
+            }
+            Arrays.fill(content,'\u0000');
+            return true;
+        }
+        Arrays.fill(content,'\u0000');
+        return false;
+    }
+...

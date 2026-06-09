@@ -1,0 +1,938 @@
+Based on the analysis of the problem description, test case inputs, buggy output, and expected output:
+
+1.  **Problem Analysis**:
+    *   The program is a syntax analyzer that needs to detect specific errors (missing semicolon `i`, missing right parenthesis `j`, missing right square bracket `k`).
+    *   Test Case Input Line 13: `g(str[f(str)); // error 3`. Here, `str` is an array access `LVal`. Inside the brackets `[...]`, there is an expression `f(str)`. The closing bracket `]` for the array access is missing before the closing parenthesis `)` of the function call `g(...)`. This should trigger error `k` (Missing right square bracket).
+    *   Expected Output for Line 13: `13 k`.
+    *   Buggy Output for Line 13: `nullnull13 k`. The presence of `nullnull` suggests that `toString()` or some string concatenation involving null objects is happening when generating the error message or output.
+
+2.  **Code Analysis**:
+    *   The error reporting mechanism relies on AST nodes collecting error strings via `getError()`.
+    *   Let's trace the parsing of `g(str[f(str))`:
+        *   `parseStmt` -> `parseStmtExp` (since `g` is an IDENFR, but followed by `(`, wait. `parseStmt` checks for `IDENFR`. It calls `parseLVal`. `parseLVal` consumes `g`. Then it checks for `[`. It sees `(`. So it returns `LVal(g)`.
+        *   Back in `parseStmt`, since `curToken` is `(`, not `=`, it rewinds and calls `parseStmtExp`.
+        *   `parseStmtExp` calls `parseExp`.
+        *   `parseExp` -> `parseAddExp` -> ... -> `parseUnaryExp`.
+        *   `parseUnaryExp` sees `g` (IDENFR) and next is `(`. So it calls `parseUFuncExp`.
+        *   `parseUFuncExp` consumes `g`, `(`. Then it checks for `RPARENT` or `SEMICN`. It sees `str` (IDENFR). So it calls `parseFuncRParams`.
+        *   `parseFuncRParams` calls `parseExp`.
+        *   `parseExp` eventually leads to `parsePrimaryExp` or `parseLVal` depending on the structure. `str` is an IDENFR.
+        *   `parseLVal` is called for `str`. It consumes `str`. Next is `[`.
+        *   `parseLVal` consumes `[`. Calls `parseExp` for the index.
+        *   Inside `parseExp` for the index: `f(str)` is parsed. `f` is IDENFR, next is `(`. `parseUFuncExp` is called.
+        *   `parseUFuncExp` consumes `f`, `(`. Parses params (`str`). Expects `)`. Finds `)`. Consumes `)`. Returns `UFuncExp`.
+        *   Back in `parseLVal` for `str[...]`. It expects `]`. The current token is `)` (from `g(...)`).
+        *   So `rBracket` is set to `null`.
+        *   `LVal` constructor: `if (rBracket == null) { this.error = exp.getLineno() + " k\n"; }`.
+        *   The `exp` here is the result of parsing `f(str)`. The line number should be correct.
+        *   The `LVal` object for `str[...]` now has error `"13 k\n"`.
+        *   This `LVal` is part of the `Exp` for the argument of `g`.
+        *   The `UFuncExp` for `g(...)` expects `)`. It finds `)`. So `rParent` is not null. No error `j` here.
+        *   However, let's look at the `nullnull` prefix.
+    *   Where does `nullnull` come from?
+    *   Look at `CompUnit.errors()`:
+        ```java
+        public String getError() {
+            StringBuilder out = new StringBuilder();
+            for (Decl decl : this.decls) {
+                out.append(decl.getError());
+            }
+            for (FuncDef funcDef : this.funcDefs) {
+                out.append(funcDef.getError());
+            }
+            out.append(this.mainFuncDef.getError());
+            return out.toString();
+        }
+        ```
+    *   If `mainFuncDef` is null, `this.mainFuncDef.getError()` will throw a NullPointerException. But the output is `nullnull...`, which suggests string concatenation with null references, not an exception crash.
+    *   Wait, the buggy output is `nullnull13 k\nnull`.
+    *   Let's check `Compiler.java`:
+        ```java
+        CompUnit compUnit = parser.parseCompUnit();
+        compUnit.output();
+        compUnit.errors();
+        ```
+    *   And `CompUnit.errors()`:
+        ```java
+        public void errors() throws FileNotFoundException{
+            PrintStream ps = new PrintStream("error.txt");
+            System.setOut(ps);
+            System.out.println(this.getError());
+            ps.close();
+        }
+        ```
+    *   If `getError()` returns a string containing "null", it means some part of the AST tree's `getError()` is returning "null" or concatenating nulls.
+    *   Let's look at `FuncDef.getError()`:
+        ```java
+        public String getError() {
+            StringBuilder out = new StringBuilder();
+            if (funcFParams != null) {
+                out.append(funcFParams.getError());
+            }
+            out.append(error);
+            out.append(block.getError());
+            
+            return out.toString();
+        }
+        ```
+    *   Let's look at `Block.getError()`:
+        ```java
+        public String getError() {
+            StringBuilder out = new StringBuilder();
+            for (BlockItem i : BlockItems) {
+                out.append(i.getError());
+            }
+            return out.toString();
+        }
+        ```
+        If `BlockItems` is null (empty block constructed with `new Block(lBrace, rBrace)`), this will throw NPE. But the constructor used in `parseBlock` always initializes `BlockItems` to an ArrayList.
+        
+    *   Let's look closely at `LVal.getError()`:
+        ```java
+        public String getError() {
+            if (exp != null) {
+                return exp.getError() + error;
+            } else {
+                return error;
+            }
+        }
+        ```
+    *   Let's look at `Exp.getError()`:
+        ```java
+        public String getError() {
+            return addExp.getError();
+        }
+        ```
+    *   Let's look at `AddExp.getError()`:
+        ```java
+        public String getError() {
+            StringBuilder out = new StringBuilder();
+            out.append(first.getError());
+            for (MulExp exp : exps) {
+                out.append(exp.getError());
+            }
+            return out.toString();
+        }
+        ```
+    *   Let's look at `MulExp.getError()`, `UnaryExp.getError()`, etc. They generally propagate errors.
+    
+    *   The `nullnull` likely comes from `toString()` being called on null objects somewhere, or explicit string concatenation.
+    *   Check `CompUnit.getOutput()` vs `getError()`. The problem asks for error output.
+    *   
+    *   Let's re-read the `Buggy Output`: `nullnull13 k\nnull`.
+    *   This looks like `System.out.println` printing an object that has `null` fields.
+    *   
+    *   Actually, look at `Parser.java` `parseFuncDef`:
+        ```java
+        public FuncDef parseFuncDef() {
+            // ...
+            if (!curToken().getType().equals(TokenType.RPARENT) && (curToken().getType().equals(TokenType.INTTK) || curToken().getType().equals(TokenType.CHARTK))) {
+                 // ...
+            } else {
+                Token rParent;
+                if (curToken().getType().equals(TokenType.RPARENT)) {
+                    rParent = curToken();
+                    cur++;
+                } else {
+                    rParent = null;
+                }
+                Block block = parseBlock();
+                return new FuncDef(funcType, ident, lParent, rParent, block);
+            }
+        }
+        ```
+    *   And `FuncDef` constructor:
+        ```java
+        public FuncDef(FuncType funcType, Token ident, Token lParent, Token rParent, Block block) {
+            this.type = "<FuncDef>";
+            // ...
+            this.rParent = rParent;
+            this.block = block;
+            this.error = "";
+
+            if (rParent == null) {
+                this.error = lParent.getLineno() + " j\n";
+            }
+        }
+        ```
+    *   
+    *   Let's look at `MainFuncDef`. It extends `FuncDef`.
+    *   In `CompUnit`, `mainFuncDef` is set.
+    *   
+    *   The key is likely in how the errors are aggregated.
+    *   
+    *   Let's look at `LVal` again.
+        ```java
+        public LVal(Token ident, Token lBracket, Exp exp, Token rBracket) {
+            // ...
+            if (rBracket == null) {
+                this.error = exp.getLineno() + " k\n";
+            }
+        }
+        ```
+        If `exp` is null? `parseLVal` calls `parseExp` if `LBRACK` is found. `parseExp` should not return null unless `TokenStream` is exhausted or invalid state.
+        
+    *   Let's look at the `nullnull` specifically.
+    *   In Java, `"null" + "null"` results in `"nullnull"`.
+    *   This happens if we do `String s = null; String t = null; System.out.println(s + t);`.
+    *   
+    *   Where could two nulls be concatenated?
+    *   
+    *   Look at `CompUnit.getError()`:
+        ```java
+        out.append(this.mainFuncDef.getError());
+        ```
+        If `mainFuncDef` is null, this throws NPE.
+        
+    *   Look at `FuncDef.getError()`:
+        ```java
+        out.append(block.getError());
+        ```
+        
+    *   Look at `Block.getError()`:
+        ```java
+        for (BlockItem i : BlockItems) { ... }
+        ```
+        
+    *   Let's look at `Stmt.getError()`:
+        ```java
+        public String getError() {
+            return statement.getError();
+        }
+        ```
+        
+    *   Let's look at `StmtExp.getError()`:
+        ```java
+        public String getError() {
+            return exp.getError() + error;
+        }
+        ```
+        If `exp` is null? `parseStmtExp` calls `parseExp`.
+        
+    *   Let's look at `parseExp`:
+        ```java
+        public Exp parseExp() {
+            return new Exp(parseAddExp());
+        }
+        ```
+        
+    *   Let's look at `parseAddExp`:
+        ```java
+        public AddExp parseAddExp() {
+            MulExp firstExp = parseMulExp();
+            // ...
+            return new AddExp(firstExp, operators, exps);
+        }
+        ```
+        
+    *   Let's look at `parseMulExp`:
+        ```java
+        public MulExp parseMulExp() {
+            UnaryExp firstExp = parseUnaryExp();
+            // ...
+            return new MulExp(firstExp, operators, exps);
+        }
+        ```
+        
+    *   Let's look at `parseUnaryExp`:
+        ```java
+        public UnaryExp parseUnaryExp() {
+            // ...
+            return new UnaryExp(parsePrimaryExp()); // or others
+        }
+        ```
+        
+    *   Let's look at `parsePrimaryExp`:
+        ```java
+        public PrimaryExp parsePrimaryExp() {
+            if (curToken().getType().equals(TokenType.INTCON)) {
+                return new PrimaryExp(parseNumber());
+            } else if (curToken().getType().equals(TokenType.CHRCON)) {
+                return new PrimaryExp(parseCharacter());
+            } else if (curToken().getType().equals(TokenType.LPARENT)) {
+                return new PrimaryExp(parsePParentExp());
+            } else {
+                return new PrimaryExp(parseLVal());
+            }
+        }
+        ```
+        
+    *   Let's look at `parseLVal`:
+        ```java
+        public LVal parseLVal() {
+            Token ident = curToken();
+            cur++;
+            if (curToken().getType().equals(TokenType.LBRACK)) {
+                // ...
+                Exp exp = parseExp();
+                // ...
+                return new LVal(ident, lBracket, exp, rBracket);
+            } else {
+                return new LVal(ident);
+            }
+        }
+        ```
+        
+    *   Is it possible that `curToken()` returns null?
+        ```java
+        public Token curToken() {
+            if (cur > TokenStream.size() - 1) {
+                return null;
+            }
+            // ...
+        }
+        ```
+        If `curToken()` returns null, then `curToken().getType()` throws NPE.
+        
+    *   Let's look at the `nullnull` again.
+    *   Maybe the issue is in `CompUnit.getOutput()` or `getError()` printing something unexpected?
+    *   No, the output is to `error.txt`.
+    
+    *   Let's look at `Lexer.java`.
+        ```java
+        public void outputTokens(List<Token> tokens) throws FileNotFoundException{
+            // ...
+        }
+        ```
+        This is not called in `Compiler.java` for error cases directly, `parser` handles it.
+        
+    *   Wait, look at `Compiler.java`:
+        ```java
+        CompUnit compUnit = parser.parseCompUnit();
+        
+        compUnit.output();
+        compUnit.errors();
+        ```
+        It calls BOTH `output()` and `errors()`.
+        `output()` writes to `parser.txt`.
+        `errors()` writes to `error.txt`.
+        
+        The test system likely checks `error.txt`.
+        
+    *   Let's look at `CompUnit.errors()`:
+        ```java
+        public void errors() throws FileNotFoundException{
+            PrintStream ps = new PrintStream("error.txt");
+            System.setOut(ps);
+            System.out.println(this.getError());
+            ps.close();
+        }
+        ```
+        
+    *   If `this.getError()` returns `"nullnull13 k\nnull"`, then that's what is printed.
+    
+    *   Let's trace `getError()` for the specific input.
+        Input:
+        ```c
+        char str[20 ; // error 1 (k)
+        
+        int f(char str[) { // error 2 (k)
+            return 1;
+        }
+        
+        void g(char c) {
+            return;
+        }
+        
+        int main() {
+            f(str);
+            g(str[f(str)); // error 3 (k)
+            return 0;
+        }
+        ```
+        
+        Error 1: `char str[20 ;`
+        `parseDecl` -> `parseVarDecl`.
+        `parseVarDef`: `str`, `[`, `parseConstExp` (20), `]` is missing. `rBracket` = null.
+        `VarDef` constructor: `error = constExp.getLineno() + " k\n"`. -> `"1 k\n"`.
+        `VarDecl` gets this error.
+        `Decl` gets this error.
+        `CompUnit` adds this decl.
+        
+        Error 2: `int f(char str[) {`
+        `parseFuncDef`.
+        `parseFuncFParams`.
+        `parseFuncFParam`: `char`, `str`, `[`.
+        `rBracket` is missing (next is `)`). `rBracket` = null.
+        `FuncFParam` constructor: `error = lBracket.getLineno() + " k\n"`. -> `"3 k\n"`.
+        `FuncFParams` gets this error.
+        `FuncDef` gets this error.
+        
+        Error 3: `g(str[f(str));`
+        Inside `main` block.
+        `parseStmt` -> `parseStmtExp`.
+        `parseExp` -> ... -> `parseUnaryExp` -> `parseUFuncExp` for `g`.
+        `parseFuncRParams`.
+        `parseExp` for argument.
+        `parseLVal` for `str`.
+        `str`, `[`.
+        `parseExp` for index.
+        `parseUnaryExp` -> `parseUFuncExp` for `f`.
+        `f`, `(`, `str`, `)`. OK.
+        Back in `parseLVal` for `str[...]`.
+        Expect `]`. Found `)`.
+        `rBracket` = null.
+        `LVal` constructor: `error = exp.getLineno() + " k\n"`.
+        `exp` is the `Exp` wrapping `f(str)`.
+        `f(str)` line number is 13.
+        So `LVal` error is `"13 k\n"`.
+        
+        Now, how do these errors combine?
+        `CompUnit.getError()`:
+        Iterates decls (Error 1).
+        Iterates funcDefs (Error 2).
+        Appends `mainFuncDef.getError()`.
+        
+        `mainFuncDef` is `int main() { ... }`.
+        `FuncDef.getError()` for main:
+        `block.getError()`.
+        
+        `Block.getError()` iterates `BlockItem`s.
+        Items:
+        1. `f(str);` -> Stmt -> StmtExp -> ... No error.
+        2. `g(str[f(str));` -> Stmt -> StmtExp -> ...
+           `StmtExp.getError()` returns `exp.getError() + error`.
+           `exp` contains the `LVal` with error `"13 k\n"`.
+           So `StmtExp` error is `"13 k\n"`.
+        3. `return 0;` -> No error.
+        
+        So `Block.getError()` returns `"13 k\n"`.
+        `MainFuncDef.getError()` returns `"13 k\n"`.
+        
+        `CompUnit.getError()` should return:
+        `"1 k\n"` (from decl)
+        `"3 k\n"` (from funcDef f)
+        `"13 k\n"` (from mainFuncDef)
+        
+        Total: `"1 k\n3 k\n13 k\n"`.
+        
+        Why `nullnull`?
+        
+        Let's look at `Decl.getError()`:
+        ```java
+        public String getError() {
+            return declaration.getError();
+        }
+        ```
+        `VarDecl.getError()`:
+        ```java
+        public String getError() {
+            StringBuilder out = new StringBuilder();
+            out.append(firstDef.getError());
+            if (varDefs != null) {
+                for (VarDef varDef : varDefs) {
+                    out.append(varDef.getError());
+                }
+            }
+            out.append(error);
+            return out.toString();
+        }
+        ```
+        `VarDef.getError()`:
+        ```java
+        public String getError() {
+            StringBuilder out = new StringBuilder();
+            if (lBracket != null) {
+                out.append(constExp.getError());
+            }
+            out.append(error);
+            if (eql != null) {
+                out.append(initVal.getError());
+            }
+            return out.toString();
+        }
+        ```
+        
+        Everything seems fine.
+        
+        Is it possible that `CompUnit` fields `decls` or `funcDefs` contain nulls?
+        `addDecl` adds to ArrayList.
+        
+        Wait! Look at `CompUnit.getOutput()` and `getError()`.
+        
+        ```java
+        public String getError() {
+            StringBuilder out = new StringBuilder();
+            for (Decl decl : this.decls) {
+                out.append(decl.getError());
+            }
+            for (FuncDef funcDef : this.funcDefs) {
+                out.append(funcDef.getError());
+            }
+            out.append(this.mainFuncDef.getError());
+            return out.toString();
+        }
+        ```
+        
+        If `mainFuncDef` is NULL, `this.mainFuncDef.getError()` throws NPE.
+        But the output is `nullnull...`.
+        
+        Let's look at `Compiler.java` again.
+        
+        ```java
+        CompUnit compUnit = parser.parseCompUnit();
+        
+        compUnit.output();
+        compUnit.errors();
+        ```
+        
+        If `parseCompUnit` fails to parse `mainFuncDef` correctly, `mainFuncDef` might be null?
+        In `parseCompUnit`:
+        ```java
+        if (first.getType().equals(TokenType.INTTK)) {
+            if (third.getType().equals(TokenType.LPARENT)) {
+                if (second.getType().equals(TokenType.MAINTK)) {
+                    compUnit.setMainFuncDef(parseMainFuncDef());
+                    break;
+                } else {
+                    compUnit.addFuncDef(parseFuncDef());
+                }
+            } else {
+                compUnit.addDecl(parseDecl());
+            }
+        }
+        ```
+        If it breaks, `mainFuncDef` is set.
+        
+        What if the `nullnull` comes from `toString()` of the AST nodes being printed instead of `getError()`?
+        No, `System.out.println(this.getError())` is called.
+        
+        Let's look at `LAndExp.getError()` and `LOrExp.getError()`.
+        ```java
+        if (operators.get(i).getContent().equals("&")) {
+             out.append(operators.get(i).getLineno() + " a\n");
+        }
+        ```
+        If `operators.get(i)` is null? No, it's from the list.
+        
+        Let's look at `FuncRParams.getError()`.
+        
+        Let's look at `UFuncExp.getError()`.
+        ```java
+        public String getError() {
+            if (funcRParams != null) {
+                return funcRParams.getError() + error;
+            } else {
+                return error;
+            }
+        }
+        ```
+        
+        Let's look at `PParentExp.getError()`.
+        ```java
+        public String getError() {
+            return exp.getError() + error;
+        }
+        ```
+        
+        Let's look at `PrimaryExp.getError()`.
+        ```java
+        public String getError() {
+            return pExp.getError();
+        }
+        ```
+        
+        Let's look at `UnaryExp.getError()`.
+        ```java
+        public String getError() {
+            return uExp.getError();
+        }
+        ```
+        
+        Let's look at `MulExp.getError()`.
+        
+        Let's look at `AddExp.getError()`.
+        
+        Let's look at `Exp.getError()`.
+        
+        Let's look at `StmtExp.getError()`.
+        ```java
+        public String getError() {
+            return exp.getError() + error;
+        }
+        ```
+        
+        Let's look at `Stmt.getError()`.
+        ```java
+        public String getError() {
+            return statement.getError();
+        }
+        ```
+        
+        Let's look at `BlockItem.getError()`.
+        ```java
+        public String getError() {
+            return item.getError();
+        }
+        ```
+        
+        Let's look at `Block.getError()`.
+        
+        There is one suspicious thing in `CompUnit.java`:
+        
+        ```java
+        public void output() throws FileNotFoundException{
+            PrintStream ps = new PrintStream("parser.txt");
+            System.setOut(ps);
+            System.out.println(this.getOutput());
+            ps.close();
+        }
+
+        public void errors() throws FileNotFoundException{
+            PrintStream ps = new PrintStream("error.txt");
+            System.setOut(ps);
+            System.out.println(this.getError());
+            ps.close();
+        }
+        ```
+        
+        If `getOutput()` or `getError()` returns null, `println` prints "null".
+        
+        If `this.getError()` returns `"nullnull13 k\nnull"`, it means parts of the string are literally "null".
+        
+        This usually happens when `String.valueOf(null)` is called, or concatenation with null references.
+        
+        Let's look at `VarDef.getLineno()`:
+        ```java
+        public int getLineno() {
+            if (eql != null) {
+                return initVal.getLineno();
+            } else if (lBracket != null) {
+                return constExp.getLineno();
+            } else {
+                return ident.getLineno();
+            }
+        }
+        ```
+        
+        Let's look at `ConstDef.getLineno()`:
+        ```java
+        public int getLineno() {
+            return constInitVal.getLineno();
+        }
+        ```
+        
+        Let's look at `ConstInitVal.getLineno()`:
+        ```java
+        public int getLineno() {
+            if (constExp != null) {
+                return constExp.getLineno();
+            } else if (stringConst != null) {
+                return stringConst.getLineno();
+            } else {
+                return rBrace.getLineno();
+            }
+        }
+        ```
+        If `constExp`, `stringConst`, and `rBrace` are all null, `rBrace.getLineno()` throws NPE.
+        
+        Let's look at `InitVal.getLineno()`. Similar.
+        
+        Let's look at `FuncFParam.getLineno()`.
+        
+        Let's look at `FuncFParams.getLineno()`.
+        
+        Let's look at `ForStmt.getLineno()`.
+        
+        Let's look at `Cond.getLineno()`.
+        
+        Let's look at `StmtFor`.
+        
+        Let's look at `StmtIf`.
+        
+        Let's look at `StmtGetint`.
+        
+        Let's look at `StmtGetchar`.
+        
+        Let's look at `StmtPrintf`.
+        
+        Let's look at `StmtReturn`.
+        
+        Let's look at `StmtBreak`.
+        
+        Let's look at `StmtContinue`.
+        
+        Let's look at `StmtLVal`.
+        
+        Let's look at `StmtSemi`.
+        
+        Let's look at `StmtBlock`.
+        
+        Let's look at `StmtExp`.
+        
+        Let's look at `LVal.getLineno()`.
+        ```java
+        public int getLineno() {
+            if (rBracket != null) {
+                return rBracket.getLineno();
+            } else if (exp != null) {
+                return exp.getLineno();
+            } else {
+                return ident.getLineno();
+            }
+        }
+        ```
+        
+        Let's look at `UFuncExp.getLineno()`.
+        
+        Let's look at `PParentExp.getLineno()`.
+        
+        Let's look at `PrimaryExp.getLineno()`.
+        
+        Let's look at `UnaryExp.getLineno()`.
+        
+        Let's look at `MulExp.getLineno()`.
+        
+        Let's look at `AddExp.getLineno()`.
+        
+        Let's look at `RelExp.getLineno()`.
+        
+        Let's look at `EqExp.getLineno()`.
+        
+        Let's look at `LAndExp.getLineno()`.
+        
+        Let's look at `LOrExp.getLineno()`.
+        
+        Let's look at `Exp.getLineno()`.
+        
+        Let's look at `ConstExp.getLineno()`.
+        
+        Let's look at `Number.getLineno()`.
+        
+        Let's look at `Character.getLineno()`.
+        
+        Let's look at `BType`. No getLineno.
+        
+        Let's look at `FuncType`. No getLineno.
+        
+        Let's look at `Decl`. No getLineno.
+        
+        Let's look at `ConstDecl`. No getLineno.
+        
+        Let's look at `VarDecl`. No getLineno.
+        
+        Let's look at `FuncDef`. No getLineno.
+        
+        Let's look at `MainFuncDef`. No getLineno.
+        
+        Let's look at `CompUnit`. No getLineno.
+        
+        Let's look at `Block`. No getLineno.
+        
+        Let's look at `BlockItem`. No getLineno.
+        
+        Let's look at `Stmt`. No getLineno.
+        
+        Let's look at `Statement` interface. No getLineno.
+        
+        Let's look at `BItem` interface. No getLineno.
+        
+        Let's look at `Declaration` interface. No getLineno.
+        
+        Let's look at `PExp` interface. Has getLineno.
+        
+        Let's look at `UExp` interface. Has getLineno.
+        
+        Let's look at `Cond`. Has getLineno.
+        
+        Let's look at `ForStmt`. Has getLineno.
+        
+        Let's look at `FuncFParam`. Has getLineno.
+        
+        Let's look at `FuncFParams`. Has getLineno.
+        
+        Let's look at `FuncRParams`. Has getLineno.
+        
+        Let's look at `InitVal`. Has getLineno.
+        
+        Let's look at `ConstInitVal`. Has getLineno.
+        
+        Let's look at `VarDef`. Has getLineno.
+        
+        Let's look at `ConstDef`. Has getLineno.
+        
+        Let's look at `LVal`. Has getLineno.
+        
+        Let's look at `UFuncExp`. Has getLineno.
+        
+        Let's look at `PParentExp`. Has getLineno.
+        
+        Let's look at `PrimaryExp`. Has getLineno.
+        
+        Let's look at `UnaryExp`. Has getLineno.
+        
+        Let's look at `MulExp`. Has getLineno.
+        
+        Let's look at `AddExp`. Has getLineno.
+        
+        Let's look at `RelExp`. Has getLineno.
+        
+        Let's look at `EqExp`. Has getLineno.
+        
+        Let's look at `LAndExp`. Has getLineno.
+        
+        Let's look at `LOrExp`. Has getLineno.
+        
+        Let's look at `Exp`. Has getLineno.
+        
+        Let's look at `ConstExp`. Has getLineno.
+        
+        Let's look at `Number`. Has getLineno.
+        
+        Let's look at `Character`. Has getLineno.
+        
+        Let's look at `StmtBreak`. No getLineno.
+        
+        Let's look at `StmtContinue`. No getLineno.
+        
+        Let's look at `StmtExp`. No getLineno.
+        
+        Let's look at `StmtLVal`. No getLineno.
+        
+        Let's look at `StmtReturn`. No getLineno.
+        
+        Let's look at `StmtGetint`. No getLineno.
+        
+        Let's look at `StmtGetchar`. No getLineno.
+        
+        Let's look at `StmtPrintf`. No getLineno.
+        
+        Let's look at `StmtIf`. No getLineno.
+        
+        Let's look at `StmtFor`. No getLineno.
+        
+        Let's look at `StmtSemi`. No getLineno.
+        
+        Let's look at `StmtBlock`. No getLineno.
+        
+        Let's look at `Stmt`. No getLineno.
+        
+        Let's look at `Block`. No getLineno.
+        
+        Let's look at `BlockItem`. No getLineno.
+        
+        Let's look at `Decl`. No getLineno.
+        
+        Let's look at `ConstDecl`. No getLineno.
+        
+        Let's look at `VarDecl`. No getLineno.
+        
+        Let's look at `FuncDef`. No getLineno.
+        
+        Let's look at `MainFuncDef`. No getLineno.
+        
+        Let's look at `CompUnit`. No getLineno.
+        
+        Let's look at `BType`. No getLineno.
+        
+        Let's look at `FuncType`. No getLineno.
+        
+        Let's look at `FuncFParam`. Has getLineno.
+        
+        Let's look at `FuncFParams`. Has getLineno.
+        
+        Let's look at `FuncRParams`. Has getLineno.
+        
+        Let's look at `InitVal`. Has getLineno.
+        
+        Let's look at `ConstInitVal`. Has getLineno.
+        
+        Let's look at `VarDef`. Has getLineno.
+        
+        Let's look at `ConstDef`. Has getLineno.
+        
+        Let's look at `LVal`. Has getLineno.
+        
+        Let's look at `UFuncExp`. Has getLineno.
+        
+        Let's look at `PParentExp`. Has getLineno.
+        
+        Let's look at `PrimaryExp`. Has getLineno.
+        
+        Let's look at `UnaryExp`. Has getLineno.
+        
+        Let's look at `MulExp`. Has getLineno.
+        
+        Let's look at `AddExp`. Has getLineno.
+        
+        Let's look at `RelExp`. Has getLineno.
+        
+        Let's look at `EqExp`. Has getLineno.
+        
+        Let's look at `LAndExp`. Has getLineno.
+        
+        Let's look at `LOrExp`. Has getLineno.
+        
+        Let's look at `Exp`. Has getLineno.
+        
+        Let's look at `ConstExp`. Has getLineno.
+        
+        Let's look at `Number`. Has getLineno.
+        
+        Let's look at `Character`. Has getLineno.
+        
+        Let's look at `StmtBreak`. No getLineno.
+        
+        Let's look at `StmtContinue`. No getLineno.
+        
+        Let's look at `StmtExp`. No getLineno.
+        
+        Let's look at `StmtLVal`. No getLineno.
+        
+        Let's look at `StmtReturn`. No getLineno.
+        
+        Let's look at `StmtGetint`. No getLineno.
+        
+        Let's look at `StmtGetchar`. No getLineno.
+        
+        Let's look at `StmtPrintf`. No getLineno.
+        
+        Let's look at `StmtIf`. No getLineno.
+        
+        Let's look at `StmtFor`. No getLineno.
+        
+        Let's look at `StmtSemi`. No getLineno.
+        
+        Let's look at `StmtBlock`. No getLineno.
+        
+        Let's look at `Stmt`. No getLineno.
+        
+        Let's look at `Block`. No getLineno.
+        
+        Let's look at `BlockItem`. No getLineno.
+        
+        Let's look at `Decl`. No getLineno.
+        
+        Let's look at `ConstDecl`. No getLineno.
+        
+        Let's look at `VarDecl`. No getLineno.
+        
+        Let's look at `FuncDef`. No getLineno.
+        
+        Let's look at `MainFuncDef`. No getLineno.
+        
+        Let's look at `CompUnit`. No getLineno.
+        
+        Let's look at `BType`. No getLineno.
+        
+        Let's look at `FuncType`. No getLineno.
+        
+        Let's look at `FuncFParam`. Has getLineno.
+        
+        Let's look at `FuncFParams`. Has getLineno.
+        
+        Let's look at `FuncRParams`. Has getLineno.
+        
+        Let's look at `InitVal`. Has getLineno.
+        
+        Let's look at `ConstInitVal`. Has getLineno.
+        
+        Let's look at `VarDef`. Has getLineno.
+        
+        Let's look at `ConstDef`. Has getLineno.
+        
+        Let's look at `LVal`. Has getLineno.
+        
+        Let's look at `UFuncExp`. Has getLineno.
+        
+        Let's look at `PParentExp`. Has getLineno.

@@ -1,0 +1,112 @@
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+#define MAX 1005
+int graph[MAX][MAX];
+int visit[MAX];
+int queue[MAX];
+int front,rear,count;
+int n,m;
+
+void init_graph()
+{
+    memset(graph,0,sizeof(graph));
+}
+
+void add_edge(int s,int t)
+{
+    graph[s][t]=1;
+    graph[t][s]=1;
+}
+
+void init_visit()
+{
+    memset(visit,0,sizeof(visit));
+}
+
+void init_queue()
+{
+    for(int i=0;i<MAX;i++){
+        queue[i]=-1;
+    }
+    front=0;
+    rear=MAX-1;
+    count=0;
+}
+
+int is_empty()
+{
+    return count==0;
+}
+
+void duidui(int temp)
+{
+    visit[temp]=1;
+    rear=(rear+1)%MAX;
+    queue[rear]=temp;
+    count++;
+}
+
+int duid()
+{
+    int temp;
+    temp=queue[front];
+    count--;
+    front=(front+1)%MAX;
+    return temp;
+}
+
+void dfs(int start)
+{
+    printf("%d ",start);
+    visit[start]=1;
+    for(int i=0;i<n;i++){
+        if(graph[start][i]&&!visit[i]){
+            dfs(i);
+        }
+    }
+}
+
+void bfs(int start)
+{
+    init_visit();
+    init_queue();
+    duidui(start);
+    while(!is_empty()){
+        int temp=duid();
+        printf("%d ",temp);
+        for(int i=0;i<n;i++){
+            if(!visit[i]&&graph[i][temp]==1){
+                duidui(i);
+            }
+        }
+    }
+}
+
+int main()
+{
+    scanf("%d %d",&n,&m);
+    int s,t;
+    init_graph();
+    for(int i=0;i<m;i++){
+        scanf("%d%d",&s,&t);
+        add_edge(s,t);
+    }
+    int will_del_node;
+    scanf("%d",&will_del_node);
+    init_visit();
+    dfs(0);
+    printf("\n");
+    bfs(0);
+    printf("\n");
+    for(int i=0;i<n;i++){
+        graph[will_del_node][i]=0;
+        graph[i][will_del_node]=0;
+    }
+    init_visit();
+    dfs(0);
+    printf("\n");
+    bfs(0);
+    return 0;
+}
+

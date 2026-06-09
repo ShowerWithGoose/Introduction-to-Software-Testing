@@ -1,0 +1,125 @@
+Based on the problem description and the comparison between the buggy output and the expected output, the error lies in the handling of the logical OR operator `||`.
+
+**Analysis:**
+1.  **Input:** The source code contains `if (a != b || a > 0)`.
+2.  **Expected Output:** The token `||` should be recognized as `OR ||`.
+3.  **Buggy Output:** The tokens generated are `IDENFR a`, `NEQ !=`, `IDENFR b`, `IDENFR a`, `GRE >`, `INTCON 0`. The `||` is missing, and instead, the second `a` is treated as an identifier immediately following `b`. This suggests that the lexer failed to recognize `||` and likely skipped or mishandled the `|` characters.
+4.  **Code Inspection (`frontend/Lexer.java`):**
+    In the `next()` method, there is logic to handle single-character and double-character tokens.
+    
+    ```java
+    if (TokenType.singleCharList.contains(nowChar)) {
+        tokenType = TokenType.getTokenType((str = inputText.substring(pos, pos + 1)));
+        tokenLength = 1;
+    }
+    if (pos < maxLength && TokenType.doubleCharList.contains(nowChar)) {
+        TokenType t = TokenType.getTokenType(inputText.substring(pos, pos + 2));
+        if (t != null) {
+            tokenType = t;
+            tokenLength = 2;
+            str = inputText.substring(pos, pos + 2);
+        } else if (isErrorA(inputText.charAt(pos))) {
+             // ... error handling for single & or |
+        }
+    }
+    ```
+    
+    The character `|` is in `TokenType.doubleCharList` (defined in `TokenType.java`).
+    However, `|` is **not** in `TokenType.singleCharList`.
+    
+    Let's trace `|`:
+    - `nowChar` is `|`.
+    - `TokenType.singleCharList.contains('|')` is `false`. So `tokenType` remains `null` (or whatever it was before, but here it's initialized to null in the block scope effectively for this path).
+    - `TokenType.doubleCharList.contains('|')` is `true`.
+    - It checks `inputText.substring(pos, pos + 2)` which is `||`.
+    - `TokenType.getTokenType("||")` should return `TokenType.OR`.
+    
+    Wait, let's look at `TokenType.java`:
+    ```java
+    OR("\\|\\|"),
+    ```
+    And the map initialization:
+    ```java
+    static {
+        for (TokenType tokenType : TokenType.values()) {
+            tokenTypeMap.put(tokenType.getStr(), tokenType);
+        }
+    }
+    ```
+    `getStr()` returns the regex string `"\\|\\|"`, not the literal `"||"`.
+    
+    The `getTokenType(String str)` method does `tokenTypeMap.get(str)`.
+    When the lexer passes `"||"` (the literal substring from the source code), it looks for the key `"||"` in the map.
+    But the map contains keys like `"\\|\\|"` (for OR), `"&&"` (for AND, which is literal), `"=="` (literal), etc.
+    
+    Let's check other operators in `TokenType.java`:
+    - `AND("&&")` -> Key is `"&&"`. Literal substring is `"&&"`. Match.
+    - `EQL("==")` -> Key is `"=="`. Literal substring is `"=="`. Match.
+    - `OR("\\|\\|")` -> Key is `"\\|\\|"`. Literal substring is `"||"`. **No Match.**
+    
+    Because `|` has a special meaning in Regex, the developer likely escaped it in the enum constructor argument, intending it for regex matching elsewhere, but here it is used as a direct lookup key in a HashMap for exact string matching.
+    
+    Consequently, `TokenType.getTokenType("||")` returns `null`.
+    Then the code falls into `else if (isErrorA(inputText.charAt(pos)))`.
+    `isErrorA('|')` returns `true`.
+    It adds an Error Type `a` (illegal symbol) and sets `tokenType = TokenType.ERROR`.
+    
+    However, looking at the Buggy Output, there is **no error reported** and no `ERROR` token printed (since `Token.print()` skips `ERROR` type). Instead, it seems the lexer just advanced past the first `|` (perhaps treating it as an error but consuming it?) or something else happened.
+    
+    Actually, if `tokenType` becomes `TokenType.ERROR`, `currentToken` is created with `ERROR`.
+    `tokenResult.add(currentToken)` adds it.
+    `outputResult` iterates and calls `print()`.
+    `print()` has: `if (type != TokenType.ERROR) { ... }`. So it is NOT printed to `lexer.txt`.
+    
+    But wait, if it consumed 1 character (`tokenLength = 1` in the error branch), the next char is the second `|`.
+    The loop continues.
+    Next char is `|`.
+    Same thing happens. Error added. Token consumed.
+    
+    So two errors of type `a` should be generated.
+    But the Buggy Output shows **no errors** in `error.txt` (implied, as the output provided is only `lexer.txt` content and it matches a "correct" program flow except for the missing OR). Wait, the prompt says "For an erroneous source program... output... into error.txt". The test case input provided is a **correct** source program (it doesn't contain isolated `&` or `|`). It contains `||`.
+    
+    So, the program *should* recognize `||` as `OR`.
+    Because of the bug in `TokenType.java` where `OR` is defined as `"\\|\\|"` instead of `"||"`, the lookup fails.
+    The lexer then treats `|` as an error (Type `a`).
+    This means the program incorrectly identifies a valid program as erroneous.
+    
+    However, the "Buggy Output" provided in the prompt description **does not show any error lines**. It shows the token stream.
+    Let's look closely at the Buggy Output around the `||` line:
+    ```
+    IFTK if
+    LPARENT (
+    IDENFR a
+    NEQ !=
+    IDENFR b
+    IDENFR a   <-- This should be OR ||
+    GRE >      <-- This corresponds to the > in a > 0
+    INTCON 0
+    ```
+    
+    If the lexer treated `|` as an error and consumed it, it would advance `pos` by 1.
+    Input: `... b || a ...`
+    1. Reads `b`. Pos at first `|`.
+    2. Reads `|`. Lookup `||` fails. `isErrorA` true. Adds Error. `tokenLength=1`. Pos advances to second `|`.
+    3. Loop continues. Skips whitespace? No, next char is `|`.
+    4. Reads `|`. Lookup `|` (substring pos, pos+2 is `| `? No, `|a`?).
+       If pos is at second `|`, substring(pos, pos+2) is `| ` (pipe and space) or `|a`.
+       `TokenType.getTokenType("| ")` is null.
+       `isErrorA('|')` is true. Adds Error. `tokenLength=1`. Pos advances to space.
+    5. Loop continues. Skips whitespace. Pos at `a`.
+    6. Reads `a` as IDENFR.
+    
+    So we would expect two errors in `error.txt`. The prompt says "Each erroneous example will have exactly one error." This implies the test case IS considered correct by the spec, but the program is failing to tokenize it correctly, potentially crashing or producing wrong tokens without reporting errors properly, OR the "Buggy Output" shown is just the `lexer.txt` part and the `error.txt` part was empty/missing in the display but logically should have had errors.
+    
+    Regardless, the root cause is clearly that `||` is not being recognized as a token.
+    
+    The fix is in `TokenType.java`. The string representation for `OR` should be the literal characters `||`, not the regex escaped version.
+
+<token/TokenType.java>
+...
+    // 运算符
+    NOT("!"),
+    AND("&&"),
+    OR("||"),
+    PLUS("+"),
+...

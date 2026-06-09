@@ -1,0 +1,68 @@
+#include<stdio.h>
+#include<math.h>
+#include<string.h>
+#include<ctype.h>
+#include<stdlib.h>
+int main()
+{
+    char s[1024]={'\0'},p[1024]={'\0'};
+    gets(s); // @@ [The function 'gets' is unsafe and has been removed from the C standard library since C11; many compilers no longer support it, leading to a compilation error. Use 'fgets' instead.]
+    int l=strlen(s);
+    int i=0,j=0;
+    for(i=0;i<l&&s[i]!='\0';i++)
+    {
+        if(s[i]!=' ')
+        {
+            p[j]=s[i];
+            j++;
+        }
+    }
+    p[j]='\0';
+                    
+    int lo=strlen(p),fig=1;
+    long long sum=0;
+    i=0;
+    
+    while(i<lo&&p[i+1]!='=') // @@ [If the expression starts with a single-digit number followed immediately by '=', this loop condition may skip processing the last number, but more critically, accessing p[i+1] when i == lo-1 leads to out-of-bounds read. However, the primary compilation error is due to 'gets'.]
+    {
+        long long sum1=p[i]-'0';
+        while(p[i+1]>='0'&&p[i+1]<='9')
+        {
+            sum1 = sum1*10 + p[i+1]-'0';
+            i++;
+        }
+        
+        while(p[i+1]=='*'||p[i+1]=='/')
+        {
+            int z=1;
+            i+=2;
+            long long sum2 = p[i]-'0';
+            while(p[i+1]>='0'&&p[i+1]<='9')
+            {
+                z++;
+                sum1 = sum1*10 + p[i+1]-'0'; // @@ [This line incorrectly continues building 'sum1' instead of 'sum2', which corrupts the value of the second operand in multiplication/division. However, this is a logical error, not the cause of the compilation error.]
+                i++;
+            }
+            
+            if(p[i-z]=='*')
+            {
+                sum1 = sum1*sum2;
+            }
+            else if(p[i-z]=='/')
+            {
+                sum1 = sum1/sum2;
+            }
+        }
+        sum += sum1*fig;
+        
+        if(p[i+1]=='+')
+        fig=1;
+        else if(p[i+1]=='-')
+        fig=-1;
+        
+        i+=2;
+    }
+    
+    printf("%lld",sum);
+    return 0;
+}

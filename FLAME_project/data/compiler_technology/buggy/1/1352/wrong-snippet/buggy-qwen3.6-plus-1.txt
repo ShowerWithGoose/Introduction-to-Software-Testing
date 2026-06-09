@@ -1,0 +1,202 @@
+Based on the analysis of the problem description, test case inputs, buggy output, and expected output, the error lies in how the line number for syntax errors is determined.
+
+**Analysis:**
+1.  **Test Case Input Errors:**
+    *   Line 16: `ch = getchar( ;` -> Missing right parenthesis `)`. Expected error: `16 j`.
+    *   Line 18: `if (f2() & f1())` -> Illegal symbol `&`. Expected error: `18 a`.
+    *   Line 19: `printf("%c",s[0];` -> Missing right parenthesis `)`. Expected error: `19 j`.
+
+2.  **Buggy Output:**
+    *   `18 a`
+    *   `16 j`
+    *   `18 a` (Duplicate)
+    *   `19 j`
+
+3.  **Discrepancy:**
+    *   The buggy output reports error `a` on line 18 twice. This suggests that the illegal symbol `&` is being detected both during lexical analysis (in `Lexer.java`) and potentially again or incorrectly handled in syntax analysis, or the error reporting mechanism is adding it multiple times. However, looking at `Lexer.java`, when `&` is encountered alone, it adds an error to `IOUtils.compileErrors`.
+    *   More importantly, the order is wrong (`18` before `16`). The `CompileError` class implements `Comparable` to sort by line number, and `IOUtils.writeError()` sorts the list. If the output is `18, 16, 18, 19`, it implies either the sorting isn't working as expected on the final list, or errors are being written out of order/unsorted if `writeError` isn't called correctly or if `lexer.txt`/`error.txt` writing logic is mixed.
+    *   Let's look at `Lexer.java`. When it encounters a single `&`, it creates a `CompileError` with `lineNum` and adds it to `errorList` AND `IOUtils.compileErrors`.
+    *   Let's look at `Parser.java` and syntax units. When a syntax error like missing `)` is found, e.g., in `PrimaryExp.java` or `FuncCallHelp.java`, it creates a `CompileError` using `lexIterator.nowToken().getLineNum()`.
+    *   **Crucial Logic Error in `Lexer.java`**: In the `next()` method, when handling `&` and `|`, if the second character is not matching (e.g., `&` followed by space or `;`), it reports an error `IllegalSymbol`. However, it sets `lexType` to `AND` or `OR` anyway. This token (`&`) is then added to the `tokenList`.
+    *   **Crucial Logic Error in Syntax Analysis Error Location**: The problem states: "The error line number corresponds to the line where the last non-terminal before the [missing symbol] is located."
+    *   In `PrimaryExp.java` (and others like `FuncCallHelp.java`, `UnaryExp.java`), when a missing `)` is detected, the code uses `lexIterator.nowToken().getLineNum()`. `nowToken()` returns the *previously* consumed token.
+    *   Let's trace Line 16: `ch = getchar( ;`.
+        *   Tokens: `ch`(IDENFR), `=`(ASSIGN), `getchar`(GETCHARTK), `(`(LPARENT), `;`(SEMICN).
+        *   Parser enters `Stmt` -> `LVal`=`Exp`. `Exp` -> ... -> `UnaryExp` -> `Ident`(`getchar`) `(` `FuncRParams`? No, next is `;`. So `FuncRParams` is empty. Then expects `)`.
+        *   Current token is `;`. `nowToken()` is `(`. Line number of `(` is 16. Correct.
+    *   Let's trace Line 19: `printf("%c",s[0];`.
+        *   Tokens: `printf`, `(`, `"..."`, `,`, `s`, `[`, `0`, `;`.
+        *   Parser in `Stmt` case 10 (`printf`). Parses `printf`, `(`, String. Then loop for `, Exp`. Finds `,`. Parses `Exp`. `Exp` -> ... -> `PrimaryExp` -> `LVal`(`s`) `[` `Exp`(`0`) `]`?
+        *   Wait, `LVal` parsing in `LVal.java`: parses `s`, sees `[`, parses `Exp`(`0`), expects `]`. Next token is `;`. It reports `LackRBRACK` (error k). But the expected error is `j` (Missing `)`).
+        *   Actually, the grammar for `printf` is `'printf''('StringConst {','Exp}')'';'`. The arguments are `Exp`s. `s[0` is an `Exp`? `s[0` is invalid syntax for an expression if `]` is missing.
+        *   If `LVal` detects missing `]`, it reports error `k` at line of `nowToken()` which is `0` (line 19).
+        *   However, the expected output says `19 j`. This implies the parser should perhaps recover or the error detection priority is different. Or maybe `s[0` is parsed as `LVal` failing, but the context is inside `printf(...)` so the missing `)` is the primary structural error?
+        *   Actually, looking at `Stmt.java` case 10: It parses `StringConst`, then loops `while(isComma())`. It finds `,`. Then `isExp()`. `Exp` calls `AddExp`... `PrimaryExp`. `PrimaryExp` sees `s` (IDENFR). It calls `LVal`. `LVal` sees `s`, `[`, `Exp`(`0`). Then expects `]`. Finds `;`. Reports `LackRBRACK`.
+        *   If `LVal` reports `k`, we get `19 k`. But expected is `19 j`.
+        *   Perhaps the `printf` parsing in `Stmt.java` doesn't use `LVal` directly for arguments? No, `Exp` uses `LVal`.
+        *   Let's look at the duplicate `18 a`. The lexer reports `a` for `&`. The token `&` (type `AND`) is passed to parser. `Cond` -> `LOrExp` -> `LAndExp` -> `EqExp` ... `RelExp` ... `AddExp` ... `MulExp` ... `UnaryExp` ... `PrimaryExp`.
+        *   Inside `PrimaryExp` or `UnaryExp`, if it encounters `AND` where it expects something else, does it report an error?
+        *   In `Stmt.java` case 4 (`if`), it parses `Cond`. `Cond` -> `LOrExp`. `LOrExp` -> `LAndExp`. `LAndExp` -> `EqExp`. ...
+        *   `f2()` is parsed. Then `&`. `LAndExp` expects `&&`. It checks `isAndOP()`. `isAndOP` checks for `LexType.AND`. It matches! So it consumes `&`. Then it expects `EqExp`. Next token is `f1()`. Parses `f1()`. Then expects `)` for `if`. Next token is `)`. Matches.
+        *   So `&` is consumed as a logical AND operator by the parser? But `&` is `AND` token. The grammar says `LAndExp → EqExp | LAndExp '&&' EqExp`. The token for `&&` is `AND`. The token for `&` is also `AND` because Lexer set `lexType = LexType.AND` even for single `&` (after reporting error).
+        *   So the parser successfully parses `f2() & f1()` as a valid `LAndExp` because the token type is `AND`. It does NOT report a syntax error for `&`.
+        *   So why is `18 a` appearing twice in buggy output?
+        *   The Lexer adds `18 a` to `IOUtils.compileErrors`.
+        *   Does the Parser add it again? No obvious place.
+        *   However, the Buggy Output has `18 a` twice.
+        *   And `16 j` is missing from the start? No, it's there.
+        *   The expected output is sorted: `16 j`, `18 a`, `19 j`.
+        *   The buggy output is: `18 a`, `16 j`, `18 a`, `19 j`.
+        *   This implies `IOUtils.compileErrors` contains `[18 a, 16 j, 18 a, 19 j]` or similar, and sorting failed or wasn't applied?
+        *   `IOUtils.writeError()` calls `Collections.sort(compileErrors)`. `CompileError.compareTo` compares `lineNum`.
+        *   If the list is `[18, 16, 18, 19]`, sorting should produce `[16, 18, 18, 19]`.
+        *   The buggy output is `18, 16, 18, 19`. This is NOT sorted.
+        *   Why would `writeError` output unsorted?
+        *   Look at `Compiler.java`. It calls `parser.printSyntaxResult()`.
+        *   `Parser.printSyntaxResult()`:
+            ```java
+            if (isSyntaxCorrect) {
+                // ...
+            } else {
+                IOUtils.writeError();
+            }
+            ```
+        *   `isSyntaxCorrect` is set to `FALSE` when an error is found.
+        *   However, `Lexer` also writes errors?
+        *   In `Lexer.lexicalAnalysis()`, it calls `printLexicalResult()`.
+        *   `Lexer.printLexicalResult()`:
+            ```java
+            if (isLexicalCorrect) {
+                // write lexer.txt
+            } else {
+                // write error.txt directly!
+                FileWriter fileWriter = new FileWriter("error.txt");
+                for (CompileError error: errorList) {
+                     fileWriter.write(...);
+                }
+                // ...
+            }
+            ```
+        *   **Here is the main bug!**
+        *   If there is a lexical error (like `&`), `Lexer` writes `error.txt` immediately with its own `errorList`. It does NOT use `IOUtils.compileErrors` and does NOT sort.
+        *   Then, `Parser` runs. It finds syntax errors (16 j, 19 j) and adds them to `IOUtils.compileErrors`.
+        *   At the end, `Compiler` calls `parser.printSyntaxResult()`. Since `isSyntaxCorrect` is false (due to syntax errors), it calls `IOUtils.writeError()`.
+        *   `IOUtils.writeError()` sorts `IOUtils.compileErrors` and appends/writes to `error.txt`?
+        *   `IOUtils.writeError()` uses `new FileWriter("error.txt", true)` (append mode).
+        *   So, `error.txt` contains:
+            1.  Content from `Lexer.printLexicalResult()`: `18 a` (unsorted, just the lexical errors).
+            2.  Content from `IOUtils.writeError()`: Sorted syntax errors `16 j`, `18 a` (wait, did parser add 18 a? No, parser didn't see 18 a as syntax error. But wait, `IOUtils.compileErrors` might contain duplicates if added elsewhere? Or maybe `18 a` is only in Lexer's list).
+            
+        Let's re-read `Lexer.next()` for `&`:
+        ```java
+        } else {
+            isLexicalCorrect = false;
+            retract();
+            CompileError error = new CompileError(lineNum, ErrorType.IllegalSymbol);
+            errorList.add(error);
+            IOUtils.compileErrors.add(error); // Added to global list too!
+        }
+        lexType = LexType.AND;
+        ```
+        So `18 a` is in `IOUtils.compileErrors`.
+        
+        Sequence:
+        1. `Lexer.lexicalAnalysis()` runs. Finds `18 a`. Adds to `errorList` and `IOUtils.compileErrors`.
+        2. `Lexer.printLexicalResult()` runs. `isLexicalCorrect` is false. It writes `error.txt` with content `18 a\n`. It overwrites/clears `error.txt` first? `new FileWriter("error.txt")` truncates. So `error.txt` now has `18 a`.
+        3. `Parser.parse()` runs.
+           - Finds `16 j`. Adds to `IOUtils.compileErrors`. Sets `isSyntaxCorrect = FALSE`.
+           - Finds `19 j`. Adds to `IOUtils.compileErrors`.
+           - Note: `18 a` is already in `IOUtils.compileErrors` from Lexer.
+        4. `Parser.printSyntaxResult()` runs. `isSyntaxCorrect` is FALSE.
+        5. Calls `IOUtils.writeError()`.
+           - Sorts `IOUtils.compileErrors` (`[18 a, 16 j, 19 j]` -> `[16 j, 18 a, 19 j]`).
+           - Writes to `error.txt` in **append** mode (`new FileWriter("error.txt", true)`).
+           - So `error.txt` becomes:
+             ```
+             18 a       (from Lexer)
+             16 j       (from Parser, sorted first)
+             18 a       (from Parser? No, 18 a was already in the list. So it appears again?)
+             19 j
+             ```
+             
+        Wait, `IOUtils.compileErrors` contains `18 a` (from Lexer), `16 j` (from Parser), `19 j` (from Parser).
+        Sorting `[18, 16, 19]` gives `[16, 18, 19]`.
+        Writing these to file (appending to existing `18 a`) results in:
+        ```
+        18 a
+        16 j
+        18 a
+        19 j
+        ```
+        This matches the Buggy Output exactly!
+
+        **The Fix:**
+        The Lexer should **not** write to `error.txt` directly. It should only collect errors. The final error output should be handled centrally by `IOUtils.writeError()` after parsing is complete, ensuring all errors (lexical and syntactic) are collected, sorted, and written once.
+
+        Alternatively, `Lexer.printLexicalResult()` should not write errors if `isParser` is true, or should not write to `error.txt` at all, leaving it to the central handler.
+
+        Given the structure, the most likely intended fix is to prevent `Lexer` from writing to `error.txt` when syntax analysis is also running, or to clear the file before the final write. But since `IOUtils.writeError` appends, and `Lexer` wrote first, we get duplication and bad ordering.
+
+        The specific code snippet causing the issue is in `Lexer.java`'s `printLexicalResult` method writing to `error.txt` prematurely, and/or `IOUtils.writeError` appending instead of overwriting (or `Lexer` not clearing).
+
+        However, usually, in these compilers, if `isParser` is true, `Lexer` shouldn't output errors to `error.txt` directly.
+
+        Let's look at `Compiler.java`. It sets `CompilerConfig.isLexer = false` before parsing. But `Lexer.printLexicalResult()` doesn't check this config?
+        
+        ```java
+        public void printLexicalResult() {
+            if (isLexicalCorrect) {
+                // ...
+            } else {
+                try {
+                    FileWriter fileWriter = new FileWriter("error.txt"); // Truncates and writes lexical errors
+                    // ...
+                }
+            }
+        }
+        ```
+
+        And `IOUtils.writeError()`:
+        ```java
+        public static void writeError() {
+            Collections.sort(compileErrors);
+            try {
+                FileWriter fileWriter = new FileWriter("error.txt",true); // Appends
+                // ...
+            }
+        }
+        ```
+
+        The conflict is clear.
+
+<frontend/lexer/Lexer.java>
+...
+    public void printLexicalResult() {
+        if (isLexicalCorrect) {
+            // 输出tokenList
+            try {
+                FileWriter fileWriter = new FileWriter("lexer.txt");
+                for (Token token: tokenList) {
+                    fileWriter.write(token.getTokenType().toString() + ' ' + token.getTokenValue()+'\n');
+                }
+                fileWriter.flush();
+                fileWriter.close();
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        } else {
+            try {
+                FileWriter fileWriter = new FileWriter("error.txt");
+                for (CompileError error: errorList) {
+                    fileWriter.write(Integer.toString(error.getLineNum()) + ' ' + error.getErrorType().getErrorTypeCode().toString() + '\n');
+//                    System.out.println(error.getLineNum() + ' ' + error.getErrorType().getErrorTypeCode().toString() + '\n');
+//                    System.out.println(error.getLineNum());
+                }
+                fileWriter.flush();
+                fileWriter.close();
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+...

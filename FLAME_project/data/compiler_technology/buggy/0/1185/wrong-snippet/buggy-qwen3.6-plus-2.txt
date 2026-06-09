@@ -1,0 +1,146 @@
+**Summary of Analysis:**
+
+1.  **Problem**: The program is a lexical analyzer. It reads `testfile.txt`, tokenizes it, and outputs to `lexer.txt` (if correct) or `error.txt` (if errors exist).
+2.  **Test Case**: The input is a valid C-like source code ending with a multi-line comment `/* ... */`.
+3.  **Expected Output**: A list of tokens corresponding to the code, ending with `RBRACE }`. No error output.
+4.  **Buggy Output**: The token list is correct up to the end of the `main` function's closing brace `}`, but it includes an extra token `DIV /` at the very end.
+5.  **Root Cause**:
+    *   The input file ends with a block comment `/* ... */`.
+    *   The `recognize()` method iterates through lines. When it encounters `/*`, it calls `findBack()`.
+    *   `findBack()` searches for `*/`. In this specific test case, the `*/` is likely on the last line or the logic consumes it.
+    *   However, looking at the `skipChar` and `findBack` logic:
+        ```java
+        public void findBack() {
+            while (posLine < lines.size()) {
+                while (getSubstring(posWord, 2, getLine(posLine)) != null && !getSubstring(posWord, 2, getLine(posLine)).equals("*/")) {
+                    skipChar(1);
+                }
+                if (getSubstring(posWord, 2, getLine(posLine)) != null && getSubstring(posWord, 2, getLine(posLine)).equals("*/")) {
+                    skipChar(2); // Skips past */
+                    break;
+                }
+            }
+        }
+        ```
+    *   After `findBack()` returns, `recognize()` continues its inner `while` loop: `while (posWord < getLine(posLine).length())`.
+    *   If `skipChar(2)` moves `posWord` exactly to `getLine(posLine).length()`, the inner loop should terminate.
+    *   However, if there is any issue with how `skipChar` handles the boundary or if `findBack` leaves `posWord` in a state where the loop condition is still met but no valid token start is found, it might proceed.
+    *   Let's look closer at the extra output: `DIV /`. This corresponds to the character `/`.
+    *   The comment is `/* ... */`. The `*/` closes it.
+    *   If the comment is the very last thing in the file, `findBack` finds `*/`, skips 2 chars.
+    *   Wait, look at `deleteWhite`. It trims lines.
+    *   The last line in `testfile.txt` is likely `*/` (possibly with whitespace). `deleteWhite` makes it `*/`.
+    *   If the previous line ended with `/*`, `findBack` is called.
+    *   Actually, usually `/*` starts on a line.
+    *   Let's trace the specific bug. The output `DIV /` suggests that a `/` was processed as a division operator.
+    *   This implies that the `/` from `*/` or a subsequent `/` was not consumed by the comment handler, or the comment handler failed to consume the entire comment correctly, leaving a `/` behind which was then picked up by `addWords()` as a `DIV`.
+    *   Looking at `findBack`:
+        ```java
+        while (getSubstring(posWord, 2, getLine(posLine)) != null && !getSubstring(posWord, 2, getLine(posLine)).equals("*/")) {
+            skipChar(1);
+        }
+        ```
+        This loop advances `posWord` until it points to `*` of `*/` (assuming `getSubstring` gets `*` and next char `/`).
+        Then:
+        ```java
+        if (... equals("*/")) {
+            skipChar(2);
+            break;
+        }
+        ```
+        `skipChar(2)` advances past `*/`.
+        
+    *   The issue often lies in how `recognize` handles the transition after `findBack`.
+    *   In `recognize`:
+        ```java
+        } else if (getSubstring(posWord, 2, getLine(posLine)) != null && getSubstring(posWord, 2, getLine(posLine)).equals("/*")) {
+            posWord += 2;
+            findBack();
+            continue;
+        }
+        ```
+        It does `posWord += 2` (skipping `/*`) then `findBack()`.
+        
+    *   If the file ends with `*/` and nothing else, `findBack` skips `*/`. `posWord` becomes equal to line length. The inner `while` loop `posWord < length` terminates. `posLine` increments. Loop ends.
+    
+    *   Why is `DIV /` appearing?
+    *   Look at the `Type` enum regex for `IDENFR` or others? No, `/` is handled in `addWords` else block.
+    *   
+    *   Let's look at `skipChar` again.
+        ```java
+        public void skipChar(int count) {
+            if (count + posWord < getLine(posLine).length()) {
+                posWord = posWord + count;
+            } else {
+                if (posLine < lines.size() - 1) {
+                    posWord = count - (getLine(posLine).length() - posWord);
+                    posLine++;
+                } else if (posLine == lines.size() - 1) {
+                    posWord = getLine(posLine).length() - 1; // BUG HERE?
+                } else {
+                }
+            }
+        }
+        ```
+    *   If we are on the last line (`posLine == lines.size() - 1`) and we try to skip characters that go beyond the end of the line:
+        `posWord` is set to `getLine(posLine).length() - 1`.
+        This means `posWord` points to the **last character** of the line, not **past** it.
+        
+    *   In `findBack`, when we find `*/` at the end of the last line:
+        1. `getSubstring` matches `*/`.
+        2. `skipChar(2)` is called.
+        3. Inside `skipChar`: `count + posWord` (index of `*` + 2) is likely `>= length`.
+        4. Since it's the last line, it executes: `posWord = getLine(posLine).length() - 1;`.
+        
+    *   So, after `findBack` returns, `posWord` is pointing to the last character of the line (which is `/` from `*/`? Or `*`? If `*/` is the last two chars, indices are `L-2` (`*`) and `L-1` (`/`). `posWord` was at `L-2`. `skipChar(2)` tries to go to `L`. It clamps to `L-1`. So `posWord` is now at `L-1`, which is `/`.
+    
+    *   Control returns to `recognize`. The `continue` statement executes.
+    *   The inner `while` loop checks `posWord < getLine(posLine).length()`.
+    *   `L-1 < L` is **True**.
+    *   The loop continues!
+    *   It reads the character at `posWord` (which is `/`).
+    *   It goes to `addWords()`.
+    *   `addWords` sees `/`. It is not `&`, `|`, etc. It hits `else if (c == '/')`.
+    *   It adds `DIV /`.
+    *   It calls `addPos(1)`.
+    *   `addPos(1)` will again hit the boundary condition in `skipChar` (via `addPos` logic which is similar/reused? No, `addPos` has its own loop).
+    
+    *   Let's check `addPos`:
+        ```java
+        public void addPos(int n) {
+            int len = n;
+            while (posLine < lines.size() && len != 0) {
+                int cnt = getLine(posLine).length();
+                if (posWord + len > cnt) {
+                    posLine++;
+                    posWord = 0;
+                    len = cnt - (getLine(posLine).length() - 1 - posWord); // This calculation looks suspect too but let's stick to skipChar first
+                } else {
+                    posWord = posWord + len;
+                    len = 0;
+                }
+            }
+        }
+        ```
+        If `posWord` is `L-1` and `len` is 1. `posWord + len` is `L`. `cnt` is `L`. `L > L` is False.
+        So `posWord` becomes `L`.
+        Next iteration of `recognize`'s inner while: `posWord < L` is False. Loop ends.
+        
+    *   So the error is definitely in `skipChar` setting `posWord` to `length - 1` instead of `length` (or handling the "end of file" state correctly) when skipping past the end of the last line. This causes the last character (part of the comment terminator) to be re-processed as a token.
+
+<frontend/Lexer.java>
+...
+    public void skipChar(int count) {
+        if (count + posWord < getLine(posLine).length()) {
+            posWord = posWord + count;
+        } else {
+            if (posLine < lines.size() - 1) {
+                posWord = count - (getLine(posLine).length() - posWord);
+                posLine++;
+            } else if (posLine == lines.size() - 1) {
+                posWord = getLine(posLine).length() - 1;
+            } else {
+            }
+        }
+    }
+...

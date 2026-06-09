@@ -1,0 +1,449 @@
+Based on the analysis of the problem description, test case inputs, buggy output, and expected output, here is the summary:
+
+**Summary:**
+The program is a syntax analyzer for a C-like language. It needs to detect specific syntax errors (missing semicolons `i`, missing right parentheses `j`, missing right square brackets `k`) and report them with the correct line number.
+The test case contains three errors:
+1.  Line 13: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);` -> Missing `)` before `;`. Expected error: `13 j`.
+2.  Line 15: `if (3 > 0 {` -> Missing `)` before `{`. Expected error: `15 j`.
+3.  Line 20: `i = (((((f(str)))));` -> This line actually has balanced parentheses in the function call `f(str)`, but let's look closer. `i = (((((f(str)))));`. The assignment is `i = ... ;`. The expression is `((((f(str)))))`. Wait, `f(str)` returns a value. The parentheses are balanced. Let's re-read the input carefully.
+    Input Line 20: `    i = (((((f(str))))); // error 3`
+    Actually, looking at the expected output `20 j`, there must be a missing parenthesis. Let's count: `(((((` (5 open) `f(str)` `)))))` (5 close). It seems balanced. However, the comment says `// error 3`. Let's look at the Buggy Output.
+    Buggy Output reports errors at lines 13, 15, 16, and 20.
+    Expected Output reports errors at lines 13, 15, and 20.
+    
+    The key discrepancy is that the buggy parser reports extra errors at line 16 (`16 j`, `16 i` x4) and potentially mishandles the recovery or detection logic such that it reports errors inside the `if` block or subsequent lines incorrectly, or fails to stop reporting after the first critical error in a malformed structure if not handled correctly. More importantly, it misses the fact that line 20 should *only* report `20 j` (if it is an error) or perhaps the error on line 20 is detected differently.
+    
+    Let's look at Line 16: `        g((((f(str)))), arr);`
+    If the parser failed to recover properly from the error on Line 15 (missing `)` in `if` condition), it might be misinterpreting the tokens in Line 16.
+    
+    However, the most significant issue usually lies in how `PrimaryExp` or `UnaryExp` handles parentheses and function calls, and how `Stmt` handles the `if` statement's closing parenthesis.
+    
+    In `Parser.java`, the `stmt()` method handles `if`:
+    ```java
+    if (getType(curPos + 1).equals(LexerType.RPARENT)) {
+        rparent = getNextToken();
+    } else {
+        errorList.add(getLine(), ErrorType.j);
+        //System.out.println(getLine() + " j\n");
+    }
+    ```
+    This correctly identifies the missing `)` on line 15.
+    
+    The issue likely stems from **error recovery**. When an error is detected (like missing `)`), the parser consumes the error but does not advance the token stream to a safe synchronization point. Consequently, subsequent parsing attempts on the next tokens (which are now out of context) generate cascading false positive errors.
+    
+    Specifically, after detecting the missing `)` on line 15, the parser proceeds to parse the body of the `if` statement (`stmt()`). The next token is `{` (start of block). This part might work. But inside the block, or after the block, the state is corrupted.
+    
+    Let's look at Line 20: `i = (((((f(str)))));`
+    Why is this an error `j`?
+    If we look closely at the input: `i = (((((f(str)))));`
+    There are 5 `(` before `f` and 5 `)` after `str`.
+    Wait, `f(str)` is a `UnaryExp`.
+    `PrimaryExp` -> `(` `Exp` `)`.
+    If the parser expects a `)` and finds something else, it reports `j`.
+    
+    The main problem described in similar compiler projects is that when an error is found, the parser should ideally skip tokens until a synchronization token (like `;`, `}`, etc.) is found to prevent cascading errors. The current code just records the error and continues, which leads to the spurious errors on line 16.
+    
+    However, there is a more subtle bug often found in these recursive descent parsers regarding **lookahead** and **consumption**.
+    
+    Let's look at `PrimaryExp`:
+    ```java
+    if (getType(curPos + 1).equals(LexerType.LPARENT)) {
+        Token lparent = getNextToken();
+        Exp exp = exp();
+        Token rparent = null;
+        if (getType(curPos + 1).equals(LexerType.RPARENT)) {
+            rparent = getNextToken();
+        } else {
+            errorList.add(getLine(), ErrorType.j);
+        }
+        return new PrimaryExp(lparent, exp, rparent);
+    }
+    ```
+    
+    And `UnaryExp`:
+    ```java
+    } else if (getType(curPos + 1).equals(LexerType.IDENFR) && getType(curPos + 2).equals(LexerType.LPARENT)) {
+            Token ident = getNextToken();
+            Token lparent = getNextToken();
+            FuncRParams funcRParams = null;
+        if(!getType(curPos+1).equals(LexerType.RPARENT) && !getType(curPos+1).equals(LexerType.SEMICN)){
+            if(getType(curPos+1).equals(LexerType.IDENFR) || getType(curPos+1).equals(LexerType.CHRCON) || getType(curPos+1).equals(LexerType.INTCON)){
+                funcRParams = funcRParams();
+            } else if(getType(curPos+1).equals(LexerType.PLUS) || getType(curPos+1).equals(LexerType.MINU) || getType(curPos+1).equals(LexerType.NOT)){
+                funcRParams = funcRParams();
+            }
+        }
+            Token rparent = null;
+            if(getType(curPos + 1).equals(LexerType.RPARENT)) rparent = getNextToken();
+            else {
+                errorList.add(getLine(), ErrorType.j);
+            }
+            return new UnaryExp(ident, lparent, funcRParams, rparent);
+    }
+    ```
+
+    The cascading errors on line 16 suggest that after the error on line 15, the parser is confused.
+    
+    However, there is a specific logical error in how `CompUnit` determines the end of `Decl` and `FuncDef`.
+    
+    ```java
+    while (!getType(curPos + 3).equals(LexerType.LPARENT)) { //decl
+        declList.add(decl());
+    }
+    while (!getType(curPos + 2).equals(LexerType.MAINTK)) { //fundef
+        funcDefList.add(funcDef());
+    }
+    ```
+    This lookahead logic is fragile. If an error occurs, `curPos` might not advance as expected, or the lookahead indices might point to invalid tokens or tokens affected by previous errors.
+    
+    But the most direct cause of "Wrong Answer" with extra errors is usually lack of error recovery. Since I cannot rewrite the whole strategy, I must look for a specific bug in the existing logic that causes *incorrect* line numbers or *missed* errors vs *extra* errors.
+    
+    Notice that Line 20 in Expected Output is `20 j`.
+    In Buggy Output, Line 20 is `20 j`. So Line 20 is detected correctly.
+    The issue is the **extra** errors on Line 16.
+    
+    Why does Line 16 generate errors?
+    Line 15: `if (3 > 0 {`
+    Parser sees `if`, `(`, `3`, `>`, `0`. Next is `{`.
+    It expects `)`. It doesn't find it. Reports `15 j`.
+    It does NOT consume `{`.
+    Then it calls `stmt()` for the body of the if.
+    `stmt()` sees `{`. It calls `block()`.
+    `block()` consumes `{`.
+    Inside block, it parses `g((((f(str)))), arr);`.
+    This is a valid statement (Expression Statement).
+    `g(...)` is a `UnaryExp` (function call).
+    Why would it error?
+    
+    If the parser didn't consume the `{` in the `if` check, `block()` will consume it.
+    
+    Let's look at `funcRParams` in `UnaryExp`.
+    The condition `!getType(curPos+1).equals(LexerType.SEMICN)` is weird.
+    
+    Actually, looking at the Buggy Output: `16 j`, `16 i`, `16 i`, `16 i`, `16 i`.
+    This suggests that on line 16, the parser is trying to parse something, failing to find `)`, then failing to find `;` multiple times.
+    
+    This often happens if the parser enters a loop or recursive call that doesn't advance `curPos` when an error is encountered.
+    
+    In `PrimaryExp`:
+    If `)` is missing, it reports error but returns. `curPos` is still at the token after `Exp`.
+    
+    In `UnaryExp` (function call):
+    If `)` is missing, it reports error but returns.
+    
+    If the parser is stuck, it's because `curPos` isn't advancing.
+    
+    However, there is a known issue in this specific type of assignment code: **The `CompUnit` lookahead logic is incorrect for error handling or specific grammar structures**, but more likely, the **`stmt` parsing logic for `if`** does not handle the missing parenthesis by skipping to the matching brace or next statement, causing the subsequent `{` to be parsed as part of the condition or causing misalignment.
+    
+    But wait, look at `Parser.java` line 185-195 (approx):
+    ```java
+    if (getType(curPos + 1).equals(LexerType.RPARENT)) {
+        rparent = getNextToken();
+    } else {
+        errorList.add(getLine(), ErrorType.j);
+        //System.out.println(getLine() + " j\n");
+    }
+    Stmt stmt1 = stmt();
+    ```
+    If `)` is missing, `rparent` is null. `curPos` is still at `{` (from line 15).
+    Then `stmt()` is called.
+    `stmt()` checks `getType(curPos + 1)`. It is `{`.
+    It goes to `else` branch (line 300+), checks `LBRACE`.
+    It creates `new Stmt(block())`.
+    `block()` consumes `{`, parses items, consumes `}`.
+    This seems correct for Line 16.
+    
+    So why errors on 16?
+    
+    Let's look at Line 20 again.
+    `i = (((((f(str)))));`
+    
+    Is it possible the error is in `PrimaryExp` or `UnaryExp` regarding nested parentheses?
+    
+    Actually, there is a very common bug in these student implementations: **The `getType` method uses `curPos` which is static/global, but `getNextToken` increments it.**
+    
+    Let's look at `CompUnit`:
+    ```java
+    while (!getType(curPos + 3).equals(LexerType.LPARENT)) { //decl
+        declList.add(decl());
+    }
+    ```
+    If `decl()` encounters an error and doesn't advance `curPos` sufficiently, this loop might infinite loop or behave wrongly. But `decl()` usually advances.
+    
+    Let's look at the specific error codes.
+    Error `j` is missing `)`.
+    
+    The extra errors on line 16 are the problem.
+    
+    If I look at `UnaryExp`:
+    ```java
+    if(!getType(curPos+1).equals(LexerType.RPARENT) && !getType(curPos+1).equals(LexerType.SEMICN)){
+         // ... parse params
+    }
+    ```
+    If the previous error left the parser in a state where `curPos` is pointing to something unexpected, this check might fail.
+    
+    However, the most likely culprit for "Extra Errors" in recursive descent parsers without synchronization is that **after reporting an error, the parser should attempt to synchronize**. Without synchronization, it tries to parse the next token in the wrong context.
+    
+    Since I must identify the location of the error in the *provided code*, and the provided code lacks synchronization, the "error" is technically the lack of recovery logic. But usually, these questions point to a specific logical flaw that causes *incorrect* detection even in simple cases, or a flaw that causes *cascading* errors due to incorrect state management.
+    
+    Let's look at `Parser.java` -> `stmt()` -> `if` handling.
+    
+    Another possibility: The `CompUnit` logic for distinguishing `Decl` and `FuncDef` is flawed.
+    `while (!getType(curPos + 3).equals(LexerType.LPARENT))`
+    For `int f(char str[])`, `curPos` is at `int`. `curPos+1` is `f`. `curPos+2` is `(`. `curPos+3` is `char`.
+    `char` != `LPARENT`. So it enters loop.
+    `decl()` is called.
+    `decl()` sees `int`. Calls `varDecl()`.
+    `varDecl()` calls `bType()` (consumes `int`).
+    `varDef()` consumes `f`.
+    Checks `[`. No.
+    Checks `=`. No.
+    Returns `VarDef`.
+    `varDecl()` checks `,`. No.
+    Checks `;`. No (it's `(`).
+    Reports Error `i` (Missing Semicolon) for `VarDecl`!
+    
+    Ah! The parser thinks `int f(...)` is a `VarDecl` because it doesn't look ahead far enough to distinguish `FuncDef` from `VarDecl` correctly in `CompUnit` or `decl`.
+    
+    In `CompUnit`:
+    ```java
+    while (!getType(curPos + 3).equals(LexerType.LPARENT)) { //decl
+        declList.add(decl());
+    }
+    ```
+    For `int f(char str[])`:
+    Tokens: `int` (0), `f` (1), `(` (2), `char` (3).
+    `getType(curPos + 3)` is `char`. `char` != `LPARENT`.
+    So it treats it as a Decl.
+    `decl()` calls `varDecl()`.
+    `varDecl()` parses `int f`. Then expects `;`. Finds `(`.
+    Reports Error `i` on line 1.
+    
+    But the expected output does NOT have an error on line 1.
+    This means the parser SHOULD have recognized `int f(...)` as a `FuncDef`.
+    
+    The condition `!getType(curPos + 3).equals(LexerType.LPARENT)` is intended to check if it's a function definition.
+    For `int f(...)`, the `(` is at `curPos + 2`.
+    The condition checks `curPos + 3`.
+    If the grammar was `Type Ident ( ...`, `(` is at +2.
+    Why check +3?
+    Maybe for `const int a = ...`?
+    
+    If it's a `FuncDef`, `(` is at `curPos + 2`.
+    The loop condition `!getType(curPos + 3).equals(LexerType.LPARENT)` will be TRUE (since `char` != `LPARENT`), so it enters the `decl` branch. This is WRONG.
+    
+    It should enter the `FuncDef` branch if `(` is at `curPos + 2`.
+    
+    So the logic in `CompUnit` is flawed. It fails to identify Function Definitions correctly, treating them as Variable Declarations, which causes immediate syntax errors (missing semicolon) and cascading failures.
+    
+    However, the test case input starts with:
+    `int f(char str[]) {`
+    `int g(int i, int arr[]) {`
+    
+    If `CompUnit` misidentifies these, it generates errors on lines 1 and 5.
+    The expected output only has errors on 13, 15, 20.
+    This implies the parser *successfully* parsed lines 1-12.
+    
+    How?
+    Maybe `getType(curPos + 3)` IS `LPARENT`?
+    Tokens:
+    0: `int`
+    1: `f`
+    2: `(`
+    3: `char`
+    
+    `getType(3)` is `char`. Not `LPARENT`.
+    
+    Wait, look at `decl()`:
+    ```java
+    public static Decl decl(){
+        if (getType(curPos + 1) == LexerType.CONSTTK) {
+            return new Decl(constDecl());
+        } else {
+            return new Decl(varDecl());
+        }
+    }
+    ```
+    It doesn't check for `FuncDef`.
+    
+    So `CompUnit` MUST distinguish them.
+    
+    If the code provided is the "Buggy" code, and it produces errors on 13, 15, 16, 20...
+    And Expected is 13, 15, 20.
+    
+    If `CompUnit` was broken as described above, we'd see errors on 1 and 5. We don't.
+    This implies that `CompUnit` logic in the *actual running version* might be different or I am misinterpreting `curPos`.
+    `curPos` is initialized to -1.
+    First call `getType(curPos + 3)` -> `getType(2)`.
+    Token 0: `int`. Token 1: `f`. Token 2: `(`.
+    `getType(2)` is `LPARENT`.
+    So `!getType(2).equals(LPARENT)` is FALSE.
+    The loop `while (!getType(curPos + 3)...` ?
+    
+    Wait. `curPos` is -1.
+    `curPos + 3` is 2.
+    Token at index 2 is `(`.
+    So `getType(2)` is `LPARENT`.
+    The condition `!...equals(LPARENT)` is FALSE.
+    So it SKIPS the `while` loop for Decls.
+    Correct!
+    
+    Then `while (!getType(curPos + 2).equals(LexerType.MAINTK))`
+    `curPos` is still -1.
+    `curPos + 2` is 1.
+    Token 1 is `f`.
+    `f` != `MAINTK`.
+    Enters loop. Calls `funcDef()`.
+    `funcDef()` parses `int f(char str[]) { ... }`.
+    Consumes tokens up to `}`.
+    `curPos` is now at `}` of first function.
+    
+    Next iteration:
+    `curPos` is at `}` (index ~10?).
+    `getType(curPos + 2)`?
+    Next tokens: `int`, `g`, `(`...
+    `curPos + 1` is `int`. `curPos + 2` is `g`.
+    `g` != `MAINTK`.
+    Enters loop. Calls `funcDef()`.
+    Parses `g`.
+    
+    Next iteration:
+    `curPos` at `}` of `g`.
+    `curPos + 1` is `int`. `curPos + 2` is `main`.
+    `main` == `MAINTK`.
+    Loop ends.
+    Calls `mainFuncDef()`.
+    
+    So `CompUnit` logic is actually CORRECT for this input.
+    
+    So where are the extra errors on 16 coming from?
+    
+    Line 15: `if (3 > 0 {`
+    Error `15 j` reported.
+    Parser is at `{`.
+    Calls `stmt()` for body.
+    `stmt()` sees `{`. Calls `block()`.
+    `block()` parses `g((((f(str)))), arr);`.
+    
+    Inside `block()`:
+    `blockItem()` -> `stmt()`.
+    `stmt()` sees `g` (IDENFR).
+    Checks `curPos + 2` (`(`).
+    Flag = 0 (not assignment).
+    Goes to `else` (Expression Statement).
+    `exp()` -> `addExp()` ... -> `unaryExp()`.
+    `unaryExp()` sees `g` and `(`.
+    Parses function call `g(...)`.
+    
+    Inside `g`'s params:
+    `((((f(str)))))` and `arr`.
+    
+    `((((f(str)))))` is an `Exp`.
+    `Exp` -> `AddExp` -> ... -> `PrimaryExp`.
+    `PrimaryExp` sees `(`.
+    Consumes `(`.
+    Parses `Exp`.
+    Expects `)`.
+    
+    This is deeply nested.
+    
+    If the parser correctly parses Line 16, why does it output errors?
+    
+    Maybe the error is in `funcRParams` or `UnaryExp` when handling the arguments `g(..., arr)`.
+    
+    Or, crucially, look at `Parser.java` line 280-290 in `stmt()`:
+    
+    ```java
+    } else {
+        int flag = 0;
+        if (getType(curPos + 1).equals(LexerType.IDENFR)) {
+            if (getType(curPos + 2).equals(LexerType.ASSIGN)) {
+                flag = 1;
+            } else if (getType(curPos+2).equals(LexerType.LBRACK)) {
+                 // ... array check
+            }
+        }
+
+        if (flag == 1) {
+           // Assignment
+        } else{ // [Exp] ';'
+            if(!getType(curPos+1).equals(LexerType.SEMICN)){
+                expList.add(exp());
+            }
+            Token semicolon = null;
+            int line = getLine();
+            if(getType(curPos+1).equals(LexerType.SEMICN)) semicolon = getNextToken();
+            else {
+                errorList.add(line, ErrorType.i);
+            }
+            return new Stmt(expList, semicolon);
+        }
+    }
+    ```
+    
+    If `exp()` fails to consume all tokens correctly, or if `curPos` is left in a bad state, the check for `SEMICN` might fail.
+    
+    However, the most suspicious part is the **Buggy Output** having `16 j` AND `16 i`.
+    `16 j` means missing `)`.
+    `16 i` means missing `;`.
+    
+    This suggests that inside the expression on line 16, a `)` was expected but not found, AND subsequently a `;` was expected but not found.
+    
+    Given the complexity, the most likely error location that causes *spurious* errors in valid code (Line 16 is valid) is in the **`UnaryExp`** parsing logic, specifically how it handles function parameters or nested parentheses, OR in the **`PrimaryExp`** logic.
+    
+    But looking at the provided code, there is a subtle bug in `Parser.java` in the `compUnit` method or `decl`/`funcDef` separation? No, we proved that works.
+    
+    Let's look at `ErrorList`. It sorts errors.
+    
+    The difference is `16 j` and `16 i` appearing.
+    
+    I will highlight the `stmt` method in `Parser.java` where the expression statement is parsed, and the `UnaryExp` method, as these are the active components for Line 16. Specifically, the lack of error recovery/synchronization is the root cause, but if I must point to a code snippet, it's the parsing logic that proceeds blindly after potential internal errors.
+    
+    However, often in these tests, the "Error" is a specific off-by-one or wrong lookahead in the parser methods themselves.
+    
+    Let's look at `PrimaryExp` again.
+    
+    <Fronted/parser/Parser.java>
+    ...
+    //  PrimaryExp → '(' Exp ')' | LVal | Number | Character
+    public static PrimaryExp primaryExp() {
+        if (getType(curPos + 1).equals(LexerType.LPARENT)) {
+            Token lparent = getNextToken();
+            Exp exp = exp();
+            Token rparent = null;
+            if (getType(curPos + 1).equals(LexerType.RPARENT)) {
+                rparent = getNextToken();
+            } else {
+                errorList.add(getLine(), ErrorType.j);
+                //System.out.println(getLine() + " j\n");
+            }
+            return new PrimaryExp(lparent, exp, rparent);
+        } 
+    ...
+    }
+    ...
+    // UnaryExp → PrimaryExp | Ident '(' [FuncRParams] ')' | UnaryOp UnaryExp
+    public static UnaryExp unaryExp() {
+    ...
+    } else if (getType(curPos + 1).equals(LexerType.IDENFR) && getType(curPos + 2).equals(LexerType.LPARENT)) {
+            Token ident = getNextToken();
+            Token lparent = getNextToken();
+            FuncRParams funcRParams = null;
+        if(!getType(curPos+1).equals(LexerType.RPARENT) && !getType(curPos+1).equals(LexerType.SEMICN)){
+            if(getType(curPos+1).equals(LexerType.IDENFR) || getType(curPos+1).equals(LexerType.CHRCON) || getType(curPos+1).equals(LexerType.INTCON)){
+                funcRParams = funcRParams();
+            } else if(getType(curPos+1).equals(LexerType.PLUS) || getType(curPos+1).equals(LexerType.MINU) || getType(curPos+1).equals(LexerType.NOT)){
+                funcRParams = funcRParams();
+            }
+        }
+            Token rparent = null;
+            if(getType(curPos + 1).equals(LexerType.RPARENT)) rparent = getNextToken();
+            else {
+                errorList.add(getLine(), ErrorType.j);
+            }
+            return new UnaryExp(ident, lparent, funcRParams, rparent);
+    } 
+    ...
+    }
+    ...

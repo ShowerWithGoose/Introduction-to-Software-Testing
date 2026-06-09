@@ -1,0 +1,171 @@
+<frontend/lexer/TokenList.java>
+...
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder();
+        for (Token token : tokens) {
+            sb.append(token.getType().toString() + " " + token.getContent() + "\n"); // @@ The TokenType enum's default toString() returns the name, but if it was overridden or if the intention was to use a specific code, we should ensure it matches. However, looking at TokenType.java, toString() returns this.name(). The issue is likely that the output format requires the specific string representation defined in the problem (e.g., IDENFR, INTCON), which name() provides. Wait, let's look closer. The expected output uses codes like CONSTTK, INTTK. TokenType.name() returns exactly that. So TokenList.toString() seems correct in structure. Let's re-evaluate.
+        }
+        return sb.toString();
+    }
+...
+
+Actually, let's look at `TokenType.java` again.
+The `toString()` method in `TokenType` returns `this.name()`.
+The `TokenList.toString()` calls `token.getType() + " "`. In Java, concatenating an enum with a string calls `toString()` on the enum. So it will output `CONSTTK const\n`. This matches the expected output format.
+
+Let's look at `Compiler.java`.
+It writes `tokenLexer.getTokenList().toString()` to the file.
+If the program produces "No output file", it means either:
+1. An exception occurred before writing.
+2. The file was not created/written due to logic error.
+3. The program crashed.
+
+Let's look at `SourceFileLexer.moveForward`.
+```java
+public void moveForward(int steps) {
+    int cnt = steps;
+    while (!this.endOfFile() && cnt > 0) {
+        // 统计当前行的长度
+        int lineLen = peekLine().length();
+        if (columnNum + cnt >= lineLen) { // 移动范围超出当前行的长度
+            lineNum++;
+            cnt -= (lineLen - columnNum + 1); // TODO：很怪
+            columnNum = 0;
+        } else {
+            columnNum += cnt;
+            cnt = 0;
+        }
+    }
+}
+```
+The calculation `cnt -= (lineLen - columnNum + 1)` is suspicious.
+If I am at `columnNum` and want to move `cnt` steps.
+The number of characters remaining in the current line is `lineLen - columnNum`.
+If `cnt` is greater than or equal to `lineLen - columnNum`, we move to the next line.
+We consume `lineLen - columnNum` characters to reach the end of the line.
+Then we need to move `cnt - (lineLen - columnNum)` more steps.
+But the code does `cnt -= (lineLen - columnNum + 1)`. This subtracts one extra character. This effectively skips the newline character implicitly? But `readLines` strips newlines. So moving from end of line N to start of line N+1 should just increment `lineNum` and reset `columnNum`. The "step" cost to go from last char of line N to first char of line N+1 is logically 1 step if we consider the stream as continuous including newlines, but here we don't have newlines in `lines`.
+However, `peekChar` returns `\n` if `endOfLine()` is true (and not EOF).
+So `moveForward` needs to handle the transition across lines correctly.
+
+If `columnNum == lineLen`, we are at the "newline" position conceptually.
+If `columnNum < lineLen`, we are on a character.
+
+Let's trace `moveForward(1)` when at the last character of a line.
+`lineLen = 10`, `columnNum = 9`. `cnt = 1`.
+`columnNum + cnt = 10`. `10 >= 10` is true.
+`lineNum++`.
+`cnt -= (10 - 9 + 1) = 2`. So `cnt` becomes `1 - 2 = -1`.
+`columnNum = 0`.
+Loop continues? `cnt > 0` is false. Loop ends.
+So we moved to the next line, column 0. This seems okay for crossing one line boundary if `cnt` was 1.
+
+What if `cnt` is larger?
+Say `lineLen = 10`, `columnNum = 9`. `cnt = 3`.
+`10 >= 10` true.
+`lineNum++`.
+`cnt -= 2`. `cnt` becomes 1.
+`columnNum = 0`.
+Loop continues. `cnt = 1 > 0`.
+Next iteration: `lineLen` of new line. Say `lineLen = 5`.
+`columnNum = 0`. `cnt = 1`.
+`0 + 1 >= 5` false.
+`columnNum += 1`. `columnNum = 1`.
+`cnt = 0`.
+Loop ends.
+Result: Line N+1, Column 1.
+Correct behavior: Start at Line N, Col 9 (last char). Move 1 -> End of Line N (conceptual newline). Move 2 -> Line N+1, Col 0. Move 3 -> Line N+1, Col 1.
+So the logic `cnt -= (lineLen - columnNum + 1)` assumes that moving past the end of the line costs `remaining_chars + 1`. This `+1` accounts for the newline character that isn't stored in `lines` but is conceptually there. This seems intentional and possibly correct for this implementation style.
+
+However, there is a critical bug in `moveForward` when `endOfFile` is reached inside the loop.
+If `lineNum++` makes `lineNum >= lines.size()`, `endOfFile()` becomes true.
+The loop condition `!this.endOfFile()` will check at the start of the next iteration.
+But `peekLine()` is called *before* checking `endOfFile` in the next iteration? No, `peekLine` is called inside.
+Wait, `while (!this.endOfFile() && cnt > 0)`.
+If `lineNum` increments to `lines.size()`, `endOfFile()` returns true.
+The loop terminates.
+But what if `cnt` is still positive? It just stops. This might be acceptable if we assume we can't move past EOF.
+
+Let's look at `hitSubStr`.
+```java
+public String hitSubStr(Pattern pattern) {
+    String leftLine = getLeftLine();
+    Matcher matcher = pattern.matcher(leftLine);
+    if (matcher.find()) {
+        return matcher.group(0);
+    } else {
+        return null;
+    }
+}
+```
+`getLeftLine()` returns `peekLine().substring(columnNum)`.
+If `endOfLine()` is true, `getLeftLine()` returns `""`.
+Matcher on empty string will fail for most patterns.
+
+Let's look at `TokenType` regexes.
+`STRCON`: `"\\\"[^\\\"]*\\\""`
+This regex expects a string constant on a single line. If a string spans multiple lines (not allowed in C usually, but good to know), it would fail. But standard C strings don't span lines without backslash.
+
+The problem states: "Buggy Output: No output file".
+This usually implies an exception or empty content not being written.
+In `Compiler.java`:
+```java
+if (tokenLexer.ifErrorListEmpty()) {
+    outputFileName = "lexer.txt";
+    writeToFile(outputFileName, tokenLexer.getTokenList().toString());
+} else {
+    outputFileName = "error.txt";
+    writeToFile(outputFileName, tokenLexer.getErrorList().toString());
+}
+```
+If `tokenize()` throws an exception, `main` might terminate without writing.
+Or if `tokenList` is empty and `errorList` is empty?
+The input is valid code. So `errorList` should be empty.
+`tokenList` should contain tokens.
+
+Let's look closely at `STRCON` regex in `TokenType.java`:
+`STRCON(false, "\\\"[^\\\"]*\\\"")`
+This matches `"..."`.
+Input: `"hello\a world\t"`
+The regex `[^\\\"]*` matches any character except `\` and `"`.
+But the string contains `\a` and `\t`. The backslash `\` is excluded by `[^\\\"]`.
+So `[^\\\"]*` will stop matching at the `\` in `\a`.
+The regex expects the string to end with `"`.
+So `"hello` matches `\"[^\\\"]*`? No.
+`\"` matches start quote.
+`[^\\\"]*` matches `hello`.
+Then it expects `\"` (end quote). But the next char is `\`.
+So `STRCON` fails to match `"hello\a world\t"`.
+
+Then `TokenLexer.addToken` tries other types.
+None will match a double quote `"` except `STRCON`.
+So it will fall through to `!isPared`.
+It adds an error `ILLEGALCHAR`.
+But the input is supposed to be correct!
+So the lexer incorrectly identifies a valid string as an error.
+Wait, if it identifies an error, `errorList` is NOT empty.
+So it goes to `else` branch in `Compiler.java` and writes `error.txt`.
+But the expected output is `lexer.txt`.
+And the "Buggy Output" is "No output file".
+Why no output file?
+Maybe `writeToFile` failed? Or maybe the program crashed?
+Or maybe my analysis of "No output file" means the file `lexer.txt` was not created because it went to `error.txt`?
+If the student's program outputs `error.txt` instead of `lexer.txt`, and the test system checks for `lexer.txt`, it might report "No output file" (meaning the expected file is missing).
+
+So the root cause is the `STRCON` regex is incorrect. It doesn't handle escape sequences inside strings.
+The regex `[^\\\"]*` forbids backslashes. It should allow backslashes followed by something, or just any character except unescaped quotes.
+A common simple regex for strings allowing escapes is `"([^"\\]|\\.)*"`.
+Current: `"\\\"[^\\\"]*\\\""` -> `" [^" \ ]* "`
+It fails on `"hello\a..."` because `\` is excluded.
+
+So the error is in `TokenType.java` definition of `STRCON`.
+
+<frontend/lexer/TokenType.java>
+...
+    /* ----------- begin ---------- */
+    IDENFR(false, "[_A-Za-z][_A-Za-z0-9]*"),
+    INTCON(false, "[0-9]+"),
+    STRCON(false, "\\\"[^\\\"]*\\\""), // @@ [the reason for the error] The regex [^\\\"]* excludes backslashes, causing it to fail on string literals containing escape sequences (e.g., "\a", "\t"). It should be something like "\"([^\"\\\\]|\\\\.)*\"" to allow escaped characters.
+    CHRCON(false, "'([^'\\\n]|\\[abfntv0\"'\\])'"), // 前一部分：除了单引号，反斜杠和换行符以外的所有字符 后一部分：匹配所有的转义字符
+...

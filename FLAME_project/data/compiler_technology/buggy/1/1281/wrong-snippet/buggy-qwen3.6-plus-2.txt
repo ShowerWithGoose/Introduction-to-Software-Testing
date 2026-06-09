@@ -1,0 +1,666 @@
+Based on the problem description and the test case analysis:
+
+1.  **Test Case Analysis**:
+    *   **Error 1**: `printf("Hello SysY!\n")` is missing a semicolon. The `printf` statement starts on line 2. The expected error line is **2**. The buggy output correctly identifies line 2.
+    *   **Error 2**: `if (1)` is followed by newlines and comments, then `;`. The `if` statement starts on line 4. However, the grammar for `Stmt` includes `Block`. The code after `if(1)` is effectively an empty statement or part of the structure. Wait, looking at the input:
+        ```c
+        if (1)
+
+
+        /*********/
+        ;
+        ```
+        The `if` condition is `1`. The statement following it is `;` (an empty statement). This is syntactically valid `if (1) ;`. So there is no error here?
+        Let's re-read the input carefully.
+        Line 4: `if (1)`
+        Line 5-7: Empty/Comments
+        Line 8: `;`
+        This forms `if (1) ;`. This is valid.
+        
+        Then:
+        Line 9: `int a // error 2`
+        This is a `VarDecl` missing a semicolon. The variable declaration starts on line 9. The expected error line is **9**. The buggy output says **11**.
+        
+        Then:
+        Line 11: `for (;;) {}`
+        This is valid.
+        
+        Then:
+        Line 13: `return 0 // error 3`
+        This is a `return` statement missing a semicolon. It starts on line 13. The expected error line is **13**. The buggy output says **14**.
+
+2.  **Discrepancy Analysis**:
+    *   The buggy program reports errors at lines 2, 11, and 14.
+    *   The expected errors are at lines 2, 9, and 13.
+    *   Error 1 (Line 2) is correct.
+    *   Error 2 (Line 9 vs 11): The parser seems to be skipping lines or misidentifying the start of the declaration. Or, more likely, the `if` statement parsing is consuming tokens incorrectly or the line number tracking for the `VarDecl` is wrong.
+    *   Error 3 (Line 13 vs 14): Similarly, the `return` statement error is reported one line too late.
+
+    Let's look at how line numbers are tracked. The `Lexer` tracks line numbers in the `Token` objects. The `Parser` retrieves the line number from `iterator.peekPreviousToken().getLine()` when reporting errors.
+    
+    In `parseVarDecl`:
+    ```java
+    if(!token.getType().equals(TokenType.SEMICN)){
+        errors.add(new Error(iterator.peekPreviousToken().getLine(), "i"));
+        iterator.unReadToken(1);
+    }
+    ```
+    `peekPreviousToken()` returns the last token read by `readNextToken()`. In `parseVarDecl`, the loop reads tokens until it finds a comma or something else. Finally, it reads a token expecting `;`. If it's not `;`, `peekPreviousToken()` is that non-semicolon token.
+    
+    For `int a`, the tokens are `INTTK` (line 9), `IDENFR` (line 9). The next token is likely `FORTK` (line 11) because the semicolon is missing. So `peekPreviousToken()` would be `FORTK` at line 11? No, `parseVarDecl` calls `parseVarDef`.
+    
+    Let's trace `parseVarDecl` for `int a`:
+    1. `btype = new BType(iterator.readNextToken());` -> Reads `int` (Line 9).
+    2. `necVarDef = parseVarDef();`
+       - `ident = iterator.readNextToken();` -> Reads `a` (Line 9).
+       - `token = iterator.readNextToken();` -> Reads next token. Since `;` is missing, the next token is `for` (Line 11) (skipping comments/newlines in lexer).
+       - `token` is `FORTK`. It is not `LBRACK`, not `ASSIGN`. So `iterator.unReadToken(1);` happens inside `parseVarDef`? No, `parseVarDef` ends.
+    3. Back in `parseVarDecl`:
+       - `token = iterator.readNextToken();` -> This reads the token after `a`. But `parseVarDef` already read `for` and unread it?
+       
+    Let's check `parseVarDef`:
+    ```java
+    ident = iterator.readNextToken(); // reads 'a'
+    token = iterator.readNextToken(); // reads 'for' (next significant token)
+    if(token.getType().equals(TokenType.LBRACK)) { ... }
+    if(token.getType().equals(TokenType.ASSIGN)){ ... }
+    else{
+        iterator.unReadToken(1); // Unreads 'for'
+    }
+    return new VarDef(...);
+    ```
+    So `parseVarDef` returns, having unread `for`.
+    
+    Back in `parseVarDecl`:
+    ```java
+    necVarDef = parseVarDef();
+    Token token = iterator.readNextToken(); // Reads 'for' again!
+    while (token.getType().equals(TokenType.COMMA)) { ... } // False
+    /* token SHOULD be ';' */
+    if(!token.getType().equals(TokenType.SEMICN)){ // 'for' != ';'
+        errors.add(new Error(iterator.peekPreviousToken().getLine(), "i")); // peekPrevious is 'for', line 11
+        iterator.unReadToken(1);
+    }
+    ```
+    This explains why Error 2 is reported at line 11 instead of line 9. The error line should correspond to the last non-terminal before the semicolon, which is the `VarDef` (specifically the identifier `a` or the type `int`). The spec says: "The error line number corresponds to the line where the last non-terminal before the semicolon is located." For `VarDecl`, the last component is `VarDef`. The `VarDef` consists of `Ident` etc. The tokens for `VarDef` are on line 9. The parser detects the missing semicolon when it sees `for` on line 11. It uses `peekPreviousToken()` which is `for` (line 11). It should use the line number of the last token of the `VarDef` (which is `a`, line 9).
+
+    Similarly for `return 0`:
+    `parseStmt` for `return`:
+    ```java
+    returnTk = token; // return (Line 13)
+    token = iterator.readNextToken(); // 0 (Line 13)
+    if(isMatchExp(token)){ ... exp = parseExp(); token = iterator.readNextToken(); } 
+    // parseExp consumes 0. Next token is '}' (Line 14).
+    
+    if(!token.getType().equals(TokenType.SEMICN)){ // '}' != ';'
+        errors.add(new Error(iterator.peekPreviousToken().getLine(), "i")); // peekPrevious is '}', line 14
+        iterator.unReadToken(1);
+    }
+    ```
+    This explains why Error 3 is reported at line 14 instead of 13.
+
+    **Fix Strategy**:
+    When reporting error `i` (missing semicolon), the line number should be that of the last token belonging to the construct that *should* have been terminated by the semicolon, not the token that *followed* (and caused the detection).
+    
+    For `VarDecl`, the last token of the declaration is the last token of the last `VarDef`.
+    For `ReturnStmt`, the last token is the last token of the `Exp` or the `return` keyword if no exp.
+    
+    The current code uses `iterator.peekPreviousToken().getLine()`. `peekPreviousToken` returns the token that was just read and failed the check (e.g., `for` or `}`). We need the line number of the token *before* that one, which is the last valid token of the current syntax component.
+    
+    However, `TokensIterator` has `pre` and `last`. `readNextToken` sets `pre = last` and `last = next`. So `peekPreviousToken` returns `pre`? No, `peekPreviousToken` returns `pre` in the provided code?
+    
+    Let's check `TokensIterator`:
+    ```java
+    public Token readNextToken() {
+        pre = last;
+        return last = this.iterator.next();
+    }
+
+    public Token peekPreviousToken() {
+        return pre;
+    }
+    ```
+    So `peekPreviousToken()` returns the token *before* the current `last`.
+    
+    In `parseVarDecl`:
+    1. `parseVarDef` reads `a` (last=`a`, pre=`int`). Then reads `for` (last=`for`, pre=`a`). Then unreads `for`.
+       Unread logic:
+       ```java
+       public void unReadToken(int k) {
+           int cnt = k;
+           while (cnt > 0) {
+               cnt--;
+               if (this.iterator.hasPrevious()) {
+                   last = this.iterator.previous();
+               } else {
+                   break;
+               }
+           }
+       }
+       ```
+       This updates `last` but does **not** update `pre`. This is a bug in `TokensIterator` or at least inconsistent state. If `unReadToken` is called, `last` moves back, but `pre` remains what it was before the read that is being undone?
+       
+       Actually, if `unReadToken(1)` is called after reading `for`:
+       Before read: last=`a`, pre=`int`.
+       Read `for`: last=`for`, pre=`a`.
+       Unread 1: `iterator.previous()` returns `a`. `last` becomes `a`. `pre` is still `a` (from the read step).
+       
+       Then `parseVarDecl` calls `iterator.readNextToken()`.
+       `pre` = `last` (`a`). `last` = `for`.
+       So `token` is `for`. `peekPreviousToken()` is `pre` which is `a`.
+       
+       Wait, if `peekPreviousToken()` returns `a` (Line 9), then the error line would be 9.
+       Why did the buggy output say 11?
+       
+       Let's re-evaluate `TokensIterator.unReadToken`.
+       It only updates `last`. It does NOT update `pre`.
+       
+       Scenario `int a`:
+       1. `parseVarDef`:
+          - `ident = readNextToken()` -> `a`. State: last=`a`, pre=`int`.
+          - `token = readNextToken()` -> `for`. State: last=`for`, pre=`a`.
+          - `else { unReadToken(1); }` -> `last` becomes `a`. `pre` remains `a`.
+       2. `parseVarDecl`:
+          - `token = readNextToken()` -> `for`. State: last=`for`, pre=`a` (because `pre=last` assigns `a` to `pre`, then `last` becomes `for`).
+          - Check `token` (`for`) != `SEMICN`.
+          - `errors.add(..., peekPreviousToken().getLine())`. `peekPreviousToken()` returns `pre`, which is `a`. Line 9.
+          
+       If this logic holds, the output should be 9. But the buggy output is 11.
+       
+       Is it possible `parseVarDef` does NOT unread?
+       ```java
+       if(token.getType().equals(TokenType.ASSIGN)){
+           equal = token;
+           initval = parseInitVal();
+       }
+       else{
+           iterator.unReadToken(1);
+       }
+       ```
+       Yes, it unreads.
+       
+       Let's look at `parseStmt` for `return 0`.
+       1. `returnTk` = `return`.
+       2. `token = readNextToken()` -> `0`.
+       3. `isMatchExp(0)` is true.
+       4. `unReadToken(1)`. State: last=`return` (assuming pre was something else).
+       5. `exp = parseExp()`.
+          - `parseAddExp`... eventually reads `0`.
+          - Inside `parseAddExp`:
+            - `necMulExp = parseMulExp()`...
+            - `token = readNextToken()` -> `}` (Line 14).
+            - Loop condition fails.
+            - `unReadToken(1)`. State: last=`0`.
+       6. Back in `parseStmt`:
+          - `token = readNextToken()` -> `}`. State: last=`}`, pre=`0`.
+          - Check `token` (`}`) != `SEMICN`.
+          - `errors.add(..., peekPreviousToken().getLine())`. `peekPreviousToken()` is `pre` which is `0`. Line 13.
+          
+       If this logic holds, the output should be 13. But the buggy output is 14.
+       
+       Why is the buggy output 11 and 14?
+       11 is the line of `for`. 14 is the line of `}`.
+       These are the lines of the token *currently read* (`token`), not the previous one.
+       
+       Did the code use `token.getLine()` instead of `peekPreviousToken().getLine()`?
+       
+       Let's look at the provided code snippet for `Parser.java` again.
+       
+       In `parseVarDecl`:
+       ```java
+       if(!token.getType().equals(TokenType.SEMICN)){
+           errors.add(new Error(iterator.peekPreviousToken().getLine(), "i"));
+           iterator.unReadToken(1);
+       }
+       ```
+       
+       In `parseStmt` (return part):
+       ```java
+       if(!token.getType().equals(TokenType.SEMICN)){
+           errors.add(new Error(iterator.peekPreviousToken().getLine(), "i"));
+           iterator.unReadToken(1);
+       }
+       ```
+       
+       The code *says* `peekPreviousToken()`.
+       
+       Is `peekPreviousToken()` implemented correctly?
+       ```java
+       public Token peekPreviousToken() {
+           return pre;
+       }
+       ```
+       
+       And `readNextToken`:
+       ```java
+       public Token readNextToken() {
+           pre = last;
+           return last = this.iterator.next();
+       }
+       ```
+       
+       If `unReadToken` modifies `last` but not `pre`, then `pre` becomes stale/inconsistent with `last` relative to the iterator position?
+       
+       Let's trace `int a` again very carefully with `unReadToken` side effects.
+       
+       Start: Iterator at `int`. `last`=null, `pre`=null.
+       
+       `parseVarDecl`:
+       `btype = new BType(iterator.readNextToken());`
+       - `readNextToken`: `pre`=null, `last`=`int`. Returns `int`.
+       
+       `necVarDef = parseVarDef();`
+       - `ident = iterator.readNextToken();`
+         - `readNextToken`: `pre`=`int`, `last`=`a`. Returns `a`.
+       - `token = iterator.readNextToken();`
+         - `readNextToken`: `pre`=`a`, `last`=`for`. Returns `for`.
+       - `if (LBRACK)... else if (ASSIGN)... else { iterator.unReadToken(1); }`
+         - `unReadToken(1)`: `iterator.previous()` returns `a`. `last` = `a`. `pre` is STILL `a`.
+       
+       Back in `parseVarDecl`:
+       `Token token = iterator.readNextToken();`
+       - `readNextToken`: `pre` = `last` (`a`). `last` = `iterator.next()` (`for`).
+       - So `token` is `for`. `pre` is `a`.
+       
+       `if (!token.getType().equals(TokenType.SEMICN))` -> True.
+       `errors.add(new Error(iterator.peekPreviousToken().getLine(), "i"));`
+       - `peekPreviousToken()` returns `pre` which is `a`. Line 9.
+       
+       So why is the output 11?
+       
+       Maybe `parseVarDef` does NOT unread?
+       If `parseVarDef` did NOT unread `for`:
+       Back in `parseVarDecl`:
+       `Token token = iterator.readNextToken();` -> Reads `}`? No, `for` was consumed. Next is `for`? No, `for` was consumed by `parseVarDef`. Next is `(`?
+       
+       If `parseVarDef` consumes `for`, then `parseVarDecl` reads `(`.
+       `token` is `(`. `pre` is `for`.
+       Error line would be `for` (11).
+       
+       So, if `unReadToken` is failing to unread, or if the logic path doesn't call `unReadToken`, we get line 11.
+       
+       Let's check `parseVarDef` code again.
+       ```java
+       else{
+           iterator.unReadToken(1);
+       }
+       ```
+       It definitely calls it.
+       
+       Is it possible `unReadToken` is broken?
+       ```java
+       public void unReadToken(int k) {
+           int cnt = k;
+           while (cnt > 0) {
+               cnt--;
+               if (this.iterator.hasPrevious()) {
+                   last = this.iterator.previous();
+               } else {
+                   break;
+               }
+           }
+       }
+       ```
+       It updates `last`. It does NOT update `pre`.
+       
+       If `pre` is not updated, then in the subsequent `readNextToken`:
+       `pre = last;`
+       
+       If `unReadToken` sets `last` to `a`, then `readNextToken` sets `pre` to `a`. This seems correct for getting the line of `a`.
+       
+       However, consider the `return` case.
+       `parseExp` reads `0`, then reads `}`, then unreads `}`.
+       Inside `parseExp` -> `parseAddExp`:
+       - `necMulExp`... reads `0`.
+       - `token = readNextToken()` -> `}`. `pre`=`0`, `last`=`}`.
+       - Loop fails.
+       - `unReadToken(1)`. `last`=`0`. `pre` is still `0`.
+       
+       Back in `parseStmt`:
+       - `token = readNextToken()`. `pre`=`last`=`0`. `last`=`}`.
+       - `token` is `}`.
+       - `peekPreviousToken()` is `pre`=`0`. Line 13.
+       
+       So theoretically, the code *should* output 9 and 13.
+       
+       Why does it output 11 and 14?
+       11 is the line of `for`. 14 is the line of `}`.
+       These are the lines of the `token` that caused the error check to fail.
+       
+       This implies that `iterator.peekPreviousToken()` is returning the CURRENT token (`token`), or the code is actually using `token.getLine()`.
+       
+       Let's look at the code provided in the prompt again.
+       
+       ```java
+       if(!token.getType().equals(TokenType.SEMICN)){
+           errors.add(new Error(iterator.peekPreviousToken().getLine(), "i"));
+           iterator.unReadToken(1);
+       }
+       ```
+       
+       It explicitly uses `iterator.peekPreviousToken()`.
+       
+       Is it possible `peekPreviousToken` is implemented as `return last;`?
+       
+       ```java
+       public Token peekPreviousToken() {
+           return pre;
+       }
+       ```
+       No, it returns `pre`.
+       
+       Is it possible `readNextToken` is implemented differently?
+       
+       ```java
+       public Token readNextToken() {
+           pre = last;
+           return last = this.iterator.next();
+       }
+       ```
+       
+       If `unReadToken` is called, `last` changes. `pre` does not.
+       
+       Let's look at `parseStmt` IDENFR branch.
+       
+       Maybe the errors are coming from a different place?
+       
+       Error 2: `int a`.
+       Could it be parsed as a `Stmt`? No, `parseBlockItem` checks for `CONSTTK`, `INTTK`, `CHARTK` and calls `parseDecl`.
+       
+       Let's look at `parseDecl`.
+       ```java
+       private Decl parseDecl() {
+           Token next = iterator.readNextToken();
+           iterator.unReadToken(1);
+           SyntaxNode declNode = null;
+           if (next.getType().equals(TokenType.CONSTTK)) {
+               declNode = parseConstDecl();
+           } else if (next.getType().equals(TokenType.INTTK) || next.getType().equals(TokenType.CHARTK)) {
+               declNode = parseVarDecl();
+           } else {
+               /* ERROR */
+               System.out.println("111ERROR!!!");
+           }
+           Decl decl = new Decl(declNode);
+           return decl;
+       }
+       ```
+       
+       Everything seems standard.
+       
+       Hypothesis: The `TokensIterator` implementation of `unReadToken` is flawed because it doesn't update `pre`, AND `peekPreviousToken` is intended to return the token *before the current one*, but due to the stale `pre`, it might be returning something unexpected?
+       
+       Actually, if `unReadToken` is used, the contract of `peekPreviousToken` becomes ambiguous.
+       
+       However, there is a simpler explanation. Look at the error lines: 11 and 14.
+       Line 11 is `for`. Line 14 is `}`.
+       These are the tokens that *are* `token` in the error check.
+       
+       If the code was `errors.add(new Error(token.getLine(), "i"));`, it would produce 11 and 14.
+       
+       But the code says `iterator.peekPreviousToken().getLine()`.
+       
+       Is it possible that `peekPreviousToken` is returning `last`?
+       
+       If I assume the code provided is exactly what was run, and the output is 11/14, then `peekPreviousToken()` MUST be returning the token at line 11/14.
+       
+       In the `return` case:
+       `token` is `}` (Line 14).
+       `pre` is `0` (Line 13).
+       `last` is `}` (Line 14).
+       
+       If `peekPreviousToken` returned `last`, it would be 14.
+       
+       In the `int a` case:
+       `token` is `for` (Line 11).
+       `pre` is `a` (Line 9).
+       `last` is `for` (Line 11).
+       
+       If `peekPreviousToken` returned `last`, it would be 11.
+       
+       So, the behavior matches if `peekPreviousToken` returns `last` (the current token), OR if the code uses `token.getLine()`.
+       
+       Given the code snippet shows `peekPreviousToken`, let's look at `TokensIterator` again.
+       
+       ```java
+       public Token peekPreviousToken() {
+           return pre;
+       }
+       ```
+       
+       There is a mismatch between the expected behavior of the code as written and the observed output, UNLESS `pre` is somehow equal to `last`.
+       
+       When does `pre == last`?
+       `readNextToken`: `pre = last; last = next;`
+       They are different objects usually.
+       
+       However, if `unReadToken` is NOT called, or fails?
+       
+       Let's look at `parseVarDef` again.
+       
+       ```java
+       else{
+           iterator.unReadToken(1);
+       }
+       ```
+       
+       If `unReadToken` fails to move the iterator (e.g. `hasPrevious` is false?), then `last` remains `for`.
+       But `hasPrevious` should be true.
+       
+       Let's assume the error is in `TokensIterator.peekPreviousToken` returning the wrong thing, or the usage in `Parser` is wrong.
+       
+       Actually, looking at similar assignments, `peekPreviousToken` often means "the token before the current one".
+       
+       If the student INTENDED to get the line of the last valid token, they should use `pre`.
+       
+       If the output is 11 and 14, they are getting the line of the INVALID token.
+       
+       This suggests that `peekPreviousToken` is effectively returning the current token `token`.
+       
+       How?
+       
+       If `TokensIterator` was implemented such that `peekPreviousToken` returns `last`, then it matches.
+       
+       But the code says `return pre;`.
+       
+       Is it possible the file `TokensIterator.java` provided in the prompt is NOT the one used, or I am misinterpreting `pre`?
+       
+       Let's look at the `Compiler.java` flow.
+       
+       Regardless of the internal state confusion, the fix is clear:
+       The error line for "Missing Semicolon" should be the line of the last token of the construct, not the lookahead token.
+       
+       In `parseVarDecl`, the last token is part of `necVarDef` or the last `varDef`.
+       In `parseStmt` (return), the last token is part of `exp` or `returnTk`.
+       
+       The current code relies on `peekPreviousToken`.
+       
+       If `peekPreviousToken` is unreliable due to `unReadToken` not updating `pre`, we should store the line number of the last valid token explicitly.
+       
+       However, simply changing `peekPreviousToken` to `pre` (if it isn't already) won't help if `pre` is stale.
+       
+       Let's look at the specific error locations in `Parser.java`.
+       
+       Location 1: `parseVarDecl`
+       Location 2: `parseStmt` (return)
+       Location 3: `parseStmt` (break/continue/printf/etc)
+       
+       The pattern is consistent.
+       
+       The most likely error source is that `peekPreviousToken` is returning the current token (line 11/14) instead of the previous one (line 9/13).
+       
+       If I look at `TokensIterator`:
+       
+       ```java
+       public Token peekPreviousToken() {
+           return pre;
+       }
+       ```
+       
+       If the code output is 11/14, then `pre` MUST be 11/14.
+       
+       How can `pre` be 11/14?
+       
+       In `return` case:
+       `token` (current) is `}` (14).
+       `pre` is `0` (13).
+       
+       If `pre` was 14, then `pre` would equal `last`.
+       
+       This happens if `readNextToken` was called, setting `pre=last` (which was `}` from previous step?) No.
+       
+       There is a possibility that `unReadToken` is NOT working as expected, causing the iterator to not actually go back, so the next `readNextToken` reads the SAME token again?
+       
+       If `unReadToken` fails:
+       `parseVarDef` reads `for`. Fails to unread.
+       `parseVarDecl` reads `(` (next after `for`).
+       `token` is `(`. `pre` is `for` (11).
+       Error line 11.
+       
+       `parseStmt` return:
+       `parseExp` reads `}`. Fails to unread.
+       `parseStmt` reads `}`? No, if it failed to unread, iterator is at `}`. Next read is `}`?
+       If `unReadToken` fails, `last` is `}`.
+       `readNextToken` reads NEXT token.
+       
+       If `unReadToken` is broken, the synchronization is lost.
+       
+       However, `unReadToken` uses `iterator.previous()`. This is standard Java ListIterator. It should work.
+       
+       Let's assume the code provided IS the buggy code.
+       
+       The error is likely in how the line number is determined.
+       
+       If I change `iterator.peekPreviousToken().getLine()` to `iterator.peekPreviousToken().getLine()` it stays the same.
+       
+       Wait, look at `parseVarDecl` again.
+       
+       ```java
+       if(!token.getType().equals(TokenType.SEMICN)){
+           errors.add(new Error(iterator.peekPreviousToken().getLine(), "i"));
+           iterator.unReadToken(1);
+       }
+       ```
+       
+       If `peekPreviousToken` returns `pre`, and `pre` is correct, the answer is 9/13.
+       Since the answer is 11/14, `pre` is incorrect (it holds 11/14).
+       
+       This implies `pre` is holding the value of `last` (the current token).
+       
+       This happens if `pre` is not updated correctly or `peekPreviousToken` returns `last`.
+       
+       Given I cannot change `TokensIterator` (or can I? The prompt asks to identify the location of errors in the program below. It lists multiple files).
+       
+       The error is likely in `TokensIterator.java` where `peekPreviousToken` returns `pre`, but `pre` is not maintained correctly across `unReadToken` operations, OR `peekPreviousToken` should return `last`? No, `last` is current.
+       
+       Actually, if `unReadToken` is called, `last` moves back. `pre` stays forward.
+       Then `readNextToken` sets `pre = last` (the moved-back token).
+       So `pre` becomes the token BEFORE the current one.
+       
+       Example `int a`:
+       1. Read `for`. `last`=`for`, `pre`=`a`.
+       2. Unread. `last`=`a`. `pre`=`a`.
+       3. Read `for`. `pre`=`a`. `last`=`for`.
+       
+       `pre` is `a` (Line 9).
+       
+       So `peekPreviousToken` SHOULD return Line 9.
+       
+       Why does it return 11?
+       
+       Only if `unReadToken` DID NOT happen.
+       
+       Does `parseVarDef` skip the `else`?
+       
+       ```java
+       if(token.getType().equals(TokenType.LBRACK)) { ... }
+       if(token.getType().equals(TokenType.ASSIGN)){ ... }
+       else{
+           iterator.unReadToken(1);
+       }
+       ```
+       
+       If `token` is `for`, it is not `LBRACK`, not `ASSIGN`. So it goes to `else`.
+       
+       Is it possible `parseVarDef` is not called?
+       
+       No, `parseVarDecl` calls it.
+       
+       I will bet on the error being in `Parser.java` using `peekPreviousToken` which is semantically ambiguous or buggy in conjunction with `unReadToken`, and the fix is to use the line number of the last known good token.
+       
+       However, without refactoring, the simplest fix in `Parser.java` is to ensure we report the line of the token *before* the lookahead.
+       
+       If `peekPreviousToken` is returning the wrong thing, maybe we should use `token`'s line minus something? No.
+       
+       Let's look at `error.txt` output sorting.
+       
+       The prompt asks to identify the location of the errors.
+       
+       The errors are in `Parser.java` in the error reporting lines for missing semicolons.
+       
+       Specifically:
+       1. `parseVarDecl`
+       2. `parseStmt` (return)
+       3. `parseStmt` (break/continue)
+       4. `parseStmt` (printf)
+       5. `parseStmt` (assign/exp)
+       
+       And potentially `TokensIterator.java` if `peekPreviousToken` is defined incorrectly relative to the usage. But `Parser` is the one using it.
+       
+       I will highlight the error reporting lines in `Parser.java`.
+
+<fronted/Parser/Parser.java>
+...
+    private VarDecl parseVarDecl(){
+        ArrayList<Token> commas = new ArrayList<>();
+        ArrayList<VarDef> varDefs = new ArrayList<>();
+        BType btype;
+        VarDef necVarDef;
+        Token semicn = null;
+
+        btype = new BType(iterator.readNextToken());
+        necVarDef = parseVarDef();
+        Token token = iterator.readNextToken();
+        while (token.getType().equals(TokenType.COMMA)) {
+            /* is ',' */
+            commas.add(token);
+            varDefs.add(parseVarDef());
+            token = iterator.readNextToken();
+        }
+        /* token SHOULD be ';' */
+        if(!token.getType().equals(TokenType.SEMICN)){
+            errors.add(new Error(iterator.peekPreviousToken().getLine(), "i"));
+            iterator.unReadToken(1);
+        }
+        else{
+            semicn = token;
+        }
+        return new VarDecl( btype,
+                necVarDef, commas, varDefs, semicn);
+    }
+...
+    private Stmt parseStmt(){
+...
+        else if(token.getType().equals(TokenType.RETURNTK)){
+            Token returnTk; // return
+            Exp exp = null; //may
+            Token semicn = null; // ';'
+
+            returnTk = token;
+            token = iterator.readNextToken();
+            if(isMatchExp(token)){
+                iterator.unReadToken(1);
+                exp = parseExp();
+                token = iterator.readNextToken();
+            }
+
+            if(!token.getType().equals(TokenType.SEMICN)){
+                errors.add(new Error(iterator.peekPreviousToken().getLine(), "i"));
+                iterator.unReadToken(1);
+            }else{
+                semicn = token;
+            }
+            StmtNodeOfReturn stmtNodeOfReturn = new StmtNodeOfReturn(returnTk,exp,semicn);
+            return new Stmt(stmtNodeOfReturn);
+        }
+...

@@ -1,0 +1,838 @@
+package frontend;
+
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Comparator;
+
+public class Parser {
+    private static Parser instance;
+    private Node root;
+    private BufferedReader in;
+    private BufferedWriter out;
+    private BufferedWriter error;
+    private ArrayList<Word> words;
+    private ArrayList<Error> errors; // 待排序的errors
+    private int curPos; // words索引
+    private Word curWord; // 下一个解析的symbol
+    private Word lastWord; // 保存上一个word用于输出报错位置
+    private LexType curType;
+    private String curToken;
+    private int curLineNum;
+
+    private Parser(BufferedReader in, BufferedWriter out, BufferedWriter error) { // 饿汉单例模式
+        this.in = in;
+        this.out = out;
+        this.error = error;
+        this.words = new ArrayList<>();
+        this.errors = new ArrayList<>();
+        this.curPos = -1;
+        this.root = new Node("CompUnit");
+    }
+
+    public static Parser getInstance(BufferedReader in, BufferedWriter out, BufferedWriter error) {
+        if (instance == null) {
+            instance = new Parser(in, out, error);
+        }
+        return instance;
+    }
+
+    public void next() throws IOException {
+        if (curType != null && curType != LexType.ERROR) {
+            out.write(curWord.getType() + " " + curWord.getToken() + "\n");
+        }
+        lastWord = curWord;
+        curPos++;
+        if (curPos >= words.size()) {
+            return;
+        }
+        curWord = words.get(curPos);
+        curType = curWord.getType();
+        curToken = curWord.getToken();
+        curLineNum = curWord.getLineNum();
+        if (curType == LexType.ERROR) {
+            errors.add(new Error(curLineNum, 'a'));
+            curType = LexType.AND;
+            curToken = "&&";
+        }
+    }
+
+    public LexType getNextType() {
+        if (curPos+1 < words.size()) {
+            return words.get(curPos+1).getType();
+        }
+        else {
+            // TODO error
+            return LexType.ERROR;
+        }
+    }
+
+    public LexType getNext2Type() {
+        if (curPos+2 < words.size()) {
+            return words.get(curPos+2).getType();
+        }
+        else {
+            // TODO error
+            return LexType.ERROR;
+        }
+    }
+    public void run() throws IOException {
+        Lexer lexer = Lexer.getInstance(in, error);
+        lexer.run();
+        this.words = lexer.getWords();
+        next();
+//        for (Word word : words) {
+//            out.write(word.getType() + " " + word.getToken() + "\n");
+//        }
+        parseCompUnit();
+    }
+
+    public void parseCompUnit() throws IOException {
+       // CompUnit → {Decl} {FuncDef} MainFuncDef
+       while (curType == LexType.CONSTTK || // ConstDecl
+               (isBType(curType)) && getNextType() == LexType.IDENFR && getNext2Type() != LexType.LPARENT) {
+           root.addChild(parseDecl());
+       }
+       while ((isFuncType(curType) && getNextType() != LexType.MAINTK)) {
+           root.addChild(parseFuncDef());
+       }
+       if (curType == LexType.INTTK && getNextType() == LexType.MAINTK) {
+           root.addChild(parseMain());
+       }
+       // 输出
+        printGrammarNode("CompUnit");
+       printErrorToFile();
+    }
+
+    public Node parseDecl() throws IOException { // 无需输出语法成分
+        Node node = new Node("Decl");
+        if (curType == LexType.CONSTTK) {
+            node.addChild(parseConstDecl());
+        }
+        else if (isBType(curType)) {
+            node.addChild(parseVarDecl());
+        }
+        return node;
+    }
+
+    public Node parseFuncDef() throws IOException {
+        // FuncDef → FuncType Ident '(' [FuncFParams] ')' Block // j
+        String nodeName = "FuncDef";
+        Node node = new Node(nodeName);
+        node.addChild(parseFuncType());
+        node.addChild(parseIdent());
+        if (curType == LexType.LPARENT) {
+            node.addChild(new Node("("));
+            next();
+        }
+        if (curType != LexType.RPARENT) {
+            node.addChild(parseFuncFParams());
+        }
+        // 检查j错误
+        checkError('j', node);
+
+        node.addChild(parseBlock());
+        // 输出
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseFuncFParams() throws IOException {
+        // FuncFParams → FuncFParam { ',' FuncFParam }
+        String nodeName = "FuncFParams";
+        Node node = new Node(nodeName);
+        node.addChild(parseFuncFParam());
+        while (curType == LexType.COMMA) {
+            node.addChild(new Node(","));
+            next();
+            node.addChild(parseFuncFParam());
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseBlock() throws IOException {
+        String nodeName = "Block";
+        Node node = new Node(nodeName);
+        node.addChild(new Node("{"));
+        next();
+        while (curType != LexType.RBRACE) {
+            node.addChild(parseBlockItem());
+        }
+
+        node.addChild(new Node("}"));
+        next();
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseFuncFParam() throws IOException {
+        // FuncFParam → BType Ident ['[' ']'] // k
+        String nodeName = "FuncFParam";
+        Node node = new Node(nodeName);
+        node.addChild(parseBType());
+        node.addChild(parseIdent());
+        if (curType == LexType.LBRACK) {
+            node.addChild(new Node("["));
+            next();
+            // 检查k错误
+            checkError('k', node);
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseBlockItem() throws IOException { // 无需输出
+        String nodeName = "BlockItem";
+        Node node = new Node(nodeName);
+        if (curType == LexType.CONSTTK || isBType(curType)) {
+            node.addChild(parseDecl());
+        }
+        else {
+            node.addChild(parseStmt());
+        }
+        return node;
+    }
+
+    public Node parseStmt() throws IOException {
+        String nodeName = "Stmt";
+        Node node = new Node(nodeName);
+        if (curType == LexType.IFTK) {
+            // 'if' '(' Cond ')' Stmt [ 'else' Stmt ] // j
+            node.addChild(new Node(curToken));
+            next();
+            node.addChild(new Node("("));
+            next();
+            node.addChild(parseCond());
+            // 检查j错误
+            checkError('j', node);
+            node.addChild(parseStmt());
+            if (curType == LexType.ELSETK) {
+                node.addChild(new Node(curToken));
+                next();
+                node.addChild(parseStmt());
+            }
+        }
+        else if (curType == LexType.FORTK) {
+            //  'for' '(' [ForStmt] ';' [Cond] ';' [ForStmt] ')' Stmt
+            node.addChild(new Node(curToken));
+            next();
+            node.addChild(new Node("("));
+            next();
+            if (curType != LexType.SEMICN) {
+                node.addChild(parseForStmt());
+            }
+            node.addChild(new Node(";"));
+            next();
+            if (curType != LexType.SEMICN) {
+                node.addChild(parseCond());
+            }
+            node.addChild(new Node(";"));
+            next();
+            if (curType != LexType.RPARENT) {
+                node.addChild(parseForStmt());
+            }
+            node.addChild(new Node(")"));
+            next();
+            node.addChild(parseStmt());
+        }
+        else if (curType == LexType.BREAKTK || curType == LexType.CONTINUETK) {
+            node.addChild(new Node(curToken));
+            next();
+            // 检查i错误
+            checkError('i', node);
+        }
+        else if (curType == LexType.RETURNTK) {
+            node.addChild(new Node(curToken));
+            next();
+            if (curType != LexType.SEMICN) {
+                node.addChild(parseExp());
+            }
+            // 检查i错误
+            checkError('i', node);
+        }
+        else if (curType == LexType.PRINTFTK) {
+            // 'printf''('StringConst {','Exp}')'';' // i j
+            node.addChild(new Node(curToken));
+            next();
+            node.addChild(new Node("("));
+            next();
+            node.addChild(parseStringConst());
+            while (curType == LexType.COMMA) {
+                node.addChild(new Node(","));
+                next();
+                node.addChild(parseExp());
+            }
+            // 检查j错误
+            checkError('j', node);
+
+            // 检查i错误
+            checkError('i', node);
+        }
+        else if (curType == LexType.LBRACE) {
+            // Block
+            node.addChild(parseBlock());
+        }
+        else {
+            // TODO [Exp]; | LVal
+            boolean readAssign = false;
+            int pos = curPos;
+            while (words.get(pos).getType() != LexType.SEMICN) { // 找到第一个分号
+                if (words.get(pos).getType() == LexType.ASSIGN) {
+                    readAssign = true; // 解析LVal的标志
+                    break;
+                }
+                pos++;
+            }
+            if (readAssign) {
+                node.addChild(parseLVal());
+                node.addChild(new Node("="));
+                next();
+                if (curType == LexType.GETINTTK || curType == LexType.GETCHARTK) {
+                    node.addChild(new Node(curToken));
+                    next();
+                    node.addChild(new Node("("));
+                    next();
+                    // 检查j错误
+                    checkError('j', node);
+
+                    // 检查i错误
+                    checkError('i', node);
+                }
+                else {
+                    node.addChild(parseExp());
+                    // 检查i错误
+                    checkError('i', node);
+                }
+            }
+            else {
+                if (curType != LexType.SEMICN) {
+                    node.addChild(parseExp());
+                }
+                // 检查i错误
+                checkError('i', node);
+            }
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseCond() throws IOException {
+        String nodeName = "Cond";
+        Node node = new Node(nodeName);
+        node.addChild(parseLOrExp());
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseForStmt() throws IOException {
+        String nodeName = "ForStmt";
+        Node node = new Node(nodeName);
+        node.addChild(parseLVal());
+        node.addChild(new Node("="));
+        next();
+        node.addChild(parseExp());
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseLOrExp() throws IOException {
+        // LOrExp → LAndExp | LOrExp '||' LAndExp
+        String nodeName = "LOrExp";
+        Node node = new Node(nodeName);
+        node.addChild(parseLAndExp());
+        while (curType == LexType.OR) {
+            printGrammarNode(nodeName);
+
+            Node tmp = new Node("LOrExp");
+            tmp.addChild(node);
+            tmp.addChild(new Node(curToken));
+            next();
+            tmp.addChild(parseLAndExp());
+            node = tmp;
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseLAndExp() throws IOException {
+        //  LAndExp → EqExp | LAndExp '&&' EqExp
+        String nodeName = "LAndExp";
+        Node node = new Node(nodeName);
+        node.addChild(parseEqExp());
+        while (curType == LexType.AND) {
+            printGrammarNode(nodeName);
+            Node tmp = new Node("LAndExp");
+            tmp.addChild(node);
+            tmp.addChild(new Node(curToken));
+            next();
+            tmp.addChild(parseEqExp());
+            node = tmp;
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseEqExp() throws IOException {
+        // EqExp → RelExp | EqExp ('==' | '!=') RelExp
+        String nodeName = "EqExp";
+        Node node = new Node(nodeName);
+        node.addChild(parseRelExp());
+        while (curType == LexType.EQL || curType == LexType.NEQ) {
+            printGrammarNode(nodeName);
+            Node tmp = new Node("EqExp");
+            tmp.addChild(node);
+            tmp.addChild(new Node(curToken));
+            next();
+            tmp.addChild(parseRelExp());
+            node = tmp;
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseRelExp() throws IOException {
+        // RelExp → AddExp | RelExp ('<' | '>' | '<=' | '>=') AddExp
+        String nodeName = "RelExp";
+        Node node = new Node(nodeName);
+        node.addChild(parseAddExp());
+        while (curType == LexType.LSS || curType == LexType.LEQ ||
+                curType == LexType.GRE || curType == LexType.GEQ) {
+            printGrammarNode(nodeName);
+            Node tmp = new Node("RelExp");
+            tmp.addChild(node);
+            tmp.addChild(new Node(curToken));
+            next();
+            tmp.addChild(parseAddExp());
+            node = tmp;
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseMain() throws IOException {
+        // MainFuncDef → 'int' 'main' '(' ')' Block // j
+        String nodeName = "MainFuncDef";
+        Node node = new Node(nodeName);
+        node.addChild(new Node("int"));
+        next();
+        node.addChild(new Node("main"));
+        next();
+        node.addChild(new Node("("));
+        next();
+        // 检查j错误
+        checkError('j', node);
+
+        node.addChild(parseBlock());
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseConstDecl() throws IOException {
+        // ConstDecl → 'const' BType ConstDef { ',' ConstDef } ';' // i
+        String nodeName = "ConstDecl";
+        Node node = new Node(nodeName);
+        node.addChild(new Node("const"));
+        next();
+        node.addChild(parseBType());
+        node.addChild(parseConstDef());
+        while (curType == LexType.COMMA) {
+            node.addChild(new Node(","));
+            next();
+            node.addChild(parseConstDef());
+        }
+        // 检查i错误
+        checkError('i', node);
+
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseVarDecl() throws IOException {
+        // VarDecl → BType VarDef { ',' VarDef } ';' // i
+        String nodeName = "VarDecl";
+        Node node = new Node(nodeName);
+        node.addChild(parseBType());
+        node.addChild(parseVarDef());
+        while (curType == LexType.COMMA) {
+            node.addChild(new Node(","));
+            next();
+            node.addChild(parseVarDef());
+        }
+        // 检查i错误
+        checkError('i', node);
+
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseConstDef() throws IOException {
+        // ConstDef → Ident [ '[' ConstExp ']' ] '=' ConstInitVal // k
+        String nodeName = "ConstDef";
+        Node node = new Node(nodeName);
+        node.addChild(parseIdent());
+        if (curType == LexType.LBRACK) {
+            node.addChild(new Node("["));
+            next();
+            node.addChild(parseConstExp());
+            // 检查k错误
+            checkError('k', node);
+        }
+        node.addChild(new Node("="));
+        next();
+        node.addChild(parseConstInitVal());
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseVarDef() throws IOException {
+        // VarDef → Ident [ '[' ConstExp ']' ] | Ident [ '[' ConstExp ']' ] '=' InitVal // k
+        String nodeName = "VarDef";
+        Node node = new Node(nodeName);
+        node.addChild(parseIdent());
+        if (curType == LexType.LBRACK) {
+            node.addChild(new Node("["));
+            next();
+            node.addChild(parseConstExp());
+            // 检查k错误
+            checkError('k', node);
+        }
+        if (curType == LexType.ASSIGN) {
+            node.addChild(new Node("="));
+            next();
+            node.addChild(parseInitVal());
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseConstExp() throws IOException {
+        String nodeName = "ConstExp";
+        Node node = new Node(nodeName);
+        node.addChild(parseAddExp());
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseInitVal() throws IOException {
+        // InitVal → Exp | '{' [ Exp { ',' Exp } ] '}' | StringConst
+        String nodeName = "InitVal";
+        Node node = new Node(nodeName);
+        if (curType == LexType.LBRACE) {
+            node.addChild(new Node("{"));
+            next();
+            if (curType != LexType.RBRACE) {
+                node.addChild(parseExp());
+                while (curType == LexType.COMMA) {
+                    node.addChild(new Node(","));
+                    next();
+                    node.addChild(parseExp());
+                }
+            }
+            node.addChild(new Node("}"));
+            next();
+        }
+        else if (curWord.getType() == LexType.STRCON) {
+            node.addChild(parseStringConst());
+        }
+        else {
+            node.addChild(parseExp());
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseConstInitVal() throws IOException {
+        // ConstInitVal → ConstExp | '{' [ ConstExp { ',' ConstExp } ] '}' | StringConst
+        String nodeName = "ConstInitVal";
+        Node node = new Node(nodeName);
+        if (curType == LexType.LBRACE) {
+            node.addChild(new Node("{"));
+            next();
+            if (curType != LexType.RBRACE) {
+                node.addChild(parseConstExp());
+                while (curType == LexType.COMMA) {
+                    node.addChild(new Node(","));
+                    next();
+                    node.addChild(parseConstExp());
+                }
+            }
+            node.addChild(new Node("}"));
+            next();
+        }
+        else if (curWord.getType() == LexType.STRCON) {
+            node.addChild(parseStringConst());
+        }
+        else {
+            node.addChild(parseConstExp());
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseExp() throws IOException {
+        String nodeName = "Exp";
+        Node node = new Node(nodeName);
+        node.addChild(parseAddExp());
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseAddExp() throws IOException {
+        // AddExp → MulExp | AddExp ('+' | '−') MulExp
+        String nodeName = "AddExp";
+        Node node = new Node(nodeName);
+        node.addChild(parseMulExp());
+        while (curType == LexType.PLUS || curType == LexType.MINU) {
+            printGrammarNode(nodeName);
+            Node tmp = new Node("AddExp");
+            tmp.addChild(node);
+            tmp.addChild(new Node(curToken));
+            next();
+            tmp.addChild(parseMulExp());
+            node = tmp;
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseMulExp() throws IOException {
+        // MulExp → UnaryExp | MulExp ('*' | '/' | '%') UnaryExp
+        String nodeName = "MulExp";
+        Node node = new Node(nodeName);
+        node.addChild(parseUnaryExp());
+        while (curType == LexType.MULT || curType == LexType.DIV || curType == LexType.MOD) {
+            printGrammarNode(nodeName);
+            Node tmp = new Node("MulExp");
+            tmp.addChild(node);
+            tmp.addChild(new Node(curToken));
+            next();
+            tmp.addChild(parseUnaryExp());
+            node = tmp;
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseUnaryExp() throws IOException {
+        // UnaryExp → PrimaryExp | Ident '(' [FuncRParams] ')' | UnaryOp UnaryExp // j
+        String nodeName = "UnaryExp";
+        Node node = new Node(nodeName);
+        if (curType == LexType.PLUS || curType == LexType.MINU || curType == LexType.NOT) {
+            node.addChild(parseUnaryOp());
+            node.addChild(parseUnaryExp());
+        }
+        else if (curType == LexType.IDENFR && getNextType() == LexType.LPARENT) {
+            node.addChild(parseIdent());
+            node.addChild(new Node("("));
+            next();
+            if (curType != LexType.RPARENT) {
+                node.addChild(parseFuncRParams());
+            }
+            // 检查j错误
+            checkError('j', node);
+
+        }
+        else {
+            node.addChild(parsePrimaryExp());
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parsePrimaryExp() throws IOException {
+        // PrimaryExp → '(' Exp ')' | LVal | Number | Character// j
+        String nodeName = "PrimaryExp";
+        Node node = new Node(nodeName);
+        if (curType == LexType.LPARENT) {
+            node.addChild(new Node("("));
+            next();
+            node.addChild(parseExp());
+            // 检查j错误
+            checkError('j', node);
+
+        }
+        else if (curType == LexType.INTCON) {
+            node.addChild(parseNumber());
+        }
+        else if (curType == LexType.CHRCON) {
+            node.addChild(parseCharacter());
+        }
+        else {
+            node.addChild(parseLVal());
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseFuncRParams() throws IOException {
+        // FuncRParams → Exp { ',' Exp }
+        String nodeName = "FuncRParams";
+        Node node = new Node(nodeName);
+        node.addChild(parseExp());
+        while (curType == LexType.COMMA) {
+            node.addChild(new Node(","));
+            next();
+            node.addChild(parseExp());
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseNumber() throws IOException {
+        String nodeName = "Number";
+        Node node = new Node(nodeName);
+        if (curType == LexType.INTCON) {
+            node.addChild(new Node(curToken));
+            next();
+        }
+        else {
+            // TODO error
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseCharacter() throws IOException {
+        String nodeName = "Character";
+        Node node = new Node(nodeName);
+        if (curType == LexType.CHRCON) {
+            node.addChild(new Node(curToken));
+            next();
+        }
+        else {
+            // TODO error
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseLVal() throws IOException {
+        // LVal → Ident ['[' Exp ']'] // k
+        String nodeName = "LVal";
+        Node node = new Node(nodeName);
+        node.addChild(parseIdent());
+        if (curType == LexType.LBRACK) {
+            node.addChild(new Node("["));
+            next();
+            node.addChild(parseExp());
+            // 检查k错误
+            checkError('k', node);
+        }
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+    public Node parseUnaryOp() throws IOException {
+        String nodeName = "UnaryOp";
+        Node node = new Node(nodeName);
+        node.addChild(new Node(curToken));
+        next();
+        printGrammarNode(nodeName);
+        return node;
+    }
+
+
+    public Boolean isBType(LexType type) {
+        return type == LexType.INTTK || type == LexType.CHARTK;
+    }
+
+    public Boolean isFuncType(LexType type) {
+        return type == LexType.INTTK || type == LexType.CHARTK || type == LexType.VOIDTK;
+    }
+
+    public Node parseBType() throws IOException {
+        Node node = new Node("BType");
+        if (isBType(curType)) {
+            node.addChild(new Node(curToken));
+            next();
+        }
+        else {
+
+        }
+        return node;
+    }
+
+    public Node parseFuncType() throws IOException {
+        Node node = new Node("FuncType");
+        if (isFuncType(curType)) {
+            node.addChild(new Node(curToken));
+            next();
+        }
+        printGrammarNode("FuncType");
+        return node;
+    }
+
+    public Node parseIdent() throws IOException {
+        Node node = new Node("Ident");
+        if (curType == LexType.IDENFR) {
+            node.addChild(new Node(curToken));
+            next();
+        }
+        return node;
+    }
+
+    public Node parseStringConst() throws IOException {
+        Node node = new Node("StringConst");
+        node.addChild(new Node(curToken));
+        next();
+        return node;
+    }
+
+    public void printGrammarNode(String name) throws IOException {
+        out.write(String.format("<%s>\n", name));
+    }
+
+    public void printError(char code) throws IOException {
+        errors.add(new Error(lastWord.getLineNum(), code));
+    }
+
+    public void checkError(char code, Node node) throws IOException {
+        switch (code) {
+            case 'i' -> {
+                if (curType == LexType.SEMICN) {
+                    node.addChild(new Node(";"));
+                    next();
+                } else {
+                    printError('i');
+                }
+            }
+            case 'j' -> {
+                if (curType == LexType.RPARENT) {
+                    node.addChild(new Node(")"));
+                    next();
+                } else {
+                    printError('j');
+                }
+            }
+            case 'k' -> {
+                if (curType == LexType.RBRACK) {
+                    node.addChild(new Node("]"));
+                    next();
+                } else {
+                    printError('k');
+                }
+            }
+        }
+    }
+
+    public void printErrorToFile() throws IOException {
+        // 对error进行排序
+        errors.sort(Comparator.comparingInt(Error::getLineNum));
+        for (Error e : errors) {
+            error.write(e.getLineNum() + " " + e.getCode() + "\n");
+        }
+    }
+}
+
+/*
+模板
+        String nodeName = "";
+        Node node = new Node(nodeName);
+
+        printGrammarNode(nodeName);
+        return node;
+
+
+ */

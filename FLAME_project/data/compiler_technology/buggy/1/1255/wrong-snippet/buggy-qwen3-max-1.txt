@@ -1,0 +1,531 @@
+Based on the problem description and comparing the expected output with the buggy behavior, I can see that the issue is in the parsing order of `ConstDecl`. In the grammar, `ConstDecl` should be parsed as:
+
+```
+ConstDecl → 'const' BType ConstDef { ',' ConstDef } ';'
+```
+
+However, in the current implementation, the code is parsing the `const` token first, then the `BType`, but looking at the expected output, we need to output the tokens in the correct order as they appear in the source.
+
+Looking at the `parseConstDecl` method in `Syntax.java`, the error is that it's calling `parseConst()` (which consumes the 'const' token) first, then `parseBtype()`, but the order of setting these in the `ConstDecl` object appears correct. However, examining more carefully, I notice that in the `parseCompUnit` method, there's an issue with how the parser determines when to stop parsing declarations and start parsing function definitions.
+
+But the main issue is actually in the `parseConstDecl` method - it's parsing the tokens in the wrong order. It should first parse the `const` token, then the `BType`, but the current implementation calls `parseConst()` first which advances the token pointer, then `parseBtype()`.
+
+Wait, looking more carefully at the expected output vs what would be generated, the real issue is in the **output order** in the `ConstDecl.output()` method. Looking at the expected output, for a const declaration like `const int a = 1;`, we should output:
+- CONSTTK const
+- INTTK int  
+- ... (rest of const def)
+- <ConstDecl>
+
+But in the current `ConstDecl.output()` method, it outputs:
+```java
+fileWriter.write(con.toString() + "\n");
+bType.output(fileWriter);
+```
+
+This is actually correct order. 
+
+Looking more carefully at the test case input and expected output, I notice that the test case doesn't actually contain any `const` declarations! All the declarations are variable declarations (`int a1[10];`, etc.). So the issue must be elsewhere.
+
+Looking at the `parseCompUnit` method, I see the logic for determining when to parse declarations vs function definitions is flawed. The current logic:
+
+```java
+while (true) {
+    Token token1 = getNextToken();
+    Token token2 = getNextToken();
+    getBack(2);
+    if (token1.getTokenCode() == TokenCode.MAINTK || token2.getTokenCode() == TokenCode.LPARENT) {
+        break;
+    }
+    compUnit.addDecl(parseDecl());
+}
+```
+
+This logic is problematic because it's peeking ahead 2 tokens, but for variable declarations like `int a1[10];`, the first token is `INTTK` and second is `IDENFR`, so it would incorrectly try to parse it as a declaration (which is correct), but the condition for breaking seems wrong.
+
+Actually, looking at the expected output, I can see that the parser should be able to handle the given input correctly. The issue might be in the `parseDecl` method logic.
+
+Wait, looking at the input again: the first line is `int a1[10];` which is a `VarDecl`, not a `ConstDecl`. So `parseDecl` should call `parseVarDecl()`.
+
+But looking at the `parseDecl` method:
+
+```java
+public Decl parseDecl() {
+    Decl decl = new Decl();
+    if (nowToken.getTokenCode() == TokenCode.CONSTTK) {
+        decl.setConstDecl(parseConstDecl());
+    } else {
+        decl.setVarDecl(parseVarDecl());
+    }
+    return decl;
+}
+```
+
+This looks correct.
+
+The real issue I'm seeing is in the `parseCompUnit` method's logic for separating declarations from function definitions. The current logic will consume tokens incorrectly.
+
+Looking at this part:
+```java
+getNextToken();
+while (true) {
+    Token token1 = getNextToken();
+    Token token2 = getNextToken();
+    getBack(2);
+    if (token1.getTokenCode() == TokenCode.MAINTK || token2.getTokenCode() == TokenCode.LPARENT) {
+        break;
+    }
+    compUnit.addDecl(parseDecl());
+}
+```
+
+The initial `getNextToken()` consumes the first token, then the loop gets the next two tokens. This is consuming tokens incorrectly.
+
+But actually, looking more carefully at the expected output structure, I think the issue is in the **recursive descent parsing of expressions**. Looking at the expected output for array declarations like `int a1[10];`, we should see:
+
+```
+INTTK int
+IDENFR a1
+LBRACK [
+INTCON 10
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<ConstExp>
+RBRACK ]
+<VarDef>
+SEMICN ;
+<VarDecl>
+```
+
+This suggests that `ConstExp` should output `<ConstExp>` after the `AddExp` tree. Looking at the `ConstExp.output()` method:
+
+```java
+public void output(FileWriter fileWriter) throws IOException {
+    addExp.output(fileWriter);
+    fileWriter.write("<ConstExp>\n");
+}
+```
+
+This is correct.
+
+However, looking at the `AddExp.output()` method:
+
+```java
+public void output(FileWriter fileWriter) throws IOException {
+    mulExp.output(fileWriter);
+    fileWriter.write("<AddExp>\n");
+    if (sign != null) {
+        fileWriter.write(sign.toString() + "\n");
+        addExp.output(fileWriter);
+    }
+}
+```
+
+This outputs `<AddExp>` immediately after `mulExp`, but according to the expected output, `<AddExp>` should come after the entire expression tree is output.
+
+Wait, no - looking at the expected output pattern, for `10` it should be:
+- INTCON 10
+- <Number>
+- <PrimaryExp> 
+- <UnaryExp>
+- <MulExp>
+- <AddExp>
+- <ConstExp>
+
+So each level wraps the previous one, which means the current output order is correct.
+
+After careful analysis, I believe the issue is in the **parsing logic for CompUnit**. The current implementation has a fundamental flaw in how it separates declarations from function definitions.
+
+Looking at the grammar: `CompUnit → {Decl} {FuncDef} MainFuncDef`
+
+The current parsing logic in `parseCompUnit()` is:
+
+1. Call `getNextToken()` once at the beginning
+2. Then in a loop, peek at the next two tokens to decide if it's time to stop parsing declarations
+3. Then parse function definitions until it sees `MAINTK`
+
+But this approach is consuming tokens incorrectly. The parser should not consume tokens during lookahead without proper backtracking.
+
+However, looking at the actual expected output vs what the program would produce, I notice that the expected output includes all the lexical tokens followed by the syntax component names in the correct nested order.
+
+The most likely issue is in the **expression parsing precedence**. Looking at the grammar:
+
+```
+AddExp → MulExp | AddExp ('+' | '−') MulExp
+```
+
+This is left-recursive, but the current implementation parses it as right-recursive:
+
+```java
+public AddExp parseAddExp() {
+    AddExp addExp = new AddExp();
+    addExp.setMulExp(parseMulExp());
+    if (nowToken.getTokenCode() == TokenCode.PLUS ||
+            nowToken.getTokenCode() == TokenCode.MINU) {
+        addExp.setSign(nowToken);
+        getNextToken();
+        addExp.setAddExp(parseAddExp());
+    }
+    return addExp;
+}
+```
+
+This creates a right-associative parse tree, but the output format expects the same structure regardless of associativity. However, the bigger issue is that this parsing approach may not match the expected token consumption order.
+
+But actually, looking at the test input, there are simple expressions like `10`, `5`, etc., which shouldn't trigger the recursive case.
+
+After re-examining everything, I think the actual bug is in the **initial token handling in parseCompUnit**. The method starts by calling `getNextToken()`, which consumes the first token of the file. Then it enters a loop where it gets the next two tokens for lookahead. This means the very first token is lost or handled incorrectly.
+
+Looking at the first line of input: `int a1[10];`
+
+The first token is `INTTK int`. The `parseCompUnit` method calls `getNextToken()` which consumes this token and sets `nowToken` to `INTTK int`. Then in the while loop:
+
+- `token1 = getNextToken()` → `IDENFR a1`
+- `token2 = getNextToken()` → `LBRACK [`
+- `getBack(2)` → goes back to `nowToken = INTTK int`
+
+Then it checks if `token1` is `MAINTK` (it's `IDENFR`) or `token2` is `LPARENT` (it's `LBRACK`), so condition is false, and it calls `compUnit.addDecl(parseDecl())`.
+
+In `parseDecl()`, since `nowToken` is `INTTK`, it calls `parseVarDecl()`, which calls `parseBtype()` that consumes the `INTTK` token.
+
+This seems correct.
+
+Wait, but the initial `getNextToken()` in `parseCompUnit` is unnecessary and causes the first token to be consumed before the proper parsing begins. The standard approach is to have `nowToken` represent the current lookahead token, and parsing methods should work with that.
+
+Looking at the constructor of `Syntax`, `pos = -1` and `nowToken` is null. The first call to `getNextToken()` in `parseCompUnit()` sets `nowToken` to the first token.
+
+But then the lookahead logic calls `getNextToken()` twice more, advancing to the 3rd token, then `getBack(2)` returns to the 1st token position.
+
+This should be okay.
+
+I'm now focusing on the **output generation**. Looking at the `VarDecl.output()` method:
+
+```java
+public void output(FileWriter fileWriter) throws IOException {
+    bType.output(fileWriter);
+    for (int i = 0;i < varDefs.size() - 1;i++) {
+        varDefs.get(i).output(fileWriter);
+        fileWriter.write("COMMA ,\n");
+    }
+    varDefs.get(varDefs.size() - 1).output(fileWriter);
+    fileWriter.write(semicn.toString() + "\n");
+    fileWriter.write("<VarDecl>\n");
+}
+```
+
+This looks correct.
+
+But wait! Looking at the expected output for the first declaration:
+```
+INTTK int
+IDENFR a1
+LBRACK [
+INTCON 10
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<ConstExp>
+RBRACK ]
+<VarDef>
+SEMICN ;
+<VarDecl>
+```
+
+The `VarDef.output()` method is:
+```java
+public void output(FileWriter fileWriter) throws IOException {
+    fileWriter.write(identifier.toString() + "\n");
+    if (leftB != null) {
+        fileWriter.write(leftB.toString() + "\n");
+        constExp.output(fileWriter);
+        fileWriter.write(rightB.toString() + "\n");
+    }
+    if (equalTk != null) {
+        fileWriter.write(equalTk.toString() + "\n");
+        initVal.output(fileWriter);
+    }
+    fileWriter.write("<VarDef>\n");
+}
+```
+
+For `int a1[10];`, there's no `equalTk`, so it should output:
+- identifier: `IDENFR a1`
+- leftB: `LBRACK [`
+- constExp: (which outputs the whole expression tree ending with `<ConstExp>`)
+- rightB: `RBRACK ]`
+- `<VarDef>`
+
+This matches the expected output.
+
+I'm now considering that the issue might be in the **ConstExp parsing**. Looking at the `parseConstExp()` method:
+
+```java
+public ConstExp parseConstExp() {
+    ConstExp constExp = new ConstExp();
+    constExp.setAddExp(parseAddExp());
+    return constExp;
+}
+```
+
+And `parseAddExp()` calls `parseMulExp()`, which calls `parseUnaryExp()`, etc.
+
+For the token `INTCON 10`, the parsing should go:
+- `parseAddExp()` → `parseMulExp()` → `parseUnaryExp()` → `parsePrimaryExp()`
+
+In `parsePrimaryExp()`:
+```java
+} else if (nowToken.getTokenCode() == TokenCode.INTCON) {
+    primaryExp.setNumber(nowToken);
+    getNextToken();
+}
+```
+
+This consumes the `INTCON 10` token and advances to the next token.
+
+This seems correct.
+
+After extensive analysis, I believe the actual bug is in the **CompUnit parsing logic**, specifically in how it handles the transition from declarations to function definitions. The current logic may be consuming tokens incorrectly.
+
+But looking at the provided expected output, it shows that the parser successfully parses all the way through to `<CompUnit>`, which suggests that the parsing structure is mostly correct.
+
+Wait! I just noticed something critical. In the expected output, for the `MainFuncDef`, it shows:
+```
+INTTK int
+MAINTK main
+LPARENT (
+RPARENT )
+LBRACE {
+...
+RBRACE }
+<Block>
+<MainFuncDef>
+<CompUnit>
+```
+
+But in the `MainFuncDef.output()` method:
+```java
+public void output(FileWriter fileWriter) throws IOException {
+    fileWriter.write(intTk.toString() + "\n");
+    fileWriter.write(mainTk.toString() + "\n");
+    fileWriter.write(leftB.toString() + "\n");
+    fileWriter.write(rightB.toString() + "\n");
+    block.output(fileWriter);
+    fileWriter.write("<MainFuncDef>\n");
+}
+```
+
+This outputs the parentheses tokens before the block, which matches the expected output.
+
+I'm now focusing on the **expression parsing for array dimensions**. In `VarDef.parseVarDef()`:
+
+```java
+if (nowToken.getTokenCode() == TokenCode.LBRACK) {
+    varDef.setLeftB(parseLeftBrack());
+    varDef.setConstExp(parseConstExp());
+    varDef.setRightB(parseRightBrack());
+}
+```
+
+This should correctly parse `[10]` as `LBRACK`, `ConstExp` (containing `10`), `RBRACK`.
+
+Given all this, I suspect the issue might actually be in the **token consumption order** in the expression parsers. Let me look at the `parseUnaryExp` method more carefully:
+
+```java
+public UnaryExp parseUnaryExp() {
+    UnaryExp unaryExp = new UnaryExp();
+    Token token = getNextToken();
+    getBack(1);
+    if (nowToken.getTokenCode() == TokenCode.PLUS ||
+            nowToken.getTokenCode() == TokenCode.MINU ||
+             nowToken.getTokenCode() == TokenCode.NOT) {
+        unaryExp.setUnaryOp(parseUnaryOp());
+        unaryExp.setUnaryExp(parseUnaryExp());
+    } else if (nowToken.getTokenCode() == TokenCode.IDENFR &&
+               token.getTokenCode() == TokenCode.LPARENT) {
+        // function call
+    } else {
+        unaryExp.setPrimaryExp(parsePrimaryExp());
+    }
+    return unaryExp;
+}
+```
+
+The issue here is that `getNextToken()` is called, which advances the token stream, then `getBack(1)` is called to restore it. But if `getNextToken()` returns null (end of file), then `getBack(1)` would cause an error.
+
+However, in our test case, we're parsing `10`, which is an `INTCON`, so it should go to the `else` branch and call `parsePrimaryExp()`.
+
+In `parsePrimaryExp()`, for `INTCON`, it calls `getNextToken()`, which is correct.
+
+I think I've been overcomplicating this. Let me look at the **actual difference** between what's expected and what's happening.
+
+Since the problem states "Wrong Answer" and shows the expected output but not the actual buggy output, I need to infer where the parser would deviate.
+
+Looking at the grammar again, I notice that `ConstExp → AddExp`, and `AddExp` can be just a `MulExp`, which can be just a `UnaryExp`, etc.
+
+The key insight is in the **output order of non-terminals**. Each non-terminal should output its children first, then itself.
+
+Looking at `AddExp.output()`:
+```java
+mulExp.output(fileWriter);
+fileWriter.write("<AddExp>\n");
+```
+
+This is correct - it outputs the `MulExp` subtree, then `<AddExp>`.
+
+Similarly, `MulExp.output()` outputs `unaryExp` then `<MulExp>`.
+
+This creates the nesting seen in the expected output.
+
+After careful consideration, I believe the bug is in the **CompUnit parsing logic**, specifically in the initial token handling. The current implementation calls `getNextToken()` at the start of `parseCompUnit()`, but this token is the first token of the input, and it should be handled by the first `parseDecl()` call.
+
+However, the real smoking gun is in the **function definition parsing**. Looking at the expected output for function `f1`:
+
+```
+INTTK int
+<FuncType>
+IDENFR f1
+LPARENT (
+INTTK int
+IDENFR a
+LBRACK [
+RBRACK ]
+<FuncFParam>
+COMMA ,
+INTTK int
+IDENFR len
+<FuncFParam>
+<FuncFParams>
+RPARENT )
+...
+```
+
+Notice that after the two `FuncFParam` entries, there's `<FuncFParams>`. This means that when there are multiple function parameters, the parser should output `<FuncFParams>`.
+
+Looking at `FuncDef.output()`:
+```java
+if (!funcFParams.isEmpty()) {
+    for (int i = 0;i < funcFParams.size() - 1;i++) {
+        funcFParams.get(i).output(fileWriter);
+        fileWriter.write("COMMA ,\n");
+    }
+    funcFParams.get(funcFParams.size() - 1).output(fileWriter);
+    fileWriter.write("<FuncFParams>\n");
+}
+```
+
+This is correct.
+
+I'm now considering that the issue might be in the **Stmt parsing**, particularly for assignment statements. But the expected output shows those working correctly.
+
+Wait! I found it. Looking at the `parseCompUnit` method:
+
+```java
+public CompUnit parseCompUnit() {
+    CompUnit compUnit = new CompUnit();
+    MainFuncDef mainFuncDef;
+    getNextToken();
+    while (true) {
+        Token token1 = getNextToken();
+        Token token2 = getNextToken();
+        getBack(2);
+        if (token1.getTokenCode() == TokenCode.MAINTK || token2.getTokenCode() == TokenCode.LPARENT) {
+            break;
+        }
+        compUnit.addDecl(parseDecl());
+    }
+    while (true) {
+        if (getNextToken().getTokenCode() == TokenCode.MAINTK) {
+            getBack(1);
+            break;
+        }
+        getBack(1);
+        compUnit.addFuncDef(parseFuncDef());
+    }
+    mainFuncDef = parseMainFuncDef();
+    compUnit.setMainFuncDef(mainFuncDef);
+    return compUnit;
+}
+```
+
+The problem is in the **first while loop condition**. It checks if `token1` is `MAINTK` OR `token2` is `LPARENT`. But `LPARENT` can appear in many contexts, not just function definitions. For example, in expressions like `(a + b)`, or in `printf` calls.
+
+However, at the top level of a CompUnit, after declarations, we should see either function definitions (which start with a type keyword like `int`, `void`, `char`, followed by an identifier, followed by `LPARENT`) or the main function.
+
+The condition `token2.getTokenCode() == TokenCode.LPARENT` is intended to detect function definitions, but it's too broad because it doesn't check what `token1` is.
+
+For a function definition like `int f1(int a[], int len)`, the tokens are:
+- `INTTK`
+- `IDENFR` (f1)
+- `LPARENT`
+
+So `token1` would be `IDENFR` and `token2` would be `LPARENT`, which should trigger the break from the declaration parsing loop.
+
+But for a variable declaration like `int a1[10];`, the tokens are:
+- `INTTK`
+- `IDENFR` (a1)
+- `LBRACK`
+
+So `token2` is `LBRACK`, not `LPARENT`, so it correctly continues parsing as a declaration.
+
+This logic seems correct.
+
+I'm running out of options. Let me consider the possibility that the bug is in the **error handling or token consumption** in the expression parsers.
+
+Looking back at the `parseUnaryExp` method, there's a potential issue:
+
+```java
+Token token = getNextToken();
+getBack(1);
+```
+
+If `getNextToken()` returns null (end of input), then `token` is null, and accessing `token.getTokenCode()` would cause a NullPointerException.
+
+But in our test case, we're not at the end of input when parsing expressions.
+
+Another possibility: in the `parsePrimaryExp` method, for character constants:
+
+```java
+} else {
+    primaryExp.setCharacter(nowToken);
+    getNextToken();
+}
+```
+
+This handles `CHRCON`, which is correct.
+
+After exhaustive analysis, I believe the most likely location of the bug is in the **CompUnit parsing logic**, specifically in how it handles the initial token and the transition between different components. The current implementation may be consuming or skipping tokens incorrectly.
+
+But since I need to provide a specific code snippet, and given the complexity of the issue, I'll focus on the `parseCompUnit` method as the most probable location of the error.
+
+<frontend/Syntax.java>
+...
+    public CompUnit parseCompUnit() {
+        CompUnit compUnit = new CompUnit();
+        MainFuncDef mainFuncDef;
+        getNextToken();
+        while (true) {
+            Token token1 = getNextToken();
+            Token token2 = getNextToken();
+            getBack(2);
+            if (token1.getTokenCode() == TokenCode.MAINTK || token2.getTokenCode() == TokenCode.LPARENT) {
+                break;
+            }
+            compUnit.addDecl(parseDecl());
+        }
+        while (true) {
+            if (getNextToken().getTokenCode() == TokenCode.MAINTK) {
+                getBack(1);
+                break;
+            }
+            getBack(1);
+            compUnit.addFuncDef(parseFuncDef());
+        }
+        mainFuncDef = parseMainFuncDef();
+        compUnit.setMainFuncDef(mainFuncDef);
+        return compUnit;
+    }
+...

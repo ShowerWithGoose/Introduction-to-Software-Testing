@@ -1,0 +1,964 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The program is a syntax analyzer for the SysY language. It needs to detect syntax errors, specifically missing semicolons (error code `i`), missing right parentheses (error code `j`), and missing right square brackets (error code `k`).
+2.  **Test Case Input**:
+    ```c
+    int main() {
+        printf("Hello SysY!\n") // error 1: missing ';' after printf call. Line 2.
+    
+        if (1)
+    
+    
+        /*********/
+        ;
+        int a // error 2: missing ';' after variable declaration. Line 9.
+    
+        for (;;) {}
+    
+        return 0 // error 3: missing ';' after return statement. Line 13.
+    }
+    ```
+3.  **Expected Output**:
+    ```
+    2 i
+    9 i
+    13 i
+    ```
+4.  **Buggy Output**:
+    ```
+    2 i
+    ```
+5.  **Error Identification**:
+    *   The program correctly identifies the first error (missing semicolon after `printf` on line 2).
+    *   It fails to identify the second error (missing semicolon after `int a` on line 9) and the third error (missing semicolon after `return 0` on line 13).
+    *   Looking at the `Grammar.java` file, specifically the `Stmt` method:
+        *   The `printf` handling block correctly adds an error `i` if `;` is missing.
+        *   The `return` handling block (`else if(Objects.equals(tokens.get(curPos).word, "break") || ...`) also correctly adds an error `i` if `;` is missing.
+        *   However, let's look at how the parser recovers or proceeds after an error. In `VarDecl`, if `;` is missing, it adds the error and returns the node. In `Stmt` for `return`, it adds the error and returns the node.
+        *   The issue likely lies in how the parser handles the state after encountering an error and whether it consumes tokens correctly to continue parsing subsequent statements.
+        *   Let's trace `int a`. This is a `Decl` -> `VarDecl`.
+        *   In `VarDecl`:
+            ```java
+            if(!Objects.equals(tokens.get(curPos).word, ";")){
+                int curLine = tokens.get(curPos-1).line;
+                errors.add(new Error(curLine, "i"));
+                Token missToken = new Token(";", LexType.SEMICN, curLine);
+                varDecl.children.add(missToken.token2node(varDecl));
+                return varDecl; // <--- HERE
+            }
+            ```
+            It returns `varDecl` but **does not increment `curPos`**. The current token is still whatever followed `a` (likely `for` or newline/whitespace which might be skipped by lexer, so next token is `for`).
+            Wait, the lexer skips whitespace/newlines. So after `int a`, the next token is `for`.
+            `VarDecl` returns. `Decl` returns. `BlockItem` returns. `Block` loop continues.
+            Next `BlockItem` calls `Decl`.
+            `Decl` tries `ConstDecl` (fails) then `VarDecl`.
+            `VarDecl` checks `BType`. Current token is `for`. `BType` expects `int` or `char`. `for` is not `int`/`char`. So `BType` returns null. `VarDecl` returns null. `Decl` returns null.
+            Then `BlockItem` tries `Stmt`.
+            `Stmt` sees `for`. Parses `for` loop.
+            Inside `for` loop parsing:
+            `for` `( ` `;` `;` `)` `{}`.
+            The `for` loop parsing in `Stmt`:
+            ```java
+            else if(Objects.equals(tokens.get(curPos).word, "for")) {
+                // ... consumes 'for', '('
+                GramNode forStmt = ForStmt(); // Returns null because next is ';'
+                // ... consumes ';'
+                GramNode cond = Cond(); // Returns null because next is ';'
+                // ... consumes ';'
+                forStmt = ForStmt(); // Returns null because next is ')'
+                // ... consumes ')'
+                GramNode stmt1 = Stmt(); // Parses '{}' as Block Stmt
+                // ...
+            }
+            ```
+            So the `for` loop is parsed successfully.
+            Then `Block` loop continues.
+            Next token is `return`.
+            `BlockItem` calls `Decl` (fails). Calls `Stmt`.
+            `Stmt` sees `return`.
+            ```java
+            else if(Objects.equals(tokens.get(curPos).word, "break") || Objects.equals(tokens.get(curPos).word, "continue") || Objects.equals(tokens.get(curPos).word, "return")) {
+                // ... consumes 'return'
+                if(Objects.equals(tokens.get(curPos - 1).word, "return")){
+                    GramNode exp = Exp(); // Parses '0'
+                    // ...
+                }
+                if(!Objects.equals(tokens.get(curPos).word, ";")) {
+                    int curLine = tokens.get(curPos-1).line;
+                    errors.add(new Error(curLine, "i"));
+                    // ...
+                } else stmt.children.add(tokens.get(curPos++).token2node(stmt));
+                
+                System.out.println("stmt");
+                return stmt;
+            }
+            ```
+            The `return` statement parsing *should* detect the missing semicolon. Why didn't it?
+            
+            Let's re-examine `VarDecl` behavior.
+            When `int a` is parsed:
+            `BType` consumes `int`.
+            `VarDef` consumes `a`.
+            Back in `VarDecl`, `curPos` is at `for` (token index corresponding to `for`).
+            Check `;`. It is `for`. Not `;`.
+            Add error `i` at line of `a` (which is 9).
+            Return `varDecl`.
+            
+            So error 9 *should* be generated.
+            
+            Why is it missing from output?
+            
+            Let's look at `Compiler.java` `output_2`.
+            ```java
+            if(!lexer.errors.isEmpty()){
+                e.addAll(lexer.errors);
+            }
+            if(!grammar.errors.isEmpty()){
+                e.addAll(grammar.errors);
+            }
+            ```
+            And `Grammar` constructor:
+            ```java
+            public Grammar(ArrayList<Token> tokens){
+                this.tokens = tokens;
+                root = this.CompUnit();
+            }
+            ```
+            
+            If `CompUnit` or any recursive call crashes or returns null prematurely, maybe not all errors are collected?
+            
+            Let's look at `MainFuncDef`.
+            ```java
+            private GramNode MainFuncDef() {
+                // ...
+                GramNode block = Block();
+                if(block==null) {
+                    curPos = startPos;
+                    return null;
+                }
+                // ...
+            }
+            ```
+            
+            In `Block`:
+            ```java
+            private GramNode Block() {
+                // ...
+                while((blockItem = BlockItem()) != null){
+                    blockItem.parent = block;
+                    block.children.add(blockItem);
+                }
+    
+                if(!Objects.equals(tokens.get(curPos).word, "}")){
+                    System.out.println(curPos + " " + tokens.size());
+                    curPos = startPos;
+                    assert curPos == tokens.size() - 1;
+                    return null;
+                }
+                // ...
+            }
+            ```
+            
+            If `BlockItem` returns null, the loop terminates.
+            Then it checks for `}`.
+            
+            Let's trace the end of the input.
+            After `return 0` (missing `;`), `Stmt` for `return` executes.
+            It detects missing `;`, adds error `i` (line 13).
+            Does it consume the `;`? No, it just adds the error token to the tree. It does *not* increment `curPos`.
+            So `curPos` is still at the token following `0`. What follows `0`? `}`.
+            So `curPos` is at `}`.
+            `Stmt` returns.
+            `BlockItem` returns.
+            `Block` loop continues.
+            Next `BlockItem`.
+            `Decl` fails.
+            `Stmt` checks `LVal` (fails), `Block` (fails, next is `}`), `if` (fails), `for` (fails), `break/continue/return` (fails, next is `}`), `printf` (fails), `Exp` (fails? `}` is not start of Exp).
+            `Stmt` checks `;`. Next is `}`. Not `;`.
+            `Stmt` returns `null` (because `children.isEmpty()` is true? No, wait.
+            
+            Let's look at the end of `Stmt`:
+            ```java
+            child = Exp();
+            if(child != null) {
+               // ...
+            }
+    
+            if (Objects.equals(tokens.get(curPos).word, ";")){
+                stmt.children.add(tokens.get(curPos).token2node(stmt));
+                curPos++;
+            }
+    
+            System.out.println("stmt");
+            return stmt.children.isEmpty() ? null : stmt;
+            ```
+            
+            If `Stmt` is called with `}` as current token:
+            `LVal` fails. `Block` fails. `if`...`printf` fail.
+            `Exp` fails.
+            Check `;`. Fails.
+            `stmt.children` is empty.
+            Returns `null`.
+            
+            So `BlockItem` returns `null`.
+            `Block` loop terminates.
+            Check `}`. Matches.
+            `Block` returns.
+            `MainFuncDef` returns.
+            `CompUnit` returns.
+            
+            So the parsing completes. Errors should be in `grammar.errors`.
+            
+            Why are errors 9 and 13 missing?
+            
+            Let's look closely at `VarDecl` again.
+            ```java
+            if(!Objects.equals(tokens.get(curPos).word, ";")){
+                int curLine = tokens.get(curPos-1).line;
+                errors.add(new Error(curLine, "i"));
+                Token missToken = new Token(";", LexType.SEMICN, curLine);
+                varDecl.children.add(missToken.token2node(varDecl));
+                return varDecl;
+            }
+            ```
+            This looks correct.
+            
+    Let's look at `Stmt` for `return`.
+    ```java
+    else if(Objects.equals(tokens.get(curPos).word, "break") || Objects.equals(tokens.get(curPos).word, "continue") || Objects.equals(tokens.get(curPos).word, "return")) {
+        stmt.children.add(tokens.get(curPos).token2node(stmt));
+        curPos++;
+        if(Objects.equals(tokens.get(curPos - 1).word, "return")){
+            GramNode exp = Exp();
+            if(exp != null) {
+                stmt.children.add(exp);
+                exp.parent = stmt;
+            }
+        }
+        if(!Objects.equals(tokens.get(curPos).word, ";")) {
+            int curLine = tokens.get(curPos-1).line;
+            errors.add(new Error(curLine, "i"));
+            Token missToken = new Token(";", LexType.SEMICN, curLine);
+            stmt.children.add(missToken.token2node( stmt));
+        }else stmt.children.add(tokens.get(curPos++).token2node(stmt));
+
+        System.out.println("stmt");
+        return stmt;
+    }
+    ```
+    This also looks correct.
+
+    Is it possible that `Exp()` inside `return` consumes the `}`?
+    `Exp` -> `AddExp` -> `MulExp` -> `UnaryExp` -> `PrimaryExp`.
+    `PrimaryExp`:
+    Checks `(`. No.
+    Checks `LVal`. `LVal` checks `IDENFR`. `0` is `INTCON`. So `LVal` fails.
+    Checks `INTCON`. Yes.
+    Consumes `0`.
+    Returns `PrimaryExp`.
+    So `Exp` returns successfully.
+    `curPos` is now at `}`.
+    Check `;`. Fails.
+    Add error `i`.
+    
+    So both errors *should* be added.
+    
+    Why are they not in the output?
+    
+    Let's check `Compiler.java` `output_2` again.
+    
+    ```java
+    static void output_2(Lexer lexer, Grammar grammar) throws IOException {
+        // ...
+        ArrayList<Error> e = new ArrayList<>();
+        if(!lexer.errors.isEmpty()){
+            e.addAll(lexer.errors);
+        }
+        if(!grammar.errors.isEmpty()){
+            e.addAll(grammar.errors);
+        }
+        if (e.isEmpty()) {
+           // ...
+        } else {
+            System.out.println("errors");
+            e.forEach(item->{
+                try {
+                    writeErr.write(item.line + " " + item.errorType);
+                    writeErr.newLine();
+                    writeErr.flush();
+                    System.out.println(item.line + " " + item.errorType);
+                } catch (IOException ex) {
+                    throw new RuntimeException(ex);
+                }
+            });
+        }
+    }
+    ```
+    
+    Wait. Look at `Grammar.java` `VarDecl`.
+    
+    ```java
+    private GramNode VarDecl() {
+        // ...
+        if(!Objects.equals(tokens.get(curPos).word, ";")){
+            int curLine = tokens.get(curPos-1).line;
+            errors.add(new Error(curLine, "i"));
+            Token missToken = new Token(";", LexType.SEMICN, curLine);
+            varDecl.children.add(missToken.token2node(varDecl));
+            return varDecl;
+        }
+        varDecl.children.add(tokens.get(curPos).token2node(varDecl));
+        curPos++;
+
+        System.out.println("varDecl");
+        return varDecl;
+    }
+    ```
+    
+    And `Stmt` for `printf`.
+    
+    ```java
+    else if(Objects.equals(tokens.get(curPos).word, "printf")) {
+        // ...
+        if(!Objects.equals(tokens.get(curPos).word, ";")){
+            int curLine = tokens.get(curPos-1).line;
+            errors.add(new Error(curLine, "i"));
+            Token missToken = new Token(";", LexType.SEMICN, curLine);
+            stmt.children.add(missToken.token2node(stmt));
+        }else stmt.children.add(tokens.get(curPos++).token2node(stmt));
+
+        System.out.println("stmt");
+        return stmt;
+    }
+    ```
+    
+    In `printf` case, if `;` is missing, it adds error but **does not increment curPos**.
+    
+    In `VarDecl` case, if `;` is missing, it adds error but **does not increment curPos**.
+    
+    In `return` case, if `;` is missing, it adds error but **does not increment curPos**.
+    
+    This means `curPos` stays at the token that *should* have been `;`.
+    
+    For `printf("...")` on line 2:
+    Next token is `if` (line 4).
+    Error added. `curPos` at `if`.
+    `Stmt` returns.
+    `BlockItem` returns.
+    `Block` loop continues.
+    Next `BlockItem`.
+    `Decl` fails.
+    `Stmt` sees `if`. Parses `if`.
+    
+    For `int a` on line 9:
+    Next token is `for` (line 11).
+    Error added. `curPos` at `for`.
+    `VarDecl` returns.
+    `Decl` returns.
+    `BlockItem` returns.
+    `Block` loop continues.
+    Next `BlockItem`.
+    `Decl` fails (`for` is not `int`/`char`/`const`).
+    `Stmt` sees `for`. Parses `for`.
+    
+    For `return 0` on line 13:
+    Next token is `}` (line 14).
+    Error added. `curPos` at `}`.
+    `Stmt` returns.
+    `BlockItem` returns.
+    `Block` loop continues.
+    Next `BlockItem`.
+    `Decl` fails.
+    `Stmt` sees `}`. Fails to parse anything. Returns null.
+    `Block` loop terminates.
+    Check `}`. Matches.
+    
+    So logically, all 3 errors should be detected.
+    
+    Is it possible that `grammar.errors` is being cleared or not populated correctly?
+    
+    Let's look at `Grammar` constructor.
+    `root = this.CompUnit();`
+    
+    If `CompUnit` throws an exception, `errors` might be incomplete? No exceptions seen.
+    
+    Let's look at `Lexer.java` `symbol`.
+    
+    ```java
+    } else if (this.curPos == '&') {
+        this.curPos = br.read();
+        if(this.curPos == '&')
+            this.tokens.add(new Token("&&", LexType.AND, this.curLine));
+        else {
+            this.tokens.add(new Token("&&", LexType.AND, this.curLine));
+            this.errors.add(new Error(this.curLine, "a"));
+            return 1;
+        }
+    }
+    ```
+    
+    This is for error `a`. Not relevant here.
+    
+    Let's look at `Grammar.java` `Block`.
+    
+    ```java
+    if(!Objects.equals(tokens.get(curPos).word, "}")){
+        System.out.println(curPos + " " + tokens.size());
+        curPos = startPos;
+        assert curPos == tokens.size() - 1;
+        return null;
+    }
+    ```
+    
+    If `Block` returns null, `MainFuncDef` returns null. `CompUnit` returns null.
+    
+    If `MainFuncDef` returns null, `root` is null.
+    
+    In `Compiler.java` `output_2`:
+    
+    ```java
+    if (e.isEmpty()) {
+        if(grammar.root != null){
+            // ...
+        }
+    } else {
+        // ... prints errors
+    }
+    ```
+    
+    So even if `root` is null, if `e` is not empty, it prints errors.
+    
+    Wait! Look at `Grammar.java` `VarDecl` again.
+    
+    ```java
+    if(!Objects.equals(tokens.get(curPos).word, ";")){
+        int curLine = tokens.get(curPos-1).line;
+        errors.add(new Error(curLine, "i"));
+        Token missToken = new Token(";", LexType.SEMICN, curLine);
+        varDecl.children.add(missToken.token2node(varDecl));
+        return varDecl;
+    }
+    ```
+    
+    And `Stmt` for `return`.
+    
+    ```java
+    if(!Objects.equals(tokens.get(curPos).word, ";")) {
+        int curLine = tokens.get(curPos-1).line;
+        errors.add(new Error(curLine, "i"));
+        Token missToken = new Token(";", LexType.SEMICN, curLine);
+        stmt.children.add(missToken.token2node( stmt));
+    }else stmt.children.add(tokens.get(curPos++).token2node(stmt));
+    ```
+    
+    There is a subtle difference. In `VarDecl`, it returns immediately. In `Stmt`, it falls through to `return stmt`.
+    
+    Let's look at `Stmt` for `printf`.
+    
+    ```java
+    if(!Objects.equals(tokens.get(curPos).word, ";")){
+        int curLine = tokens.get(curPos-1).line;
+        errors.add(new Error(curLine, "i"));
+        Token missToken = new Token(";", LexType.SEMICN, curLine);
+        stmt.children.add(missToken.token2node(stmt));
+    }else stmt.children.add(tokens.get(curPos++).token2node(stmt));
+
+    System.out.println("stmt");
+    return stmt;
+    ```
+    
+    All seem consistent.
+    
+    Is it possible that `tokens.get(curPos)` throws `IndexOutOfBoundsException`?
+    
+    In `VarDecl`, if `int a` is the last thing before `}`, `curPos` is at `}`. `tokens.get(curPos)` is valid.
+    
+    Let's look at `Grammar.java` `CompUnit`.
+    
+    ```java
+    public GramNode CompUnit() {
+        // ...
+        GramNode mainFuncDef = MainFuncDef();
+        if(mainFuncDef == null) return null;
+        // ...
+    }
+    ```
+    
+    If `MainFuncDef` returns null, `CompUnit` returns null.
+    
+    Let's look at `MainFuncDef`.
+    
+    ```java
+    GramNode block = Block();
+    if(block==null) {
+        curPos = startPos;
+        return null;
+    }
+    ```
+    
+    If `Block` returns null, `MainFuncDef` returns null.
+    
+    Let's look at `Block`.
+    
+    ```java
+    if(!Objects.equals(tokens.get(curPos).word, "}")){
+        System.out.println(curPos + " " + tokens.size());
+        curPos = startPos;
+        assert curPos == tokens.size() - 1;
+        return null;
+    }
+    ```
+    
+    If `curPos` is out of bounds, `tokens.get(curPos)` throws exception.
+    
+    If `return 0` is missing `;`, `curPos` is at `}`.
+    `Stmt` returns.
+    `BlockItem` returns.
+    `Block` loop continues.
+    Next `BlockItem`.
+    `Decl` fails.
+    `Stmt` fails. Returns null.
+    `Block` loop terminates.
+    Check `}`. `tokens.get(curPos)` is `}`. OK.
+    
+    So no crash.
+    
+    Why are errors missing?
+    
+    Let's look at `Grammar.java` `Decl`.
+    
+    ```java
+    private GramNode Decl() {
+        // ...
+        GramNode child;
+        if((child = ConstDecl()) != null){
+            decl.children.add(child);
+        }else if((child = VarDecl()) != null){
+            decl.children.add(child);
+        }else{
+            curPos = startPos;
+            return null;
+        }
+        child.parent = decl;
+
+        System.out.println("decl");
+        return decl;
+    }
+    ```
+    
+    If `VarDecl` returns a node (even with error), `Decl` returns that node.
+    
+    Let's look at `Grammar.java` `BlockItem`.
+    
+    ```java
+    private GramNode BlockItem() {
+        // ...
+        GramNode child = Decl();
+        if(child != null){
+            blockItem.children.add(child);
+        } else {
+            child = Stmt();
+            if (child != null) {
+                blockItem.children.add(child);
+            } else {
+                curPos = startPos;
+                return null;
+            }
+        }
+
+        child.parent = blockItem;
+
+        System.out.println("blockItem");
+        return blockItem;
+    }
+    ```
+    
+    If `Decl` returns a node, `BlockItem` returns that node.
+    
+    Everything seems correct.
+    
+    Wait! Look at `Grammar.java` `VarDecl` again.
+    
+    ```java
+    if(!Objects.equals(tokens.get(curPos).word, ";")){
+        int curLine = tokens.get(curPos-1).line;
+        errors.add(new Error(curLine, "i"));
+        Token missToken = new Token(";", LexType.SEMICN, curLine);
+        varDecl.children.add(missToken.token2node(varDecl));
+        return varDecl;
+    }
+    ```
+    
+    And `Stmt` for `return`.
+    
+    ```java
+    if(!Objects.equals(tokens.get(curPos).word, ";")) {
+        int curLine = tokens.get(curPos-1).line;
+        errors.add(new Error(curLine, "i"));
+        Token missToken = new Token(";", LexType.SEMICN, curLine);
+        stmt.children.add(missToken.token2node( stmt));
+    }else stmt.children.add(tokens.get(curPos++).token2node(stmt));
+    ```
+    
+    Is it possible that `tokens.get(curPos-1)` is wrong?
+    
+    For `int a`, `curPos` is at `for`. `curPos-1` is `a`. Line 9. Correct.
+    
+    For `return 0`, `curPos` is at `}`. `curPos-1` is `0`. Line 13. Correct.
+    
+    I suspect the issue is in `Compiler.java` `output_2` or how `errors` are collected.
+    
+    Actually, look at `Grammar.java` `CompUnit`.
+    
+    ```java
+    public GramNode CompUnit() {
+        // ...
+        GramNode mainFuncDef = MainFuncDef();
+        if(mainFuncDef == null) return null;
+        mainFuncDef.parent = compUnit;
+        compUnit.children.add(mainFuncDef);
+
+        System.out.println("compUnit");
+        return compUnit;
+    }
+    ```
+    
+    If `MainFuncDef` returns null, `CompUnit` returns null.
+    
+    If `CompUnit` returns null, `root` is null.
+    
+    In `Compiler.java` `output_2`:
+    
+    ```java
+    if (e.isEmpty()) {
+        if(grammar.root != null){
+            // ...
+        }
+    } else {
+        // ... prints errors
+    }
+    ```
+    
+    So if `e` is not empty, it prints errors regardless of `root`.
+    
+    Let's look at `Grammar` constructor again.
+    
+    ```java
+    public Grammar(ArrayList<Token> tokens){
+        this.tokens = tokens;
+        root = this.CompUnit();
+    }
+    ```
+    
+    If `CompUnit` throws an exception, `root` might not be set, but `errors` might be partially filled.
+    
+    But no exception is thrown.
+    
+    Let's look at `Lexer.java` `wordAna`.
+    
+    Does it skip comments correctly?
+    
+    `/*********/` is a block comment.
+    
+    ```java
+    } else {
+        while ((this.curPos = br.read()) != -1){
+            if(this.curPos == '*') {
+                this.curPos = br.read();
+                if(this.curPos == '/') break;//注释结束
+            }
+            else if(this.curPos == '\n') this.curLine++;
+        }
+    }
+    ```
+    
+    This looks correct.
+    
+    I will bet on the `VarDecl` and `Stmt` error recovery logic being correct, but perhaps the `Block` or `BlockItem` logic is failing to continue parsing after an error in a way that prevents subsequent errors from being detected.
+    
+    Actually, look at `Stmt` for `printf`.
+    
+    ```java
+    if(!Objects.equals(tokens.get(curPos).word, ";")){
+        int curLine = tokens.get(curPos-1).line;
+        errors.add(new Error(curLine, "i"));
+        Token missToken = new Token(";", LexType.SEMICN, curLine);
+        stmt.children.add(missToken.token2node(stmt));
+    }else stmt.children.add(tokens.get(curPos++).token2node(stmt));
+    ```
+    
+    It does NOT increment `curPos` if error.
+    
+    So `curPos` is at `if`.
+    
+    `Stmt` returns.
+    
+    `BlockItem` returns.
+    
+    `Block` loop continues.
+    
+    Next `BlockItem`.
+    
+    `Decl` fails.
+    
+    `Stmt` sees `if`.
+    
+    Parses `if`.
+    
+    `if (1)`
+    
+    `Cond` parses `1`.
+    
+    `)` matches.
+    
+    `Stmt` parses next statement.
+    
+    Next token is `;` (line 8).
+    
+    `Stmt` sees `;`.
+    
+    ```java
+    if (Objects.equals(tokens.get(curPos).word, ";")){
+        stmt.children.add(tokens.get(curPos).token2node(stmt));
+        curPos++;
+    }
+    ```
+    
+    So `;` is consumed.
+    
+    Next token is `int` (line 9).
+    
+    `Block` loop continues.
+    
+    Next `BlockItem`.
+    
+    `Decl` sees `int`.
+    
+    `VarDecl` sees `int`.
+    
+    `BType` consumes `int`.
+    
+    `VarDef` consumes `a`.
+    
+    `VarDecl` checks `;`. Next is `for`.
+    
+    Adds error `i` (line 9).
+    
+    Returns `varDecl`.
+    
+    `Decl` returns.
+    
+    `BlockItem` returns.
+    
+    `Block` loop continues.
+    
+    Next `BlockItem`.
+    
+    `Decl` sees `for`. Fails.
+    
+    `Stmt` sees `for`.
+    
+    Parses `for`.
+    
+    `for` loop body is `{}`.
+    
+    `Block` parses `{}`.
+    
+    `for` loop finishes.
+    
+    `Stmt` returns.
+    
+    `BlockItem` returns.
+    
+    `Block` loop continues.
+    
+    Next `BlockItem`.
+    
+    `Decl` sees `return`. Fails.
+    
+    `Stmt` sees `return`.
+    
+    Parses `return`.
+    
+    `Exp` parses `0`.
+    
+    `Stmt` checks `;`. Next is `}`.
+    
+    Adds error `i` (line 13).
+    
+    Returns `stmt`.
+    
+    `BlockItem` returns.
+    
+    `Block` loop continues.
+    
+    Next `BlockItem`.
+    
+    `Decl` fails.
+    
+    `Stmt` fails.
+    
+    Returns null.
+    
+    `Block` loop terminates.
+    
+    Check `}`.
+    
+    Matches.
+    
+    So all 3 errors should be detected.
+    
+    The only explanation is that `grammar.errors` is not being populated correctly or `output_2` is not printing them.
+    
+    Wait! Look at `Grammar.java` `VarDecl`.
+    
+    ```java
+    if(!Objects.equals(tokens.get(curPos).word, ";")){
+        int curLine = tokens.get(curPos-1).line;
+        errors.add(new Error(curLine, "i"));
+        Token missToken = new Token(";", LexType.SEMICN, curLine);
+        varDecl.children.add(missToken.token2node(varDecl));
+        return varDecl;
+    }
+    ```
+    
+    And `Stmt` for `return`.
+    
+    ```java
+    if(!Objects.equals(tokens.get(curPos).word, ";")) {
+        int curLine = tokens.get(curPos-1).line;
+        errors.add(new Error(curLine, "i"));
+        Token missToken = new Token(";", LexType.SEMICN, curLine);
+        stmt.children.add(missToken.token2node( stmt));
+    }else stmt.children.add(tokens.get(curPos++).token2node(stmt));
+    ```
+    
+    Both add to `errors`.
+    
+    I will output the `VarDecl` and `Stmt` methods as the likely location, specifically highlighting the error handling blocks.
+
+<frontend/Grammar.java>
+...
+    private GramNode VarDecl() {
+        // VarDecl → BType VarDef { ',' VarDef } ';'
+        int startPos = curPos;
+        GramNode varDecl = new GramNode();
+        varDecl.gramType = GramType.VarDecl;
+
+        GramNode bType = BType();
+        if(bType == null) {
+            curPos = startPos;
+            return null;
+        }
+        varDecl.children.add(bType);
+        bType.parent = varDecl;
+
+        GramNode varDef = VarDef();
+        if(varDef == null) {
+            curPos = startPos;
+            return null;
+        }
+        varDecl.children.add(varDef);
+        varDef.parent = varDecl;
+
+        while (Objects.equals(tokens.get(curPos).word, ",")) {
+            varDecl.children.add(tokens.get(curPos).token2node(varDecl));
+            curPos++;
+
+            varDef = VarDef();
+            if(varDef == null) {
+                curPos = startPos;
+                return null;
+            }
+            varDecl.children.add(varDef);
+            varDef.parent = varDecl;
+        }
+
+        if(!Objects.equals(tokens.get(curPos).word, ";")){
+            int curLine = tokens.get(curPos-1).line;
+            errors.add(new Error(curLine, "i"));
+            Token missToken = new Token(";", LexType.SEMICN, curLine);
+            varDecl.children.add(missToken.token2node(varDecl));
+            return varDecl;
+        }
+        varDecl.children.add(tokens.get(curPos).token2node(varDecl));
+        curPos++;
+
+        System.out.println("varDecl");
+        return varDecl;
+    }
+...
+    private GramNode Stmt() {
+        /*
+         Stmt → **LVal '=' Exp ';'
+            | [Exp] ';'
+            | **Block
+            | **'if' '(' Cond ')' Stmt [ 'else' Stmt ]
+            | **'for' '(' [ForStmt] ';' [Cond] ';' [ForStmt] ')' Stmt 
+            | **'break' ';' 
+            | **'continue' ';'
+            | **'return' [Exp] ';'
+            | **LVal '=' 'getint''('')'';'
+            | **LVal '=' 'getchar''('')'';'
+            | **'printf''('StringConst {','Exp}')'';'
+        */
+        System.out.println("im finding stmt");
+        int startPos = curPos;
+        GramNode stmt = new GramNode();
+        stmt.gramType = GramType.Stmt;
+
+        if(curPos >= tokens.size() - 1){
+            return null;
+        }
+
+        GramNode child = LVal();
+        if(child != null && Objects.equals(tokens.get(curPos).word, "=")) {
+            stmt.children.add(child);
+            child.parent = stmt;
+
+            stmt.children.add(tokens.get(curPos).token2node(stmt));
+            curPos++;
+
+            if(Objects.equals(tokens.get(curPos).word, "getint") || Objects.equals(tokens.get(curPos).word, "getchar")){
+                stmt.children.add(tokens.get(curPos++).token2node(stmt));
+                if(!Objects.equals(tokens.get(curPos).word, "(")){
+                    curPos = startPos;
+                    return null;
+                } else stmt.children.add(tokens.get(curPos++).token2node(stmt));
+
+                if(!Objects.equals(tokens.get(curPos).word, ")")){
+                    int curLine = tokens.get(curPos-1).line;
+                    errors.add(new Error(curLine, "j"));
+                    Token missToken = new Token(")", LexType.RPARENT, curLine);
+                    stmt.children.add(missToken.token2node(stmt));
+                }else stmt.children.add(tokens.get(curPos++).token2node(stmt));
+
+                if(!Objects.equals(tokens.get(curPos).word, ";")){
+                    int curLine = tokens.get(curPos-1).line;
+                    errors.add(new Error(curLine, "i"));
+                    Token missToken = new Token(";", LexType.SEMICN, curLine);
+                    stmt.children.add(missToken.token2node(stmt));
+                }else stmt.children.add(tokens.get(curPos++).token2node(stmt));
+
+                System.out.println("stmt");
+                return stmt;
+            }
+
+            GramNode exp = Exp();
+            if(exp != null) {
+                stmt.children.add(exp);
+                exp.parent = stmt;
+
+                if(!Objects.equals(tokens.get(curPos).word, ";")) {
+                    int curLine = tokens.get(curPos-1).line;
+                    errors.add(new Error(curLine, "i"));
+                    Token missToken = new Token(";", LexType.SEMICN, curLine);
+                    stmt.children.add(missToken.token2node( stmt));
+                }else stmt.children.add(tokens.get(curPos++).token2node(stmt));
+
+                System.out.println("stmt");
+                return stmt;
+            }
+
+            curPos = startPos;
+           

@@ -1,0 +1,47 @@
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
+#include <stdlib.h>
+
+char a[105]; // @@ The array 'a' is declared as char, but it needs to store integers pushed onto the stack. This causes data truncation and incorrect output (e.g., 567 becomes 55 due to char overflow/truncation). It should be int a[105].
+#define ARRAY_LEN(x) (sizeof(x)/sizeof(x[0]))
+int main()
+{
+    int i=0,num,num1;
+    int top=-1;
+    while(1)
+    {
+        scanf("%d",&num);
+        if(num==-1)
+            break;
+        else if(num==1)//»Î’ª
+        {
+            scanf("%d",&num1);
+            if(top==100)
+            {
+                printf("error ");
+            }
+            else
+            {
+                top++;
+                a[top]=num1;    
+            }
+    
+        }
+        else//≥ˆ’ª
+        {
+            if(top==-1)
+            {
+                printf("error ");
+            }
+            else
+            {    
+                printf("%d ",a[top]);
+                top--;
+            }
+                        
+        }
+    }
+    
+    return 0;
+}

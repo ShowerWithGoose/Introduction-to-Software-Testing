@@ -1,0 +1,413 @@
+package frontend;
+import java.io.*;
+import java.util.*;
+
+public class Lexer {
+    private static Lexer instance;
+    private String source;
+    private int curPos;
+    private String token;
+    private LexType lexType;
+    private List<String> reserveWords;
+    private int lineNum;
+    private int number;
+    private String inputFile;
+    private String outputFile;
+    private String errorFile;
+    private List<Token> tokens = new ArrayList<>();
+    private List<String> errors = new ArrayList<>();
+
+    private Lexer() {
+        reserveWords = Arrays.asList("const", "int", "char", "if", "else", "for", "while", "return", "break", "continue", "void", "main", "getint", "getchar", "printf");
+    }
+
+    public static Lexer getInstance() {
+        if (instance == null) {
+            instance = new Lexer();
+        }
+        return instance;
+    }
+
+    public void initialize(String inputFile, String outputFile, String errorFile) {
+        this.inputFile = inputFile;
+        this.outputFile = outputFile;
+        this.errorFile = errorFile;
+        this.lineNum = 1;
+        loadSource();
+    }
+
+    private void loadSource() {
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new FileReader(inputFile))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sb.append(line).append("\n");
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        this.source = sb.toString();
+    }
+
+    public void tokenize() {
+        while (curPos < source.length()) {
+            next();
+            if (lexType != null) {
+                tokens.add(new Token(lexType, token));
+            }
+        }
+        outputResults();
+        outputErrors();
+    }
+
+    public void next() {
+        token = "";
+        lexType = null;
+
+        while (curPos < source.length() && Character.isWhitespace(source.charAt(curPos))) {
+            if (source.charAt(curPos) == '\n') {
+                lineNum++;
+            }
+            curPos++;
+        }
+
+        if (curPos >= source.length()) {
+            return;
+        }
+
+        char currentChar = source.charAt(curPos);
+        char nextChar = curPos + 1 < source.length() ? source.charAt(curPos + 1) : '\0';
+
+        if (currentChar == '/' && nextChar == '/') {
+            skipSingleLineComment();
+            next(); // Recursive call to continue lexing after skipping comment
+            return;
+        } else if (currentChar == '/' && nextChar == '*') {
+            skipMultiLineComment();
+            next(); // Recursive call to continue lexing after skipping comment
+            return;
+        }
+
+        switch (currentChar) {
+            case '!':
+                if (nextChar == '=') {
+                    token = "!=";
+                    lexType = LexType.NEQ;
+                    curPos += 2;
+                } else {
+                    token = "!";
+                    lexType = LexType.NOT;
+                    curPos++;
+                }
+                break;
+            case '&':
+                if (nextChar == '&') {
+                    token = "&&";
+                    lexType = LexType.AND;
+                    curPos += 2;
+                } else {
+                    addError(lineNum + " a");
+                    curPos++;
+                }
+                break;
+            case '|':
+                if (nextChar == '|') {
+                    token = "||";
+                    lexType = LexType.OR;
+                    curPos += 2;
+                } else {
+                    addError(lineNum + " a");
+                    curPos++;
+                }
+                break;
+            case '+':
+                token = "+";
+                lexType = LexType.PLUS;
+                curPos++;
+                break;
+            case '-':
+                token = "-";
+                lexType = LexType.MINU;
+                curPos++;
+                break;
+            case '*':
+                token = "*";
+                lexType = LexType.MULT;
+                curPos++;
+                break;
+            case '/':
+                token = "/";
+                lexType = LexType.DIV;
+                curPos++;
+                break;
+            case '%':
+                token = "%";
+                lexType = LexType.MOD;
+                curPos++;
+                break;
+            case '<':
+                if (nextChar == '=') {
+                    token = "<=";
+                    lexType = LexType.LEQ;
+                    curPos += 2;
+                } else {
+                    token = "<";
+                    lexType = LexType.LSS;
+                    curPos++;
+                }
+                break;
+            case '>':
+                if (nextChar == '=') {
+                    token = ">=";
+                    lexType = LexType.GEQ;
+                    curPos += 2;
+                } else {
+                    token = ">";
+                    lexType = LexType.GRE;
+                    curPos++;
+                }
+                break;
+            case '=':
+                if (nextChar == '=') {
+                    token = "==";
+                    lexType = LexType.EQL;
+                    curPos += 2;
+                } else {
+                    token = "=";
+                    lexType = LexType.ASSIGN;
+                    curPos++;
+                }
+                break;
+            case ';':
+                token = ";";
+                lexType = LexType.SEMICN;
+                curPos++;
+                break;
+            case ',':
+                token = ",";
+                lexType = LexType.COMMA;
+                curPos++;
+                break;
+            case '(':
+                token = "(";
+                lexType = LexType.LPARENT;
+                curPos++;
+                break;
+            case ')':
+                token = ")";
+                lexType = LexType.RPARENT;
+                curPos++;
+                break;
+            case '[':
+                token = "[";
+                lexType = LexType.LBRACK;
+                curPos++;
+                break;
+            case ']':
+                token = "]";
+                lexType = LexType.RBRACK;
+                curPos++;
+                break;
+            case '{':
+                token = "{";
+                lexType = LexType.LBRACE;
+                curPos++;
+                break;
+            case '}':
+                token = "}";
+                lexType = LexType.RBRACE;
+                curPos++;
+                break;
+            case '"':
+                tokenizeStringConstant();
+                break;
+            case '\'':
+                tokenizeCharConstant();
+                break;
+            default:
+                if (isNonDigit(currentChar)) {
+                    tokenizeIdentifierOrReservedWord();
+                } else if (Character.isDigit(currentChar)) {
+                    tokenizeNumber();
+                } else {
+                    addError("Unknown token at line " + lineNum + ": " + currentChar);
+                    curPos++;
+                }
+                break;
+        }
+    }
+
+    private void skipSingleLineComment() {
+        curPos += 2; // Skip the "//"
+        while (curPos < source.length() && source.charAt(curPos) != '\n') {
+            curPos++;
+        }
+        if (curPos < source.length() && source.charAt(curPos) == '\n') {
+            lineNum++;
+            curPos++;
+        }
+    }
+
+    private void skipMultiLineComment() {
+        curPos += 2; // Skip the "/*"
+        while (curPos + 1 < source.length() && !(source.charAt(curPos) == '*' && source.charAt(curPos + 1) == '/')) {
+            if (source.charAt(curPos) == '\n') {
+                lineNum++;
+            }
+            curPos++;
+        }
+        if (curPos + 1 < source.length() && source.charAt(curPos) == '*' && source.charAt(curPos + 1) == '/') {
+            curPos += 2; // Skip the "*/"
+        } else {
+            addError("Unterminated multi-line comment at line " + lineNum);
+            curPos++;
+        }
+    }
+
+    private void tokenizeStringConstant() {
+        StringBuilder tokenBuilder = new StringBuilder();
+        tokenBuilder.append('"');
+        curPos++;
+        while (curPos < source.length() && source.charAt(curPos) != '"') {
+            char currentChar = source.charAt(curPos);
+            if (currentChar == '\n') {
+                lineNum++;
+            }
+            tokenBuilder.append(currentChar);
+            curPos++;
+        }
+        if (curPos < source.length() && source.charAt(curPos) == '"') {
+            tokenBuilder.append('"');
+            curPos++;
+            token = tokenBuilder.toString();
+            lexType = LexType.STRCON;
+        } else {
+            addError("Unterminated string constant at line " + lineNum);
+            lexType = LexType.ERROR;
+        }
+    }
+
+    private void tokenizeCharConstant() {
+        StringBuilder tokenBuilder = new StringBuilder();
+        tokenBuilder.append('\''); // 添加起始引号
+        curPos++;
+        if (curPos < source.length() && curPos + 1 < source.length() && source.charAt(curPos + 1) == '\'') {
+            tokenBuilder.append(source.charAt(curPos));
+            tokenBuilder.append('\''); // 添加结束引号
+            token = tokenBuilder.toString();
+            lexType = LexType.CHRCON;
+            curPos += 2;
+        } else {
+            addError("Unterminated char constant at line " + lineNum);
+            lexType = LexType.ERROR;
+            while (curPos < source.length() && source.charAt(curPos) != '\n') {
+                curPos++;
+            }
+        }
+    }
+
+    private void tokenizeIdentifierOrReservedWord() {
+        StringBuilder tokenBuilder = new StringBuilder();
+        tokenBuilder.append(source.charAt(curPos));
+        curPos++;
+        while (curPos < source.length() && (isNonDigit(source.charAt(curPos)) || Character.isDigit(source.charAt(curPos)))) {
+            tokenBuilder.append(source.charAt(curPos));
+            curPos++;
+        }
+        token = tokenBuilder.toString();
+        reserve();
+    }
+
+    private void tokenizeNumber() {
+        StringBuilder tokenBuilder = new StringBuilder();
+        tokenBuilder.append(source.charAt(curPos));
+        curPos++;
+        while (curPos < source.length() && Character.isDigit(source.charAt(curPos))) {
+            tokenBuilder.append(source.charAt(curPos));
+            curPos++;
+        }
+        token = tokenBuilder.toString();
+        lexType = LexType.INTCON;
+        number = Integer.parseInt(token);
+    }
+
+    private void reserve() {
+        switch (token) {
+            case "else":
+                lexType = LexType.ELSETK;
+                break;
+            case "void":
+                lexType = LexType.VOIDTK;
+                break;
+            case "main":
+                lexType = LexType.MAINTK;
+                break;
+            case "for":
+                lexType = LexType.FORTK;
+                break;
+            case "const":
+                lexType = LexType.CONSTTK;
+                break;
+            case "getint":
+                lexType = LexType.GETINTTK;
+                break;
+            case "int":
+                lexType = LexType.INTTK;
+                break;
+            case "getchar":
+                lexType = LexType.GETCHARTK;
+                break;
+            case "char":
+                lexType = LexType.CHARTK;
+                break;
+            case "printf":
+                lexType = LexType.PRINTFTK;
+                break;
+            case "break":
+                lexType = LexType.BREAKTK;
+                break;
+            case "return":
+                lexType = LexType.RETURNTK;
+                break;
+            case "continue":
+                lexType = LexType.CONTINUETK;
+                break;
+            case "if":
+                lexType = LexType.IFTK;
+                break;
+            default:
+                lexType = LexType.IDENFR;
+                break;
+        }
+    }
+
+    private void addError(String errorMsg) {
+        errors.add(errorMsg);
+    }
+
+    private boolean isNonDigit(char c) {
+        return Character.isLetter(c) || c == '_';
+    }
+
+    private void outputResults() {
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(outputFile))) {
+            for (Token token : tokens) {
+                writer.write(token.getLexType() + " " + token.getValue());
+                writer.newLine();
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void outputErrors() {
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(errorFile))) {
+            for (String error : errors) {
+                writer.write(error);
+                writer.newLine();
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}

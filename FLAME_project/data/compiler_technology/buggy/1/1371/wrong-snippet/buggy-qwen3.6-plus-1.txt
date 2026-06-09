@@ -1,0 +1,783 @@
+Based on the analysis of the problem description, test case, expected output, and source code:
+
+1.  **Problem Analysis**: The program is a syntax analyzer. It needs to parse a C-like language. The specific test case involves variable declarations (`int a;`, `int b = ...`) and a `main` function.
+2.  **Expected Output vs Buggy Output**: The buggy output is empty, while the expected output shows a full trace of tokens and non-terminals. This suggests the parser either crashed, produced no output, or the output mechanism failed. However, looking at the `Grammar.java` code, there are significant logical flaws in how it distinguishes between `Decl` (Declaration) and `FuncDef`/`MainFuncDef`.
+3.  **Code Analysis (`Grammar.java`)**:
+    *   In `parserCompUnit`, the logic for parsing `Decl` and `FuncDef` is highly irregular. It manually peeks ahead (`this.move()`, `this.up()`) to decide whether to call `parserDecl` or `parserFuncDef`.
+    *   Specifically, look at `parserDecl()`:
+        ```java
+        public void parserDecl(){
+          if (this.now().getContent().equals("const")) {
+              // ... handles const decl
+          } //ConstDecl;
+          else {
+              this.move(); // Moves past 'int' or 'char'
+              if(returnContent().equals("main")) { // Checks if next is 'main'
+                  this.up(); // Moves back
+                  return; // Exits without parsing anything if it looks like main?
+              }
+              this.up(); // Moves back to 'int'/'char'
+              match_BType(); // Parses 'int'/'char' and advances
+              parserVarDef();
+              // ...
+          }
+        }
+        ```
+    *   And `parserMainFuncDef()`:
+        ```java
+        public void parserMainFuncDef() {
+           match_BType(); // Expects 'int'
+           addToList(new Token(Token.Type.KEYWORD,"main",this.now().getLine())); // Adds 'main' token BUT does not advance cursor (match_BType advances, but this line just adds a token based on current cursor which is now at 'main'?)
+           // Wait, match_BType consumes 'int'. So now() is 'main'.
+           // It adds a token for 'main' but DOES NOT consume it (no move()).
+           match_lparent(); // Expects '(' but current token is still 'main'. Mismatch/Error.
+           // ...
+        }
+        ```
+    *   The critical error is in `parserMainFuncDef`. It calls `match_BType()` which consumes `int`. Then it manually adds a `main` token but doesn't consume the `main` identifier. Then it calls `match_lparent()`, which expects `(` but finds `main`. This likely triggers an error or infinite loop depending on error handling, or simply fails to parse correctly.
+    *   Furthermore, in `parserCompUnit`, the logic `if(returnContent().equals("main")) { this.up(); break; }` inside the `FuncDef` loop attempts to handle `main` by breaking out and calling `parserMainFuncDef`. But `parserMainFuncDef` implementation is flawed as described above.
+    *   Let's look closer at `parserMainFuncDef`:
+        ```java
+        public void parserMainFuncDef() {
+           match_BType(); // Consumes 'int', adds INTTK. Cursor now at 'main'.
+           addToList(new Token(Token.Type.KEYWORD,"main",this.now().getLine())); // Adds MAINTK for 'main'. Cursor STILL at 'main'.
+           match_lparent(); // Checks if current token is '('. It is 'main'. Fails.
+           // ...
+        }
+        ```
+        The `addToList` method only moves the cursor if the token type is NOT `NAME`. Here, the token type is `KEYWORD`. So `addToList` DOES move the cursor.
+        Let's re-read `addToList`:
+        ```java
+        public void addToList(Token token){
+            this.list.add(token);
+            if(token.getType()!= Token.Type.NAME)
+                this.move();
+        }
+        ```
+        So, `match_BType()` consumes `int`. Cursor at `main`.
+        `addToList(new Token(..., "main", ...))` adds `main` token. Since type is `KEYWORD` (not `NAME`), it calls `this.move()`. Cursor now at `(`.
+        `match_lparent()` checks for `(`. It matches.
+        So `parserMainFuncDef` might actually work structurally if called correctly.
+
+    *   Let's look at `parserCompUnit` again.
+        The loop `while(returnContent().equals("int")||returnContent().equals("char")||returnContent().equals("void"))` handles FuncDefs.
+        Inside:
+        ```java
+        this.move(); // Consume int/void/char
+        if(returnContent().equals("main")) {
+            this.up(); // Go back to int/void/char
+            break; // Break loop to call parserMainFuncDef
+        }
+        this.move(); // Consume Ident (Func Name)
+        sign_2=1;
+        if(returnContent().equals("(")) {
+             this.up(); // Go back to Ident
+             this.up(); // Go back to int/void/char
+             parserFuncDef();
+             sign_2 = 0;
+        }
+        ```
+        If it breaks, it calls `parserMainFuncDef()`.
+        
+    *   However, there is a major issue in `parserDecl` called from the first loop in `parserCompUnit`.
+        The first loop:
+        ```java
+        while (returnContent().equals("int")||returnContent().equals("char")
+                ||returnContent().equals("const")||returnContent().equals(",")) {
+            if(returnContent().equals("const")) {
+                parserDecl();
+                continue;
+            }
+            int line = this.now().getLine();
+            this.move(); // Consume int/char
+            this.move(); // Consume Ident
+            sign_1 = 1;
+            if(returnContent().equals("[")||returnContent().equals("=")||
+                    returnContent().equals(";")||returnContent().equals(",")||this.now().getLine()>line) {
+                this.up(); // Back to Ident
+                this.up(); // Back to int/char
+                parserDecl();
+                sign_1 = 0;
+            }
+        }
+        ```
+        This logic tries to distinguish `int a;` (Decl) from `int main()...` (Func).
+        If input is `int main() { ... }`:
+        1. `returnContent` is "int".
+        2. `move()` -> "main".
+        3. `move()` -> "(".
+        4. `returnContent` is "(".
+        5. Condition `returnContent().equals("[")...` is false. `this.now().getLine()>line`? Usually same line. False.
+        6. So it does NOT call `parserDecl`. It stays with `sign_1 = 1`.
+        7. Loop continues? `returnContent` is "(". Not int/char/const/,. Loop ends.
+        8. `if (sign_1 == 1) { this.up(); this.up(); }` -> Goes back to "int".
+        
+        Then next loop: `while(int/char/void)`.
+        1. `returnContent` is "int".
+        2. `move()` -> "main".
+        3. `if(returnContent().equals("main"))` -> True.
+        4. `this.up()` -> Back to "int".
+        5. `break`.
+        
+        Then `parserMainFuncDef()`.
+        
+        This seems logically sound for `main`. What about `int a;`?
+        1. `returnContent` is "int".
+        2. `move()` -> "a".
+        3. `move()` -> ";".
+        4. `returnContent` is ";".
+        5. Condition `returnContent().equals(";")` is True.
+        6. `up`, `up` -> Back to "int".
+        7. `parserDecl()`.
+        
+        Inside `parserDecl()` for `int a;`:
+        1. Not const.
+        2. `move()` -> "a".
+        3. `if(returnContent().equals("main"))` -> False.
+        4. `up()` -> Back to "int".
+        5. `match_BType()` -> Consumes "int".
+        6. `parserVarDef()` -> Parses "a", then checks for `[` or `=`. Finds `;`.
+        7. `match_semicn()` -> Consumes `;`.
+        
+        This also seems correct.
+
+    *   So why is the output empty?
+        Look at `output.java`.
+        ```java
+        if(sign == 0 && errors.isEmpty()) {
+            // write to parser.txt
+        }
+        // write errors to error.txt
+        ```
+        In `Compiler.java`:
+        ```java
+        Grammar grammar  = new Grammar(token,list,sign,errors);
+        output out1 = new output(list,error_flag,errors);
+        ```
+        `sign` is passed as `0` to `Grammar`. But `Grammar` has a member `sign`.
+        In `Grammar` constructor: `this.sign = sign;` (which is 0).
+        However, inside `Grammar`, `sign` is modified when errors occur (e.g., `sign = 1;`).
+        But `Compiler.java` passes local variable `sign` (which is 0) to `output`. It does NOT pass `grammar.sign`.
+        Wait, `output` constructor takes `int sign`.
+        `new output(list, error_flag, errors)`.
+        `error_flag` is set in `Compiler.read` if lexer finds errors.
+        
+        If the parser encounters an error, it adds to `errors` list.
+        In `output.java`:
+        ```java
+        if(sign == 0 && errors.isEmpty()) {
+             // output parser.txt
+        }
+        // Always output error.txt
+        ```
+        If `errors` is NOT empty, it skips parser.txt output.
+        
+        Does the parser generate an error for the valid input?
+        Let's check `parserBlockItem` or `parserStmt`.
+        
+        Actually, there is a subtle bug in `parserDecl` inside the `else` block:
+        ```java
+        else {
+            this.move();
+            if(returnContent().equals("main")) {
+                this.up();
+                return;
+            }
+            this.up();
+            match_BType();
+            // ...
+        }
+        ```
+        If `parserDecl` is called for `int main...` (which shouldn't happen due to `CompUnit` logic, but if it did), it returns early.
+        
+        Let's look at `parserFuncDef`.
+        ```java
+        public void parserFuncDef() {
+            this.move(); // Consumes return type (int/void/char)
+            if(returnContent().equals("main")) {
+                this.up();
+                return;
+            }
+            this.up(); // Back to return type
+            match_funcType(); // Consumes return type
+            // ...
+        }
+        ```
+        
+        Let's look at `parserMainFuncDef` again.
+        ```java
+        public void parserMainFuncDef() {
+           match_BType(); // Consumes int
+           addToList(new Token(Token.Type.KEYWORD,"main",this.now().getLine())); // Adds main, moves cursor
+           match_lparent(); // Consumes (
+           match_rparent(); // Consumes )
+           parserBlock(); // Parses block
+           addToList(new Token(Token.Type.NAME,"<MainFuncDef>",0));
+        }
+        ```
+        
+        Is there an error in `parserBlock`?
+        ```java
+        public void parserBlock() {
+          if (this.now().getType()==Token.Type.LBRACE) {
+              addToList(new Token(Token.Type.LBRACE,"{",this.now().getLine()));
+              parserBlockItem();
+              while (!returnContent().equals("}")) {
+               parserBlockItem();
+              }
+              match_rbrace();
+          }
+          addToList(new Token(Token.Type.NAME,"<Block>",0));
+        }
+        ```
+        If `parserBlockItem` fails to consume tokens correctly, it might infinite loop or error.
+        
+        Let's look at `parserBlockItem`.
+        ```java
+        public void parserBlockItem() {
+          if (returnContent().equals("const")||returnContent().equals("int")
+          ||returnContent().equals("char")) {
+              parserDecl();
+          } else if(returnContent().equals("}")) {
+              return;
+          }
+          else {
+              parserStmt();
+          }
+        }
+        ```
+        
+        Let's look at `parserStmt` for `printf`.
+        ```java
+         } else if(returnContent().equals("printf")) {
+             addToList(new Token(Token.Type.KEYWORD,"printf",this.now().getLine()));
+             addToList(new Token(Token.Type.LPARENT,"(",this.now().getLine())); // BUG: Adds LPARENT but doesn't check/consume actual '(' token properly?
+             // addToList moves cursor if not NAME. KEYWORD moves cursor.
+             // So after printf, cursor is at '('.
+             // This line adds LPARENT token for '('. Moves cursor to String.
+             addToList(new Token(Token.Type.STRCON,returnContent(),this.now().getLine())); // Adds STRCON. Moves cursor to ','.
+             while(returnContent().equals(",")) {
+                 addToList(new Token(Token.Type.COMMA,",",this.now().getLine()));
+                 parserExp();
+             }
+             match_rparent();
+             match_semicn();
+         }
+        ```
+        This looks okay-ish, assuming `addToList` behaves as expected.
+        
+        However, there is a critical error in **`parserExp`**:
+        ```java
+    public void parserExp(){
+        this.up(); // BUG: Why up?
+        int line = this.now().getLine();
+        this.move();
+        if (returnContent().equals(";")||returnContent().equals("}")) {
+            return;
+        }
+        parserAddExp();
+        addToList(new Token(Token.Type.NAME,"<Exp>",0));
+    }
+        ```
+        `parserExp` is called by `parserInitVal`, `parserStmt`, etc.
+        If `parserExp` starts by doing `this.up()`, it goes back one token. Then `this.move()` goes forward. Net effect: 0?
+        No. `this.up()` decrements `cur`. `this.move()` increments `cur`.
+        So it effectively looks at the *current* token again?
+        If `cur` was pointing to the start of the expression, `up` makes it point to previous. `move` makes it point to start of expression.
+        Then it checks if it is `;` or `}`. If so, returns without parsing Exp.
+        This logic is intended to handle optional Exp in Stmt (`[Exp] ';'`).
+        
+        But wait. If `parserExp` is called from `parserInitVal` (e.g., `int b = 114514;`):
+        Context: `parserInitVal` calls `parserExp`.
+        Current token is `114514` (INTCON).
+        `this.up()` -> points to `=`.
+        `this.move()` -> points to `114514`.
+        Check `;` or `}`? No.
+        `parserAddExp()`.
+        
+        This seems to work by accident for some cases, but it's very fragile.
+        
+        Let's look at the **Buggy Output** being empty.
+        If `errors` list is not empty, `parser.txt` is not written.
+        Does the parser generate an error?
+        
+        In `parserCompUnit`, the logic for `Decl` vs `FuncDef` relies on peeking.
+        
+        Let's look at `lexer.java`.
+        The lexer handles comments.
+        
+        Let's look at `Grammar.java` -> `parserDecl` again.
+        
+        There is a specific bug in `parserMainFuncDef` regarding the `main` token output format.
+        Expected: `MAINTK main`
+        Code: `addToList(new Token(Token.Type.KEYWORD,"main",...))`
+        `output.java` converts KEYWORD "main" to `MAINTK`. Correct.
+        
+        Let's look at `parserFuncDef` vs `parserMainFuncDef` invocation.
+        
+        Actually, the most likely cause for "Wrong Answer" with empty output or incorrect output in these types of assignments is often **failure to match the structure** leading to an **Error** being recorded, thus suppressing the parser output.
+        
+        In `Grammar.java`, `match_rbrace`, `match_rparent`, `match_semicn` add errors if they fail.
+        
+        Let's trace `int a;`.
+        `parserCompUnit` loop 1.
+        `int` -> `move` -> `a` -> `move` -> `;`.
+        `;` matches condition. `up`, `up`. `parserDecl`.
+        `parserDecl`: `move` -> `a`. `main`? No. `up`. `match_BType` (consumes `int`). `parserVarDef`.
+        `parserVarDef`: `match_Ident` (consumes `a`). `[`? No. `=`? No. `<VarDef>` added.
+        Back to `parserDecl`. `,`? No. `match_semicn` (consumes `;`). `<VarDecl>` added.
+        
+        Trace `int main() { ... }`.
+        Loop 1 ends. `sign_1` reset?
+        Loop 2. `int`. `move` -> `main`. `main`? Yes. `up`. `break`.
+        `parserMainFuncDef`.
+        `match_BType` (consumes `int`).
+        `addToList` (consumes `main`).
+        `match_lparent` (consumes `(`).
+        `match_rparent` (consumes `)`).
+        `parserBlock`.
+        
+        Inside `parserBlock`:
+        `{` consumed.
+        `parserBlockItem`.
+        `int a = 5;`.
+        `parserDecl`.
+        `move` -> `a`. `main`? No. `up`. `match_BType` (consumes `int`).
+        `parserVarDef`.
+        `match_Ident` (consumes `a`).
+        `[`? No.
+        `=`? Yes. `addToList` (=). `parserInitVal`.
+        `parserInitVal`: `parserExp`.
+        `parserExp`: `up` (to =), `move` (to 5). `;`? No. `parserAddExp`.
+        `parserAddExp` -> `parserMulExp` -> `parserUnaryExp` -> `parserPrimaryExp`.
+        `parserPrimaryExp`: `INTCON`. Adds `INTCON 5`. `<Number>`. `<PrimaryExp>`.
+        Back up chain adding `<UnaryExp>`, `<MulExp>`, `<AddExp>`.
+        Back to `parserExp`. Adds `<Exp>`.
+        Back to `parserInitVal`. Adds `<InitVal>`.
+        Back to `parserVarDef`. Adds `<VarDef>`.
+        Back to `parserDecl`. `,`? No. `match_semicn` (consumes `;`). `<VarDecl>`.
+        
+        This trace looks correct.
+        
+        Why would it fail?
+        
+        Look at `parserStmt` for `return 0;`.
+        `returnContent` is `return`.
+        `addToList` (return).
+        `if (this.now().getLine()==line)` ...
+        `parserExp`.
+        `match_semicn`.
+        `<Stmt>`.
+        
+        Look at `parserStmt` for `printf`.
+        `printf("%d\n%d %d\n", a, b, c);`
+        `addToList` (printf). Cursor at `(`.
+        `addToList` (LPARENT). Cursor at `String`.
+        `addToList` (STRCON). Cursor at `,`.
+        `while(,)`:
+          `addToList` (COMMA). Cursor at `a`.
+          `parserExp`.
+          `parserExp` does `up` (to ,), `move` (to a).
+          Parses `a`.
+          Cursor at `,`.
+        `while(,)`:
+          `addToList` (COMMA). Cursor at `b`.
+          `parserExp`.
+          Parses `b`.
+          Cursor at `,`.
+        `while(,)`:
+          `addToList` (COMMA). Cursor at `c`.
+          `parserExp`.
+          Parses `c`.
+          Cursor at `)`.
+        `match_rparent`.
+        `match_semicn`.
+        `<Stmt>`.
+        
+        Everything seems to parse correctly.
+        
+        However, there is a discrepancy in **`parserCompUnit`** logic regarding `sign_1` and `sign_2`.
+        
+        If the parser works correctly, `errors` should be empty. `error_flag` from lexer should be 0.
+        So `sign` passed to output is 0. `errors` is empty.
+        So it SHOULD output.
+        
+        If the output is empty, maybe `list` is empty?
+        `list` is populated by `addToList`.
+        
+        Is it possible that `parserMainFuncDef` is NOT called?
+        In `parserCompUnit`:
+        ```java
+        while(returnContent().equals("int")||returnContent().equals("char")||returnContent().equals("void")) {
+            if(returnContent().equals("void")) {
+                parserFuncDef();
+                continue;
+            }
+            this.move();
+            if(returnContent().equals("main")) {
+                this.up();
+                break;
+            }
+            this.move();
+            sign_2=1;
+            if(returnContent().equals("(")) {
+                this.up();
+                this.up();
+                parserFuncDef();
+                sign_2 = 0;
+            } }
+        if(sign_2 == 1) {
+            this.up();
+            this.up();
+        }
+        parserMainFuncDef();
+        ```
+        
+        If there are NO func defs before main, the loop condition `returnContent().equals("int")...` is checked.
+        If the previous declarations consumed all tokens up to `int main`, then `returnContent` is `int`.
+        Enters loop.
+        `move` -> `main`.
+        `if(main)` -> true. `up`. `break`.
+        Calls `parserMainFuncDef`.
+        
+        This seems correct.
+        
+        Let's look closely at **`parserDecl`** again.
+        
+        ```java
+      else {
+          this.move();
+          if(returnContent().equals("main")) {
+              this.up();
+              return;
+          }
+          this.up();
+          match_BType();
+          parserVarDef();
+          while(returnContent().equals(",")) {
+              addToList(new Token(Token.Type.COMMA,",",this.now().getLine()));
+              parserVarDef();
+          }
+          match_semicn();
+          addToList(new Token(Token.Type.NAME,"<VarDecl>",0));
+      } //VarDecl
+    ```
+    
+    If `parserDecl` is called for `int main...` (which it shouldn't be), it returns.
+    
+    There is a potential issue in **`parserFuncDef`**:
+    ```java
+    public void parserFuncDef() {
+        this.move();
+        if(returnContent().equals("main")) {
+            this.up();
+            return;
+        }
+        this.up();
+        match_funcType();
+        // ...
+    }
+    ```
+    
+    And in **`parserCompUnit`**, the handling of `sign_2`.
+    
+    Actually, I suspect the error is in **`parserExp`**'s usage of `up()` and `move()`.
+    
+    In `parserStmt`, for `LVal '=' Exp ';'`:
+    ```java
+                else {
+                    parserExp();
+                    match_semicn();
+                }
+    ```
+    
+    In `parserExp`:
+    ```java
+    public void parserExp(){
+        this.up();
+        int line = this.now().getLine();
+        this.move();
+        if (returnContent().equals(";")||returnContent().equals("}")) {
+            return;
+        }
+        parserAddExp();
+        addToList(new Token(Token.Type.NAME,"<Exp>",0));
+    }
+    ```
+    
+    If `parserExp` is called, `cur` is at the first token of the expression.
+    `up()` goes to previous token.
+    `move()` goes back to first token of expression.
+    
+    This implies `parserExp` expects the caller to have left the cursor at the start of the expression.
+    
+    However, look at `parserInitVal`:
+    ```java
+         else{
+             parserExp();
+         }
+    ```
+    Caller `parserInitVal` has just processed `=`. `cur` is at the value.
+    `parserExp` does `up` (to =), `move` (to value). Correct.
+    
+    Look at `parserStmt` for `printf` args:
+    ```java
+                 parserExp();
+    ```
+    Caller processed `,`. `cur` is at arg.
+    `parserExp` does `up` (to ,), `move` (to arg). Correct.
+    
+    Look at `parserStmt` for `return [Exp] ;`:
+    ```java
+             if (this.now().getLine()==line) {
+                 parserExp();
+                 match_semicn();
+             }
+    ```
+    Caller processed `return`. `cur` is at Exp or `;`.
+    `parserExp` does `up` (to return), `move` (to Exp or ;).
+    If `;`, it returns. Correct.
+    
+    Look at `parserStmt` for `[Exp] ;`:
+    ```java
+         } else  {
+             parserExp();
+             match_semicn();
+         }
+    ```
+    This branch is taken if `IDENFR` but not `=` or `[`. Or other starts.
+    If it's just `;` (empty statement)?
+    `returnContent` is `;`.
+    Does it enter `else`?
+    The `if/else if` chain in `parserStmt`:
+    - `if`, `for`, `break`, `continue`, `{`, `return`, `printf`, `IDENFR`.
+    - `else`: `parserExp()`.
+    
+    If `returnContent` is `;`, it falls to `else`.
+    `parserExp()`.
+    `up` (to previous), `move` (to ;).
+    Checks `;`. Returns.
+    `match_semicn()`.
+    This handles empty statements.
+    
+    So `parserExp` logic seems consistent with its callers.
+    
+    **Where is the error?**
+    
+    Let's look at **`parserLval`** in `parserUnaryExp`.
+    ```java
+         } else if (this.now().getType() == Token.Type.IDENFR) {
+            this.move();
+            if(returnContent().equals("(")){
+                this.up();
+                addToList(new Token(Token.Type.IDENFR,returnContent(),this.now().getLine()));
+                addToList(new Token(Token.Type.LPARENT,"(",this.now().getLine()));
+                parserFuncRParams();
+                match_rparent();
+            } else {
+                this.up();
+                parserPrimaryExp();
+            }
+         }
+    ```
+    If `IDENFR` followed by `(`, it treats it as FuncCall.
+    It does `up()` to go back to IDENFR.
+    Then `addToList(IDENFR)` -> consumes IDENFR.
+    Then `addToList(LPARENT)` -> consumes `(`.
+    
+    If `IDENFR` NOT followed by `(`:
+    `up()` to go back to IDENFR.
+    `parserPrimaryExp()`.
+    `parserPrimaryExp` sees IDENFR.
+    `else { parserLval(); }`.
+    `parserLval` calls `match_Ident()` -> consumes IDENFR.
+    
+    This seems correct.
+    
+    **Wait!** Look at `parserPrimaryExp`:
+    ```java
+    public void parserPrimaryExp(){
+        if(this.now().getContent().equals("(")){
+            // ...
+        }
+        else if (this.now().getType() == Token.Type.INTCON) {
+             // ...
+        }
+        else if (this.now().getType() == Token.Type.CHRCON) {
+            // ...
+        }else {
+            parserLval();
+        }
+        addToList(new Token(Token.Type.NAME,"<PrimaryExp>",0));
+    }
+    ```
+    
+    And `parserLval`:
+    ```java
+    public void parserLval() {
+        match_Ident();
+        if(this.now().getContent().equals("[")) {
+            addToList(new Token(Token.Type.LBRACK,"[",this.now().getLine()));
+            parserExp();
+           match_rbrack();
+        }
+        addToList(new Token(Token.Type.NAME,"<LVal>",0));
+    }
+    ```
+    
+    This looks correct.
+    
+    **Is there an error in `output.java`?**
+    
+    ```java
+        if(sign == 0 && errors.isEmpty()) {
+        for (int i = 0; i < tokens.size(); i++) {
+            if (tokens.get(i).getType() == Token.Type.KEYWORD ) {
+                String s = tokens.get(i).getContent();
+                StringBuilder sb = new StringBuilder();
+                for (int j = 0; j < s.length(); j++) {
+                    char t = s.charAt(j);
+                    sb.append((char) (t - 32));
+                }
+                sb.append('T');
+                sb.append('K');
+                dos1.write(sb + " " + tokens.get(i).getContent());
+                dos1.write('\n');}
+                else if (tokens.get(i).getType() == Token.Type.NAME ) {
+                    dos1.write(tokens.get(i).getContent());
+                    dos1.write('\n');
+                } else {
+                    dos1.write(tokens.get(i).getType().toString() + " " + tokens.get(i).getContent());
+                    dos1.write('\n');
+            }
+        }
+    }
+    ```
+    
+    The keyword conversion: `int` -> `INT` + `TK` -> `INTTK`. Correct.
+    `main` -> `MAIN` + `TK` -> `MAINTK`. Correct.
+    
+    **The Error Location:**
+    
+    In `Grammar.java`, `parserCompUnit`, the logic for distinguishing `Decl` and `FuncDef` is extremely brittle and likely fails for certain inputs or leaves the cursor in a wrong state.
+    
+    However, the most obvious bug that causes "Wrong Answer" in these parsers is usually related to **missing outputs** or **incorrect error detection**.
+    
+    Let's look at `parserBlockItem` again.
+    ```java
+    public void parserBlockItem() {
+      if (returnContent().equals("const")||returnContent().equals("int")
+      ||returnContent().equals("char")) {
+          parserDecl();
+      } else if(returnContent().equals("}")) {
+          return;
+      }
+      else {
+          parserStmt();
+      }
+    }
+    ```
+    
+    If `parserDecl` is called for `int main...` inside a block (which is invalid C, but `main` is only global), it might behave weirdly. But `main` is not inside a block.
+    
+    **Actually, look at `parserDecl` in `Grammar.java`**:
+    
+    ```java
+    public void parserDecl(){
+      if (this.now().getContent().equals("const")) {
+          // ...
+      } 
+      else {
+          this.move();
+          if(returnContent().equals("main")) {
+              this.up();
+              return;
+          }
+          this.up();
+          match_BType();
+          parserVarDef();
+          // ...
+      }
+    }
+    ```
+    
+    If `parserDecl` is called when the current token is `int` and the next is `main`, it moves to `main`, sees `main`, moves back, and **returns without consuming anything**.
+    
+    In `parserCompUnit`, if the lookahead logic fails to identify `main` as a FuncDef/MainFuncDef start and calls `parserDecl`, `parserDecl` will return without advancing. This causes an **infinite loop** in `parserCompUnit`'s `while` loop because `returnContent()` remains `int`.
+    
+    Let's verify if `parserCompUnit` can call `parserDecl` for `int main`.
+    
+    Loop 1:
+    `int`. `move` -> `main`. `move` -> `(`.
+    `returnContent` is `(`.
+    Condition: `[` `=` `;` `,` or `line > line`.
+    `(` is none of these. `line` is likely same.
+    So `parserDecl` is NOT called. `sign_1` remains 1.
+    Loop continues? `returnContent` is `(`. Loop condition `int/char/const/,` is false. Loop ends.
+    `if (sign_1 == 1) { up(); up(); }`. Cursor back to `int`.
+    
+    Loop 2:
+    `int`. `move` -> `main`.
+    `if(main)` -> true. `up`. `break`.
+    `parserMainFuncDef`.
+    
+    So `parserDecl` is NOT called for `int main`.
+    
+    **However**, what if there is a `void` function?
+    `void func() {}`.
+    Loop 1: `void` is not `int/char/const/,`. Loop 1 skipped.
+    Loop 2: `void`.
+    `if(void)` -> `parserFuncDef`.
+    
+    Inside `parserFuncDef`:
+    `move` -> `func`.
+    `if(main)` -> false.
+    `up` -> `void`.
+    `match_funcType` -> consumes `void`.
+    `match_Ident` -> consumes `func`.
+    `match_lparent` -> consumes `(`.
+    `parserFuncParams`.
+    `match_rparent` -> consumes `)`.
+    `parserBlock`.
+    
+    This seems correct.
+    
+    **Conclusion:**
+    
+    The code is complex and fragile. The most likely error causing a "Wrong Answer" (especially if the output is completely empty or missing parts) is in the **`output.java`** file where it checks `sign == 0`.
+    
+    In `Compiler.java`:
+    ```java
+    Grammar grammar  = new Grammar(token,list,sign,errors);
+    output out1 = new output(list,error_flag,errors);
+    ```
+    
+    `sign` is a local variable initialized to 0. It is NEVER updated by `Grammar`.
+    `Grammar` has its own `sign` member which is updated to 1 on error.
+    But `Compiler` passes the local `sign` (0) to `output`.
+    
+    So `output` always receives `sign = 0`.
+    
+    If `errors` is empty, it outputs `parser.txt`.
+    If `errors` is NOT empty, it skips `parser.txt` and outputs `error.txt`.
+    
+    If the parser correctly parses the input, `errors` is empty. Output is generated.
+    
+    If the parser INCORRECTLY detects an error (adds to `errors`), then `parser.txt` is suppressed.
+    
+    Given the test case is valid, if the parser adds any spurious error, the output will be empty (or just error.txt).
+    
+    Does the parser add spurious errors?
+    
+    Look at `match_rbrace` in `Grammar.java`:
+    ```java
+    public boolean  match_rbrace(){
+        if(returnContent().equals("}")) {
+            addToList(new Token(Token.Type.RBRACE,"}",this.now().getLine()));
+            return true;
+        }
+        this.move();
+        return false;
+    }
+    ```
+    It does NOT add an error

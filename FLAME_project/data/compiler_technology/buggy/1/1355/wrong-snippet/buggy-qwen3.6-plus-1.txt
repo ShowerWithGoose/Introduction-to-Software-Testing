@@ -1,0 +1,464 @@
+Based on the problem description and the test case, the program fails to detect three "missing semicolon" errors (error type `i`).
+
+1.  **Error 1**: Line 2 `printf("Hello SysY!\n")` is missing a semicolon.
+2.  **Error 2**: Line 9 `int a` is missing a semicolon.
+3.  **Error 3**: Line 13 `return 0` is missing a semicolon.
+
+The expected output is:
+```
+2 i
+9 i
+13 i
+```
+
+The buggy output is empty, implying that the parser either crashes, enters an infinite loop, or simply fails to identify these specific syntax errors and report them.
+
+Let's analyze the `Parser.java` code, specifically how it handles statements and declarations where semicolons are expected.
+
+**Analysis of `Stmt_func` in `Parser.java`:**
+
+*   **Case `printf`**:
+    ```java
+    case "printf" -> {
+        // ... parses printf arguments ...
+        if(now.token.equals(";")) {
+             stmt.SEMICN = ";";
+        }
+        else {
+             //i型错误输出
+             Error error = new Error(symList.get(i - 2).line, "i");
+             errorList.add(error);
+             lastSym();
+        }
+    }
+    ```
+    This looks correct for detecting the missing semicolon after `printf`. However, we need to check if the parser actually reaches this point or if it gets stuck earlier.
+
+*   **Case `return`**:
+    ```java
+    case "return" -> {
+        // ... parses return expression ...
+        if(now.token.equals(";")) {
+             stmt.SEMICN = ";";
+        }
+        else {
+             //i型错误输出
+             Error error = new Error(symList.get(i - 2).line, "i");
+             errorList.add(error);
+             lastSym();
+        }
+    }
+    ```
+    This also looks structurally correct for detecting the error.
+
+*   **Case `default` (which handles `LVal = Exp;` or `Exp;`)**:
+    The `printf` statement in the test case `printf("Hello SysY!\n")` starts with the token `printf`. In the `Stmt_func` switch statement, there is a specific case for `"printf"`. So it should enter that block.
+
+Let's look at `VarDecl_func` for Error 2 (`int a`):
+```java
+public VarDecl VarDecl_func() {
+     VarDecl varDecl = new VarDecl();
+     if(IsBType(now.token)) {
+          varDecl.BType = now.token;
+          nextSym();
+          varDecl.varDefs.add(VarDef_func());
+          nextSym();
+          while(now.token.equals(",")) {
+               nextSym();
+               varDecl.varDefs.add(VarDef_func());
+               nextSym();
+          }
+          if(!now.token.equals(";")) {
+               //i型错误输出
+               Error error = new Error(symList.get(i - 2).line, "i");
+               errorList.add(error);
+               lastSym();
+          }
+          else {
+               varDecl.SEMICN = ";";
+          }
+     }
+     else {
+          return null;
+     }
+     return varDecl;
+}
+```
+This also seems to handle the missing semicolon.
+
+**The Root Cause:**
+
+The issue likely lies in how the parser recovers from errors or how it proceeds after detecting an error. If an error is detected, `lastSym()` is called to put the pointer back. However, the calling function might not handle this state correctly, or the parser might get stuck in a loop because the token stream isn't advancing past the error point effectively in all contexts.
+
+But there is a more fundamental issue in the `CompUnit_func` and `Block_func` logic regarding how they iterate.
+
+Look at `Block_func`:
+```java
+public Block Block_func() {
+     Block block = new Block();
+     if(now.token.equals("{")) {
+          block.LBRACE = "{";
+          nextSym();
+          if(now.token.equals("}")) {
+               block.RBRACE = "}";
+          }
+          else {
+               while(!now.token.equals("}")) {
+                    block.blockItems.add(BlockItem_func());
+                    nextSym(); // <--- THIS IS THE PROBLEM
+               }
+               block.RBRACE = "}";
+          }
+     }
+     else {
+          return null;
+     }
+     return block;
+}
+```
+
+In `Block_func`, after parsing a `BlockItem` (which could be a `Decl` or a `Stmt`), it calls `nextSym()`.
+
+Let's trace `printf("Hello SysY!\n")` (missing semicolon).
+1. `BlockItem_func` calls `Stmt_func`.
+2. `Stmt_func` sees `printf`.
+3. It parses `printf`, `(`, `StringConst`, `)`.
+4. It checks for `;`. It's not there (next token is likely `if` or newline/EOF depending on lexer, but logically the next significant token).
+5. It records Error `i` at line 2.
+6. It calls `lastSym()`. The current token `now` is reset to the one before the missing semicolon check failure? No, `lastSym()` decrements `i` and sets `now` to `symList.get(i-1)`. Wait, `nextSym` increments `i` then sets `now`. `lastSym` decrements `i` then sets `now` to `symList.get(i-1)`?
+   ```java
+   public void lastSym() {
+        i--;
+        now = symList.get(i - 1);
+   };
+   ```
+   If `i` was pointing to the token *after* the expected semicolon (let's say `if`), `lastSym` makes `i` point to `if`'s index, and `now` becomes the token *before* `if`. This seems inconsistent. Usually, `lastSym` should just decrement `i` and update `now` to `symList.get(i)`. Let's look at `nextSym`:
+   ```java
+   public void nextSym() {
+        now = symList.get(i);
+        i++;
+   };
+   ```
+   So `i` points to the *next* token to be read. `now` is the *current* token.
+   If we are at `)`, `nextSym` makes `now` = `if` (or whatever is next), `i` increments.
+   Check `if (now.token.equals(";"))`. False.
+   Error recorded.
+   `lastSym()`: `i` decrements. `now` = `symList.get(i-1)`.
+   If `i` was index of `if` + 1, now `i` is index of `if`. `now` becomes token at `index of if - 1`. This is wrong. It should probably be:
+   ```java
+   public void lastSym() {
+        i--;
+        now = symList.get(i);
+   };
+   ```
+   Or if `i` is the index of the *current* token `now`, then `nextSym` should be `i++; now = symList.get(i);`.
+   
+   Let's re-read carefully:
+   `nextSym`: `now = symList.get(i); i++;` -> `now` is token at old `i`. `i` is now index of next token.
+   `lastSym`: `i--; now = symList.get(i - 1);` -> `i` becomes old `i` - 1. `now` becomes token at `old i - 2`.
+   
+   This implementation of `lastSym` is definitely buggy. It rewinds too far.
+   
+   However, even if `lastSym` is fixed, there is another issue in `Block_func`.
+   
+   In `Block_func`:
+   ```java
+   while(!now.token.equals("}")) {
+        block.blockItems.add(BlockItem_func());
+        nextSym();
+   }
+   ```
+   
+   If `BlockItem_func` (calling `Stmt_func`) encounters an error and calls `lastSym()`, the parser state is rewound. Then `Block_func` calls `nextSym()`.
+   
+   If `Stmt_func` for `printf` fails to find `;`, it reports error, calls `lastSym()`.
+   Suppose `lastSym` correctly rewinds to the token where parsing stopped (e.g., the token after `)` which was identified as not being `;`).
+   Then `Block_func` calls `nextSym()`. This advances past that token.
+   
+   If the token after `)` is `if` (start of next statement), then `nextSym` sets `now` to `if`.
+   The loop continues. `BlockItem_func` is called again.
+   
+   This logic *might* work if `lastSym` is correct. But `lastSym` is clearly incorrect as analyzed above.
+   
+   Let's look at the specific error locations again.
+   
+   **Error 1: Line 2 `printf(...)`**
+   The parser enters `Stmt_func` -> `case "printf"`.
+   It parses up to `)`.
+   `nextSym()` is called inside `printf` case? No, looking at the code:
+   ```java
+   if(now.token.equals(")")) {
+        stmt.RPARENT = ")";
+        nextSym(); // Advances to token after )
+   }
+   // ...
+   if(now.token.equals(";")) {
+       // ...
+   } else {
+       // Error i
+       lastSym();
+   }
+   ```
+   So `now` is the token after `)`. Let's say it's `if` (from line 4).
+   Error is recorded. `lastSym()` is called.
+   With the buggy `lastSym`: `i` decreases by 1. `now` becomes `symList.get(i-1)`.
+   If `i` was pointing to `if` (index K), `now` was `if`.
+   `lastSym`: `i` becomes K-1. `now` becomes `symList.get(K-2)`. This is the token *before* `if`.
+   Then `Block_func` calls `nextSym()`.
+   `nextSym`: `now` = `symList.get(K-1)` (which is `)` ?? No, `symList` contains tokens.
+   
+   Let's assume the token list is: `printf`, `(`, `str`, `)`, `if`, ...
+   Indices: 0, 1, 2, 3, 4, ...
+   
+   Inside `printf` case:
+   - Parses `printf` (0), `(` (1), `str` (2), `)` (3).
+   - After parsing `)`, `nextSym()` is called. `now` = `symList.get(4)` (`if`), `i` = 5.
+   - Checks `now.token.equals(";")`. False.
+   - Error recorded.
+   - `lastSym()`: `i` becomes 4. `now` = `symList.get(3)` (`)`).
+   - Returns from `Stmt_func`.
+   - Back in `Block_func`: `nextSym()` is called.
+   - `nextSym()`: `now` = `symList.get(4)` (`if`), `i` = 5.
+   - Loop continues. `BlockItem_func` called.
+   - `Stmt_func` called with `now` = `if`.
+   
+   This actually seems to recover correctly for the first error, *if* the rest of the parsing works.
+   
+   **Error 2: Line 9 `int a`**
+   This is a `VarDecl`.
+   `BlockItem_func` checks `if(now.token.equals("int") ...)` -> calls `Decl_func`.
+   `Decl_func` calls `VarDecl_func`.
+   `VarDecl_func`:
+   - `now` is `int`. `nextSym()`. `now` is `a`.
+   - `VarDef_func()`:
+     - `now` is `a`. `nextSym()`. `now` is next token (likely `for` or `}`).
+     - Returns `VarDef`.
+   - Back in `VarDecl_func`: `nextSym()` is called?
+     ```java
+     varDecl.varDefs.add(VarDef_func());
+     nextSym(); // <--- HERE
+     ```
+     Wait, `VarDef_func` consumes `a`. `now` is currently the token after `a`.
+     Then `VarDecl_func` calls `nextSym()`. Now `now` is the token after *that*.
+     Then it checks `while(now.token.equals(","))`.
+     Then it checks `if(!now.token.equals(";"))`.
+     
+     If the input is `int a`, followed by `for`.
+     Tokens: `int`, `a`, `for`.
+     1. `VarDecl_func` starts. `now`=`int`.
+     2. `nextSym()`. `now`=`a`. `i` points to `for`.
+     3. `VarDef_func()`:
+        - `now`=`a`.
+        - `nextSym()`. `now`=`for`. `i` points to end/next.
+        - Returns.
+     4. Back in `VarDecl_func`.
+     5. `nextSym()`. `now`=`???` (Token after `for`). `i` increments.
+     6. Check `,`. False.
+     7. Check `;`. False (`now` is not `;`).
+     8. Error `i` recorded. Line number from `symList.get(i-2)`.
+     9. `lastSym()`.
+     
+     This also seems to detect the error.
+     
+   **Why is the output empty?**
+   
+   Look at `Compiler.java`:
+   ```java
+   Parser parser = new Parser();
+   ```
+   And `Parser` constructor:
+   ```java
+   public Parser() throws IOException {
+        CompUnit compUnit = CompUnit_func();
+        if(errorList.isEmpty())
+             compUnit.print(lw);
+        else {
+             //按行号排序
+             Collections.sort(errorList);
+             for (Error error : errorList) {
+                  ew.write(error.line + " " + error.type + "\n");
+             }
+        }
+        lw.close();
+        ew.close();
+   }
+   ```
+   
+   If `CompUnit_func` throws an exception or hangs, no output is produced.
+   
+   Let's look at `CompUnit_func`:
+   ```java
+   public CompUnit CompUnit_func() {
+        CompUnit compUnit = new CompUnit();
+        nextSym(); // Reads first token
+        while(i <= symList.size()) { // Potential infinite loop or out of bounds
+             if(now.token.equals("const")) { ... }
+             if(now.token.equals("void")) { ... }
+             if(now.token.equals("char")) { ... }
+             if(now.token.equals("int")){
+                   if(symList.get(i).token.equals("main")){ // Accessing symList.get(i) when i might be out of bounds
+                       compUnit.mainFuncDef = MainFuncDef_func();
+                       if(compUnit.mainFuncDef != null)
+                            break;
+                   }
+                   // ...
+             }
+        }
+        return compUnit;
+   }
+   ```
+   
+   The condition `while(i <= symList.size())` is suspicious. `i` is the index of the *next* token. `symList.size()` is the count. Valid indices are `0` to `size()-1`.
+   If `i == symList.size()`, `now` holds the last token processed.
+   Inside the loop, it accesses `symList.get(i)`. If `i == symList.size()`, this throws `IndexOutOfBoundsException`.
+   
+   However, usually parsers stop when `i` reaches size.
+   
+   Let's look at the `MainFuncDef_func` call.
+   If `MainFuncDef_func` returns null or fails, does the loop continue?
+   
+   In the test case:
+   `int main() { ... }`
+   
+   Inside `main` block:
+   1. `printf` error.
+   2. `if (1)` ...
+      ```java
+      if (1)
+      
+      
+      /*********/
+      ;
+      ```
+      This is an `if` statement with an empty statement or block?
+      `if (1)` followed by `;` is a valid statement (empty statement).
+      
+      Let's trace `if (1) ;`.
+      `Stmt_func` case `if`:
+      - Parses `if`, `(`, `Cond`, `)`.
+      - `stmt.stmt = Stmt_func();`
+      - Inside recursive `Stmt_func`:
+        - `now` is `;`.
+        - Case `;`: `stmt.SEMICN = ";"`.
+        - Returns.
+      - Back in outer `Stmt_func`:
+      - `nextSym();` // Advances past `;`
+      - Checks `else`.
+      
+      This seems fine.
+      
+   3. `int a` error.
+   4. `for (;;) {}`
+   5. `return 0` error.
+   6. `}`
+   
+   If the parser crashes due to `IndexOutOfBoundsException` in `CompUnit_func` or elsewhere, the `error.txt` might not be flushed/written properly if the exception propagates up.
+   
+   In `Compiler.java`:
+   ```java
+   try {
+       lexer.scanner();
+   } catch (IOException e) {
+       throw new RuntimeException(e);
+   }
+
+   Parser parser = new Parser();
+   ```
+   If `Parser` constructor throws an exception (like `IndexOutOfBoundsException`), it is not caught. The program terminates. The `FileWriter ew` in `Parser` might not be closed or flushed, resulting in empty output.
+   
+   The likely crash point is `symList.get(i)` when `i` is out of bounds.
+   
+   In `CompUnit_func`:
+   ```java
+   while(i <= symList.size()) {
+        // ...
+        if(now.token.equals("int")){
+              if(symList.get(i).token.equals("main")){ // CRASH HERE if i == size
+   ```
+   
+   Also in `VarDecl_func` and others, `symList.get(i)` is accessed.
+   
+   However, the most prominent logical error that prevents error detection/recovery is often the `lastSym` implementation or the loop control in `Block_func`.
+   
+   But wait, if the program crashes, it produces NO output. The "Buggy Output" is empty. This supports the crash theory.
+   
+   The crash is likely in `CompUnit_func` when checking for `main` or other lookahead, or in `Block_func` if it loops infinitely.
+   
+   Let's look at `Block_func` again.
+   ```java
+   while(!now.token.equals("}")) {
+        block.blockItems.add(BlockItem_func());
+        nextSym();
+   }
+   ```
+   If `BlockItem_func` fails to consume any tokens (returns null or similar without advancing), and `nextSym` advances, it might skip tokens. But if `BlockItem_func` encounters an error and `lastSym` rewinds, and then `nextSym` advances, it effectively skips the problematic token.
+   
+   However, if `BlockItem_func` returns `null` (e.g. `Decl_func` returns null), `Block_func` still adds `null` to the list?
+   ```java
+   public BlockItem BlockItem_func() {
+        BlockItem blockItem = new BlockItem();
+        if(now.token.equals("int") || now.token.equals("char") || now.token.equals("const")) {
+             blockItem.decl = Decl_func();
+        }
+        else {
+             blockItem.stmt = Stmt_func();
+        }
+        return blockItem;
+   }
+   ```
+   If `Decl_func` returns `null`, `blockItem.decl` is `null`. `blockItem.stmt` is `null`.
+   Then `Block_func` adds this empty `BlockItem`.
+   Then `nextSym()` advances.
+   
+   If `Decl_func` returns `null` because it didn't match, `Block_func` advances past the token. This might skip valid tokens or cause misalignment.
+   
+   But the primary suspect for "Empty Output" is a crash.
+   
+   The code snippet to fix is likely in `Parser.java` where `symList.get(i)` is accessed without bounds checking, or the `lastSym` method is corrected, or the loop condition in `CompUnit_func`.
+   
+   Given the prompt asks for the location of the errors, and the output is completely empty, identifying the crash site is key.
+   
+   The access `symList.get(i)` in `CompUnit_func` when `i` can equal `symList.size()` is a definite crash risk.
+   
+   Also, `lastSym` is logically flawed.
+   
+   I will provide the `Parser.java` snippet containing `CompUnit_func` and `lastSym` as the likely error locations.
+
+<frontend/Parser.java>
+...
+     public void lastSym() {
+          i--;
+          now = symList.get(i - 1);
+     };
+...
+     public CompUnit CompUnit_func() {
+          CompUnit compUnit = new CompUnit();
+          nextSym();
+          while(i <= symList.size()) {
+               if(now.token.equals("const")) {
+                    compUnit.decls.add(Decl_func());
+                    nextSym();
+               }
+               if(now.token.equals("void")) {
+                    compUnit.funcDefs.add(FuncDef_func());
+                    nextSym();
+               }
+               if(now.token.equals("char")) {
+                    if(symList.get(i).type.equals("IDENFR")){
+                         if(symList.get(i + 1).token.equals("(")) {
+                              compUnit.funcDefs.add(FuncDef_func());
+                              nextSym();
+                         }
+                         else {
+                              compUnit.decls.add(Decl_func());
+                              nextSym();
+                         }
+                    }
+               }
+               if(now.token.equals("int")){
+                     if(symList.get(i).token.equals("main")){
+                         compUnit.mainFuncDef = MainFuncDef_func();
+                         if(compUnit.mainFuncDef != null)
+                              break;
+                    }
+...

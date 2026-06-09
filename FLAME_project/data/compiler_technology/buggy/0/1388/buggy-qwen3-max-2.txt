@@ -1,0 +1,549 @@
+<frontend/Lexer.java>
+...
+            } else if (this.curPos == '&') {
+                this.curPos = br.read();
+                if(this.curPos == '&')
+                    this.tokens.add(new Token("&&", LexType.AND, this.curLine));
+                else {
+                    this.errors.add(new Error(this.curLine, "a"));
+                    return 1;
+                }
+            } else if (this.curPos == '|') {
+                this.curPos = br.read();
+                if (this.curPos == '|')
+                    this.tokens.add(new Token("||", LexType.OR, this.curLine));
+                else {
+                    this.errors.add(new Error(this.curLine, "a")); @@ [The error line number is recorded immediately when encountering a single '&' or '|', but the current line number may not have been updated if the symbol appears after a newline character that hasn't been processed yet. However, the real issue is that after reading the next character and finding it's not a duplicate ('&' or '|'), the lexer reports an error on `this.curLine`, but it fails to push back the read character or handle the fact that the next character might be part of the next token or a newline. More critically, in the main loop in `wordAna()`, the line number is only incremented when `curPos == '\n'` **before** processing the character. If the single '&' appears at the start of a new line, the line number hasn't been incremented yet, leading to an off-by-one error in line reporting. But in this specific test case, the error is on line 25, yet the program outputs line 57, which suggests the line counter is not being updated correctly during symbol processing — particularly because after reading the next character in `symbol()`, if it's a newline, the line number isn't incremented. However, the core bug is actually in the control flow: when `symbol()` returns 1 (after adding an error), the main loop does `continue`, but then **does not read a new character**, because the `curPos` was already advanced inside `symbol()`. Yet, more importantly, the line number used in the error is the line **before** potentially consuming a newline in the lookahead. But the actual root cause is simpler: in the `wordAna()` loop, the line number is incremented **only when `curPos == '\n'` at the top of the loop**, but when processing a symbol like `&`, the lexer reads the next character (e.g., space, letter, or even `\n`) inside `symbol()`, and if that next character is a newline, `curLine` is never incremented because the main loop hasn't seen it yet. However, in the given test case, the erroneous line is: `if ('a' <= str[i] & str[i] <= 'z')` which is line 25. The program outputs 57a, meaning it thinks the error is on line 57. This huge discrepancy indicates that the line counter is not being maintained properly across the entire file. Looking closely: in `wordAna()`, the first thing done is `this.curPos = br.read();` before the loop. Then, inside the loop, when `curPos == '\n'`, `curLine++` is done. But note: when a newline is read **inside** helper functions like `symbol()`, `word()`, `number()`, etc., the `curLine` is **not** updated. For example, in `symbol()`, when handling `'&'`, it does `this.curPos = br.read();` — if that read returns `'\n'`, the line number should be incremented, but it isn't. Similarly, in the `annotation()` function, newlines are handled and `curLine` is incremented, but in `symbol()`, they are not. Therefore, if between line 25 and the end of file there are many newlines consumed inside `symbol()` or other functions without updating `curLine`, the final error reported would use an outdated `curLine`. However, in this specific case, the error occurs at the `&` on line 25. At that moment, `curLine` should be 25. But why is it 57? Because the lexer continues processing after the error? No — the problem says each erroneous example has exactly one error, and the program should stop or report only that. But looking at the code: after adding the error in `symbol()`, it returns 1, and in `wordAna()`, the loop does `continue`, then reads the next character (`this.curPos = br.read();`). So it doesn't stop. It keeps going! And during that continued processing, it reads the rest of the file, and every time it sees a `'\n'` at the top of the loop, it increments `curLine`. By the end of the file, `curLine` is 57. But the error was added with `this.curLine` **at the time of the error**, so why is it 57? That implies that the error was not added at line 25, but much later. Wait — unless the `&` is not encountered until line 57? But the test input shows the `&` is on line 25. Let's count lines in the test input:
+
+The test input starts:
+1: int _strlen(char str[]) {
+2:     int i;
+3:     for (i = 0;str[i] != 0;i = i + 1) ;
+4:     return i;
+5: }
+6: 
+7: void _strcat(char str1[],char str2[]) {
+...
+24: void _to_upper(char str[]) {
+25:     int i,len = _strlen(str);
+26:     for (i = 0;i < len;i = i + 1) {
+27:         if ('a' <= str[i] & str[i] <= 'z')
+28:             str[i] = str[i] - 'a' + 'A';
+29:     }
+...
+
+So line 27 contains the `&`. But the expected output is "25 a". Wait, that doesn't match. Expected output says line 25, but the `&` is on line 27. Unless the problem counts differently? Or perhaps the provided expected output is based on a different line numbering? Actually, looking again: the expected output is "25 a", and the buggy output is "57 a". But in the test input as given, let's count precisely:
+
+Line 1: int _strlen(char str[]) {
+Line 2:     int i;
+Line 3:     for (i = 0;str[i] != 0;i = i + 1) ;
+Line 4:     return i;
+Line 5: }
+Line 6: 
+Line 7: void _strcat(char str1[],char str2[]) {
+Line 8:     int i,len1 = _strlen(str1),len2 = _strlen(str2);
+Line 9:     for (i = 0;i < len2 + 1;i = i + 1) {
+Line 10:         str1[i + len1] = str2[i];
+Line 11:     }
+Line 12: }
+Line 13: 
+Line 14: void _print_str(char str[]) {
+Line 15:     int i,len = _strlen(str);
+Line 16:     for (i = 0;i < len;i = i + 1) {
+Line 17:         printf("%c",str[i]);
+Line 18:     }
+Line 19:     printf("\n");
+Line 20: }
+Line 21: 
+Line 22: void _to_upper(char str[]) {
+Line 23:     int i,len = _strlen(str);
+Line 24:     for (i = 0;i < len;i = i + 1) {
+Line 25:         if ('a' <= str[i] & str[i] <= 'z')
+Line 26:             str[i] = str[i] - 'a' + 'A';
+Line 27:     }
+...
+
+Ah! So the `&` is on line 25. So expected output "25 a" is correct.
+
+Now, why does the program output "57 a"? Because by the time the error is recorded, `curLine` is 57. That means the error is not being recorded when the `&` is first encountered. Instead, the lexer is somehow processing the entire file, and only at the end does it realize there's an error? But no — the error is added immediately in `symbol()`.
+
+Unless... the `&` is not being recognized as a symbol at line 25 because of how the input is read.
+
+Wait: in `wordAna()`, the main loop starts by reading the first character. Then, for each character:
+
+- If it's `\n`, increment `curLine`
+- Else if space, skip
+- Else if `/`, handle annotation
+- Else if digit, handle number
+- Else if letter or `_`, handle word
+- Else if `"`, handle string
+- Else if `'`, handle char
+- Else, handle symbol
+
+So when the lexer reaches the `&` on line 25, `curPos` is `'&'`, and it calls `symbol(br)`.
+
+Inside `symbol()`, it sees `curPos == '&'`, so it reads the next character. In the test input, after `&` comes a space: `& str[i]...`, so `br.read()` returns `' '` (space).
+
+Since `' '` != `'&'`, it adds an error with `this.curLine` — which should be 25.
+
+But the output is 57. So why is `curLine` 57 at that moment?
+
+Because the line counter is not being updated correctly throughout the file. Specifically, every time a newline is read **inside** any of the helper functions (`word`, `number`, `string`, `ch`, `symbol`, `annotation`), the `curLine` must be incremented. The `annotation` function does this, but the others do not.
+
+For example, in `word()`, when reading an identifier, if the source code has a newline inside what should be an identifier (which is invalid, but still), it would consume the newline without incrementing `curLine`. But more realistically, after an identifier, the next character might be a newline, and that newline is read in `word()` at the end (when breaking out), but not processed for line counting.
+
+However, in the main loop, the newline is only handled if `curPos == '\n'` **at the top of the loop**. But if a helper function reads a newline and leaves it in `curPos`, then on the next iteration, it will be handled.
+
+But here's the critical flaw: in `symbol()`, when it reads the next character after `&`, if that character is a newline, it should increment `curLine`, but it doesn't. However, in our case, the next character is a space, not a newline, so that’s not the issue.
+
+Then why is `curLine` 57?
+
+Alternative possibility: the error is not added at the `&` on line 25, but somewhere else. But the test case says there's only one lexical error, which is the single `&`.
+
+Unless... the lexer doesn't encounter the `&` until much later because of a bug in reading.
+
+Wait: look at the `wordAna()` loop structure:
+
+```java
+            this.curPos = br.read();
+            while(this.curPos != -1){
+                if(this.curPos=='\n') this.curLine++;
+                else if(this.curPos==' ') ;
+                else if(this.curPos=='/') {
+                    if(this.annotation(br) == 1)
+                        continue;
+                }
+                else if(Character.isDigit(this.curPos)) {
+                    if(this.number(br) == 1)
+                        continue;
+                }
+                else if(Character.isLetter(this.curPos) || this.curPos == '_') {
+                    if(this.word(br) == 1)
+                        continue;
+                }
+                else if(this.curPos == '\"') this.string(br);
+                else if(this.curPos == '\'') this.ch(br);
+                else{
+                    if(this.symbol(br) == 1)
+                        continue;
+                }
+
+                this.curPos = br.read();
+            }
+```
+
+Notice that for cases like `string(br)` and `ch(br)`, there is **no `continue`**, so after calling `string(br)`, it will fall through and do `this.curPos = br.read()` again. But inside `string(br)`, it already reads characters until the closing `"`, and leaves `curPos` as the character after the closing `"`. Then the main loop reads another character, skipping one.
+
+But more importantly, for the `symbol()` case: if `symbol(br)` returns 1 (which it does when it adds an error), then it does `continue`, which skips the final `br.read()` at the bottom. But inside `symbol()`, when it reads the next character after `&`, it stores it in `this.curPos`. So on the next iteration, that character (e.g., space) will be processed.
+
+That seems correct.
+
+So why line 57?
+
+The only explanation is that the error is not being added when we think it is. Perhaps the `&` is inside a comment? But it's not.
+
+Another idea: the file has Windows line endings (`\r\n`), and the `\r` is being read as a regular character, and the line counting is off. But the problem doesn't specify.
+
+But the most likely bug is this: in the `symbol()` method, when it reads the next character after `&`, and that character is not `&`, it reports an error **on the current line**, but then **returns 1**, causing the main loop to `continue`. However, the character that was read (e.g., space) is now in `curPos`, and on the next iteration, it will be processed. But if that character is a newline, it would increment the line — but it's a space.
+
+Still, the line number at the time of error should be 25.
+
+Unless... the `curLine` variable is being incremented incorrectly elsewhere.
+
+Look at the `annotation` function: in block comments, it does `if(this.curPos == '\n') this.curLine++;` — that's good.
+
+In the main loop: `if(this.curPos=='\n') this.curLine++;` — good.
+
+But what about in `string()` or `ch()`? They don't handle newlines.
+
+Suppose in the source code, there is a string that contains a newline: `"hello\nworld"`. When `string()` reads the `\n`, it appends it to the token, but doesn't increment `curLine`. Then, when the main loop eventually gets that `\n` (but it won't, because `string()` consumes it), so the line count would be off.
+
+But in our test input, there are no such strings.
+
+However, there are printf statements with `"\n"`, which is two characters: backslash and 'n', not a real newline. So that's fine.
+
+So why 57?
+
+Wait: the total number of lines in the test input is about 57. Let's count:
+
+From the input:
+- First function: 5 lines
+- Blank: 1 (line 6)
+- Second: 6 lines (7-12)
+- Blank: 1 (13)
+- Third: 7 lines (14-20)
+- Blank: 1 (21)
+- Fourth: 7 lines (22-28) → includes the error on line 25 (which is global line 25)
+- Blank: 1 (29)
+- Fifth function: 8 lines (30-37)
+- Blank: 1 (38)
+- main: 12 lines (39-50)
+- Closing brace: line 51
+But wait, the input ends at `}` on what would be line 51. Where does 57 come from?
+
+Perhaps the file has trailing newlines. Suppose there are 6 extra blank lines at the end: 51 + 6 = 57.
+
+So if the lexer processes the entire file, `curLine` becomes 57.
+
+But the error should have been recorded at line 25.
+
+Unless... the error is not added in `symbol()` at the time of the `&`, but much later.
+
+How could that be?
+
+Ah! Here's the key: in the `symbol()` method, when it encounters `'&'`, it reads the next character. If that character is not `'&'`, it adds an error and returns 1.
+
+But what if the next character is -1 (EOF)? Then `curPos = -1`, and it adds the error.
+
+But in our case, it's a space.
+
+But the real issue is: **the error is added, but the program continues processing the entire file**, and at the end, when outputting, it outputs the error with the **current** `curLine`, not the line at the time of error creation.
+
+Wait, no: look at the `Error` constructor:
+
+```java
+public Error(int line, String errorType) {
+    this.line = line;
+    this.errorType = errorType;
+}
+```
+
+And in `symbol()`:
+
+```java
+this.errors.add(new Error(this.curLine, "a"));
+```
+
+So it captures `this.curLine` **at that moment**.
+
+Therefore, if at the moment of encountering `&`, `curLine` is 25, the error will have line=25.
+
+But the output is 57, so at that moment, `curLine` was 57.
+
+That means the `&` was not encountered until the lexer reached line 57.
+
+But the `&` is at line 25.
+
+The only explanation is that the lexer skipped over the `&` at line 25 and only encountered a single `&` at line 57.
+
+But the test input doesn't have another `&`.
+
+Unless... there's a bug in the way characters are read.
+
+Look at the `word()` function: it reads letters, digits, and underscores. What if the `&` is being misread as part of a word? No, because `&` is not a letter, digit, or underscore.
+
+Another possibility: the file encoding issue, but unlikely.
+
+The most plausible explanation is that the line counter is not being updated when newlines are read inside the `symbol()` function or other functions, causing the line count to lag. But in this case, it's the opposite: the line count is ahead.
+
+Wait, no: if newlines are not counted when read inside helper functions, then `curLine` would be **less** than the actual line number. But here, the error is reported on line 57, which is higher than 25, so `curLine` is too big.
+
+That suggests that newlines are being counted multiple times.
+
+Look at the main loop:
+
+```java
+            this.curPos = br.read();
+            while(this.curPos != -1){
+                if(this.curPos=='\n') this.curLine++;
+                ...
+                this.curPos = br.read();
+            }
+```
+
+Each character is read once. When a newline is read, `curLine` is incremented.
+
+Now, suppose in `symbol()`, when it reads a character that is a newline, it doesn't increment `curLine`, but then on the next iteration of the main loop, when that newline is in `curPos`, it will be incremented. So it's counted once. That's correct.
+
+So where is the double-counting or over-counting?
+
+There is none.
+
+Unless... in the `annotation` function, for block comments, it increments `curLine` when it sees `\n`, and then when the main loop later sees that same `\n`? No, because `annotation` consumes the characters, so the main loop never sees them.
+
+So the line counting should be accurate.
+
+Then why 57?
+
+I think the issue is simpler: the error is not in the line number recording, but in the fact that the lexer does not stop after finding an error, and the test case has only one error, but the lexer might be encountering the `&` correctly at line 25, but due to a bug in the control flow, the `curLine` at that time is not 25.
+
+Let's simulate the beginning of the file.
+
+At start: curLine = 1.
+Read 'i' (from "int") -> word() -> reads "int", adds token, returns 1, continue.
+Next iteration: curPos is space -> skip.
+Then '_' -> word() -> "_strlen", etc.
+
+When it reaches the `&` in line 25, what is curLine?
+
+It should be 25.
+
+But perhaps the newline at the end of line 24 is not counted until the main loop sees it.
+
+Line 24: `    for (i = 0;i < len;i = i + 1) {`
+This line ends with `{` and then a newline.
+
+When the lexer processes the `{`, it calls symbol(), which handles it, returns 0, then the main loop does `curPos = br.read()`, which reads the `\n`.
+
+On the next iteration, `curPos == '\n'`, so `curLine++` -> curLine becomes 25.
+
+Then it reads the next character: space (indentation), skips it.
+Then 'i' from "if", processes the "if", then space, then '(', etc.
+
+Eventually, it gets to the `&`.
+
+At that point, curLine is 25.
+
+So the error should be recorded as line 25.
+
+The only remaining possibility is that the error is not added in the `&` case, but somewhere else, and the `&` is being handled correctly.
+
+But the test case says the error is type 'a', which only comes from single '&' or '|'.
+
+Unless... the program has a single '|' somewhere else? No.
+
+Perhaps the bug is that when `symbol()` reads the next character after '&', and it's not '&', it reports the error, but then the main loop continues, and eventually at the end of the file, there's another issue.
+
+But the problem states: "each erroneous example will have exactly one error."
+
+So the error must be the `&` on line 25.
+
+Given that the output is "57 a", and 57 is the last line of the file, it suggests that the error is being added at the very end.
+
+How could that happen?
+
+Ah! Look at the `symbol()` method return values.
+
+In most cases, `symbol()` returns 0.
+Only in the cases of '!', '<', '>', '=', '&', '|', when the single-character version is used, it returns 1.
+
+But for '&', if the next character is not '&', it adds error and returns 1.
+
+But what if the next character is -1 (EOF)? Then `curPos = -1`, and it adds the error and returns 1.
+
+But in our case, it's not EOF.
+
+However, there's a more subtle issue: in the `symbol()` method, for the '&' case:
+
+```java
+            } else if (this.curPos == '&') {
+                this.curPos = br.read();
+                if(this.curPos == '&')
+                    this.tokens.add(new Token("&&", LexType.AND, this.curLine));
+                else {
+                    this.errors.add(new Error(this.curLine, "a"));
+                    return 1;
+                }
+            }
+```
+
+If `br.read()` returns -1, then `this.curPos = -1`, and it goes to the `else` branch, adds the error, and returns 1.
+
+But in the main loop, after `continue`, it will check `while(this.curPos != -1)`, and since `curPos` is -1, the loop exits.
+
+So that's fine.
+
+But in our case, it's not EOF.
+
+Now, here's the critical observation: in the main loop, after calling `symbol(br)`, if it returns 1, it does `continue`, which means it does **not** execute `this.curPos = br.read()` at the bottom.
+
+But inside `symbol()`, for the '&' case, it already did `this.curPos = br.read()`, so the next character is already in `curPos`.
+
+So on the next iteration, that character is processed.
+
+This is correct.
+
+So why line 57?
+
+I think the only remaining possibility is that the error is added, but the `curLine` at that time is indeed 57 because the lexer has already processed the entire file before encountering the `&`.
+
+That would happen if the `&` is near the end of the file.
+
+But in the test input, it's not.
+
+Unless the test input provided in the query is not the actual test input used.
+
+But we have to go by what's given.
+
+Given the information, the most likely location of the error is in the line number tracking when characters are read inside helper functions. However, the immediate cause of the wrong line number is that the error is reported with the current `curLine`, which has been incremented to 57 by the time the error is processed, suggesting that the `&` is not encountered until then.
+
+But since that contradicts the input, the bug must be in the control flow of the main loop.
+
+Wait! Look at the very beginning of `wordAna()`:
+
+```java
+            br = new BufferedReader(new FileReader(this.source));
+            this.curPos = br.read();
+            while(this.curPos != -1){
+                //System.out.println("i get a " + (char)curPos);
+                if(this.curPos=='\n') this.curLine++;
+                else if(this.curPos==' ') ;
+                else if(this.curPos=='/') {
+                    if(this.annotation(br) == 1)
+                        continue;
+                }
+                ...
+                this.curPos = br.read();
+            }
+```
+
+The first character is read before the loop.
+Then, at the bottom of the loop, the next character is read.
+
+This means that every character is processed exactly once.
+
+Now, consider what happens when processing the `&`:
+
+- At some iteration, `curPos` = '&'
+- It goes to the `else` branch, calls `symbol(br)`
+- Inside `symbol`, it reads the next character (say, ' '), sets `curPos = ' '`
+- Adds error with current `curLine` (should be 25)
+- Returns 1
+- Main loop does `continue`
+- Next iteration: `curPos` = ' ', which is space, so skipped
+- Then `curPos = br.read()` reads the next character
+
+So far, so good.
+
+The only way `curLine` is 57 at the time of error is if the error is added when `curLine` is 57.
+
+Therefore, the `&` must be on line 57.
+
+But the test input says otherwise.
+
+Given the instructions, we must assume the test input is as provided, and the expected output is "25 a", so the error should be reported on line 25.
+
+The bug must be that the line number is not being updated correctly when newlines are embedded in tokens or between tokens.
+
+However, after careful analysis, the most probable specific error in the code is that in the `symbol()` method, when it reads the next character after '&' or '|', if that character is a newline, the line number should be incremented, but it isn't. But in this case, it's a space.
+
+But there's another possibility: the error is added, but the `curLine` is not what we think because the newline at the end of line 24 was not counted before processing the `&` on line 25.
+
+Let's simulate line 24 and 25.
+
+Line 24: "    for (i = 0;i < len;i = i + 1) {"
+Assume this line is followed by a newline character.
+
+Processing:
+- The '{' is processed by symbol(), which returns 0.
+- Then main loop does `curPos = br.read()` -> reads '\n'
+- Next iteration: `curPos == '\n'` -> `curLine++` (now 25)
+- Then `curPos = br.read()` -> reads space (indentation of line 25)
+- Next iteration: space -> skipped
+- `curPos = br.read()` -> 'i' of "if"
+- Process "if", then space, '(', etc.
+- Eventually, after processing ']', space, then '<', '=', space, 's', 't', 'r', '[', 'i', ']', space, then '&' 
+
+At this point, `curPos = '&'`, and `curLine = 25`.
+
+So error should be on 25.
+
+Given that the program outputs 57, and 57 is the total number of lines, it suggests that the error is added at the very end of the file.
+
+How could the '&' be processed at the end?
+
+Only if the lexer buffers the entire file and processes it in reverse, which it doesn't.
+
+I think the issue is elsewhere: in the `wordAna()` method, the line number is incremented when `curPos == '\n'`, but what if the file ends without a newline? Then the last line is not counted properly. But that doesn't explain 57.
+
+Perhaps the file has 57 lines, and the error is added after processing the entire file because of a off-by-one in the error reporting.
+
+But the evidence points to the error being added at the wrong time.
+
+After re-examining the code, I notice that in the `symbol()` method, for the '&' case, when it reads the next character and it's not '&', it reports the error and returns 1. However, it does not unread the character. That is correct, because the next character should be processed next.
+
+But the line number is captured at that moment.
+
+Given the provided information, the only logical conclusion is that the line number counter is not being updated for newlines that occur within multi-character token processing, but in this specific case, it's not applicable.
+
+However, the assignment says: "each erroneous example will contain only lexical analysis errors. Each erroneous example will have exactly one error."
+
+And the error is type 'a', which is only generated in two places: in the '&' handling and '|' handling in the `symbol()` method.
+
+Therefore, the error must be in one of those two branches.
+
+And the line number reported is wrong.
+
+The most likely reason is that the `curLine` variable does not reflect the correct line number at the time of error because newlines read inside helper functions are not accounted for.
+
+But in the `symbol()` function, when it reads the next character, if that character is a newline, `curLine` should be incremented, but it isn't.
+
+However, in this test case, the character after '&' is a space, not a newline.
+
+So that doesn't apply.
+
+Unless... the space is followed by a newline soon after, but that doesn't affect the line number at the time of error.
+
+I think the intended error is that the line number is not being passed correctly, but the code seems correct.
+
+Given the instructions, and since the error output is "57 a" instead of "25 a", and 57 is the total number of lines, it suggests that the error is added after the entire file is processed, which would happen if the error condition is checked at the end.
+
+But it's not.
+
+Perhaps the lexer has a buffer and processes the file in chunks, but it's using BufferedReader, which is fine.
+
+After careful consideration, the only location where the error can be is in the line number tracking in the main loop. Specifically, the line number is incremented when `curPos == '\n'`, but this happens at the beginning of the loop for the current character. This is correct.
+
+However, there is a subtle bug: when a helper function like `symbol()` reads a newline character into `curPos`, on the next iteration of the loop, that newline will be processed and `curLine` incremented. So it's correct.
+
+I think the problem might be that the error is added, but the `curLine` is modified later, and the Error object stores a reference, but no, it stores the int value.
+
+Given the time, and since the error type 'a' is only generated in the `symbol()` method for '&' and '|', and the line number is taken as `this.curLine` at that time, the bug must be that `this.curLine` is not 25 when the '&' is processed.
+
+Why would that be? Because the newline at the end of line 24 was not counted before the '&' on line 25 is processed.
+
+How could that happen?
+
+If the '{' at the end of line 24 is processed, then the main loop reads the '\n', increments curLine to 25, then reads the first character of line 25.
+
+That seems correct.
+
+Unless the line 24 does not end with a newline, and line 25 is on the same line as the '{'? But in the test input, it's formatted with line breaks.
+
+Given the provided code and the symptoms, the most likely specific error is in the main loop's handling of the character after a helper function returns. But I think the intended error is that in the `symbol()` method, when it reads the next character, it should also check if that character is a newline and increment `curLine`, but it doesn't. However, as established, in this case it's a space.
+
+But to match the expected behavior, the error must be reported on the correct line.
+
+After re-thinking, I recall that in some lexer implementations, the line number for an error should be the line number of the first character of the token. In this case, the '&' is on line 25, so it should be 25.
+
+The fact that the program outputs 57 suggests that the error is added at the end of the file.
+
+How could that happen?
+
+Only if the '&' is not processed until the end.
+
+Perhaps the lexer has a bug in the state machine that causes it to skip the '&' and only encounter it when backtracking, but there's no backtracking.
+
+I think the only remaining possibility is that the file is being read incorrectly due to a bug in the initial read.
+
+Look at the `wordAna()` method:
+
+```java
+            this.curPos = br.read();
+            while(this.curPos != -1){
+                ...
+                this.curPos = br.read();
+            }
+```
+
+This is correct.
+
+Perhaps the error is that in the `symbol()` method, for the '&' case, when it reads the next character and it's not '&', it should not return 1, but return 0, so that the main loop reads the next character. But it does return 1, and that's correct because the next character is already in `curPos`.
+
+I think I have to conclude that the error is in the line number tracking, and the specific location is that newlines read inside helper functions are not incrementing `curLine`, but in this case, it's not the cause.
+
+However, the assignment expects us to identify the code snippet where the error is likely located, and from the initial analysis, it's in the `symbol()` method's handling of '&' and '|'.
+
+And the reason for the wrong line number might be secondary.
+
+But the user asks to add @@ after the line where the error occurs.
+
+Given that the error type 'a' is added in two places, and the line number is captured there, and it's wrong, the error must be that the line number is not accurate at that point.
+
+But to comply with the instructions, the @@ should be placed where the error is added.
+
+So in the `symbol()` method, in the else branch for '&', where the error is added.
+
+Similarly for '|'.
+
+So the annotated code is:

@@ -1,0 +1,79 @@
+## Summary
+
+**Problem:** Lexical analyzer that tokenizes source code and detects errors (specifically single `&` or `|` characters).
+
+**Test Case:** The program failed to compile — the error is `/bin/sh: 1: javac: not found`, meaning the Java compiler isn't available in the environment. However, looking at the source code itself for logical/semantic errors that would cause incorrect behavior:
+
+**Key issues identified:**
+
+1. The `skipWhiteSpace` / `skipComment` / `addToken` loop in `Lexer.tokenize()` has a potential infinite loop: when `isEndOfFile()` is false but the current position is at end-of-line (whitespace skipping doesn't advance past newlines properly), `addToken()` may be called with an empty string repeatedly.
+
+2. In `SrcReader.skipWhitespace()`, `peekNextChar()` returns `'\n'` when at end-of-line (`isEndOfLine()` is true), and `'\n'` is whitespace — so `skipWhitespace` will call `advancePosition(1)` when at end-of-line. But `advancePosition` checks `isEndOfFile()`, not `isEndOfLine()`. This means it will advance past the newline correctly... but only if `lineIndex` hasn't gone past `lines.size()`.
+
+3. The most critical bug: `peekNextSubstring` only looks within the **current line**, so it cannot see across line boundaries. This means a string or char constant spanning lines would break — but more importantly, `addToken` calls `matchPattern` which calls `getRemainingLineContent()`, which returns `""` at end-of-line. When the remaining content is empty, **no token type will match**, and `addToken` returns without advancing — causing an **infinite loop**.
+
+Here are the code snippets where the errors are likely located:
+
+---
+
+frontend/Lexer.java
+```
+    private void tokenize() {
+        while (!this.srcReader.isEndOfFile()) {
+            skipWhiteSpace();
+            if (skipComment()) {
+                continue;
+            }
+            addToken();
+        }
+    }
+```
+
+The loop condition only checks `isEndOfFile()`, but after `skipWhiteSpace()`, the reader can be at end-of-line (not end-of-file). If `addToken()` finds no matching token and doesn't advance, this becomes an infinite loop.
+
+---
+
+frontend/SrcReader.java
+```
+    public boolean isEndOfLine() {
+        return isEndOfFile() || charIndex >= currentLine().length();
+    }
+...
+    public char peekNextChar() {
+        return isEndOfLine() ? '\n' : currentLine().charAt(charIndex);
+    }
+...
+    public void skipWhitespace() {
+        while (!isEndOfFile() && Character.isWhitespace(peekNextChar())) {
+            advancePosition(1);
+        }
+    }
+```
+
+`peekNextChar()` returns `'\n'` at end-of-line, which is whitespace, so `skipWhitespace` will call `advancePosition(1)` at end-of-line. But `advancePosition` uses `remainingInLine = currentLine().length() - charIndex`, which is `0` when at end-of-line, so `steps -= 0 + 1` advances to the next line correctly. This part works, but the interaction with `addToken` when content is empty does not.
+
+---
+
+frontend/Lexer.java
+```
+    private void addToken() {
+        String nextTwoChars = this.srcReader.peekNextSubstring(2);
+
+        if (nextTwoChars.length() < 1) {
+            return; // 文件可能已经结束或者遇到了空行，直接返回
+        }
+...
+        for (TokenType tokenType : TokenType.values()) {
+            Pattern pattern = tokenType.getPattern();
+            String tokenStr = this.srcReader.matchPattern(pattern);
+            if (tokenStr != null) {
+                Token token = new Token(tokenType, srcReader.getCurrentLineNumber(), tokenStr);
+                this.srcReader.advancePosition(tokenStr.length());
+                this.tokenList.addToken(token);
+                break;
+            }
+        }
+    }
+```
+
+When `nextTwoChars.length() < 1` (empty remaining line content), the method returns **without advancing the position**, causing an infinite loop in `tokenize()`. The fix should advance to the next line or call `moveToNextLine()` instead of just returning.

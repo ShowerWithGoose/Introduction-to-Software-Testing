@@ -1,0 +1,383 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The program needs to perform syntax analysis on a source file. If errors are found, it should output the line number and error code to `error.txt`. Specifically, error 'j' indicates a missing right parenthesis `)`.
+2.  **Test Case Input**:
+    ```c
+    void f(int a {} // error 1: Missing ')' after parameter list. Line 1.
+    
+    int main( { // error 2: Missing ')' after 'main('. Line 3 (assuming blank line is line 2).
+        int a = 10;
+        f(a + 10; // error 3: Missing ')' in function call. Line 5.
+        return 0;
+    }
+    ```
+    *Note: The expected output is `1 j`, `3 j`, `5 j`. This implies the blank line counts as line 2.*
+3.  **Buggy Output**: "No output file". This suggests that the program likely crashed (exception) or terminated without writing any file, possibly due to an unhandled exception during parsing when encountering unexpected tokens (like `{` instead of `)`).
+4.  **Code Analysis**:
+    *   In `Parser.java`, the `parseFuncDef` method handles function definitions.
+    *   It reads `FuncType` and `Ident`.
+    *   It reads `(`.
+    *   It checks if the next token is `)`. If not, it checks if it is `{`. If it is `{`, it reports error 'j' and parses the block. This handles `void f(int a {}` partially, but `int a` is consumed by `parseFuncFParams`? No, `parseFuncDef` calls `parseFuncFParams` only if the peek is not `)` and not `{`.
+    *   Let's trace `void f(int a {}`:
+        *   `funcType` = `void`, `funcName` = `f`.
+        *   `lparent` = `(`.
+        *   `peek()` is `int` (not `)`).
+        *   `peek()` is not `{`.
+        *   So it calls `parseFuncFParams()`.
+        *   `parseFuncFParams` calls `parseFuncFParam`.
+        *   `parseFuncFParam` reads `int` and `a`.
+        *   Back in `parseFuncFParams`, `peek()` is `{`. Loop ends.
+        *   Back in `parseFuncDef`.
+        *   Checks `if (!tokens.peek().is(TokenType.RPARENT))`. Peek is `{`. True.
+        *   Calls `addError("j")`.
+        *   Does **not** consume the `{`.
+        *   Calls `funcDef.setBlock(parseBlock())`.
+        *   `parseBlock` expects `{`. It consumes `{`.
+        *   Then it loops while `peek()` is not `}`.
+        *   Inside `void f(int a {}`, after `{`, the next token is `}`.
+        *   So `parseBlock` consumes `}` and returns.
+        *   This seems to handle Error 1 correctly, producing `1 j`.
+
+    *   Let's trace `int main( {`:
+        *   `funcType` = `int`, `funcName` = `main`.
+        *   `lparent` = `(`.
+        *   `peek()` is `{` (not `)`).
+        *   `peek()` **is** `{`.
+        *   Enters `if (tokens.peek().is(TokenType.LBRACE))`.
+        *   Calls `addError("j")`. Line 3. Correct.
+        *   Calls `funcDef.setBlock(parseBlock())`.
+        *   `parseBlock` consumes `{`.
+        *   Then parses block items.
+        *   This seems to handle Error 2 correctly, producing `3 j`.
+
+    *   Let's trace `f(a + 10;`:
+        *   This is inside `main`'s block.
+        *   `parseStmt` is called.
+        *   `tokens.peek()` is `f` (IDENFR).
+        *   Goes to `default` case in switch. `iskey` = false.
+        *   `tryLVal()` is called. It consumes `f`. Returns `LVal`.
+        *   `tokens.peek()` is `(`. Not `ASSIGN`.
+        *   So `lVal!=null` but `peek()!=ASSIGN`.
+        *   Goes to `else` block: `tokens.setPos(pos)` (backtrack to before `f`).
+        *   `tokens.peek()` is `f`. Not `SEMICN`.
+        *   `tryExp()` is called.
+        *   `tryExp` calls `tryAddExp`.
+        *   `tryAddExp` calls `tryMulExp`.
+        *   `tryMulExp` calls `tryUnaryExp`.
+        *   `tryUnaryExp`:
+            *   Peek is `f`. Next is `(`.
+            *   Enters `if (tokens.peek().is(TokenType.IDENFR) && tokens.peek(1).is(TokenType.LPARENT))`.
+            *   Consumes `f`. Sets `ident`.
+            *   Consumes `(`. Sets `lparent`.
+            *   Checks `if (!tokens.peek().is(TokenType.RPARENT))`. Peek is `a`. True.
+            *   Calls `tryFuncRParams()`.
+            *   `tryFuncRParams`:
+                *   Calls `tryExp()`. Parses `a + 10`. Returns `Exp`.
+                *   Peek is `;`. Not `,`. Loop ends.
+                *   Returns `FuncRParams`.
+            *   Back in `tryUnaryExp`. `funcRParams` is set.
+            *   Checks `if (!tokens.peek().is(TokenType.RPARENT))`. Peek is `;`. True.
+            *   Calls `addError("j")`. **Crucial Point**: `addError` uses `tokens.peek(-1)`.
+            *   `tokens.peek(-1)` is the last consumed token, which is `10` (INTCON) from the expression `a + 10`. Or is it `;`?
+            *   Let's check `TokenStream.peek(-1)`.
+            *   `pos` is currently at `;`.
+            *   `peek(-1)` returns `tokens.get(pos - 1)`, which is `10`.
+            *   `addError` puts error at line of `10`. Line 5.
+            *   Then `return unaryExp`.
+            *   Back in `tryMulExp`, `tryAddExp`, `tryExp`. Returns `Exp`.
+            *   Back in `parseStmt`. `exp` is not null.
+            *   Checks `if (!tokens.peek().is(TokenType.SEMICN))`. Peek is `;`. False.
+            *   Else: `stmt.addIdent(tokens.next())`. Consumes `;`.
+            *   Returns `stmt`.
+            *   This produces `5 j`.
+
+    *   So why "No output file"?
+    *   Look at `Compiler.java`.
+    *   `parser.parse()` is called.
+    *   If `GetSymTable.isError()` is true, it writes `error.txt`.
+    *   `GetSymTable.isError()` checks `errors` map in `GetSymTable`.
+    *   But `Parser` has its own `errors` map (`TreeMap<Integer, String> errors`).
+    *   `Parser.addError` adds to `Parser.errors`.
+    *   `GetSymTable.addError` adds to `GetSymTable.errors`.
+    *   In `Parser.java`, `addError` calls `errors.put(...)`. This is `Parser.errors`.
+    *   In `Compiler.java`:
+        ```java
+        if (!GetSymTable.isError()) {
+             // write parser.txt
+        } else {
+             // write error.txt
+             writer.write(parser.toString());
+        }
+        ```
+    *   `GetSymTable.isError()` returns `!GetSymTable.errors.isEmpty()`.
+    *   `GetSymTable.errors` is populated by `GetSymTable.addError`.
+    *   Who calls `GetSymTable.addError`?
+        *   Semantic analysis checks (`checkError` methods).
+        *   Some syntax errors in `Parser` like `&` or `|` directly call `errors.put` (Parser's map) OR `GetSymTable.addError`?
+        *   In `Parser.parseLAndExp`: `errors.put(tokens.peek().getLine(), "a");` -> Parser's map.
+        *   In `Parser.parseLOrExp`: `errors.put(tokens.peek().getLine(), "a");` -> Parser's map.
+        *   In `Parser.parseFuncDef`: `addError("j")` -> Parser's map.
+        *   In `Parser.parseStmt`: `addError("j")` -> Parser's map.
+        *   In `Parser.tryUnaryExp`: `addError("j")` -> Parser's map.
+        
+    *   The `Parser.toString()` method:
+        ```java
+        @Override
+        public String toString() {
+            if (errors.isEmpty()) {
+                return compUnit.toString();
+            }
+            StringBuilder sb = new StringBuilder();
+            for (int i : errors.keySet()) {
+                sb.append(i + " " + errors.get(i) + "\n");
+            }
+            return sb.toString();
+        }
+        ```
+        This correctly outputs the errors from `Parser.errors`.
+
+    *   However, `Compiler.java` decides whether to write `error.txt` based on `GetSymTable.isError()`.
+    *   `GetSymTable.isError()` checks `GetSymTable.errors`.
+    *   `GetSymTable.errors` is **empty** because no semantic errors occurred and no syntax errors called `GetSymTable.addError`.
+    *   Therefore, `GetSymTable.isError()` returns `false`.
+    *   The compiler goes into the `if (!GetSymTable.isError())` block.
+    *   It tries to write `parser.txt`.
+    *   `writer.write(parser.toString())`.
+    *   Since `Parser.errors` is NOT empty, `parser.toString()` returns the error strings (e.g., "1 j\n3 j\n5 j\n").
+    *   It writes this to `parser.txt`.
+    *   The test expects `error.txt` to contain the errors.
+    *   The problem states: "For incorrect source programs, output ... to `error.txt`".
+    *   The current code outputs errors to `parser.txt` if `GetSymTable` thinks there are no errors.
+    *   This is a logic error in `Compiler.java` or how errors are tracked.
+    *   BUT, the prompt says "Buggy Output: No output file".
+    *   If it wrote to `parser.txt`, there would be a file.
+    *   Why "No output file"?
+    *   Maybe an exception occurred?
+    *   Let's look at `parseFuncDef` again for `int main( {`.
+    *   `funcDef.setBlock(parseBlock())`.
+    *   `parseBlock` consumes `{`.
+    *   Then `while (!tokens.peek().is(TokenType.RBRACE))`.
+    *   Inside `main`, we have `int a = 10; f(a + 10; return 0;`.
+    *   `parseBlockItem` is called.
+    *   `int` -> `parseVarDecl`.
+    *   `parseVarDecl` parses `int a = 10;`. Correct.
+    *   Next token `f`.
+    *   `parseBlockItem` -> `parseStmt`.
+    *   `parseStmt` parses `f(a + 10;`. As analyzed, it backtracks, parses as Exp Stmt, detects missing `)`, adds error, consumes `;`. Returns Stmt.
+    *   Next token `return`.
+    *   `parseStmt` parses `return 0;`. Correct.
+    *   Next token `}`.
+    *   `parseBlock` loop ends. Consumes `}`. Returns Block.
+    *   `parseFuncDef` returns.
+    *   `parse()` in `Parser`:
+        ```java
+        while (tokens.peek() != null) {
+            compUnit.addFuncDef(parseFuncDef());
+        }
+        ```
+    *   After `main` is parsed, `tokens.peek()` is `null`. Loop ends.
+    *   `parse()` finishes.
+    *   Back in `Compiler`.
+    *   `GetSymTable.isError()` is false.
+    *   Writes `parser.txt`.
+    
+    Why "No output file"?
+    Perhaps the test system checks for `error.txt` specifically? Or maybe `parser.txt` is considered "wrong" and thus "No output file" in the context of the expected `error.txt`?
+    Or is there a crash?
+    
+    Let's look at `tryUnaryExp` again.
+    ```java
+    if (!tokens.peek().is(TokenType.RPARENT)) {
+        addError("j");
+    } else {
+        unaryExp.setRparent(tokens.next());
+    }
+    ```
+    If error is added, `rparent` is NOT set.
+    Later, `toString()` of `UnaryExp`:
+    ```java
+    if (lparent != null) {
+        // ...
+        ans += rparent + string; // rparent is null!
+    }
+    ```
+    If `rparent` is null, `rparent + string` will throw `NullPointerException` if `rparent` is accessed as an object?
+    `Token` class `toString()` is called. If `rparent` is `null`, `null.toString()` throws NPE.
+    
+    Where is `UnaryExp.toString()` called?
+    It's called via `Exp` -> `AddExp` -> ... -> `UnaryExp`.
+    In `parseStmt`, when we parse `f(a + 10;` as an expression statement:
+    `tryExp()` returns an `Exp` containing the AST.
+    The AST contains `UnaryExp` with `rparent = null`.
+    Then `stmt.addExp(exp)`.
+    Then `parser.toString()` is called.
+    `compUnit.toString()` is NOT called because `errors` is not empty.
+    So `parser.toString()` returns the error string directly.
+    So `UnaryExp.toString()` is NEVER called in the error case!
+    
+    So no NPE there.
+
+    What about `CompUnit.toString()`?
+    It iterates `funcDefs`.
+    `FuncDef.toString()`:
+    ```java
+    return tmp +
+            funcName + "\n" +
+            lparent + "\n" +
+            para +
+            rparent + "\n" + // rparent might be null if error j occurred in FuncDef?
+            block;
+    ```
+    In `parseFuncDef`:
+    If `peek()` is `{` (like `main(`), `addError("j")` is called, and `parseBlock()` is called. `rparent` is NOT set.
+    So `FuncDef.rparent` is null.
+    But again, if errors exist, `compUnit.toString()` is NOT called.
+
+    So why "No output file"?
+    
+    Let's re-read `Compiler.java`.
+    ```java
+    if (!GetSymTable.isError()) {
+        FileWriter writer = new FileWriter("parser.txt");
+        writer.write(parser.toString());
+        writer.close();
+    } else {
+        FileWriter writer = new FileWriter("error.txt");
+        writer.write(parser.toString());
+        writer.close();
+    }
+    ```
+    
+    If `GetSymTable.isError()` is false, it writes `parser.txt`.
+    The expected output is `error.txt`.
+    The judge might be looking for `error.txt`. If it doesn't find `error.txt`, it might report "No output file" (meaning no *expected* output file).
+    
+    However, usually "No output file" means the program crashed or didn't write anything.
+    
+    Is it possible `GetSymTable.isError()` throws an exception? No.
+    
+    Let's look at `Parser.parse()` again.
+    ```java
+    while (!tokens.peek(2).is(TokenType.LPARENT)) {
+         // ...
+    }
+    ```
+    `tokens.peek(2)` can be null.
+    `TokenStream.peek(int i)`:
+    ```java
+    if (pos + i >= tokens.size() || pos + i < 0) {
+        return null;
+    }
+    ```
+    If `peek(2)` is null, `null.is(TokenType.LPARENT)` throws `NullPointerException`.
+    
+    Input:
+    `void f(int a {}`
+    Tokens: `void`, `f`, `(`, `int`, `a`, `{`, `}`.
+    
+    Initial state: `pos = 0`.
+    `peek(2)` is `(`. `is(LPARENT)` is true.
+    Loop condition `!true` -> `false`. Loop doesn't run.
+    
+    Next `while (tokens.peek() != null)`.
+    `peek()` is `void`.
+    `parseFuncDef()`.
+    Consumes `void`, `f`, `(`.
+    `peek()` is `int`.
+    `parseFuncFParams`.
+    Consumes `int`, `a`.
+    `peek()` is `{`.
+    Back in `parseFuncDef`.
+    `peek()` is `{`. Not `)`.
+    `peek()` IS `{`.
+    `addError("j")`.
+    `parseBlock()`.
+    Consumes `{`.
+    `peek()` is `}`.
+    Loop in `parseBlock` doesn't run.
+    Consumes `}`.
+    Returns Block.
+    Returns FuncDef.
+    
+    `peek()` is `null`?
+    Wait, `testfile.txt` has:
+    ```
+    void f(int a {} // error 1
+    
+    int main( { // error 2
+    ...
+    ```
+    After parsing `void f...`, `pos` is at end of `}`.
+    Next token is newline? Lexer skips whitespace/newlines?
+    Lexer `scan()`:
+    ```java
+    else if (c == '\n') {
+        line++;
+    } else if (!Character.isWhitespace(c)) {
+        // scan
+    }
+    ```
+    Newlines are skipped (only increment line).
+    So next token is `int`.
+    
+    `peek()` is `int`. Not null.
+    `parseFuncDef()`.
+    Consumes `int`, `main`, `(`.
+    `peek()` is `{`.
+    `addError("j")`.
+    `parseBlock()`.
+    Consumes `{`.
+    Parses body.
+    Consumes `}`.
+    Returns.
+    
+    `peek()` is null.
+    Loop ends.
+    
+    So `parse()` completes successfully.
+    
+    So the issue is definitely that `GetSymTable.isError()` is false, so it writes `parser.txt` instead of `error.txt`.
+    
+    The fix should be to check `parser.isError()` (or `!parser.getErrors().isEmpty()`) instead of `GetSymTable.isError()` to decide whether to write `error.txt`.
+    
+    However, the prompt asks to identify the location of the errors in the program.
+    
+    The primary logical error is in `Compiler.java` where it checks the wrong error flag.
+    
+    Another potential issue: `Parser.addError` uses `tokens.peek(-1)`.
+    If `tokens.peek(-1)` is null (e.g. error at very beginning), it puts line 0.
+    
+    But the main reason for "Wrong Answer" / "No output file" (if interpreted as missing `error.txt`) is `Compiler.java`.
+
+<Compiler.java>
+import frontend.ast.Parser;
+import frontend.lexer.Lexer;
+import frontend.lexer.TokenStream;
+import frontend.symbols.GetSymTable;
+
+import java.io.FileWriter;
+import java.io.IOException;
+import java.util.ArrayList;
+
+public class Compiler {
+    public static void main(String[] args) throws IOException {
+        Lexer lexer = new Lexer("testfile.txt");
+        lexer.scan();
+        TokenStream tokenStream = new TokenStream(new ArrayList<>(lexer.getTokens()));
+        Parser parser = new Parser(tokenStream);
+        parser.parse();
+//        GetSymTable getSymTable=new GetSymTable(parser.getCompUnit(),parser.getErrors());
+//        getSymTable.parse();
+        if (!GetSymTable.isError()) {
+            FileWriter writer = new FileWriter("parser.txt");
+            writer.write(parser.toString());
+            //writer.write(GetSymTable.root.toString());
+            writer.close();
+        } else {
+            FileWriter writer = new FileWriter("error.txt");
+            writer.write(parser.toString());
+            //writer.write(getSymTable.outError());
+            writer.close();
+        }
+    }
+}

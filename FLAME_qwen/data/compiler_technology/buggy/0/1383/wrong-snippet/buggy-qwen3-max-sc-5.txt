@@ -1,0 +1,394 @@
+Based on the problem description and test case input, the error appears to be related to handling of the `&` and `|` symbols individually (error type "a"). The test case input shows a compilation error due to missing Java compiler (`javac not found`), but more importantly, the actual lexical analysis logic for detecting single `&` or `|` is implemented in the `Lexer.java` file.
+
+Looking at the code, the error handling for single `&` and `|` is present, but there's a critical issue in the character literal parsing section that may cause incorrect line number tracking or premature termination. However, the most likely location of the bug related to error type "a" is in the handling of `&` and `|` in the main loop of lexical analysis.
+
+But upon closer inspection, the real issue is in the **character literal parsing logic** — specifically, when handling normal (non-escape) characters inside single quotes. The code incorrectly increments `i` twice, which can cause misalignment in scanning and potentially skip over important characters like `&` or `|`, or worse, cause them to be processed outside of any valid token context, leading to an "OTHER" error instead of the expected "ILLEGAL_SYMBOL" error.
+
+However, given the test case failed with no output and the error type "a" corresponds to single `&` or `|`, the most direct location where this should be caught is in the `&` and `|` handling blocks. But those appear correct.
+
+Wait — the actual problem is revealed by the test input:  
+> Test Case Input: `/bin/sh: 1: javac: not found`
+
+This suggests the test environment couldn't even compile the Java code, meaning the **real issue is not in the logic**, but the fact that the program didn't run at all. However, since we're told to assume the program ran and produced buggy output vs expected output, and the only lexical error type mentioned is "a", we must focus on the symbol handling.
+
+But note: the problem states **"each erroneous example will contain only lexical analysis errors"** and **"exactly one error"**, and error type "a" is for single `&` or `|`.
+
+Now, examine the `&` handling:
+
+```java
+} else if (ch == '&') {
+    if (i + 1 < sourceCode.length() && sourceCode.charAt(i + 1) == '&') {
+        result.add(new Token(TokenType.ANDSY, "&&", lineNum));
+        i++;
+    } else {
+        result.add(new Token(TokenType.ERROR, "&", lineNum));
+        ErrorChecker.addError(ErrorType.ILLEGAL_SYMBOL, lineNum);
+    }
+}
+```
+
+This looks correct. Same for `|`.
+
+But wait — what if the single `&` appears at the very end of the file? Then `i + 1 >= sourceCode.length()`, so it goes to the `else` branch — correct.
+
+So why would it fail?
+
+Now look at the **expected behavior**: for an erroneous program, **only** the error should be output to `error.txt`, and **nothing** should be output to `lexer.txt`.
+
+However, in the current implementation, **even when an error is detected**, the lexer still adds an `ERROR` token to the `result` list, and later `printResultToFile("lexer.txt")` is **always called**, regardless of whether there were errors.
+
+But the problem says:
+- For a **correct** program → output tokens to `lexer.txt`
+- For an **erroneous** program → output error to `error.txt`
+
+It does **not** say to output both. In fact, the presence of any lexical error means the entire output should go to `error.txt`, and `lexer.txt` should either be empty or not contain any tokens (especially not ERROR tokens).
+
+However, looking at `Compiler.java`:
+
+```java
+Lexer.lexicalAnalysis(content);
+Lexer.printResultToFile("lexer.txt");
+...
+ErrorChecker.printErrorToFile("error.txt");
+```
+
+This always writes to **both files**.
+
+But the problem states:
+> For an erroneous source program, output the line number ... into **error.txt**
+
+It does **not** say to output anything to `lexer.txt`. So if there's any error, `lexer.txt` should probably be empty or not written.
+
+However, the problem also says: "each erroneous example will have exactly one error", and the output format specifies separate files.
+
+But the sample outputs don't show both files being written. The key is: **if there is any lexical error, the program should only produce `error.txt`, not `lexer.txt`**.
+
+But the current code writes to `lexer.txt` unconditionally.
+
+However, the problem statement doesn't explicitly forbid writing tokens to `lexer.txt` in case of error — but the expected behavior in practice (and in many compilers) is that if there's a lexical error, you don't proceed to output valid tokens.
+
+But wait — the problem says:
+> For a correct source program, output ... into **lexer.txt**  
+> For an erroneous source program, output ... into **error.txt**
+
+This implies **mutual exclusivity**: only one file is written.
+
+Therefore, the bug is in `Compiler.java`: it always writes to `lexer.txt`, even when there are errors.
+
+But the test case input shows the program failed to run (`javac not found`), so maybe that's a red herring.
+
+Alternatively, perhaps the real bug is in the **character literal parsing**, which has a serious flaw:
+
+In the `'` handling block:
+
+```java
+} else {
+    i++;
+    if (i < sourceCode.length() && sourceCode.charAt(i) == '\'') {
+        ...
+    } else {
+        i -= 2;
+        ...
+    }
+}
+```
+
+Let's trace:
+- At `ch == '\''`, enter block.
+- `i++` → now points to first char inside quote.
+- Read `c = sourceCode.charAt(i)`
+- Since it's not a backslash, go to `else`
+- Then do `i++` again → now `i` points to the character after the content
+- Then check if `sourceCode.charAt(i) == '\''`
+
+But if the input is just `'\n'`, then:
+- i0: `'`
+- i1: `\n` (newline)
+- i2: ??? — but after `i++` inside else, `i` becomes i1+1 = i2
+- Then check if i2 < length and charAt(i2) == `'`
+
+But if the string is `'\n'`, then positions: [0]=''', [1]='\n', [2]="'"
+So it works.
+
+But what if the character literal is malformed, like `'a` (no closing quote)? Then:
+- i starts at position of `'`
+- i++ → now at 'a'
+- not escape, so i++ again → now at position after 'a'
+- then check if that position has `'` — it doesn't
+- so do `i -= 2` → back to original `'` position
+- add error
+- then loop continues, and will re-process the same `'` again → infinite loop?
+
+But more critically, the **line number is not updated** when scanning inside character literals or strings for newlines.
+
+Ah! That's a known issue: in the string literal scanning:
+
+```java
+while (i < sourceCode.length() && sourceCode.charAt(i) != '"') {
+    buffer.add(sourceCode.charAt(i));
+    i++;
+}
+```
+
+It does **not** check for `\n` to increment `lineNum`. So if a string spans multiple lines, the line number becomes incorrect.
+
+Similarly, in character literals, if there's a newline inside (which is invalid), the line number won't be updated.
+
+But the immediate problem for error type "a" is likely elsewhere.
+
+However, the most probable location of the bug that causes the program to **not detect** a single `&` as error type "a" is actually **not present** — the logic seems correct.
+
+But wait: the `ErrorType.ILLEGAL_SYMBOL` uses message `"a"`, which is correct per the table.
+
+And `ErrorChecker.addError(ErrorType.ILLEGAL_SYMBOL, lineNum)` should output `"lineNum a"`.
+
+So why would it fail?
+
+Unless... the single `&` is being consumed as part of another token.
+
+But the only way that could happen is if it's inside a comment or string.
+
+But the test case is likely something like:
+
+```c
+if (a & b);
+```
+
+Which should trigger error "a".
+
+Given all this, the code appears logically correct.
+
+But there's one subtle bug in the **character literal parsing** that can cause the scanner to **skip characters or misalign**, which might indirectly cause a `&` to be left unprocessed or processed incorrectly.
+
+Specifically, in the non-escape branch:
+
+```java
+} else {
+    i++;
+    if (i < sourceCode.length() && sourceCode.charAt(i) == '\'') {
+        // ASCII must be in range
+        if ((c >= 32 && c <= 126)) {
+            result.add(new Token(TokenType.CHARSY, "'" + c + "'", lineNum));
+        } else {
+            result.add(new Token(TokenType.ERROR, String.valueOf(c), lineNum));
+            ErrorChecker.addError(ErrorType.ILLEGAL_CHAR, lineNum);
+        }
+    } else {
+        i -= 2;
+        result.add(new Token(TokenType.ERROR, "'", lineNum));
+        ErrorChecker.addError(ErrorType.OTHER, lineNum);
+    }
+}
+```
+
+The issue: after reading the opening `'`, we do `i++` to get `c`. Then, in the `else` (non-escape), we do **another `i++`**, so now `i` points to the character after `c`. Then we check if that is `'`.
+
+But if the input is `'a'`, then:
+- initial i: index of `'`
+- after first i++: i points to 'a', c = 'a'
+- then i++ again: i points to second `'`
+- check sourceCode.charAt(i) == `'` → yes
+- add token
+- loop continues from i+1
+
+Correct.
+
+But if the input is `'a`, then:
+- initial i: index of `'`
+- i++ → points to 'a', c='a'
+- i++ → points to end of file (i == length)
+- condition fails: i < length is false
+- so go to else
+- i -= 2 → back to initial `'`
+- add error
+- then the for-loop will do i++ at end, so next char is 'a' → which is letter → parsed as identifier!
+
+So `'a` would produce:
+- error for unterminated char
+- then token `IDENFR a`
+
+But that's a different error.
+
+However, this is not related to `&`.
+
+Given the time, and since the problem states the error is type "a", and the handling of `&` seems correct, the only remaining possibility is that the **program outputs to both files**, but the test expects only `error.txt` to be written when there's an error.
+
+But the problem says: "output the line number ... into error.txt" — it doesn't say "only", but conventionally, you don't output tokens when there's a lexical error.
+
+However, the assignment says: "For an erroneous source program, output ... into error.txt", implying that's the only output.
+
+But the current `Compiler.java` writes to `lexer.txt` regardless.
+
+So the bug is in `Compiler.java`: it should **not** write to `lexer.txt` if there are any errors.
+
+But the problem states: "each erroneous example will have exactly one error", so we can check if `ErrorChecker` has any errors, and skip writing `lexer.txt`.
+
+However, the provided code doesn't do that.
+
+But the test case output is empty, and expected output is also empty? That doesn't help.
+
+Given the instructions, and since the error type "a" is handled in the `&` and `|` blocks, and those seem correct, but there's a **critical bug in the character literal parsing that can cause the index to go out of sync**, which might indirectly affect other tokens, but more importantly, the **most likely location that matches the error type "a" is the `&` and `|` handling**.
+
+But they look correct.
+
+Wait — look at the `|` handling:
+
+```java
+} else if (ch == '|') {
+    if (i + 1 < sourceCode.length() && sourceCode.charAt(i + 1) == '|') {
+        result.add(new Token(TokenType.ORSY, "||", lineNum));
+        i++;
+    } else {
+        result.add(new Token(TokenType.ERROR, "|", lineNum));
+        ErrorChecker.addError(ErrorType.ILLEGAL_SYMBOL, lineNum);
+    }
+}
+```
+
+This is correct.
+
+But what if the input has a single `|` at the very end? Then `i+1 >= length`, so it goes to else — correct.
+
+So the logic is sound.
+
+The only remaining possibility is that the **error is not being reported because the program crashes before reaching it**, due to a bug in another part of the lexer.
+
+And the most likely crash point is in the **character literal parsing**, specifically when handling escape sequences.
+
+Look at this part:
+
+```java
+if (i + 1 < sourceCode.length() && c == '\\') {
+    String finalString = "";
+    char c1 = sourceCode.charAt(i + 1);
+    switch (c1) {
+        case 'n':
+            finalString = "'\\n'";
+            i += 2;
+            break;
+        ...
+        default:
+            break;
+    }
+    result.add(new Token(TokenType.CHARSY, finalString, lineNum));
+}
+```
+
+If the escape sequence is invalid, e.g., `'\x'`, then it hits the `default` and does **not** update `i`, and `finalString` remains `""`.
+
+Then it adds a token with value `""`, which is wrong.
+
+Moreover, it doesn't report an error!
+
+So `'\x'` would be accepted as a valid character literal with empty string, which is incorrect.
+
+But again, not related to `&`.
+
+Given all this, and since the problem asks for the location of the error based on the failure, and the only error type mentioned is "a", and the handling of `&` and `|` is correct, perhaps the real issue is that the **program is not flushing or writing the error file properly**, but that seems unlikely.
+
+Alternatively, the test case might contain a single `&` inside a comment, which should be ignored, but the comment handling might be flawed.
+
+Look at comment handling for `/* ... */`:
+
+```java
+if (i + 1 < sourceCode.length() && sourceCode.charAt(i + 1) == '*') {
+    i += 2;
+    while (i + 1 < sourceCode.length() && !(sourceCode.charAt(i) == '*' && sourceCode.charAt(i + 1) == '/')) {
+        if (sourceCode.charAt(i) == '\n') {
+            lineNum++;
+        }
+        i++;
+    }
+    i++;
+}
+```
+
+This correctly skips over comments, including updating line numbers.
+
+So a `&` inside a comment would be skipped.
+
+But if the test case has `&` outside a comment, it should be caught.
+
+Given the time, and since the assignment requires us to output the code snippet where the error is likely located, and the only place that handles error type "a" is the `&` and `|` blocks, but they seem correct, the next best candidate is the **character literal parsing**, because it has multiple bugs that can cause the scanner to lose synchronization, which might cause a subsequent `&` to be missed or mis-scanned.
+
+Specifically, in the non-escape branch, the double increment of `i` can cause the scanner to skip the closing quote or go out of bounds, leading to undefined behavior.
+
+Therefore, the most likely location of the error that indirectly causes the program to fail to detect error type "a" is in the character literal parsing logic.
+
+<frontend/lexer/Lexer.java>
+...
+            } else if (ch == '\'') {
+                i++;
+                if (i < sourceCode.length()) {
+                    char c = sourceCode.charAt(i);
+                    // 判断可能的转义字符，默认此时不会出错
+                    if (i + 1 < sourceCode.length() && c == '\\') {
+                        String finalString = "";
+                        char c1 = sourceCode.charAt(i + 1);
+                        switch (c1) {
+                            case 'n':
+                                finalString = "'\\n'";
+                                i += 2;
+                                break;
+                            case 't':
+                                finalString = "'\\t'";
+                                i += 2;
+                                break;
+                            case 'a':
+                                finalString = "'\\a'";
+                                i += 2;
+                                break;
+                            case 'f':
+                                finalString = "'\\f'";
+                                i += 2;
+                                break;
+                            case 'v':
+                                finalString = "'\\v'";
+                                i += 2;
+                                break;
+                            case 'b':
+                                finalString = "'\\b'";
+                                i += 2;
+                                break;
+                            case '\\':
+                                finalString = "'\\\\'";
+                                i += 2;
+                                break;
+                            case '\'':
+                                finalString = "'\\''";
+                                i += 2;
+                                break;
+                            case '\"':
+                                finalString = "'\\\"'";
+                                i += 2;
+                                break;
+                            case '0':
+                                finalString = "'\\0'";
+                                i += 2;
+                                break;
+                            default:
+                                break;
+                        }
+                        result.add(new Token(TokenType.CHARSY, finalString, lineNum));
+                    } else {
+                        i++;
+                        if (i < sourceCode.length() && sourceCode.charAt(i) == '\'') {
+                            // ASCII必须在32~126之间，或者7~12、34、39、92、0
+                            if ((c >= 32 && c <= 126)) {
+                                result.add(new Token(TokenType.CHARSY, "'" + c + "'", lineNum));
+                            } else {
+                                result.add(new Token(TokenType.ERROR, String.valueOf(c), lineNum));
+                                ErrorChecker.addError(ErrorType.ILLEGAL_CHAR, lineNum);
+                            }
+                        } else {
+                            i -= 2;
+                            result.add(new Token(TokenType.ERROR, "'", lineNum));
+                            ErrorChecker.addError(ErrorType.OTHER, lineNum);
+                        }
+                    }
+                } else {
+                    result.add(new Token(TokenType.ERROR, "'", lineNum));
+                    ErrorChecker.addError(ErrorType.OTHER, lineNum);
+                }
+            } else if (ch == '"') {
+...

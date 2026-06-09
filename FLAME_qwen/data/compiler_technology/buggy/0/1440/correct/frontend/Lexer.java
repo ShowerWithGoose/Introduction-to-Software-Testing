@@ -1,0 +1,241 @@
+package frontend;
+
+import java.io.*;
+
+
+
+enum tokenType {
+    IDENFR("Ident"),
+    INTCON("IntConst"),
+    STRCON("StringConst"),
+    CHRCON("CharConst"),
+    MAINTK("main"),
+    CONSTTK("const"),
+    INTTK("int"),
+    CHARTK("char"),
+    BREAKTK("break"),
+    CONTINUETK("continue"),
+    IFTK("if"),
+    ELSETK("else"),
+    NOT("!"),
+    AND("&&"),
+    OR("||"),
+    FORTK("for"),
+
+    GETINTTK("getint"),
+    GETCHARTK("getchar"),
+    PRINTFTK("printf"),
+    RETURNTK("return"),
+    PLUS("+"),
+    MINU("-"),
+    VOIDTK("void"),
+    MULT("*"),
+    DIV("/"),
+    MOD("%"),
+    LSS("<"),
+    LEQ("<="),
+    GRE(">"),
+    GEQ(">="),
+    EQL("=="),
+    NEQ("!="),
+    ASSIGN("="),
+    SEMICN(";"),
+    COMMA(","),
+    LPARENT("("),
+    RPARENT(")"),
+    LBRACK("["),
+    RBRACK("]"),
+    LBRACE("{"),
+    RBRACE("}");
+
+
+    private final String representation;
+
+    tokenType(String representation) {
+        this.representation = representation;
+    }
+
+    private String getRepresentation() {
+        return representation;
+    }
+
+    public static tokenType getTokenType(String str) {
+        for (tokenType tokenType : tokenType.values()) {
+            if (tokenType.getRepresentation().equals(str)) {
+                return tokenType;
+            }
+        }
+        return null; // 未找到对应的 tokenType  
+    }
+}
+
+class Token {
+    private final String value;
+    private tokenType type;
+    private final int line;
+
+    public Token(String token, tokenType type, int line) {
+        this.value = token;
+        this.type = type;
+        this.line = line;
+    }
+}
+
+public class Lexer {
+    private final String inputFilePath = "testfile.txt";
+    private final String outputFilePath = "lexer.txt";
+    private final String errorputFilePath = "error.txt";
+
+    public void lexer() {
+
+        try (PushbackReader reader = new PushbackReader(new FileReader(inputFilePath));
+             FileWriter writer = new FileWriter(outputFilePath);
+             FileWriter errorWriter = new FileWriter(errorputFilePath)) {
+            int lineNum = 1;//统计行数
+            int currentChar = 0;
+            StringBuilder currentToken = new StringBuilder();//token单词
+
+            while ((currentChar = reader.read())!=-1) {
+                char c = (char) currentChar;
+                if (c == '\n') {
+                    lineNum++;
+                }
+                if(Character.isWhitespace(c)){
+                    continue;
+                }
+                if(c=='/'){
+                    c=(char) reader.read();
+                    if(c=='/'){
+                        //处理//注释
+                        while ((currentChar = reader.read())!=-1){
+                            c=(char) currentChar;
+                            if(c=='\n'){
+                                lineNum++;
+                                break;
+                            }
+                        }
+                        continue;
+                    } else if (c=='*') {
+                        //处理/**/
+                        while ((currentChar = reader.read())!=-1){
+                            c=(char) currentChar;
+                            if(c=='\n'){
+                                lineNum++;
+                            } else if (c=='*') {
+                                if((currentChar= reader.read())==-1)break;
+                                c=(char) currentChar;
+                                if(c=='/')break;else reader.unread(c);
+                            }
+                        }
+                        continue;
+                    }else {
+                        //不是注释
+                        reader.unread(c);
+                        c='/';
+                    }
+                }
+                currentToken.append(c);
+                if (c=='\"') {
+                    //是StrConst
+                    while ((currentChar = reader.read())!=-1){
+                        c = (char) currentChar;
+                        currentToken.append(c);
+                        if(c=='"') {
+//                         Token token=new Token(currentToken.toString(),tokenType.getTokenType(currentToken.toString()),lineNum);
+                            writer.write("STRCON "+currentToken+"\n");
+                            break;
+                        }
+                    }
+                } else if (c=='\'') {
+                    //是CharConst
+                    c=(char) reader.read();
+                    currentToken.append(c);
+                    if(c=='\\'){
+                        c=(char) reader.read();
+                        currentToken.append(c);
+                    }
+                    c=(char) reader.read();
+                    currentToken.append(c);
+                    writer.write("CHRCON "+currentToken+"\n");
+                }  else if (Character.isDigit(c)) {
+                    //是intConst
+                    while ((currentChar=reader.read())!=-1){
+                        c=(char) currentChar;
+                        if(Character.isDigit(c)){
+                            currentToken.append(c);
+                        }else {
+                            writer.write("INTCON "+currentToken+"\n");
+                            reader.unread(c);
+                            break;
+                        }
+                    }
+                } else if (c=='_'||Character.isLetter(c)) {
+                    //是标识符
+                    while ((currentChar=reader.read())!=-1){
+                        c=(char) currentChar;
+                        if(Character.isLetterOrDigit(c)||c=='_'){
+                            currentToken.append(c);
+                        }else {
+                            if(tokenType.getTokenType(currentToken.toString())!=null){
+                                writer.write(tokenType.getTokenType(currentToken.toString())+" "+currentToken+"\n");
+                            }else {
+                                writer.write("IDENFR "+currentToken+"\n");
+                            }
+                            reader.unread(c);
+                            break;
+                        }
+                    }
+                }else {
+                    //是其余标识符
+                    switch (c){
+                        case '&':
+                            c=(char)reader.read();
+                            if(c=='&'){
+                                currentToken.append(c);
+                                writer.write(tokenType.getTokenType(currentToken.toString())+" "+currentToken+"\n");
+                            }else {
+                                //单个&，a类错误
+                                errorWriter.write(lineNum+" a\n");
+                                reader.unread(c);
+                            }
+                            break;
+                        case '|':
+                            c=(char)reader.read();
+                            if(c=='|'){
+                                currentToken.append(c);
+                                writer.write(tokenType.getTokenType(currentToken.toString())+" "+currentToken+"\n");
+                            }else {
+                                //单个|，a类错误
+                                errorWriter.write(lineNum+" a\n");
+                                reader.unread(c);
+                            }
+                            break;
+                        case '!':
+                        case '>':
+                        case '<':
+                        case '=':
+                            c=(char)reader.read();
+                            if(c=='='){
+                                //是双字符标识符
+                                currentToken.append(c);
+                                writer.write(tokenType.getTokenType(currentToken.toString())+" "+currentToken+"\n");
+                            }else {
+                                //是单字符标识符
+                                writer.write(tokenType.getTokenType(currentToken.toString())+" "+currentToken+"\n");
+                                reader.unread(c);
+                            }
+                            break;
+                        default:
+                            //普通单字符标识符
+                            writer.write(tokenType.getTokenType(currentToken.toString())+" "+currentToken+"\n");
+                    }
+                }
+                currentToken.setLength(0);
+            }
+        } catch(IOException e){
+            e.printStackTrace();
+        }
+    }
+}
+
+

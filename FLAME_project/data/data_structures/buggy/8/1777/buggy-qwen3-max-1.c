@@ -1,0 +1,14 @@
+#include <math.h>
+#include<stdio.h>
+#include<string.h>
+#include<stdlib.h>
+
+int main()
+{
+    int n,m;
+    while(~scanf("%d%d",&n,&m))
+    {
+        printf("%d %d\n",n,m); // @@ [This program only echoes the input and does not implement graph traversal (DFS/BFS), vertex deletion, or any of the required logic. It completely ignores edges and the vertex to delete, leading to wrong output.]
+    }
+    return 0;
+}

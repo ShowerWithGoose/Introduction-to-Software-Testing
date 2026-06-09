@@ -1,0 +1,83 @@
+## Summary
+
+The test case fails with `/bin/sh: 1: javac: not found`, which is a **compilation error** — the Java compiler isn't available in the environment. However, looking at the source code itself, there's a real bug that would cause incorrect behavior even if it compiled: the `curChar` field is initialized to `0` in the constructor, but `reader.read()` is only called at the start of `Tokenize()`. More critically, the `next()` method checks `if (curChar == -1)` at the top, but `curChar` starts at `0`, so the first call to `next()` before `reader.read()` is invoked would be fine — but the real issue is the **char literal handling** for escape sequences and the **`curChar` initialization**.
+
+The most likely source of a compilation error (beyond the missing `javac`) is in `frontend/TokenType.java` — the `value` field has no getter and is never used, but more importantly, the enum compiles fine. The actual code bug is in `Lexer.java` in the `next()` method's char literal (`'\''`) handling, which reads an extra character unconditionally before checking for `\\`.
+
+Here are the suspicious code locations:
+
+frontend/Lexer.java
+```
+...
+            } else if (curChar == '\'') {
+                tokenContent += (char)curChar;
+                curChar = reader.read();
+                if (curChar != -1 && (char)curChar != '\\') {
+                    tokenContent += (char)curChar;
+                    curChar = reader.read();
+
+                    tokenContent += (char)curChar;
+                    curChar = reader.read();
+                }
+                while (curChar != -1 && (char)curChar != '\'') {
+                    tokenContent += (char)curChar;
+                    curChar = reader.read();
+                }
+...
+```
+
+frontend/TokenType.java
+```
+...
+    GETINTTK("getInt"),
+    GETCHARTK("getChar"),
+...
+    private String value;
+
+    TokenType(String value) {
+        this.value = value;
+    }
+...
+```
+
+The `GETINTTK` and `GETCHARTK` enum values use `"getInt"` and `"getChar"` (camelCase), but the keywords in source code are `getint` and `getchar` (all lowercase). The `reserve()` method in `Lexer.java` compares `tokenContent` (which is the raw source text, all lowercase) against these enum display values — but actually `reserve()` compares string literals directly, so that's fine. The enum display strings don't affect keyword matching.
+
+The primary compilation failure is the missing `javac` runtime issue, but the code-level bug most likely to cause wrong output is:
+
+frontend/Lexer.java
+```
+...
+    private Lexer() {
+        srcCode = "";
+        curChar = 0;
+        lineNum = 1;
+...
+    public List<Token> Tokenize() throws IOException{
+        List<Token> tokens = new ArrayList<>();
+        curChar = reader.read();
+...
+        while(true){
+            next();
+            Token token = new Token(tokenType, tokenContent, lineNum);
+            if(token.getType() == TokenType.EOF) 
+                break;
+            if (token.getType() != TokenType.NOTE)
+                tokens.add(token);
+        }
+        return tokens;
+    }
+...
+    public void outputTokens(List<Token> tokens) throws FileNotFoundException{
+        if (errorFlag == 0) {
+...
+        } else {
+            PrintStream ps = new PrintStream("error.txt");
+            System.setOut(ps);
+            System.out.println(errorFlag + " a");
+            ps.close();
+        }
+    }
+...
+```
+
+The `errorFlag` is set inside `next()` but the token with the error is still added to `tokens` in `Tokenize()` (since there's no check for `errorFlag` there), and `next()` returns without setting `tokenType` to anything meaningful when an error occurs — leaving `tokenType` as whatever it was previously, potentially causing a valid-looking token to be added before the error is reported.

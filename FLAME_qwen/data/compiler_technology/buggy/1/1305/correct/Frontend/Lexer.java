@@ -1,0 +1,183 @@
+package Frontend;
+
+import Token.Token;
+import Token.TokenTypes;
+import Error.Error;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class Lexer {
+    public List<Token> tokens = new ArrayList<>();
+    public Map<String, TokenTypes> keywords = new HashMap<String, TokenTypes>() {{
+        put("main", TokenTypes.MAINTK);
+        put("const", TokenTypes.CONSTTK);
+        put("int", TokenTypes.INTTK);
+        put("char", TokenTypes.CHARTK);
+        put("break", TokenTypes.BREAKTK);
+        put("continue", TokenTypes.CONTINUETK);
+        put("if", TokenTypes.IFTK);
+        put("else", TokenTypes.ELSETK);
+        put("getint", TokenTypes.GETINTTK);
+        put("getchar", TokenTypes.GETCHARTK);
+        put("printf", TokenTypes.PRINTFTK);
+        put("return", TokenTypes.RETURNTK);
+        put("for", TokenTypes.FORTK);
+        put("void", TokenTypes.VOIDTK);
+    }};
+    public void scan(String source){
+        int line = 1;
+        int length = source.length();
+        for(int i = 0; i < length; i++){
+            char c = source.charAt(i);
+            char next_c;
+            if(i + 1 < length){
+                next_c = source.charAt(i + 1);
+            }
+            else {
+                next_c = '\0';
+            }
+            if(c == '\n'){
+                line++;
+            }
+            else if (c == ';') tokens.add(new Token(TokenTypes.SEMICN, line, ";"));
+            else if (c == ',') tokens.add(new Token(TokenTypes.COMMA, line, ","));
+            else if (c == '(') tokens.add(new Token(TokenTypes.LPARENT, line, "("));
+            else if (c == ')') tokens.add(new Token(TokenTypes.RPARENT, line, ")"));
+            else if (c == '[') tokens.add(new Token(TokenTypes.LBRACK, line, "["));
+            else if (c == ']') tokens.add(new Token(TokenTypes.RBRACK, line, "]"));
+            else if (c == '{') tokens.add(new Token(TokenTypes.LBRACE, line, "{"));
+            else if (c == '}') tokens.add(new Token(TokenTypes.RBRACE, line, "}"));
+            else if (c == '%') tokens.add(new Token(TokenTypes.MOD, line, "%"));
+            else if (c == '+') tokens.add(new Token(TokenTypes.PLUS, line, "+"));
+            else if (c == '-') tokens.add(new Token(TokenTypes.MINU, line, "-"));
+            else if (c == '*') tokens.add(new Token(TokenTypes.MULT, line, "*"));
+            else if (c == '/') {
+                if (next_c == '/') {
+                    int j = source.indexOf('\n', i + 2);
+                    if (j == -1) j = length;
+                    i = j - 1;
+                } else if (next_c == '*') { // /* */
+                    for (int j = i + 2; j < length; j++) {
+                        char e = source.charAt(j);
+                        if (e == '\n') line++;
+                        else if (e == '*' && source.charAt(j + 1) == '/') {
+                            i = j + 1;
+                            break;
+                        }
+                    }
+                } else tokens.add(new Token(TokenTypes.DIV, line, "/"));
+            }
+            else if (c == '=') {
+                if (next_c != '='){
+                    tokens.add(new Token(TokenTypes.ASSIGN, line, "="));
+                }
+                else {
+                    tokens.add(new Token(TokenTypes.EQL, line, "=="));
+                    i++;
+                }
+            }
+            else if (c == '>') {
+                if (next_c != '='){
+                    tokens.add(new Token(TokenTypes.GRE, line, ">"));
+                }
+                else {
+                    tokens.add(new Token(TokenTypes.GEQ, line, ">="));
+                    i++;
+                }
+            }
+            else if (c == '<') {
+                if (next_c != '='){
+                    tokens.add(new Token(TokenTypes.LSS, line, "<"));
+                }
+                else {
+                    tokens.add(new Token(TokenTypes.LEQ, line, "<="));
+                    i++;
+                }
+            }
+            else if (c == '!') {
+                if (next_c != '='){
+                    tokens.add(new Token(TokenTypes.NOT, line, "!"));
+                }
+                else {
+                    tokens.add(new Token(TokenTypes.NEQ, line, "!="));
+                    i++;
+                }
+            }
+            else if (c == '&') {
+                if (next_c == '&') {
+                    tokens.add(new Token(TokenTypes.AND, line, "&&"));
+                    i++;
+                }
+                else {
+                    Error.errors.add(new Error(line, 'a'));
+                    tokens.add(new Token(TokenTypes.AND, line, "&&"));
+                    i++;
+                }
+            } else if (c == '|') { // ||
+                if (next_c == '|') {
+                    tokens.add(new Token(TokenTypes.OR, line, "||"));
+                    i++;
+                }
+                else {
+                    Error.errors.add(new Error(line, 'a'));
+                    tokens.add(new Token(TokenTypes.OR, line, "||"));
+                    i++;
+                }
+            }
+            else if (c == '_' || Character.isLetter(c)) {
+                String s = "";
+                for (int j = i; j < length; j++) {
+                    char n = source.charAt(j);
+                    if (n == '_' || Character.isLetter(n) || Character.isDigit(n)) s += n;
+                    else {
+                        i = j - 1;
+                        break;
+                    }
+                }
+                tokens.add(new Token(keywords.getOrDefault(s, TokenTypes.IDENFR), line, s));
+            }
+            else if (Character.isDigit(c)) {
+                String s = "";
+                for (int j = i; j < length; j++) {
+                    char n = source.charAt(j);
+                    if (Character.isDigit(n)) s += n;
+                    else {
+                        i = j - 1;
+                        break;
+                    }
+                }
+                tokens.add(new Token(TokenTypes.INTCON, line, s));
+            }
+            else if (c == '\'') {
+                String s = "'";
+                for (int j = i + 1; j < length; j++) {
+                    char n = source.charAt(j);
+                    if (n != '\'') {
+                        s += n;
+                    } else {
+                        i = j;
+                        s += "'";
+                        break;
+                    }
+                }
+                tokens.add(new Token(TokenTypes.CHRCON, line, s));
+            }
+            else if (c == '\"') {
+                String s = "\"";
+                for (int j = i + 1; j < length; j++) {
+                    char n = source.charAt(j);
+                    if (n != '\"') {
+                        s += n;
+                    } else {
+                        i = j;
+                        s += "\"";
+                        break;
+                    }
+                }
+                tokens.add(new Token(TokenTypes.STRCON, line, s));
+            }
+        }
+    }
+}

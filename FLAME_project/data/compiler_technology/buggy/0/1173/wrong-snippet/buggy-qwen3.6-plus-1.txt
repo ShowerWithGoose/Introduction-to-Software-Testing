@@ -1,0 +1,347 @@
+Based on the comparison between the Buggy Output and the Expected Output, the error lies in the lexical analysis of integer constants. Specifically, in the `rev` function, the line `num=num/10 ;` is incorrectly tokenized. The buggy output shows `DIV /` followed by `INTCON 0`, whereas the expected output shows `DIV /` followed by `INTCON 10`. This indicates that when parsing the integer `10`, the lexer is only capturing the first digit `1` or somehow truncating the number, but looking closely at the buggy output `INTCON 0` vs expected `INTCON 10`, it seems the lexer might be misinterpreting the sequence or there is an issue with how digits are consumed.
+
+Let's look closer at the `next()` method in `Lexer.java`.
+The section handling digits is:
+```java
+        else if (isDigit(c)) {
+            while (isDigit(c)) {
+                token += c;
+                c = getChar();
+            }
+            retract();
+            //number = Integer.parseInt(token);
+            lexType = LexType.INTCON;
+        }
+```
+This logic looks correct for consuming all consecutive digits.
+
+However, let's look at the specific difference in the output again.
+Buggy:
+```
+IDENFR num
+ASSIGN =
+IDENFR num
+DIV /
+INTCON 0   <-- Error here
+SEMICN ;
+```
+Expected:
+```
+IDENFR num
+ASSIGN =
+IDENFR num
+DIV /
+INTCON 10  <-- Correct here
+SEMICN ;
+```
+
+Wait, looking at the previous line in the buggy output:
+```
+IDENFR re
+ASSIGN =
+IDENFR re
+MULT *
+INTCON 10
+PLUS +
+IDENFR num
+MOD %
+INTCON 10
+SEMICN ;
+```
+Here `INTCON 10` is parsed correctly.
+
+Why would `num/10` fail?
+In the source: `num=num/10 ;`
+After `num` (identifier), we have `=`. Then `num` (identifier). Then `/`. Then `10`.
+
+Let's re-examine the `next()` method flow.
+If the previous token was `num` (identifier), the pointer is at `/`.
+`next()` is called.
+`c = '/'`.
+It goes to `else if (isDiv(c))`.
+`token += '/'`.
+`c = getChar()` -> gets `1`.
+`isDiv('1')` is false.
+`isMult('1')` is false.
+So it goes to `else lexType = typeMap.get(token);` which sets `lexType` to `DIV`.
+The token `/` is added to buffer.
+
+Next `next()` call.
+`c = '1'`.
+It goes to `else if (isDigit(c))`.
+`while (isDigit(c))`:
+1. `token += '1'`. `c = getChar()` -> gets `0`.
+2. `isDigit('0')` is true. `token += '0'`. `c = getChar()` -> gets ` ` (space).
+3. `isDigit(' ')` is false. Loop ends.
+`retract()`.
+`lexType = INTCON`.
+Token is `10`.
+
+This logic seems correct. Why is the output `0`?
+
+Let's look at the `getChar()` and `retract()` implementation.
+```java
+    public char getChar() {
+        if (curPos < source.length()) {
+            curPos ++;
+            return source.charAt(curPos - 1);
+        }
+        return '\n';
+    }
+
+    public void retract() {
+        curPos--;
+    }
+```
+
+Is it possible that the error is not in the integer parsing itself, but in how the previous token ended or how whitespace/newlines are handled affecting the position?
+
+Let's look at the `isEnter` handling in `next()`:
+```java
+        while (isSpace(c) || isTab(c) || isEnter(c)) {
+            if (isEnter(c)) {
+                lineNum++;
+            }
+            if (!havNext()){
+                return;
+            }
+            c = getChar();
+        }
+```
+
+Let's look closely at the Buggy Output again.
+`INTCON 0` appears where `INTCON 10` should be.
+Is it possible that the `1` was consumed by something else?
+No, `/` is a single character token.
+
+Let's look at the `error` handling.
+The problem states: "For an erroneous source program... output the line number...".
+The test case input provided is a **correct** source program (no lexical errors like standalone `&` or `|`). So `correctProgram` should remain true.
+
+Let's look at the `printResult` method.
+It prints `printBuffer`.
+
+Is there any state corruption?
+Notice the `source` reading:
+```java
+        while ((c = reader.read()) != -1) {
+            source += (char)c;
+        }
+```
+This reads the whole file into a string.
+
+Let's look at the `next()` method again, specifically the identifier part.
+```java
+        if (isLetter(c) || isUnderLine(c)) {
+            while (isDigit(c) || isLetter(c) || isUnderLine(c)) {
+                token += c;
+                c = getChar();
+            }
+            retract();
+            ...
+        }
+```
+
+And the digit part:
+```java
+        else if (isDigit(c)) {
+            while (isDigit(c)) {
+                token += c;
+                c = getChar();
+            }
+            retract();
+            ...
+        }
+```
+
+There is a subtle bug in many lexers regarding `retract`. If `getChar` returns a character and advances `curPos`, `retract` decreases `curPos`. This is standard.
+
+However, consider the case where `getChar` is called at the end of the file.
+```java
+    public char getChar() {
+        if (curPos < source.length()) {
+            curPos ++;
+            return source.charAt(curPos - 1);
+        }
+        return '\n';
+    }
+```
+If we are at the last character, `curPos` increments, returns char. Next call, `curPos == length`, returns `\n`. `curPos` does NOT increment.
+If we then call `retract()`, `curPos` becomes `length - 1`.
+This effectively "un-reads" the newline returned by the EOF check? No, because `curPos` wasn't incremented for the `\n`.
+So if `getChar` returns `\n` due to EOF, `curPos` is unchanged. Calling `retract()` would move `curPos` back one valid character. This is a bug if `retract` is called after an EOF return.
+
+In the digit loop:
+```java
+            while (isDigit(c)) {
+                token += c;
+                c = getChar();
+            }
+            retract();
+```
+If the number is at the very end of the file, e.g., `...10` (EOF).
+1. `c='1'`. `token="1"`. `c=getChar()` -> `'0'`. `curPos` advanced.
+2. `isDigit('0')` true. `token="10"`. `c=getChar()` -> `\n` (EOF). `curPos` NOT advanced (stays at end).
+3. `isDigit('\n')` false. Loop ends.
+4. `retract()`. `curPos` moves back from end to before `0`.
+5. Next `next()` call starts at `0`. It will parse `0` as `INTCON 0`.
+
+This matches the symptom! The `10` is split into `10` (but `0` is put back) and then `0` is parsed separately?
+Wait. If `retract` moves back before `0`, then the current token `token` is `"10"`. It is added to `printBuffer` as `INTCON 10`.
+Then the next call to `next()` starts processing `0`. It parses `0` as `INTCON 0`.
+So we would see `INTCON 10` AND `INTCON 0`.
+But the expected output only has `INTCON 10`. The buggy output has `INTCON 0` INSTEAD of `INTCON 10`?
+No, look at the buggy output block:
+```
+IDENFR num
+DIV /
+INTCON 0
+SEMICN ;
+```
+It seems `10` was NOT printed as `10`. It was printed as `0`.
+This implies that the `1` was lost or consumed differently.
+
+Let's re-read the code logic for `isDiv`.
+```java
+        else if (isDiv(c)) {
+            token += c;
+            c = getChar();
+            if (isDiv(c)){
+                // comment
+            }
+            else if (isMult(c)) {
+                // comment
+            }
+            else lexType = typeMap.get(token);
+        }
+```
+If we have `/10`, `c` is `/`. `token="/"`. `c` becomes `1`.
+`isDiv('1')` false. `isMult('1')` false.
+`lexType = DIV`.
+The method finishes. `token` is `/`. It is printed.
+The character `1` is currently held in `c`, but `curPos` has been advanced to point to `1` (since `getChar` advanced it).
+Wait, `getChar` advances `curPos`. So `curPos` points to the character AFTER `1`? No, `getChar` returns `source.charAt(curPos-1)`. So if `curPos` was at index of `/`, it increments, returns `/`. Next `getChar` increments, returns `1`. `curPos` is now at index of `0`.
+So when `next()` returns, `curPos` is pointing at `0`. The `1` has been consumed by the `getChar()` inside the `isDiv` block, but it was NOT retracted!
+
+In the `isDiv` block, if it's not a comment start (`//` or `/*`), it just sets `lexType` and returns. It does **not** retract the lookahead character `c`.
+
+Compare this to the identifier/digit blocks:
+```java
+            while (...) {
+                ...
+                c = getChar();
+            }
+            retract(); // <--- Retract is called here
+```
+
+Compare to `isAnd`/`isOr`:
+```java
+        else if (isAnd(c)) {
+            token += c;
+            c = getChar();
+            if (isAnd(c)) {
+                token += c;
+                lexType = LexType.AND;
+            }
+            else {
+                error('a', lineNum);
+                // Missing retract here too? 
+            }
+        }
+```
+
+The bug is in the `isDiv` (and likely other single/double char operator) handling. When checking for multi-character operators (like `//`, `/*`, `<=`, `==`, etc.), if the second character does NOT form a multi-character operator, the lexer must **retract** that second character so it can be processed in the next `next()` call.
+
+In the `isDiv` block:
+```java
+        else if (isDiv(c)) {
+            token += c;
+            c = getChar(); // Consumes '1'
+            if (isDiv(c)){
+               ...
+            }
+            else if (isMult(c)) {
+               ...
+            }
+            else {
+                lexType = typeMap.get(token);
+                // MISSING RETRACT HERE
+            }
+        }
+```
+Because `retract()` is missing, the `1` from `10` is consumed and lost (skipped over). The next `next()` call starts at `0`. Thus `10` becomes `0`.
+
+This same issue likely exists for `isNot`, `isAssign`, `isLss`, `isGre` block:
+```java
+        else if (isNot(c) || isAssign(c) || isLss(c) || isGre(c)) {
+            token += c;
+            char tmp = getChar();
+            if (isAssign(tmp)) {
+                token += tmp;
+            }
+            else {
+                retract(); // <--- This one HAS retract
+            }
+            lexType = typeMap.get(token);
+        }
+```
+This block correctly retracts.
+
+The `isAnd` and `isOr` blocks:
+```java
+        else if (isAnd(c)) {
+            token += c;
+            c = getChar();
+            if (isAnd(c)) {
+                token += c;
+                lexType = LexType.AND;
+            }
+            else {
+                error('a', lineNum);
+                // Missing retract
+            }
+        }
+```
+If an error occurs, it doesn't retract. But the problem says "Each erroneous example will have exactly one error". If the input is correct, this path isn't taken for valid `&&`. If it's a single `&`, it's an error. The spec says output error. It doesn't say continue tokenizing the rest correctly necessarily, but usually lexers try to recover. However, for the current test case (correct program), `&&` is used.
+If `&&`:
+1. `c='&'`. `token="&"`. `c=getChar()` -> `'&'`.
+2. `isAnd('&')` true. `token="&&"`. `lexType=AND`.
+3. Returns. `curPos` is after the second `&`. Correct.
+
+So the primary suspect is the `isDiv` block missing `retract()` in the `else` branch.
+
+<frontend/Lexer.java>
+...
+        else if (isDiv(c)) {
+            token += c;
+            c = getChar();
+            if (isDiv(c)){
+                token = "";
+                while (c != '\n'){
+                    if (!havNext()){
+                        return;
+                    }
+                    c = getChar();
+                }
+                retract();
+            }
+            else if (isMult(c)) {
+                token = "";
+                do {
+                    do {
+                        c = getChar();
+                    }
+                    while (!isMult(c));
+                    do {
+                        c = getChar();
+                        if (isDiv(c)){
+                            return;
+                        }
+                    }
+                    while (isMult(c));
+                }
+                while (!isMult(c));
+            }
+            else lexType = typeMap.get(token);
+        }
+...

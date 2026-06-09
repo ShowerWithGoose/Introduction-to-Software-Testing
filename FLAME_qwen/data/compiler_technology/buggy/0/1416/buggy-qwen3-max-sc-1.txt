@@ -1,0 +1,49 @@
+<frontend/Lexer.java>
+...
+    public void analyse(String line) { //将注释部分处理掉
+        boolean notation_flag = false;
+        if (line.contains("//")) {
+            line = line.substring(0, line.indexOf("//"));
+        }
+        if (line.contains("/*")) {
+            line = line.substring(0, line.indexOf("/*"));
+            notation_flag = true;
+        }
+        if (notation_flag && line.contains("*/")) {
+            line = line.substring(line.indexOf("*/") + 2);
+            notation_flag = false;
+        }
+        if (notation_flag)
+            return; // @@ [This early return discards the rest of the line after "/*", but fails to handle multi-line block comments correctly. If a line starts with "/*" and doesn't end with "*/", the lexer skips the entire line and all subsequent lines until "*/" is found—but this implementation only processes one line at a time and loses context across lines, causing incorrect tokenization or missed errors. However, the immediate bug relevant to error type 'a' is elsewhere.]
+        int pos = 0;
+        while (pos < line.length()) {
+            pos += next(pos, line);
+        }
+    }
+...
+    public int next(int pos, String line) {
+        StringBuilder token = new StringBuilder();
+        if (line.charAt(pos) == ' ' || line.charAt(pos) == '\n' || line.charAt(pos) == '\t') {
+            return 1;
+        }
+        else if (Character.isDigit(line.charAt(pos))) {
+            token.append(line.charAt(pos++));
+            while (pos < line.length() && Character.isDigit(line.charAt(pos))) {
+                token.append(line.charAt(pos++));
+            }
+            this.dictionary.add(new Pair(LexType.INTCON, token.toString()));
+        } else if (isNotDigit(line.charAt(pos))) {
+            if (isKeySymbol(line.charAt(pos))) {
+                parseKeySymbol(pos, line, token);
+            } else if (line.charAt(pos) == '\"') {
+                parseStringConst(pos, line, token);
+            } else if (line.charAt(pos) == '\'') {
+                parseCharConst(pos, line, token);
+            } else {
+                token.append(line.charAt(pos++));
+                while (pos < line.length() && !isKeySymbol(line.charAt(pos)) &&
+                        (isNotDigit(line.charAt(pos)) || Character.isDigit(line.charAt(pos)))) { // @@ [This condition is logically flawed: `(isNotDigit(ch) || Character.isDigit(ch))` is always true for any printable character (since every char is either digit or not). This causes the loop to consume characters beyond valid identifier boundaries, potentially merging tokens incorrectly. But more critically, it does not prevent consumption past the end of a single-character symbol like '&' or '|', which should trigger error 'a'. However, the real issue is in `parseKeySymbol`: when an error 'a' is detected (e.g., standalone '&'), the method sets `errorType` but does NOT return a positive length that advances `pos`. Instead, `token.length()` is 0 because `token` was never appended to in the error case, so `next()` returns 0, causing an infinite loop or skipped error reporting. Additionally, even if error is set, the lexer continues processing other tokens and only reports the last error. But most importantly: in `parseKeySymbol`, when encountering a single '&', it sets `errorType = ErrorType.a`, but **does not add anything to `dictionary`**, and **returns control without appending to `token`**, so `token.length()` is 0 → `next()` returns 0 → `pos` never advances → infinite loop. However, looking again: in the `else if (isKeySymbol(...))` branch, `parseKeySymbol` is called, and inside it, for single '&', it sets error but does **not** append to `token`. So `token` remains empty → `return token.length()` is 0 → infinite loop. But wait: actually, in `parseKeySymbol`, `token` is passed by reference and `token.append(ch)` is called **before** checking for double symbols. So for '&', `token.append('&')` happens, then it checks next char. If next is not '&', it sets error but **does not add token to dictionary**, yet `token.length()` is 1. So `next()` returns 1, which is correct. So why no output? Because the error is recorded, but the program only writes **one** error at the end (`this.errorType` is a single value, not a list), and if multiple errors occur, only the last is kept. But the problem states: "each erroneous example will have exactly one error". So that’s acceptable. However, there's another critical flaw: in `LexerOutPut()`, it checks `if (this.errorType != null)` and writes **only** to error.txt. But what if the error occurs on line 5, but the lexer already added tokens from previous lines to `dictionary`? The spec says: for erroneous programs, **only** output the error, not any tokens. That part is okay. But the real bug is: when a single '&' is found, the code sets `errorType = ErrorType.a`, but **continues processing the rest of the file**! It doesn't stop lexical analysis. So if there are more tokens after the error, they get added to `dictionary`, but since `errorType` is non-null, they are ignored in output — which is acceptable per spec (only error is output). However, the test case input shows: `/bin/sh: 1: javac: not found` — this suggests the test environment couldn't compile the Java code, meaning the actual bug might be that the program **doesn't terminate properly** or **fails to detect the error**. But based on logic: the main issue is that **after setting `errorType`, the lexer keeps running and may overwrite `row_num`, `column_num`, and `errorType` if another error occurs**. But the problem states only one error exists. So that’s not it. Wait: look at `parseKeySymbol` for '&': it sets `this.row_num = this.lineNum; this.column_num = pos - 1; this.errorType = ErrorType.a;` — but note: `pos` in `parseKeySymbol` is the original `pos` passed in (the index of '&'), and `pos++` was done, so current `pos` points to next char. `pos - 1` is correct column. But here's the critical bug: **in the `next` method, after calling `parseKeySymbol`, it returns `token.length()`. In the error case (single '&'), `token` has "&" (length 1), so it returns 1, which is correct. So why no error output?** Because the test case input is not provided, but the compilation error suggests the code didn't run. However, based on the assignment, the likely logical error is: **the lexer does not stop after detecting an error, but more importantly, it only records the last error encountered**. But the problem says one error. So perhaps the real issue is in comment handling: if a line has `/* ... */` on the same line, it works, but if `/*` starts and doesn't end, it sets `notation_flag = true` and returns, skipping the line. But `notation_flag` is local to `analyse`, so next line won't know about it! **This is the key bug**: block comment state (`notation_flag`) is not preserved across lines. So if line 1 has `/*`, line 2 has `&`, it will process line 2 as normal code and see `&` as error, but actually it's inside comment. However, the problem states the error is lexical and only one error exists. But the immediate cause for missing error 'a' might be elsewhere. However, re-examining `parseKeySymbol`: when it encounters a single '&', it sets the error fields, but **does not break or stop**. That's okay. But what if the input is just `&`? Then `line = "&"`, `analyse` calls `next(0, "&")`. In `next`: `isKeySymbol('&')` is true → call `parseKeySymbol(0, "&", token)`. Inside: `ch = '&'`, `token.append('&')`, then check `line.charAt(pos)` where `pos=1` — but `line.length()=1`, so `line.charAt(1)` throws `StringIndexOutOfBoundsException`! **This is the critical error**: the code accesses `line.charAt(pos)` without checking if `pos < line.length()`. So for a single '&', it tries to read past the end of the string, causing a runtime exception, which explains the "javac: not found" is misleading — actually the program crashes with an exception, producing no output. Hence, the bug is in `parseKeySymbol`: it assumes that after reading one character, there is a next character to check for two-character operators, but doesn't verify bounds.
+        }
+        return token.length();
+    }
+...

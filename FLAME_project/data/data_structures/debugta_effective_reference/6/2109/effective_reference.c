@@ -1,0 +1,59 @@
+#include<stdio.h>
+#include<string.h>
+#include<stdlib.h>
+#include<ctype.h>
+#define MAXSIZE 100
+int top=-1;
+int isempty()
+{
+	return top==-1;
+}
+int isfull()
+{
+	return top==MAXSIZE-1;
+}
+void error(char *a)
+{
+	printf("%s ",a);
+}
+void push(int s[],int e)
+{
+	if(isfull())
+	error("error");
+	else
+	s[++top]=e;	
+}
+void pop(int s[])
+{
+	if(isempty())
+	{
+		error("error");
+	}
+	else
+	printf("%d ",s[top--]);
+}
+
+
+int main()
+{
+	int op;
+	int a;
+	int s[MAXSIZE];//Õ» 
+	while(scanf("%d",&op)!=EOF)
+	{
+		if(op==-1)
+		return 0;
+		if(op==1)
+		{
+			scanf("%d",&a);
+			push(s,a);
+		}
+		else if(op==0)
+		{
+			pop(s);
+		}
+	}
+	return 0;
+}
+
+

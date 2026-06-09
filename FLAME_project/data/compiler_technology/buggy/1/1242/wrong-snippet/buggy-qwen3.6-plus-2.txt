@@ -1,0 +1,170 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The program is a syntax analyzer that needs to detect specific syntax errors (missing semicolon `i`, missing right parenthesis `j`, missing right square bracket `k`) and output the line number where the error occurred. The line number should correspond to the last non-terminal symbol before the missing token.
+2.  **Test Case Input**:
+    *   Line 1: `char str[20 ;` -> Missing `]`. Expected error `1 k`.
+    *   Line 3: `int f(char str[) {` -> Missing `]`. Expected error `3 k`.
+    *   Line 13: `g(str[f(str));` -> Inside `f(str)`, `str` is an array, so `str[` expects an expression and `]`. Instead, it finds `)`. This is a missing `]`. Expected error `13 k`.
+3.  **Buggy Output**: `1 k`, `3 k`, `13 k`, `13 e`.
+4.  **Expected Output**: `1 k`, `3 k`, `13 k`.
+5.  **Discrepancy**: The buggy output includes an extra error `13 e`. Error `e` corresponds to "Parameter type mismatch".
+6.  **Root Cause**:
+    *   In `UnaryExpParser.java`, when parsing a function call `Ident '(' [FuncRParams] ')'`, the code checks for parameter type mismatches.
+    *   It retrieves the actual parameters using `FuncRparamsParser`.
+    *   In the test case `g(str[f(str));`, when parsing the inner call `f(str)`:
+        *   The parser identifies `f` as a function.
+        *   It calls `funcRparamsParser.Parser()` to parse `str`.
+        *   `FuncRparamsParser` calls `Exp()`, which eventually calls `LVal()` or `PrimaryExp()`.
+        *   `LValParser` (or `LVal`) parses `str`. Since `str` is followed by `[`, it attempts to parse an array access `str[Exp]`.
+        *   However, the next token is `)`. The `Exp()` inside the brackets fails or consumes incorrectly? Let's trace carefully.
+        *   Actually, `FuncRparamsParser` parses `str`. `str` is an identifier. `Exp()` -> `AddExp()` -> ... -> `PrimaryExp()` -> `LVal()`.
+        *   `LValParser.Parser(true)` reads `str`. It sees `[`. It calls `Exp()`.
+        *   Inside `Exp()`, it tries to parse an expression starting with `)`. `AddExp()` fails. `Exp()` returns false?
+        *   If `Exp()` returns false, `LValParser` might still return true if it handles the failure gracefully or if the logic is flawed.
+        *   Looking at `LValParser.java`:
+            ```java
+            if (TokenList.NextIs(Category.LBRACK) && Exp()) { //
+                store = TokenList.GetIndex();
+                if (!TokenList.NextIs(Category.RBRACK)) {
+                    TokenList.SetIndex(store);
+                    kError = true;
+                }
+                // ...
+                return true;
+            }
+            ```
+            If `Exp()` returns false, the `if` condition fails. It goes to:
+            ```java
+            TokenList.SetIndex(store); // store was set after reading ident
+            if (write) {
+               // ...
+            }
+            return true;
+            ```
+            So `LVal` parses `str` successfully as a simple variable, ignoring the `[` because `Exp()` failed? No, `NextIs(LBRACK)` is true. But `Exp()` returns false. So the block is skipped.
+            Wait, `TokenList.NextIs` consumes the token? No, `NextIs` in `TokenList.java` calls `GetToken()`.
+            ```java
+            public static boolean NextIs(Category category) {
+                return GetToken().GetCategory() == category;
+            }
+            ```
+            Yes, `NextIs` **consumes** the token. This is a critical design flaw in `TokenList`. Most parsers use `peek` for checking and `get` for consuming. Here, `NextIs` advances the index.
+            
+            Let's re-evaluate `LValParser`:
+            1. `token = GetToken()` (reads `str`).
+            2. `store = GetIndex()`.
+            3. `if (TokenList.NextIs(Category.LBRACK) && Exp())`:
+               - `NextIs(LBRACK)` consumes `[`. Returns true.
+               - `Exp()` tries to parse starting from `)`. Fails.
+               - Condition is false.
+            4. `TokenList.SetIndex(store)`: Resets index to after `str`. The `[` is effectively "un-consumed" relative to the store point? No, `store` was taken *before* `NextIs`. So `SetIndex(store)` puts the pointer back at `[`.
+            5. Returns true. `LVal` is `str`.
+            
+            Now back to `FuncRparamsParser`. It parsed `str`.
+            Back to `UnaryExpParser`.
+            It has `rParamsTypeList` containing the type of `str`. `str` is `char[20]` (from line 1). So type is `CHARARRAY`.
+            Function `f` expects `char[]` (which is `CHARARRAY`).
+            So types match. Why error `e`?
+            
+            Let's look at the outer call `g(str[f(str))`.
+            `g` expects `char c` (VARIABLE).
+            Argument is `str[f(str)]`? No, the source is `g(str[f(str));`.
+            Parsing `g(...)`:
+            `FuncRparamsParser` parses the argument.
+            Argument starts with `str`.
+            `Exp()` -> `PrimaryExp()` -> `LVal()`.
+            `LValParser` reads `str`.
+            `NextIs(LBRACK)` consumes `[`.
+            `Exp()` is called.
+            Inside `Exp()`, it parses `f(str)`.
+            `f(str)` is a `UnaryExp`.
+            `UnaryExpParser` for `f`:
+            - Reads `f`.
+            - `NextIs(LPARENT)` consumes `(`.
+            - `FuncRparamsParser` parses `str`.
+              - `Exp()` -> `LVal()` reads `str`.
+              - `NextIs(LBRACK)`? Next is `)`. So `LVal` returns `str` (variable).
+              - Type of `str` is `CHARARRAY`.
+            - `f` expects `char[]` (`CHARARRAY`). Match.
+            - `NextIs(RPARENT)`? Next is `)`. Consumes it.
+            - Returns true.
+            So `f(str)` is parsed as a valid expression returning some value (likely treated as VARIABLE or INT depending on return type of f, which is int).
+            So `Exp()` inside the brackets of `str[...]` succeeds.
+            Back to `LValParser` for outer `str`:
+            - `Exp()` succeeded.
+            - `store = GetIndex()`. Current token is `)`.
+            - `if (!TokenList.NextIs(Category.RBRACK))`:
+              - `NextIs(RBRACK)` checks if `)` is `]`. It is not.
+              - Returns false.
+              - Enters `if` body.
+              - `TokenList.SetIndex(store)`. Pointer stays at `)`.
+              - `kError = true`.
+            - `if (write)`: Adds error `k` at current line (13).
+            - Returns true.
+            
+            So `LVal` returns true, with `kError=true`.
+            The `LVal` represents `str[f(str)]` syntactically (though missing `]`).
+            The type of this LVal?
+            In `LValParser`, `rparamsType` is set based on the symbol type.
+            `str` is `CharArray`.
+            If it's an array access `str[Exp]`, the result should be `VARIABLE` (the element type, `char`).
+            Let's check `DefineRparamsType` and how it's updated.
+            In `LValParser.Parser`:
+            ```java
+            if (!cError) {
+                DefineRparamsType(SymbolTable.Type(scope,ident));
+            }
+            // ...
+            if (TokenList.NextIs(Category.LBRACK) && Exp()) {
+                 // ...
+                 // It does NOT update rparamsType to VARIABLE here!
+            }
+            ```
+            This looks like a bug in semantic type calculation, but does it cause error `e`?
+            
+            Let's look at `UnaryExpParser.Match`.
+            The outer function is `g(char c)`. Expects `VARIABLE` (Char).
+            The argument parsed was `str[...]`.
+            If `rparamsType` remained `CHARARRAY` (because it wasn't updated to `VARIABLE` upon array indexing), then:
+            `Match(SymbolType.Char, RparamsType.CHARARRAY)`:
+            ```java
+            else if (rparamsType == RparamsType.CHARARRAY) {
+                if (symbolType == SymbolType.Int || ... || SymbolType.Char ...) {
+                     return false; // Mismatch!
+                }
+            }
+            ```
+            `SymbolType.Char` is in the list. So it returns `false`.
+            This triggers error `e`.
+            
+            So the spurious error `e` is caused by two things:
+            1. `LValParser` fails to update `rparamsType` to `VARIABLE` when an array subscript is used (even if erroneous).
+            2. The parser continues to check parameter types even when a syntax error (`k`) has occurred.
+            
+            However, the question asks to identify the location of the errors. The primary issue leading to the *wrong answer* (extra error) is the type checking logic in `UnaryExpParser` proceeding despite syntax errors, or incorrect type propagation in `LValParser`.
+            
+            Usually, in these assignments, if a syntax error is detected, we might still need to report it, but we shouldn't report cascading semantic errors if the syntax is broken. Or, the type propagation is simply wrong.
+            
+            Let's look at `LValParser.java` again.
+            
+<frontend/Parser/LValParser.java>
+...
+            if (TokenList.NextIs(Category.LBRACK) && Exp()) { //
+                store = TokenList.GetIndex();
+                if (!TokenList.NextIs(Category.RBRACK)) {
+                    TokenList.SetIndex(store);
+                    kError = true;
+                }
+                if (write) {
+                    if (cError) {
+                        ErrorMap.AddError(new Error(TokenList.ErrorLine(),'c'));
+                    }
+                    if (kError) {
+                        ErrorMap.AddError(new Error(TokenList.ErrorLine(),'k'));
+                    }
+                    StoreSyntax("<LVal>", TokenList.GetIndex() - 1);
+                    //System.out.println("<LVal>");
+                }
+                return true;
+            }
+...

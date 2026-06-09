@@ -1,0 +1,219 @@
+Based on the analysis of the problem description, test case, and source code:
+
+1.  **Problem Analysis**: The program needs to perform syntax analysis and report specific errors (missing `)`, missing `;`, etc.) with their line numbers. The error line number should correspond to the line where the last non-terminal symbol before the missing token appears.
+2.  **Test Case Analysis**:
+    *   Input: `void f(int a {} // error 1` (Line 1). Expected Error: `1 j` (Missing `)`).
+    *   Input: `int main( { // error 2` (Line 3). Expected Error: `3 j` (Missing `)`). Note: Line 2 is empty/commented in logic or just blank, but `int main(` is on line 3 based on typical counting if line 1 is `void...`. Let's assume standard line counting.
+    *   Input: `f(a + 10; // error 3` (Line 5). Expected Error: `5 j` (Missing `)`).
+    *   The buggy output is "No output file", which implies the program likely crashed (exception) or terminated prematurely without generating the error file.
+3.  **Code Analysis**:
+    *   In `Grammar.java`, the `UnaryExp` method handles function calls `Ident '(' [FuncRParams] ')'`.
+    *   The code snippet:
+        ```java
+        } else if (type == Type.IDENFR
+                && words.get(wordPoint + 1).getType() == Type.LPARENT) {
+            //Ident
+            addOut();
+            //'('
+            addOut();
+            while (words.get(wordPoint).getType() != Type.RPARENT) {
+                FuncRParams();
+            }
+            //')'
+            if (words.get(wordPoint).getType() == Type.RPARENT) {
+                addOut();
+            } else {
+                addError('j');
+            }
+        }
+        ```
+    *   **Issue 1 (Infinite Loop/Crash)**: The `while` loop condition `words.get(wordPoint).getType() != Type.RPARENT` relies on `FuncRParams` consuming tokens. If there is a syntax error like `f(a + 10;` (missing `)`), `FuncRParams` will parse `a + 10`. After `Exp()` inside `FuncRParams`, the current token is `;` (SEMICN). The loop checks `SEMICN != RPARENT`, which is true. It calls `FuncRParams()` again. Inside `FuncRParams`, it calls `Exp()`. `Exp` tries to parse starting from `;`. Depending on `Exp` implementation, it might fail or not consume anything. If it doesn't consume anything, `wordPoint` stays same, infinite loop. If it throws exception or returns, the loop continues. Eventually, `wordPoint` might go out of bounds causing `IndexOutOfBoundsException` when accessing `words.get(wordPoint)` or `words.get(wordPoint + 1)` in other places, leading to no output file.
+    *   **Issue 2 (Logic for Error Reporting)**: Even if it didn't crash, the logic for detecting missing `)` is after the loop. If the loop terminates because `wordPoint` goes out of bounds or some other condition, the error might not be reported correctly. However, the primary suspect for "No output" is a crash.
+    *   **Specific Crash Scenario**: In `FuncRParams`, if `Exp()` encounters an unexpected token (like `;`), it might not advance `wordPoint`. Then `FuncRParams` returns. The `while` loop in `UnaryExp` checks `SEMICN != RPARENT`, true. Calls `FuncRParams` again. `Exp()` called again. If `Exp` doesn't handle `;` gracefully (e.g., expects an expression), it might crash or loop.
+    *   Actually, looking at `Exp` -> `AddExp` -> `MulExp` -> `UnaryExp` -> `PrimaryExp`. If `PrimaryExp` sees `;`, it goes to `LVal`. `LVal` expects `IDENFR`. `;` is not `IDENFR`. `LVal` calls `addOut()`? No, `LVal` starts with `updateNumber()` then `addOut()`. `addOut()` gets `words.get(wordPoint)`. If `wordPoint` is valid, it adds `;` as an identifier? No, `Type.SEMICN` is not `IDENFR`. Wait, `LVal` grammar is `Ident ...`. The code for `LVal`:
+        ```java
+        private void LVal() {
+            updateNumber();
+            addOut(); // This consumes the current token regardless of type?
+            ...
+        }
+        ```
+        `addOut()` consumes the token. So if `;` is encountered, `LVal` consumes it. Then `LVal` checks for `[`. It's not `[`. Returns. `PrimaryExp` returns. `UnaryExp` returns. `MulExp` returns. `AddExp` returns. `Exp` returns. `FuncRParams` returns.
+        Back in `UnaryExp` loop: `wordPoint` is now past `;`. Next token might be `}` or EOF. If `}`, `} != )`. Loop continues. `FuncRParams` called. `Exp` called. `LVal` called. `addOut` consumes `}`. ... This will consume all remaining tokens until crash or end of list.
+        If it reaches end of list, `words.get(wordPoint)` throws Exception.
+        
+    *   **Correct Approach**: The parser should check if the current token is in the FOLLOW set or expected token. If not, report error and synchronize. The current implementation blindly loops until `)`.
+
+    *   **Another Potential Crash**: `CompUnit` looks ahead `words.get(wordPoint + 2)`. If the file ends abruptly, this throws IndexOutOfBounds.
+
+    *   **Main Error Location**: The infinite loop/consumption error in `UnaryExp` when handling `FuncRParams` and missing `)` is the most likely cause for incorrect behavior/crash on the third error case `f(a + 10;`. The first two errors are in `FuncDef` parsing `FuncFParams` or `MainFuncDef`.
+    
+    Let's look at `FuncDef`:
+    ```java
+    if (words.get(wordPoint).getType() != Type.RPARENT) {
+        FuncFParams();
+    }
+    //')'
+    if (words.get(wordPoint).getType() == Type.RPARENT) {
+        addOut();
+    } else {
+        addError('j');
+    }
+    ```
+    For `void f(int a {}`, `FuncFParams` parses `int a`. Then `wordPoint` is at `{`. `{` != `)`. So `FuncFParams` is called? No, the `if` checks before calling.
+    Wait, `FuncDef` code:
+    ```java
+    //'('
+    addOut();
+    //不为右括号，有参数
+    if (words.get(wordPoint).getType() != Type.RPARENT) {
+        FuncFParams();
+    }
+    //')'
+    if (words.get(wordPoint).getType() == Type.RPARENT) {
+        addOut();
+    } else {
+        addError('j');
+    }
+    ```
+    For `void f(int a {}`:
+    1. `FuncType` consumes `void`.
+    2. `addOut` consumes `f`.
+    3. `addOut` consumes `(`.
+    4. Current is `int`. `!= )`. Call `FuncFParams`.
+    5. `FuncFParams` calls `FuncFParam`.
+    6. `FuncFParam` consumes `int`, `a`.
+    7. Back in `FuncFParams`: checks `,`. Current is `{`. Not `,`. Breaks loop.
+    8. Back in `FuncDef`. Current is `{`.
+    9. Checks `== )`. False. Adds Error `j`. Line number is from `noneTerminalLine` updated in `FuncDef` or `FuncFParams`? `updateNumber` is called at start of `FuncDef`. So line 1. Correct.
+    10. Then `Block()` is called. `Block` expects `{`. Consumes `{`. Then loops until `}`. Consumes `}`.
+    11. Returns.
+    
+    So Error 1 is handled correctly? Why "No output"?
+    
+    Let's look at Error 2: `int main( {`.
+    1. `CompUnit` sees `int`, next `main`. Calls `MainFuncDef`.
+    2. `MainFuncDef`:
+       ```java
+       addOut(); // int
+       addOut(); // main
+       addOut(); // (
+       if (words.get(wordPoint).getType() == Type.RPARENT) {
+           addOut();
+       } else {
+           addError('j');
+       }
+       Block();
+       ```
+    3. Current is `{`. `!= )`. Adds Error `j`. Line 3. Correct.
+    4. `Block()` called. Consumes `{`. Loops. Inside block: `int a = 10;`. Parses VarDecl.
+    5. Next `f(a + 10;`. `Stmt`.
+    
+    Error 3: `f(a + 10;`.
+    1. `Stmt` sees `IDENFR` (`f`).
+    2. Checks `words.get(wordPoint + 1)` which is `(`.
+    3. Enters `if (words.get(wordPoint + 1).getType() == Type.LPARENT)`.
+    4. Calls `Exp()`. **Wait**. The grammar for Stmt says `LVal '=' Exp ';'` or `Exp ';'`. A function call `f(...)` is an `Exp` (via `UnaryExp`).
+    5. So it calls `Exp()`.
+    6. `Exp` -> `AddExp` -> ... -> `UnaryExp`.
+    7. `UnaryExp` sees `f` (`IDENFR`) and next `(`.
+    8. Enters the problematic block identified earlier:
+       ```java
+       } else if (type == Type.IDENFR
+               && words.get(wordPoint + 1).getType() == Type.LPARENT) {
+           addOut(); // f
+           addOut(); // (
+           while (words.get.wordPoint).getType() != Type.RPARENT) {
+               FuncRParams();
+           }
+           ...
+       }
+       ```
+    9. `FuncRParams` parses `a + 10`.
+       - `Exp` -> `AddExp` -> `MulExp` -> `UnaryExp` -> `PrimaryExp` -> `LVal` (`a`).
+       - `AddExp` sees `+`. Loops.
+       - `MulExp` -> `UnaryExp` -> `PrimaryExp` -> `Number` (`10`).
+       - `AddExp` loop ends.
+       - `Exp` returns.
+       - `FuncRParams` checks `,`. Current is `;`. Not `,`. Returns.
+    10. Back in `UnaryExp` while loop. Current is `;`. `;` != `)`. Loop continues.
+    11. Calls `FuncRParams()` again.
+    12. `FuncRParams` calls `Exp()`.
+    13. `Exp` calls `AddExp`... `UnaryExp`.
+    14. `UnaryExp` sees `;`.
+        - Not `+`, `-`, `!`.
+        - Not `IDENFR` with `(`.
+        - Calls `PrimaryExp()`.
+    15. `PrimaryExp` sees `;`.
+        - Not `(`.
+        - Not `INTCON`.
+        - Not `CHRCON`.
+        - Calls `LVal()`.
+    16. `LVal`:
+        ```java
+        updateNumber();
+        addOut(); // Consumes ;
+        if (words.get(wordPoint).getType() == Type.LBRACK) { ... }
+        outStr.add("<LVal>");
+        ```
+        It consumes `;`.
+    17. `PrimaryExp` returns. `UnaryExp` returns. `MulExp` returns. `AddExp` returns. `Exp` returns.
+    18. `FuncRParams` returns.
+    19. Back in `UnaryExp` while loop. Current token is now `}` (from next line `return 0; }`? No, `f(a + 10;` is followed by newline, then `return 0;`).
+        - Input:
+          ```
+          f(a + 10; // error 3
+          return 0;
+          }
+          ```
+        - After consuming `;`, next is `return` (`RETURNTK`).
+    20. Loop: `RETURNTK` != `)`. True.
+    21. Calls `FuncRParams`.
+    22. `Exp` -> ... -> `UnaryExp`.
+    23. `UnaryExp` sees `RETURNTK`.
+        - Not unary op.
+        - Not IDENFR.
+        - `PrimaryExp`.
+    24. `PrimaryExp` sees `RETURNTK`.
+        - Calls `LVal`.
+    25. `LVal` consumes `RETURNTK`.
+    26. This continues consuming tokens until `)` is found or crash.
+    27. It will consume `return`, `0`, `;`, `}`, etc.
+    28. Eventually `wordPoint` exceeds `words.size()`. `words.get(wordPoint)` throws `IndexOutOfBoundsException`.
+    29. Program crashes. No output file generated.
+
+    **Conclusion**: The error is in `Grammar.java` in the `UnaryExp` method, specifically the `while` loop handling function call parameters, which does not handle missing `)` correctly and leads to infinite consumption/crash.
+
+<Grammar.java>
+...
+    private void UnaryExp() {
+        // UnaryExp → PrimaryExp | Ident '(' [FuncRParams] ')' | UnaryOp UnaryExp
+        updateNumber();
+        Type type = words.get(wordPoint).getType();
+        if (type == Type.PLUS
+                || type == Type.MINU
+                || type == Type.NOT) {
+            UnaryOp();
+            UnaryExp();
+        } else if (type == Type.IDENFR
+                && words.get(wordPoint + 1).getType() == Type.LPARENT) {
+            //Ident
+            addOut();
+            //'('
+            addOut();
+            while (words.get(wordPoint).getType() != Type.RPARENT) {
+                FuncRParams();
+            }
+            //')'
+            if (words.get(wordPoint).getType() == Type.RPARENT) {
+                addOut();
+            } else {
+                addError('j');
+            }
+        } else {
+            PrimaryExp();
+        }
+
+        outStr.add("<UnaryExp>");
+    }
+...

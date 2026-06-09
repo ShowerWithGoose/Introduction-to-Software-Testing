@@ -1,0 +1,776 @@
+Based on the comparison between the buggy output and the expected output, the program stops generating output immediately after printing `<InitVal` (missing the closing `>`). This indicates that the program likely crashed or terminated prematurely while processing the first variable declaration `int a[12] = {0,1,...};`.
+
+Looking at the `parseDeclaration` method in `Parser.java`, it handles `VarDecl`. Inside the loop for `VarDef`, it calls `parseInitValue(isConst)`. Since `isConst` is false for `int a...`, it calls `parseInitValue(false)`.
+
+In `parseInitValue`, when it encounters `{`, it enters the block parsing logic. It iterates through the elements. For each element, it calls `parseExpr()`. After parsing the expression, it checks `if (isConst)` to decide whether to print `<ConstExp>` or `<Exp>`. Since `isConst` is false, it should print `<Exp>`.
+
+However, looking closely at the `parseInitValue` code:
+```java
+private SyntaxTree.InitValue parseInitValue(boolean isConst) {
+    // ...
+    if (tokens.tryNext(TokenType.LBRACE)) {
+        List<SyntaxTree.InitValue> values = new LinkedList<>();
+        while (!tokens.check(TokenType.RBRACE)) {
+            values.add(new SyntaxTree.InitValue(parseExpr()));
+            if (isConst) {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstExp>\n");
+            } else {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<Exp>\n");
+            }
+            tokens.tryNext(TokenType.COMMA);
+        }
+        tokens.tryNext(TokenType.RBRACE);
+        if (isConst) {
+            OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstInitVal>\n");
+        } else {
+            OutputTool.writeToFile(Config.syntaxTreeWriter, "<InitVal>\n");
+        }
+        return new SyntaxTree.InitValue(values);
+    } 
+    // ...
+}
+```
+The buggy output shows `<InitVal` at the very end. The expected output shows `<InitVal>`. The missing `>` suggests the string written was truncated or the program crashed during the write operation or immediately after. However, looking at the `OutputTool.writeToFile` method, it writes the string as provided. The string literal in the code is `"<InitVal>\n"`.
+
+Let's look at the `parseDeclaration` method again.
+```java
+    private SyntaxTree.Declaration parseDeclaration() {
+        // ...
+        do {
+            // ...
+            if (tokens.tryNext(TokenType.ASSIGN)) {
+                vars.add(new SyntaxTree.VarDef(name.getName(), type.getType(), index, parseInitValue(isConst)));
+            } else vars.add(new SyntaxTree.VarDef(name.getName(), type.getType(), index));
+            if (isConst) {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstDef>\n");
+            } else {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<VarDef>\n");
+            }
+        } while (tokens.hasNext() && tokens.tryNext(TokenType.COMMA));
+        tokens.popAndCheck(TokenType.SEMICN); // i
+        if (isConst) {
+            OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstDecl>\n");
+        } else {
+            OutputTool.writeToFile(Config.syntaxTreeWriter, "<VarDecl>\n");
+        }
+        return new SyntaxTree.VarDecl(isConst, type.getType(), vars);
+    }
+```
+
+The buggy output ends with `<InitVal`. It does NOT show `<VarDef>`, `<VarDecl>`, etc. This means the crash happens inside `parseInitValue` or immediately upon returning from it, before `<VarDef>` is printed.
+
+Wait, looking at the buggy output again:
+```
+...
+INTCON 6
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACE }
+<InitVal
+```
+The last line is `<InitVal`. It is missing the `>`.
+In `parseInitValue`, the line is:
+`OutputTool.writeToFile(Config.syntaxTreeWriter, "<InitVal>\n");`
+
+If this line executed, it would write `<InitVal>\n`. The output file shows `<InitVal`. This implies either:
+1. The program crashed *during* the write (unlikely for a simple string).
+2. The output buffer wasn't flushed/closed properly? But `Compiler.java` closes the writer at the end. If the parser crashes via an exception, the `close()` might not be called if it's not in a `finally` block or if the exception propagates up. In `Compiler.java`:
+```java
+        parser.parse();
+        if (Config.emitSyntaxTree) {
+            Config.syntaxTreeWriter.close();
+        }
+```
+If `parser.parse()` throws an exception, `close()` is never called. If the buffer contains `<InitVal>` but hasn't been flushed to disk, and the program crashes, the file might be incomplete. However, `writeToFile` uses `fileWriter.write(string)`. By default, `FileWriter` is buffered. If the program crashes abruptly, the buffer might not be flushed.
+
+But why would it crash?
+Let's look at `parseExpr` called inside `parseInitValue`.
+`parseExpr` calls `parseMulExpr`, which calls `parseUnaryExpr`, which calls `parsePrimaryExpr`.
+Inside `parsePrimaryExpr`:
+```java
+    private SyntaxTree.PrimaryExpr parsePrimaryExpr() {
+        // ...
+        } else if (tokens.check(TokenType.INTCON)) {
+            ret = new SyntaxTree.PrimaryExpr(new SyntaxTree.IntNum(tokens.pop().getIntValue()));
+            OutputTool.writeToFile(Config.syntaxTreeWriter, "<Number>\n");
+        } 
+        // ...
+        OutputTool.writeToFile(Config.syntaxTreeWriter, "<PrimaryExp>\n");
+        return ret;
+    }
+```
+This looks fine.
+
+Let's look at `tryGetLVal` in `Parser.java`.
+```java
+    private boolean tryGetLVal() {
+        // ...
+        Config.emitSyntaxTree = false;
+        Config.emitError = false;
+        int cur = tokens.getCur();
+        Token name = tokens.pop();
+        if (tokens.tryNext(TokenType.LBRACK)) {
+            parseExpr();
+            tokens.tryNext(TokenType.RBRACK);
+        }
+        boolean ret = false;
+        if (tokens.check(TokenType.ASSIGN)) {
+            ret = true;
+        }
+        tokens.setCur(cur);
+        Config.emitSyntaxTree = true;
+        Config.emitError = true;
+        return ret;
+    }
+```
+This method temporarily disables output. This is used in `parseStatement` to distinguish between `LVal = Exp` and `Exp ;`.
+
+Is there an issue with `parseInitValue`?
+The input is `int a[12] = {0,1,2,3,2,3,4,5,3,4,5,6};`.
+The parser correctly parses `int`, `a`, `[`, `12`, `]`, `=`, `{`.
+Then it loops 12 times parsing `INTCON`.
+For `0`: `parseExpr` -> ... -> `<Exp>`.
+...
+For `6`: `parseExpr` -> ... -> `<Exp>`.
+Then `}` is encountered. `tokens.tryNext(TokenType.RBRACE)` consumes it.
+Then it prints `<InitVal>\n`.
+
+If the output is `<InitVal` (missing `>`), it strongly suggests the string literal in the code is wrong OR the program crashed before writing the full string.
+Checking the code snippet provided:
+`OutputTool.writeToFile(Config.syntaxTreeWriter, "<InitVal>\n");`
+The string is correct.
+
+However, notice the previous lines in the buggy output.
+`<AddExp>` is printed.
+Then `RBRACE }` is printed (from `tokens.tryNext(TokenType.RBRACE)`? No, `tryNext` only prints if it matches AND `emitSyntaxTree` is true. `tryNext` in `TokenList.java`:
+```java
+    public boolean tryNext(TokenType... type) {
+        for (TokenType t : type) {
+            if (tokens.get(cur).getType().equals(t)) {
+                cur++;
+                preToken = tokens.get(cur - 1);
+                if (Config.emitSyntaxTree) {
+                    OutputTool.writeToFile(Config.syntaxTreeWriter, tokens.get(cur - 1).toString() + '\n');
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+```
+So `RBRACE }` is printed by `tryNext`.
+
+Then `<InitVal` is printed.
+If the program crashed *after* writing `<InitVal` but before `>`, that's impossible with a single `write` call unless the string itself was truncated in memory (unlikely) or the write failed partially.
+
+More likely scenario: The program threw an exception *after* printing `<InitVal>`? No, if it threw an exception, the buffer might not flush. If `<InitVal>\n` was in the buffer, and the program crashed, the file might contain nothing or partial data depending on OS buffering. But here we see `<InitVal`.
+
+Wait, look at `parseDeclaration` again.
+```java
+            if (tokens.tryNext(TokenType.ASSIGN)) {
+                vars.add(new SyntaxTree.VarDef(name.getName(), type.getType(), index, parseInitValue(isConst)));
+            }
+```
+If `parseInitValue` throws an exception, the program stops.
+
+Is there a bug in `parseInitValue`?
+```java
+    private SyntaxTree.InitValue parseInitValue(boolean isConst) {
+        // ...
+        if (tokens.tryNext(TokenType.LBRACE)) {
+            List<SyntaxTree.InitValue> values = new LinkedList<>();
+            while (!tokens.check(TokenType.RBRACE)) {
+                values.add(new SyntaxTree.InitValue(parseExpr()));
+                if (isConst) {
+                    OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstExp>\n");
+                } else {
+                    OutputTool.writeToFile(Config.syntaxTreeWriter, "<Exp>\n");
+                }
+                tokens.tryNext(TokenType.COMMA);
+            }
+            tokens.tryNext(TokenType.RBRACE);
+            if (isConst) {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstInitVal>\n");
+            } else {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<InitVal>\n");
+            }
+            return new SyntaxTree.InitValue(values);
+        } 
+        // ...
+    }
+```
+This looks correct for the input.
+
+Let's look at `parseExpr`.
+```java
+    private SyntaxTree.AddExpr parseExpr() {
+        // ...
+        SyntaxTree.MulExpr leading = parseMulExpr();
+        List<SyntaxTree.ExprWithLeading<SyntaxTree.MulExpr>> follows = new LinkedList<>();
+        while (tokens.check(TokenType.MINU, TokenType.PLUS)) {
+            OutputTool.writeToFile(Config.syntaxTreeWriter, "<AddExp>\n");
+            follows.add(new SyntaxTree.ExprWithLeading<>(tokens.pop().getType(), parseMulExpr()));
+        }
+        OutputTool.writeToFile(Config.syntaxTreeWriter, "<AddExp>\n");
+        return new SyntaxTree.AddExpr(leading, follows);
+    }
+```
+This prints `<AddExp>` at the end. The buggy output shows `<AddExp>` before `RBRACE`. This matches.
+
+What if the error is in `parseDeclaration` regarding `isConst`?
+`boolean isConst = tokens.tryNext(TokenType.CONSTTK);`
+For `int a...`, `isConst` is false.
+`Token type = tokens.pop();` -> `INTTK`.
+
+Is it possible the crash happens in `vars.add(...)`? Unlikely.
+
+Let's look at the `Compiler.java` again.
+```java
+        Parser parser = new Parser(lexer.getTokens());
+        if (Config.emitSyntaxTree) {
+            Config.syntaxTreeWriter = new java.io.FileWriter(Config.syntaxTreeOutput);
+        }
+        parser.parse();
+```
+If `parser.parse()` throws an exception, the writer is not closed.
+
+Why would `parser.parse()` throw an exception?
+`parse()` calls `parseDeclaration()`.
+`parseDeclaration()` calls `parseInitValue()`.
+`parseInitValue()` calls `parseExpr()`.
+`parseExpr()` calls `parseMulExpr()`.
+`parseMulExpr()` calls `parseUnaryExpr()`.
+`parseUnaryExpr()` calls `parsePrimaryExpr()`.
+`parsePrimaryExpr()` checks `TokenType.INTCON`. It matches.
+`tokens.pop()` is called.
+`new SyntaxTree.IntNum(tokens.pop().getIntValue())`? No, `tokens.pop()` returns the token. `token.getIntValue()` creates a BigInteger.
+`new SyntaxTree.PrimaryExpr(...)`
+`OutputTool.writeToFile(..., "<Number>\n")`
+`OutputTool.writeToFile(..., "<PrimaryExp>\n")`
+Returns.
+`parseUnaryExpr` continues.
+`OutputTool.writeToFile(..., "<UnaryExp>\n")`
+Returns.
+`parseMulExpr` continues.
+No `* / %`.
+`OutputTool.writeToFile(..., "<MulExp>\n")`
+Returns.
+`parseExpr` continues.
+No `+ -`.
+`OutputTool.writeToFile(..., "<AddExp>\n")`
+Returns.
+
+Back in `parseInitValue`:
+`values.add(new SyntaxTree.InitValue(parseExpr()))` -> `parseExpr` returned.
+`if (isConst)` -> false.
+`OutputTool.writeToFile(..., "<Exp>\n")` -> Printed.
+`tokens.tryNext(TokenType.COMMA)` -> Consumes comma if present.
+
+Loop continues for all 12 items.
+Last item `6`.
+`<Exp>` printed.
+`tokens.tryNext(TokenType.COMMA)` -> Returns false (next is `}`).
+Loop condition `!tokens.check(TokenType.RBRACE)` -> False. Loop ends.
+`tokens.tryNext(TokenType.RBRACE)` -> Consumes `}`. Prints `RBRACE }`.
+`if (isConst)` -> false.
+`OutputTool.writeToFile(..., "<InitVal>\n")`.
+
+If this line executes, `<InitVal>\n` is written to the buffer.
+Then `return new SyntaxTree.InitValue(values)`.
+
+Back in `parseDeclaration`:
+`vars.add(...)`.
+`if (isConst)` -> false.
+`OutputTool.writeToFile(..., "<VarDef>\n")`.
+
+The buggy output STOPS at `<InitVal`. It does NOT have `>`.
+This implies the string written was `<InitVal`?
+Or the buffer was flushed partially?
+
+Actually, look at the `OutputTool.writeToFile` implementation:
+```java
+    public static void writeToFile(FileWriter fileWriter, String string) {
+        if (!Config.emitSyntaxTree) { return; }
+        try {
+            fileWriter.write(string);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+```
+It just writes.
+
+Is it possible that `<InitVal>` is printed, but the program crashes immediately after, and the file content observed is truncated due to lack of flush/close?
+If the buffer size is small, `<InitVal>\n` might be in the buffer. If the program crashes, the OS might write part of the buffer? Or nothing?
+Usually, if a Java program crashes without closing the FileWriter, the file might be empty or contain only what was flushed.
+
+However, there is a specific detail in the buggy output: `<InitVal`.
+If the code was `OutputTool.writeToFile(Config.syntaxTreeWriter, "<InitVal");` (missing `>`), then the output would be exactly that.
+Let's check the code provided in the prompt for `Parser.java`:
+```java
+            } else {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<InitVal>\n");
+            }
+```
+The code HAS the `>`.
+
+So why is it missing in the output?
+Maybe the exception happens *inside* `writeToFile`? No, it catches IOException and throws RuntimeException.
+
+Maybe the exception happens *before* `writeToFile` completes? No, it's a single call.
+
+Let's look at `parseDeclaration` again.
+```java
+        do {
+            Token name = tokens.pop();
+//            LinkedList<SyntaxTree.AddExpr> indexes = new LinkedList<>();
+            SyntaxTree.AddExpr index = null;
+            if (tokens.tryNext(TokenType.LBRACK)) {
+                index = parseExpr();
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstExp>\n");
+                tokens.popAndCheck(TokenType.RBRACK); // k
+            }
+            if (tokens.tryNext(TokenType.ASSIGN)) {
+                vars.add(new SyntaxTree.VarDef(name.getName(), type.getType(), index, parseInitValue(isConst)));
+            } else vars.add(new SyntaxTree.VarDef(name.getName(), type.getType(), index));
+            if (isConst) {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstDef>\n");
+            } else {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<VarDef>\n");
+            }
+        } while (tokens.hasNext() && tokens.tryNext(TokenType.COMMA));
+```
+
+Wait! Look at this line inside the `if (tokens.tryNext(TokenType.LBRACK))` block:
+`OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstExp>\n");`
+
+This is executed regardless of whether it's a `ConstDecl` or `VarDecl`.
+For `int a[12]`, it is a `VarDecl`. The index `12` is a `ConstExp` grammatically (`ConstDef → Ident [ '[' ConstExp ']' ]`).
+So printing `<ConstExp>` here is correct according to the grammar structure for the array size.
+
+However, in `parseInitValue`, for `VarDecl` (`isConst=false`), it prints `<Exp>` for the elements. This is also correct (`InitVal → Exp`).
+
+So the logic seems correct.
+
+Let's look at the `parse` method in `Parser.java`.
+```java
+    public void parse() {
+        while (tokens.hasNext()) {
+            if (tokens.top(2).in(TokenType.LPARENT)) {
+                compileUnits.add(parseFuncDecl());
+            } else {
+                compileUnits.add(parseDeclaration());
+            }
+        }
+        OutputTool.writeToFile(Config.syntaxTreeWriter, "<CompUnit>\n");
+    }
+```
+`tokens.top(2)` accesses `cur + 2`.
+If `tokens` has fewer than `cur + 2` elements, `top(int i)` asserts:
+```java
+    public Token top(int i) {
+        assert(cur + i >= 0 && cur + i < tokens.size());
+        return tokens.get(cur + i);
+    }
+```
+If the assertion fails, it throws `AssertionError`.
+
+In the test case:
+`int a[12] = {0,1,2,3,2,3,4,5,3,4,5,6};`
+`char b[2] = {'a','b'};`
+...
+`int main() { ... }`
+
+When parsing the first declaration `int a...`:
+`cur` is 0. `top(2)` is `LBRACK`. `LPARENT`? No.
+So `parseDeclaration()` is called.
+
+After `parseDeclaration()` finishes for `int a...`, `cur` is at the next token (`CHARTK`).
+`tokens.hasNext()` is true.
+`tokens.top(2)`?
+Current token: `CHARTK`.
+Next token: `IDENFR` (b).
+Next next token: `LBRACK`.
+`top(2)` is `LBRACK`. `in(TokenType.LPARENT)`? No.
+So `parseDeclaration()` is called for `char b...`.
+
+After `char b...`, `cur` is at `CHARTK` (str).
+`top(2)` is `LBRACK`. No.
+`parseDeclaration()` for `char str...`.
+
+After `char str...`, `cur` is at `INTTK` (main).
+`top(0)` is `INTTK`.
+`top(1)` is `MAINTK`.
+`top(2)` is `LPARENT`.
+`in(TokenType.LPARENT)`? Yes.
+So `parseFuncDecl()` is called.
+
+This logic seems fine.
+
+Is there an error in `parseFuncDecl`?
+```java
+    private SyntaxTree.FuncDecl parseFuncDecl() {
+        Token retType = tokens.pop();
+        if (!tokens.top().getName().equals("main")) {
+            OutputTool.writeToFile(Config.syntaxTreeWriter, "<FuncType>\n");
+        }
+        Token name = tokens.pop();
+        tokens.tryNext(TokenType.LPARENT);
+        List<SyntaxTree.FuncParamDecl> params = parseParamDecls();
+        tokens.popAndCheck(TokenType.RPARENT); // j
+        SyntaxTree.Block block = parseBlock();
+        if (name.getName().equals("main")) {
+            OutputTool.writeToFile(Config.syntaxTreeWriter, "<MainFuncDef>\n");
+        } else {
+            OutputTool.writeToFile(Config.syntaxTreeWriter, "<FuncDef>\n");
+        }
+        return new SyntaxTree.FuncDecl(name.getName(), params, retType.getType(), block);
+    }
+```
+
+Wait, look at `parseDeclaration` again.
+```java
+        boolean isConst = tokens.tryNext(TokenType.CONSTTK);
+        Token type = tokens.pop();
+        LinkedList<SyntaxTree.VarDef> vars = new LinkedList<>();
+        do {
+            Token name = tokens.pop();
+            SyntaxTree.AddExpr index = null;
+            if (tokens.tryNext(TokenType.LBRACK)) {
+                index = parseExpr();
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstExp>\n");
+                tokens.popAndCheck(TokenType.RBRACK); // k
+            }
+            if (tokens.tryNext(TokenType.ASSIGN)) {
+                vars.add(new SyntaxTree.VarDef(name.getName(), type.getType(), index, parseInitValue(isConst)));
+            } else vars.add(new SyntaxTree.VarDef(name.getName(), type.getType(), index));
+            if (isConst) {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstDef>\n");
+            } else {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<VarDef>\n");
+            }
+        } while (tokens.hasNext() && tokens.tryNext(TokenType.COMMA));
+        tokens.popAndCheck(TokenType.SEMICN); // i
+        if (isConst) {
+            OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstDecl>\n");
+        } else {
+            OutputTool.writeToFile(Config.syntaxTreeWriter, "<VarDecl>\n");
+        }
+        return new SyntaxTree.VarDecl(isConst, type.getType(), vars);
+    }
+```
+
+I suspect the issue is related to **buffering** and **crash**.
+If the program crashes, the output file is incomplete.
+The last thing written was `<InitVal>\n`.
+If the buffer wasn't flushed, the file might contain previous writes that were flushed, but not the recent ones.
+However, `<InitVal` is present. This is weird.
+
+Let's look at `OutputTool.writeToFile` again.
+```java
+    public static void writeToFile(FileWriter fileWriter, String string) {
+        if (!Config.emitSyntaxTree) { return; }
+        try {
+            fileWriter.write(string);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+```
+
+If I look really closely at the Buggy Output:
+```
+RBRACE }
+<InitVal
+```
+There is no newline after `<InitVal`.
+The code writes `"<InitVal>\n"`.
+If the output is `<InitVal`, it means the `>` and `\n` are missing.
+
+This usually happens if the string constant in the code is actually `"<InitVal"`?
+But the code provided says `"<InitVal>\n"`.
+
+Is it possible the user provided code snippet is different from what was run?
+"Source Code(The source code may consist of multiple files...)"
+
+Let's assume the code provided IS the buggy code.
+Where could `<InitVal` come from?
+Maybe there is another place where `<InitVal` is printed?
+Search for `InitVal` in `Parser.java`.
+1. `OutputTool.writeToFile(Config.syntaxTreeWriter, "<InitVal>\n");` in `parseInitValue` (else branch).
+2. `OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstInitVal>\n");` in `parseInitValue` (if branch).
+3. `OutputTool.writeToFile(Config.syntaxTreeWriter, "<InitVal>\n");` in `parseInitValue` (StringConst branch).
+
+All have `>`.
+
+Wait! Look at `parseDeclaration` again.
+Is it possible that `parseInitValue` is NOT called, but something else prints `<InitVal`?
+No.
+
+Let's look at the `parseExpr` method.
+Does it print anything related? No.
+
+Let's look at `parsePrimaryExpr`.
+No.
+
+Is it possible the error is in `TokenList.popAndCheck`?
+```java
+    public void popAndCheck(TokenType... type) {
+        // ...
+        if (type.length == 1 && Config.emitError && preToken != null) {
+            if (type[0].equals(TokenType.SEMICN)) {
+                OutputTool.mistakeList.add(new Mistake(ErrorType.i, preToken.getLine()));
+            } 
+            // ...
+            else {
+                Panic.panic("Expected token: " + Arrays.toString(type) +
+                        " but found: " + tokens.get(cur).getType());
+            }
+        } else {
+            Panic.panic("Expected token: " + Arrays.toString(type) +
+                    " but found: " + tokens.get(cur).getType());
+        }
+    }
+```
+If `popAndCheck` fails, it panics.
+
+If the program panics, it throws `RuntimeException`.
+The `main` method does not catch it.
+The JVM terminates.
+The `FileWriter` is not closed.
+The buffer is not flushed.
+
+Why is `<InitVal` in the file?
+Maybe the buffer was flushed automatically at some point?
+Or maybe the string `"<InitVal>\n"` was NOT written, but a DIFFERENT string was?
+
+Actually, look at the `parseInitValue` code again.
+```java
+            if (isConst) {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstInitVal>\n");
+            } else {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<InitVal>\n");
+            }
+```
+
+If `isConst` is true, it prints `<ConstInitVal>`.
+If `isConst` is false, it prints `<InitVal>`.
+
+For `int a[12] = ...`, `isConst` is false. So it prints `<InitVal>`.
+
+If the program crashes immediately after this write, and the buffer contains `<InitVal>\n`, why is the file showing `<InitVal`?
+Perhaps the buffer size is such that `<InitVal` was flushed but `>\n` wasn't? Unlikely.
+
+Let's consider the possibility that the code provided in the prompt has a typo in my reading?
+`OutputTool.writeToFile(Config.syntaxTreeWriter, "<InitVal>\n");`
+
+Okay, let's look at the `parseDeclaration` method one more time.
+Is it possible that `parseInitValue` is called, but it CRASHES inside?
+If it crashes inside, `<InitVal>` would NOT be printed.
+But `<InitVal` IS printed (partially?).
+
+Wait, look at the Buggy Output again.
+`<InitVal` is the LAST line.
+The previous line is `RBRACE }`.
+
+If `parseInitValue` crashed BEFORE printing `<InitVal>`, then `<InitVal>` wouldn't be there.
+If it crashed AFTER, it would be there.
+
+What if the string literal in the ACTUAL buggy code was `"<InitVal"`?
+The prompt asks me to identify the location of the errors in the program BELOW.
+The program below HAS `"<InitVal>\n"`.
+
+Is there any other place?
+What if the error is in `parseDeclaration` where it prints `<VarDef>`?
+No, that's after.
+
+Let's look at `parseExpr` again.
+```java
+    private SyntaxTree.AddExpr parseExpr() {
+        // ...
+        while (tokens.check(TokenType.MINU, TokenType.PLUS)) {
+            OutputTool.writeToFile(Config.syntaxTreeWriter, "<AddExp>\n");
+            follows.add(new SyntaxTree.ExprWithLeading<>(tokens.pop().getType(), parseMulExpr()));
+        }
+        OutputTool.writeToFile(Config.syntaxTreeWriter, "<AddExp>\n");
+        return new SyntaxTree.AddExpr(leading, follows);
+    }
+```
+
+There is a subtle bug in `parseExpr`? No.
+
+Let's look at `parseInitValue` again.
+```java
+    private SyntaxTree.InitValue parseInitValue(boolean isConst) {
+        // ...
+        if (tokens.tryNext(TokenType.LBRACE)) {
+            List<SyntaxTree.InitValue> values = new LinkedList<>();
+            while (!tokens.check(TokenType.RBRACE)) {
+                values.add(new SyntaxTree.InitValue(parseExpr()));
+                if (isConst) {
+                    OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstExp>\n");
+                } else {
+                    OutputTool.writeToFile(Config.syntaxTreeWriter, "<Exp>\n");
+                }
+                tokens.tryNext(TokenType.COMMA);
+            }
+            tokens.tryNext(TokenType.RBRACE);
+            if (isConst) {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstInitVal>\n");
+            } else {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<InitVal>\n");
+            }
+            return new SyntaxTree.InitValue(values);
+        } 
+        // ...
+    }
+```
+
+I will bet on the **missing flush/close** causing the incomplete output, triggered by an exception.
+Where is the exception?
+If the output is exactly `<InitVal`, it's highly suspicious of the string itself.
+But assuming the code is correct as printed, the crash must happen right after.
+
+Actually, look at `parseDeclaration`.
+```java
+        do {
+            // ...
+            if (tokens.tryNext(TokenType.ASSIGN)) {
+                vars.add(new SyntaxTree.VarDef(name.getName(), type.getType(), index, parseInitValue(isConst)));
+            } 
+            // ...
+        } while (tokens.hasNext() && tokens.tryNext(TokenType.COMMA));
+```
+
+If `parseInitValue` returns successfully, `vars.add` is called.
+Then `if (isConst)` ... `<VarDef>` is printed.
+
+If the program crashed, it must be inside `parseInitValue` or `vars.add`.
+`vars.add` is unlikely to crash.
+
+So it's inside `parseInitValue`.
+But `<InitVal>` is printed at the END of `parseInitValue`.
+So it must crash AFTER printing `<InitVal>`.
+The only thing after printing `<InitVal>` is `return new SyntaxTree.InitValue(values);`.
+Creating a new object is unlikely to crash.
+
+Unless... `values` contains something bad?
+`values` contains `InitValue` objects created from `parseExpr`.
+
+Is it possible that the crash is in `parseDeclaration` AFTER `parseInitValue` returns?
+Yes. `vars.add(...)`.
+Then `if (isConst)` ...
+
+If the crash is in `vars.add`, then `<VarDef>` is not printed.
+This matches the output (missing `<VarDef>`).
+
+But why is `<InitVal>` truncated?
+If the crash is immediate, and the buffer is not flushed, why is `<InitVal` there?
+Maybe the buffer WAS flushed, but the file was truncated by the OS because the process died?
+
+Regardless of the truncation mystery, the fact that `<VarDef>` and subsequent tokens are missing means the parser crashed during/after the first declaration.
+
+The most likely cause of a crash in a student parser is an **IndexOutOfBoundsException** or **NullPointerException** or **AssertionError**.
+
+Look at `tokens.top(2)` in `parse()`.
+If the file ends unexpectedly, `top(2)` might fail.
+But we are at the beginning.
+
+Look at `parseInitValue`.
+`tokens.tryNext(TokenType.RBRACE)` consumes `}`.
+If the next token is NOT `}`, `tryNext` returns false.
+The code does NOT check the return value of `tryNext` for `RBRACE`.
+It just proceeds to print `<InitVal>`.
+Then it returns.
+
+If `RBRACE` was missing, `tryNext` returns false. `cur` is not advanced.
+The next token is still whatever was after the last number (e.g., `;` or `,`).
+Then `<InitVal>` is printed.
+Then `return`.
+Back in `parseDeclaration`.
+`vars.add(...)`.
+`if (isConst)` ... `<VarDef>` printed.
+`while` loop checks `tokens.tryNext(TokenType.COMMA)`.
+If the next token is `;`, `tryNext(COMMA)` returns false.
+Loop ends.
+`tokens.popAndCheck(TokenType.SEMICN)`.
+If the next token IS `;`, it passes.
+
+So missing `}` doesn't crash immediately.
+
+However, there is a bug in `parseInitValue` logic for `StringConst`?
+```java
+        } else if (tokens.check(TokenType.STRCON)) {
+            SyntaxTree.InitValue ret = new SyntaxTree.InitValue(tokens.pop().getString());
+            // ...
+            return ret;
+        }
+```
+
+Let's look at `parseDeclaration` again.
+```java
+        boolean isConst = tokens.tryNext(TokenType.CONSTTK);
+        Token type = tokens.pop();
+```
+If `tokens` is empty, `pop()` crashes.
+But we have tokens.
+
+I will identify the error location as the `parseInitValue` method in `Parser.java`, specifically around the output of `<InitVal>`, because the output is truncated there, indicating a crash or termination event associated with that part of the code. Although the code looks syntactically correct, the behavior suggests an issue there.
+
+Another possibility: The `parse` method in `Parser.java` uses `tokens.top(2)`.
+```java
+            if (tokens.top(2).in(TokenType.LPARENT)) {
+```
+If the input file has fewer than 2 tokens remaining, this crashes.
+But for the first declaration, there are many tokens.
+
+I'll stick with `Parser.java` `parseInitValue`.
+
+<frontend/syntax/Parser.java>
+...
+    private SyntaxTree.InitValue parseInitValue(boolean isConst) {
+        // InitVal → Exp | '{' [ Exp { ',' Exp } ] '}' | StringConst
+        //  ConstInitVal → ConstExp | '{' [ ConstExp { ',' ConstExp } ] '}' | StringConst
+        if (tokens.tryNext(TokenType.LBRACE)) {
+            List<SyntaxTree.InitValue> values = new LinkedList<>();
+            while (!tokens.check(TokenType.RBRACE)) {
+                values.add(new SyntaxTree.InitValue(parseExpr()));
+                if (isConst) {
+                    OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstExp>\n");
+                } else {
+                    OutputTool.writeToFile(Config.syntaxTreeWriter, "<Exp>\n");
+                }
+                tokens.tryNext(TokenType.COMMA);
+            }
+            tokens.tryNext(TokenType.RBRACE);
+            if (isConst) {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstInitVal>\n");
+            } else {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<InitVal>\n");
+            }
+            return new SyntaxTree.InitValue(values);
+        } else if (tokens.check(TokenType.STRCON)) {
+            SyntaxTree.InitValue ret = new SyntaxTree.InitValue(tokens.pop().getString());
+            if (isConst) {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstInitVal>\n");
+            } else {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<InitVal>\n");
+            }
+            return ret;
+        } else {
+            SyntaxTree.InitValue ret = new SyntaxTree.InitValue(parseExpr());
+            if (isConst) {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstExp>\n");
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<ConstInitVal>\n");
+            } else {
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<Exp>\n");
+                OutputTool.writeToFile(Config.syntaxTreeWriter, "<InitVal>\n");
+            }
+            return ret;
+        }
+    }
+...

@@ -1,0 +1,18 @@
+package frontend;
+
+public enum LexType {
+    IDENFR,
+    INTCON, STRCON, CHRCON,
+    MAINTK,CONSTTK,INTTK,CHARTK,VOIDTK,
+    BREAKTK,CONTINUETK,IFTK,ELSETK,FORTK,RETURNTK,
+    GETINTTK,GETCHARTK,PRINTFTK,
+    NOT,AND,OR,
+    PLUS,MINU,MULT,DIV,MOD,
+    LSS,LEQ,GRE,GEQ,EQL,NEQ,ASSIGN,
+    SEMICN,COMMA,LPARENT,RPARENT,LBRACK,RBRACK,LBRACE,RBRACE;
+
+    @Override
+    public String toString() {
+        return this.name();
+    }
+}

@@ -1,0 +1,372 @@
+The program is experiencing a **Time Limit Exceeded** error. This typically indicates an infinite loop or a situation where the lexer fails to advance through the input stream, causing it to process the same character or state repeatedly without termination.
+
+Looking at `MyLexer.java`, the `runMyLexer` method loops while `!sourceFileLexer.endOfFile()`. Inside the loop, it calls `skipWhitespace()` and `skipComment()`. If neither of these consumes input (returns false or does nothing), it calls `addToken()`.
+
+In `addToken()`, the code iterates through `TokenType.values()` trying to match patterns.
+1.  If a match is found (`tokenStr != null`), it advances the lexer via `sourceFileLexer.move(tokenStr.length())` and breaks the loop.
+2.  If **no match is found** for any token type (i.e., the current character is not recognized by any defined pattern, such as an unexpected symbol not covered by `ERRORAND` or `ERROROR`, or potentially whitespace/comment logic failing to skip something correctly), the `for` loop finishes without breaking.
+3.  Crucially, if no token matches, `sourceFileLexer.move(...)` is **never called**. The `columnNum` and `lineNum` in `SourceFileLexer` remain unchanged.
+4.  The `runMyLexer` loop continues, `skipWhitespace` likely returns immediately if the char isn't whitespace, `skipComment` returns false, and `addToken` runs again on the exact same position. This creates an **infinite loop**.
+
+Although the provided test case seems valid, robust lexers must handle unrecognized characters to avoid TLE. However, looking closer at the `TokenType` definitions:
+-   `ERRORAND` matches `&`
+-   `ERROROR` matches `|`
+-   Whitespace is skipped.
+-   Comments are skipped.
+
+Is there a case where a character is not matched?
+The `CHRCON` pattern is `\\\'[^\\\']\\\'`. This expects exactly one character inside quotes. The test case has `'\0'`. The regex `[^\\']` matches any char except `'`. `\0` is a single character. So `'\0'` should match `CHRCON`.
+Wait, let's look at `STRCON`: `\\\"[^\\\"]*\\\"`.
+Let's look at `IDENFR`: `[_A-Za-z][_A-Za-z0-9]*`.
+
+If the input contains a character that is NOT whitespace, NOT part of a comment, and DOES NOT match ANY token pattern (including error tokens), the lexer will hang.
+
+However, there is a more subtle issue often causing TLE in student lexers using this "try all patterns" approach: **Ordering and Greediness**.
+But the most likely cause for TLE in this specific structure, given that the output is empty (Buggy Output is empty), is that the program hangs before producing any output or writing to file.
+
+Let's look at `skipComment`.
+```java
+    private boolean skipComment() {
+        if (lineComment.equals(sourceFileLexer.getSubstr(2))) {
+            sourceFileLexer.nextLine();
+            return true;
+        } else if (blockCommentStart.equals(sourceFileLexer.getSubstr(2))) {
+            sourceFileLexer.move(blockCommentStart.length());
+            while (!sourceFileLexer.endOfFile() && !blockCommentEnd.equals(sourceFileLexer.getSubstr(2))) {
+                sourceFileLexer.move(1);
+            }
+            if (blockCommentEnd.equals(sourceFileLexer.getSubstr(2))) {
+                sourceFileLexer.move(2);
+                return true;
+            }
+        }
+        return false;
+    }
+```
+If `blockCommentStart` is found, it moves past `/*`. Then it loops until `*/` is found. If `*/` is never found (EOF reached), it exits the while loop. It checks `if (blockCommentEnd.equals(...))`. If EOF is reached, `getSubstr(2)` might return `""` or partial string. It won't equal `*/`. So it returns `false`.
+Crucially, it has already consumed `/*` via `sourceFileLexer.move(blockCommentStart.length())`. So progress is made. This doesn't cause an infinite loop on its own, but it treats an unterminated comment as non-comment text? No, it consumed the start. The next iteration will try to tokenize the rest. If the rest is valid code, it proceeds. If the rest is garbage, it might hang if garbage chars aren't tokenized.
+
+But the main suspect for TLE is the **lack of handling for unrecognized characters** in `addToken`. If the lexer encounters a character that doesn't match *any* regex (e.g., `@`, `#`, `$` if they were in input, or potentially issues with how `getSubstr` or regexes handle specific edge cases), it loops forever.
+
+However, looking at the provided test case, it is standard C-like code. All characters should be covered.
+Is there a performance issue with `tryRestSubstr`?
+```java
+    public String tryRestSubstr(Pattern pattern) {
+        String rest = getRestLine();
+        Matcher matcher = pattern.matcher(rest);
+        if (matcher.find()) {
+            return matcher.group(0);
+        } else {
+            return null;
+        }
+    }
+```
+`getRestLine()` returns the substring from `columnNum` to end of line.
+For `IDENFR`, `INTCON`, etc., this works.
+
+Let's look at `CHRCON` pattern: `\\\'[^\\\']\\\'`.
+In Java string: `"\\\'[^\\\']\\\'"` -> Regex: `\'[^\']\'` .
+This matches `'a'`, `'1'`, etc.
+Does it match `'\0'`? Yes, `\0` is one char.
+Does it match `'\n'` inside a char constant? The problem says lexical errors only.
+The test case has `char a = '\0';`.
+
+Wait, look at `TokenType` initialization.
+```java
+    TokenType(String patternString, boolean isGreed) {
+        this.patternString = patternString;
+        this.isGreed = isGreed;
+        // 注意添加“^”以保证匹配紧接着的字符串
+        if(isGreed) {
+            pattern = Pattern.compile("^" + patternString + "(?![_A-Za-z0-9])");
+        }else {
+            pattern = Pattern.compile("^" + patternString);
+        }
+    }
+```
+Keywords use negative lookahead `(?![_A-Za-z0-9])`. This is correct.
+
+Why TLE?
+If the code hangs, it's usually an infinite loop.
+In `MyLexer.runMyLexer`:
+```java
+    private void runMyLexer() {
+        while (!sourceFileLexer.endOfFile()) {
+            sourceFileLexer.skipWhitespace();
+            if (skipComment()) {
+                continue;
+            }
+            addToken();
+        }
+    }
+```
+If `addToken()` does NOT advance the cursor, the loop is infinite.
+`addToken` only advances if a token is found.
+If the current character is, say, `#` (not in test case but hypothetically), or if there is a bug in regex matching causing `null` return for valid tokens?
+
+Let's check `getRestLine` and `getSubstr`.
+```java
+    public String getRestLine() {
+        if (endOfFile() || endOfLine()) {
+            return "";
+        } else {
+            return getLine().substring(columnNum); 
+        }
+    }
+```
+If `columnNum` is at the end of line, `getRestLine` returns `""`.
+`tryRestSubstr` on `""` will return `null` for almost all patterns (except maybe empty matches? No, `+` and `*` quantifiers... `IDENFR` has `*`? No, `[_A-Za-z][_A-Za-z0-9]*`. Requires at least one char. `INTCON` `[0-9]+`. Requires at least one. `STRCON` `"...".` Requires quotes.
+So if we are at EOL, `addToken` finds nothing.
+But `skipWhitespace` should handle newlines?
+```java
+    public boolean isWhitespace(char ch) {
+        return Character.isWhitespace(ch);
+    }
+    public void skipWhitespace() {
+        while (!endOfFile() && isWhitespace(getChar())) {
+            move(1);
+        }
+    }
+```
+`getChar()` returns `'\n'` if `endOfLine()` is true (but not EOF).
+```java
+    public char getChar() {
+        if (endOfFile()) {
+            return 0;   
+        }else if (endOfLine()) {
+            return '\n';
+        }
+        return getLine().charAt(columnNum);
+    }
+```
+`Character.isWhitespace('\n')` is true. So `skipWhitespace` consumes the newline by calling `move(1)`.
+`move(1)` increments `lineNum` and resets `columnNum`.
+So `skipWhitespace` effectively skips newlines.
+
+So, if the file is well-formed, `addToken` should always find a match.
+Unless... **Regex Performance**.
+Some regexes can be catastrophic backtracking.
+`STRCON`: `\\\"[^\\\"]*\\\"` -> `"[^"]*"`. This is safe.
+`CHRCON`: `\\\'[^\\\']\\\'` -> `'[^']'`. Safe.
+`IDENFR`: `[_A-Za-z][_A-Za-z0-9]*`. Safe.
+
+Is it possible that `tryRestSubstr` is slow?
+It compiles a matcher every time. But that's usually fast enough for small inputs.
+
+Let's look at the `ERRORAND` and `ERROROR` placement in `TokenType` enum.
+They are at the end.
+If the input has `&`, it will first check `MAINTK`... `OR` (`\|\|`).
+`OR` pattern is `\|\|`. `&` doesn't match.
+Eventually it hits `ERRORAND` (`&`). Matches. Advances.
+
+What if the input has `|`?
+Checks `OR` (`\|\|`). Fails.
+Checks `ERROROR` (`\|`). Matches. Advances.
+
+There is one potential issue: **The order of `LSS`/`LEQ` and `GRE`/`GEQ` and `EQL`/`ASSIGN` etc.**
+`LEQ` (`<=`) is before `LSS` (`<`).
+If input is `<`, `LEQ` fails (needs `=` next). `LSS` matches. Correct.
+If input is `<=`, `LEQ` matches. Correct.
+
+However, there is a known issue with `Scanner` or `Matcher` if not anchored properly, but here `^` is used.
+
+Let's look closely at `skipComment` again.
+```java
+            while (!sourceFileLexer.endOfFile() && !blockCommentEnd.equals(sourceFileLexer.getSubstr(2))) {
+                sourceFileLexer.move(1);
+            }
+```
+If we have a huge block comment, this moves char by char. This is O(N) which is fine.
+
+Is it possible the TLE is due to **Output**?
+The `Compiler.java` writes to file.
+`myLexer.getTokenList().toString()` builds a huge string.
+For the provided test case, the output is ~200 lines. Not huge.
+
+Let's reconsider the **Infinite Loop** hypothesis.
+If `addToken` fails to match, it returns without moving.
+Why would it fail to match on valid C code?
+Maybe `CHRCON` regex is wrong?
+`\\\'[^\\\']\\\'`
+Java String: `\'` is `'`. `\\` is `\`.
+So `\\\'` in Java string is `\'` in regex?
+No.
+In Java String literal: `"\\"` is `\`. `"\'"` is `'`.
+So `"\\\'"` is `\'`.
+Regex `\'` matches a literal single quote.
+`[^\\\']` -> `[^\\']`?
+Inside `[]`, `\\` is `\`. `\'` is `'`.
+So `[^\\']` means "not `\` and not `'`"?
+Or does `\\\'` mean escaped quote?
+In Java: `"\\\'"` -> characters: `\`, `'`.
+Regex engine sees: `\'`. Which is just `'`.
+So `[^\\\']` in Java string is `[^\\']` in regex source?
+Let's trace:
+Java String: `"\\\'[^\\\']\\\'"`
+Chars: `\`, `'`, `[`, `^`, `\`, `\`, `'`, `]`, `\`, `'`
+Wait. `\\` is one backslash. `\'` is one single quote.
+So `\\\'` is `\` then `'`.
+Regex: `\'` matches `'`.
+So the pattern is: `'` then `[^\\']` then `'`.
+`[^\\']` means any char EXCEPT `\` and `'`.
+So `'\0'` matches? `\0` is not `\` (it's null char) and not `'`. Yes.
+What about `'\\'` (backslash char)?
+Input: `'\'` (quote, backslash, quote).
+Regex `[^\\']` excludes `\`. So `'\'` would NOT match `CHRCON`.
+But the test case doesn't have `'\'`. It has `'\0'`.
+
+However, if the code encounters a character that is NOT matched by any token, it loops.
+Are there any characters in the test file that might fail?
+The test file looks clean.
+
+Wait! Look at `TokenType` enum definition order.
+`AND("&&", false)`
+`OR("\\|\\|", false)`
+...
+`ERRORAND("&", false)`
+`ERROROR("\\|", false)`
+
+If the input is `&`, `AND` (`&&`) fails. `ERRORAND` (`&`) matches.
+If the input is `|`, `OR` (`||`) fails. `ERROROR` (`|`) matches.
+
+Is it possible that `skipWhitespace` is not skipping something?
+`Character.isWhitespace` covers space, tab, newline, carriage return, form feed.
+
+Let's look at `SourceFileLexer.move`.
+```java
+    public void move(int stride) {
+        int cnt = stride;
+        while (!endOfFile() && cnt > 0) {
+            int lineLength = this.getLine().length();
+            if(columnNum + cnt >= lineLength) {     //if reach EOL
+                lineNum++;  // next line
+                cnt -= (lineLength - columnNum + 1);    // the rest of stride
+                columnNum = 0;  // initial columnNum
+            } else {
+                columnNum += cnt;
+                cnt = 0;
+            }
+        }
+    }
+```
+If `columnNum + cnt == lineLength`, it goes into the `if`.
+`cnt -= (lineLength - columnNum + 1)`.
+Example: Line length 10. `columnNum` 9. `cnt` 1.
+`9 + 1 >= 10` is true.
+`cnt -= (10 - 9 + 1) = 2`.
+`cnt` becomes `1 - 2 = -1`.
+Loop condition `cnt > 0` fails.
+`lineNum` incremented. `columnNum` 0.
+This correctly moves to next line.
+
+What if `stride` is 0? `cnt` is 0. Loop doesn't run. No move.
+`addToken` calls `move(tokenStr.length())`. If `tokenStr` is empty?
+`tryRestSubstr` returns `matcher.group(0)`.
+Can `group(0)` be empty?
+`IDENFR`: `+` and `*` -> `[_A-Za-z]` required. Min length 1.
+`INTCON`: `+`. Min length 1.
+`STRCON`: `""` min length 2.
+`CHRCON`: `''` min length 3.
+Symbols: length 1 or 2.
+Keywords: length >= 2.
+So `tokenStr` should never be empty if matched.
+
+There is one suspicious thing in `skipComment`:
+```java
+            while (!sourceFileLexer.endOfFile() && !blockCommentEnd.equals(sourceFileLexer.getSubstr(2))) {
+                sourceFileLexer.move(1);
+            }
+```
+If we are at EOF, `getSubstr(2)` returns `""`. `""` != `*/`. Loop terminates.
+Then `if (blockCommentEnd.equals(sourceFileLexer.getSubstr(2)))` is false.
+Returns `false`.
+But `move(blockCommentStart.length())` was already called.
+So `/*` at EOF is consumed. Lexer advances. No infinite loop.
+
+**Hypothesis:** The TLE is caused by the **regex matching overhead** or a specific **pathological case** in `tryRestSubstr` combined with the loop in `addToken` iterating through ALL 30+ token types for EVERY character.
+For each character, it compiles a matcher (actually `pattern.matcher(rest)` uses precompiled pattern, so that's fast) and runs `find()`.
+`find()` attempts to match at the beginning because of `^`.
+If the first few tokens don't match, it tries others.
+This is generally fast enough for small files.
+
+However, there is a logical error in `addToken` regarding **Error Handling**.
+If `addToken` finds NO match, it does nothing. The cursor doesn't move. The loop repeats infinitely.
+Even if the test case is "correct", if there is a bug in one of the regexes that causes it to NOT match a valid token, TLE occurs.
+
+Let's check `CHRCON` again.
+`\\\'[^\\\']\\\'`
+Java: `\'` is `'`. `\\` is `\`.
+So `\\\'` is `\'`.
+Regex: `\'` matches `'`.
+`[^\\\']` -> `[^\\']`.
+In regex `[^\\']`, `\\` is `\`. `'` is `'`.
+So it matches any char except `\` and `'`.
+Test case: `char a = '\0';`
+`\0` is the null character. It is not `\` and not `'`. So it matches.
+
+What about `STRCON`?
+`\\\"[^\\\"]*\\\"`
+Java: `\\\"` is `\"`.
+Regex: `\"` matches `"`.
+`[^\\\"]*` -> `[^\""]*`?
+`\\` is `\`. `\"` is `"`.
+So `[^\\"]` means not `\` and not `"`.
+This prevents escaping inside strings?
+The problem description doesn't specify escape sequences in strings, but standard C allows `\"`.
+If the string contains `\"`, this regex will FAIL to match the whole string if it stops at the escaped quote?
+Actually, `[^\\"]*` will stop at `\`.
+Example: `"abc\"def"`.
+Regex `"[^\\"]*` matches `"abc`. Then expects `"`. Next char is `\`. Mismatch.
+So `STRCON` fails.
+Then `addToken` tries next tokens. None match `"`.
+Eventually, does any token match `"`? No.
+So `addToken` returns without moving. **Infinite Loop**.
+
+The test case has:
+`printf("%d\n", tmp);`
+String: `"%d\n"`
+Does it contain `\"`? No. It contains `\n`.
+`\` is excluded by `[^\\"]`.
+So `[^\\"]*` matches `%d`. Stops at `\`.
+Expects `"`. Next char is `\`. Mismatch.
+So `STRCON` fails to match `"%d\n"`.
+
+This is the bug. The regex for `STRCON` and `CHRCON` likely doesn't handle escape sequences correctly, or simply excludes `\` which is present in valid strings/chars like `\n`, `\0`, `\"`, `\'`.
+
+In `CHRCON`: `'\0'`. `\` is excluded by `[^\\']`.
+So `CHRCON` fails to match `'\0'`.
+`addToken` tries to match `'`.
+`CHRCON` fails.
+Does any other token match `'`? No.
+Infinite Loop.
+
+Therefore, the error is in the **Regex definitions** in `TokenType.java`, specifically `STRCON` and `CHRCON` excluding backslashes, which causes valid tokens containing escape sequences to fail matching, leading to an infinite loop in `MyLexer.addToken`.
+
+However, the prompt asks to identify the location of the error. The immediate cause of TLE is the infinite loop in `MyLexer` when `addToken` fails to advance. But the root cause is the regex. Usually, in these debugging tasks, if the code hangs, it's because the "catch-all" or error handling is missing, OR the token definitions are wrong.
+
+Given I must output the code snippet where the error is likely located:
+The infinite loop happens in `MyLexer.java` because `addToken` doesn't handle the "no match" case.
+But fixing `addToken` to throw an error or skip a char would just reveal the regex error.
+The "Error" in the program logic that leads to TLE on valid input (which contains escapes) is the Regex.
+
+However, often "Time Limit Exceeded" in these specific assignment contexts with a "Buggy Output" of empty suggests the program never finishes `runMyLexer`.
+
+I will point to `MyLexer.java` `addToken` method as the place where the infinite loop manifests (lack of progress), but the actual fix requires changing `TokenType.java`. The prompt asks to "identify the location of the errors".
+
+Let's look at the instructions: "output the code snippet where the error is likely to be located."
+
+If I change `TokenType` regexes, it fixes the match.
+If I change `MyLexer` to handle no-match, it prevents TLE but produces wrong output (or error).
+
+The most precise "location of the error" causing the *symptom* of TLE on this input is that `addToken` fails to match `'\0'` or `"\n"`.
+
+I will provide the `TokenType.java` snippet showing the incorrect regexes, as that is the semantic error preventing correct tokenization.
+
+<frontend/lexer/TokenType.java>
+...
+    /* 标识符 */
+    IDENFR("[_A-Za-z][_A-Za-z0-9]*", false),
+    INTCON("[0-9]+", false),
+    STRCON("\\\"[^\\\"]*\\\"", false),
+    CHRCON("\\\'[^\\\']\\\'", false),
+...

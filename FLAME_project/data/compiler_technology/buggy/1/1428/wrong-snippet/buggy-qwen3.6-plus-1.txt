@@ -1,0 +1,351 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The task is to implement a syntax analyzer that outputs syntax components for correct programs or error codes (line number and type) for incorrect programs.
+2.  **Test Case Input**:
+    ```c
+    void f(int a {} // error 1: Missing ')' after parameters
+    int main( { // error 2: Missing ')' after main params (though main usually has no params, grammar expects ')')
+        int a = 10;
+        f(a + 10; // error 3: Missing ')' in function call
+        return 0;
+    }
+    ```
+3.  **Expected Output**:
+    ```
+    1 j
+    3 j
+    5 j
+    ```
+    Note: Line 5 corresponds to `return 0;`. Wait, looking at the input:
+    Line 1: `void f(int a {}`
+    Line 2: (empty)
+    Line 3: `int main( {`
+    Line 4: `    int a = 10;`
+    Line 5: `    f(a + 10;`
+    Line 6: `    return 0;`
+    Line 7: `}`
+    
+    The expected output lists errors at lines 1, 3, and 5. All are type 'j' (Missing right parenthesis).
+
+4.  **Buggy Output**:
+    ```
+    1 j
+    3 j
+    5 j
+    5 j
+    ```
+    The program outputs an extra error `5 j`. This suggests that when parsing the statement on line 5 (`f(a + 10;`), the parser detects the missing `)` twice, or detects it once during expression parsing and once during statement parsing, or similar duplication logic.
+
+5.  **Code Analysis**:
+    Let's look at how `f(a + 10;` is parsed.
+    In `Parser.java`, `parseStmt()` handles statements.
+    The code attempts to parse an expression first to distinguish between assignment, function calls (`getint`/`getchar`), and simple expression statements.
+    
+    Inside `parseStmt()`:
+    ```java
+    } else {
+        int nowPos = this.tokenStream.getPos();
+        parseExp(); // Parses "a + 10" then encounters ';' instead of ')' if it were inside a call, but here it's just an exp.
+        int len = this.tokenStream.getPos() - nowPos;
+        this.tokenStream.move();
+        this.token = this.tokenStream.getToken();
+        if (this.token.getTokenType() == TokenType.ASSIGN) {
+             // ... handle assignment/getint/getchar
+        } else {
+            this.tokenStream.back(len + 1);
+            return parseExpStmt();
+        }
+    }
+    ```
+    However, `f(a + 10;` starts with `f`, which is an `IDENFR`.
+    The `parseStmt` logic above is for cases that don't match specific keywords. `IDENFR` falls into the `else` block.
+    
+    But wait, `f(...)` is a function call. Function calls are expressions (`UnaryExp`).
+    So `parseExp()` will call `parseAddExp()` -> ... -> `parseUnaryExp()`.
+    
+    In `parseUnaryExp()`:
+    ```java
+    public UnaryExp parseUnaryExp() {
+        // ... handles unary ops
+        if (this.token.getTokenType() == TokenType.IDENFR) {
+            this.tokenStream.move();
+            this.token = this.tokenStream.getToken();
+            this.tokenStream.back(1);
+            if (this.token.getTokenType() == TokenType.LPARENT) {
+                return parseCallFuncUnaryExp(signs); // Parses f(...)
+            } else {
+                return parsePrimaryUnaryExp(signs);
+            }
+        } 
+        // ...
+    }
+    ```
+    
+    In `parseCallFuncUnaryExp()`:
+    ```java
+    public CallFuncUnaryExp parseCallFuncUnaryExp(ArrayList<TokenType> signs) {
+        // ...
+        this.tokenStream.move(); // moves past '('
+        this.token = this.tokenStream.getToken();
+        if (FuncRParams.FIRST.contains(this.token.getTokenType())) {
+            funcRParams = parseFuncRParams(); // Parses "a + 10"
+        } else {
+            this.tokenStream.back(1);
+        }
+        expect(TokenType.RPARENT); // Expects ')'. Current token is ';'. Error 'j' added at line of ';'.
+        return new CallFuncUnaryExp(signs, Ident, funcRParams);
+    }
+    ```
+    The `expect(TokenType.RPARENT)` method adds error 'j' if `)` is missing. It consumes the token if it matches, or backs up if it doesn't?
+    Let's check `expect`:
+    ```java
+    public void expect(TokenType tokenType) {
+        int errLineNum;
+        this.token = this.tokenStream.getToken(); // Current token is ';'
+        errLineNum = this.token.getLineNum(); // Line 5
+        this.tokenStream.move(); // Moves past ';'
+        this.token = this.tokenStream.getToken(); // Next token
+        if (this.token.getTokenType() != tokenType) { // ';' != RPARENT
+            switch (tokenType) {
+                case SEMICN -> this.errorList.addError(errLineNum, "i");
+                case RPARENT -> this.errorList.addError(errLineNum, "j"); // Adds error 5 j
+            }
+            this.tokenStream.back(1); // Backs up to ';'
+        }
+    }
+    ```
+    So, `parseCallFuncUnaryExp` adds error `5 j` and leaves the token stream pointing at `;`.
+    
+    Now, back in `parseStmt()`:
+    The `else` block called `parseExp()`. `parseExp()` returned successfully (with an error recorded inside).
+    Then:
+    ```java
+    int len = this.tokenStream.getPos() - nowPos;
+    this.tokenStream.move(); // Moves past ';'
+    this.token = this.tokenStream.getToken(); // Token is 'return' (or whatever is next)
+    if (this.token.getTokenType() == TokenType.ASSIGN) {
+        // ...
+    } else {
+        this.tokenStream.back(len + 1); // Backs up to position after Exp, i.e., at ';'
+        return parseExpStmt(); // Calls parseExpStmt
+    }
+    ```
+    
+    In `parseExpStmt()`:
+    ```java
+    public ExpStmt parseExpStmt() {
+        Exp exp = null;
+        this.token = this.tokenStream.getToken(); // Token is ';'
+        if (Exp.FIRST.contains(this.token.getTokenType())) { // ';' is in Exp.FIRST?
+            // Let's check Exp.FIRST.
+            // Exp.FIRST.addAll(AddExp.FIRST)... eventually PrimaryExp.FIRST...
+            // PrimaryExp.FIRST contains CHRCON, LPARENT, IDENFR, INTCON.
+            // Does it contain SEMICN?
+            // Look at Stmt.FIRST in Stmt.java:
+            // FIRST.addAll(Exp.FIRST);
+            // FIRST.add(TokenType.SEMICN);
+            // So SEMICN is in Stmt.FIRST, but is it in Exp.FIRST?
+            // Exp.java: FIRST.addAll(AddExp.FIRST).
+            // AddExp.java: FIRST.addAll(MulExp.FIRST).
+            // MulExp.java: FIRST.addAll(UnaryExp.FIRST).
+            // UnaryExp.java: FIRST.add(IDENFR), PRIMARY, PLUS, MINU, NOT.
+            // PrimaryExp.java: CHRCON, LPARENT, Lval (IDENFR), INTCON.
+            // So SEMICN is NOT in Exp.FIRST.
+            
+            // Therefore, if (Exp.FIRST.contains(';')) is FALSE.
+            exp = null; // skipped
+        }
+        expect(TokenType.SEMICN); // Expects ';'. Current token is ';'.
+        // expect moves past ';'. No error.
+        return new ExpStmt(exp);
+    }
+    ```
+    Wait, if `parseExpStmt` doesn't add an error, where does the second `5 j` come from?
+    
+    Let's re-read `parseStmt` logic carefully.
+    
+    The input is `f(a + 10;`.
+    1. `parseStmt` enters `else`.
+    2. `nowPos` saved.
+    3. `parseExp()` is called.
+       - Inside `parseExp`, `parseUnaryExp` sees `f`.
+       - Calls `parseCallFuncUnaryExp`.
+       - Inside `parseCallFuncUnaryExp`:
+         - Consumes `f`.
+         - Sees `(`, consumes it.
+         - Parses params `a + 10`.
+         - Calls `expect(RPARENT)`. Current token is `;`.
+         - `expect` records error `5 j`. Moves past `;`. Checks next token. Backs up to `;`.
+         - Returns `CallFuncUnaryExp`.
+       - `parseExp` returns.
+    4. Back in `parseStmt`:
+       - `len` calculated.
+       - `this.tokenStream.move()`. Current token was `;`. Moves past `;`.
+       - `this.token = this.tokenStream.getToken()`. Next token is likely `return` or newline/next stmt.
+       - Checks if `ASSIGN`. It is not.
+       - Enters `else`.
+       - `this.tokenStream.back(len + 1)`.
+         - `len` is the number of tokens consumed by `parseExp`.
+         - Tokens consumed: `f`, `(`, `a`, `+`, `10`. (5 tokens).
+         - `back(5 + 1) = back(6)`.
+         - Position before `parseExp` was at `f`.
+         - Moving back 6 from current pos (which is after `;`) puts us back at `f`? Or `(`?
+         - Let's trace indices.
+           - Start at `f` (idx 0). `nowPos` = 0.
+           - `parseExp` consumes `f`(1), `(`(2), `a`(3), `+`(4), `10`(5). Stops at `;`(6).
+           - `expect(RPARENT)` saw `;`(6), moved to `return`(7), backed up to `;`(6).
+           - `parseExp` returns. Stream pos is 6 (`;`).
+           - `len` = 6 - 0 = 6.
+           - `move()`. Pos becomes 7 (`return`).
+           - `back(len + 1)` = `back(7)`.
+           - Pos becomes 0 (`f`).
+       - `return parseExpStmt()`.
+    
+    5. `parseExpStmt()` is called with stream at `f`.
+       - `this.token = getToken()` -> `f`.
+       - `Exp.FIRST` contains `IDENFR`. So `if` condition is TRUE.
+       - `exp = parseExp()`.
+         - Calls `parseUnaryExp` again!
+         - Sees `f`. Calls `parseCallFuncUnaryExp`.
+         - Inside `parseCallFuncUnaryExp`:
+           - Consumes `f`.
+           - Sees `(`.
+           - Parses params.
+           - Calls `expect(RPARENT)`. Current token is `;`.
+           - `expect` records error `5 j` AGAIN.
+           - Backs up to `;`.
+         - Returns.
+       - `expect(TokenType.SEMICN)`.
+         - Current token is `;`.
+         - Moves past `;`.
+         - No error.
+       - Returns `ExpStmt`.
+
+    So the error `5 j` is reported twice: once during the speculative `parseExp()` in `parseStmt`, and once during the actual `parseExpStmt()` which re-parses the expression.
+
+    The issue is that `parseStmt` performs a speculative parse to determine the statement type, but if that speculative parse encounters errors, those errors are recorded permanently in `errorList`. When the actual parsing happens later, the same errors are recorded again.
+
+    To fix this, we should either:
+    1. Clear errors generated during speculation if they turn out to be part of a valid path (complex).
+    2. Avoid re-parsing if possible.
+    3. Use a mechanism to suppress errors during speculation.
+    
+    However, looking at the structure, the `parseStmt` logic tries to distinguish `LVal = Exp` vs `Exp ;`.
+    If it parses `Exp` and finds `=`, it rewinds and parses as Assignment.
+    If it parses `Exp` and finds `;` (or something else), it rewinds and parses as ExpStmt.
+    
+    The problem is specifically that `parseExp` inside `parseStmt` triggers error reporting.
+    
+    A common solution in recursive descent parsers with error recovery is to not report errors during lookahead/speculation, or to accept that some errors might be duplicated if not careful. But here, the duplication is exact.
+    
+    The most likely intended fix or the location of the "bug" in the context of student assignments is often related to how `expect` works or how the parser handles the flow.
+    
+    Actually, let's look at `parseExpStmt` again.
+    ```java
+    public ExpStmt parseExpStmt() {
+        Exp exp = null;
+        this.token = this.tokenStream.getToken();
+        if (Exp.FIRST.contains(this.token.getTokenType())) {
+            exp = parseExp();
+            expect(TokenType.SEMICN);
+        }
+        return new ExpStmt(exp);
+    }
+    ```
+    And `parseStmt`:
+    ```java
+    } else {
+        int nowPos = this.tokenStream.getPos();
+        parseExp();
+        int len = this.tokenStream.getPos() - nowPos;
+        this.tokenStream.move();
+        this.token = this.tokenStream.getToken();
+        if (this.token.getTokenType() == TokenType.ASSIGN) {
+            // ...
+        } else {
+            this.tokenStream.back(len + 1);
+            return parseExpStmt();
+        }
+    }
+    ```
+    
+    The speculative `parseExp()` consumes the tokens and reports errors.
+    Then `parseExpStmt()` re-consumes the tokens and reports the same errors.
+    
+    The error is in `Parser.java` in the `parseStmt` method. The speculative parsing causes duplicate error reporting.
+    
+    However, usually, we can't easily "undo" errors added to a list.
+    Perhaps the logic in `parseStmt` is flawed for this specific grammar.
+    
+    Let's check if there's a simpler issue.
+    What if `parseExpStmt` didn't call `parseExp` again?
+    But `parseStmt` rewound the stream.
+    
+    Is there a way to prevent the first error from being logged?
+    The `ErrorList` doesn't support temporary buffering.
+    
+    Maybe the fix is to NOT call `parseExp` speculatively if we can determine the statement type another way?
+    For `LVal = Exp`, we need to see if there is an `=` after the `LVal`.
+    For `Exp ;`, we just parse `Exp` and expect `;`.
+    
+    The current code parses the whole `Exp` to see if `=` follows. This is inefficient and causes side effects (errors).
+    
+    A better approach for `parseStmt` when encountering an `IDENFR` (start of LVal or FuncCall):
+    1. Parse `LVal`.
+    2. Check if next token is `=`.
+    3. If yes, parse `= Exp ;`.
+    4. If no, it might be a FuncCall (which is an Exp) or just an Exp.
+       But `LVal` is a prefix of `UnaryExp` (if it's a call).
+       
+    Actually, `LVal` is `Ident ['[' Exp ']']`.
+    `UnaryExp` can be `Ident '(' ... ')'`.
+    
+    If we have `f(a+10;`, `parseLval` would consume `f`. Then `parseStmt` logic?
+    The current logic uses `parseExp`.
+    
+    Given the constraints and the specific bug (duplicate error), the error location is the `parseStmt` method in `Parser.java`. Specifically, the block where `parseExp()` is called speculatively.
+
+<frontend/parser/Parser.java>
+...
+    public Stmt parseStmt() {
+        this.token = this.tokenStream.getToken();
+        if (this.token.getTokenType() == TokenType.LBRACE) {
+            return parseBlockStmt();
+        } else if (this.token.getTokenType() == TokenType.IFTK) {
+            return parseIfStmt();
+        } else if (this.token.getTokenType() == TokenType.FORTK) {
+            return parseForStmt();
+        } else if (this.token.getTokenType() == TokenType.BREAKTK) {
+            return parseBreakStmt();
+        } else if (this.token.getTokenType() == TokenType.CONTINUETK) {
+            return parseContinueStmt();
+        } else if (this.token.getTokenType() == TokenType.RETURNTK) {
+            return parseReturnStmt();
+        } else if (this.token.getTokenType() == TokenType.PRINTFTK) {
+            return parsePrintfStmt();
+        } else if (DeclStmt.FIRST.contains(this.token.getTokenType())){
+            return parseDecl();
+        } else {
+            int nowPos = this.tokenStream.getPos();
+            parseExp();
+            int len = this.tokenStream.getPos() - nowPos;
+            this.tokenStream.move();
+            this.token = this.tokenStream.getToken();
+            if (this.token.getTokenType() == TokenType.ASSIGN) {
+                this.tokenStream.move();
+                this.token = this.tokenStream.getToken();
+                this.tokenStream.back(len + 2);
+                if (this.token.getTokenType() == TokenType.GETCHARTK) {
+                    return parseGetCharStmt();
+                } else if (this.token.getTokenType() == TokenType.GETINTTK) {
+                    return parseGetIntStmt();
+                } else {
+                    return parseAssignStmt();
+                }
+            } else {
+                this.tokenStream.back(len + 1);
+                return parseExpStmt();
+            }
+        }
+    }
+...

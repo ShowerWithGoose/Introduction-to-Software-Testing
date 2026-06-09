@@ -1,0 +1,47 @@
+#include <stdio.h>  
+#include <stdbool.h>  
+  
+void printPermutation(int arr[], int n) {  
+    for (int i = 0; i < n; i++) {  
+        printf("%d ", arr[i]);  
+    }  
+    printf("\n");  
+}  
+  
+void permute(int arr[], int n, int start, bool used[]) { @@ // 使用`bool`类型需要C99标准支持，且可能因编译器不支持而导致编译错误。参考程序采用int数组替代，建议改为int类型。
+    if (start == n) {  
+        printPermutation(arr, n);  
+        return;  
+    }  
+    for (int i = 1; i <= n; i++) {  
+        if (!used[i]) { // 如果数字i还没有被使用过  
+            used[i] = true; // 标记为已使用  
+            arr[start] = i; // 将数字放到当前位置  
+            permute(arr, n, start + 1, used); // 递归排列剩下的数字  
+            used[i] = false; // 回溯，标记为未使用，以便在后续的迭代中可以使用它  
+        }  
+    }  
+}  
+  
+void generatePermutations(int n) {  
+    int arr[n]; // 用于存储当前排列的数组  
+    bool used[n + 1]; // 用于跟踪哪些数字已经被使用过的数组  
+    // 初始化所有数字为未使用状态  
+    for (int i = 0; i <= n; i++) {  
+        used[i] = false;  
+    }  
+    // 开始生成全排列，从第一个位置开始填充数字  
+    permute(arr, n, 0, used);  
+}  
+  
+int main() {  
+    int N;  
+    printf("Enter the number of elements (1 <= N <= 10): ");  
+    scanf("%d", &N);  
+    if (N >= 1 && N <= 10) {  
+        generatePermutations(N);  
+    } else {  
+        printf("Invalid input. N must be between 1 and 10.\n");  
+    }  
+    return 0;  
+}

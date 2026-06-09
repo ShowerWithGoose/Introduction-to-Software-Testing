@@ -1,0 +1,533 @@
+Based on the problem description and test case, the program should output syntax component names like `<VarDef>`, `<VarDecl>`, etc., but the buggy output shows "No output file". This indicates that the parser is not properly logging the syntax components to the output.
+
+Looking at the code, I can see that in several syntax classes like `BType.java` and `Decl.java`, the logging statements are commented out:
+
+In `<syntax/BType.java>`:
+```java
+public BType(LexType lexType) {
+    if (lexType != LexType.INTTK && lexType != LexType.CHARTK) {
+        throw new RuntimeException();
+    }
+    this.lexType = lexType;
+//        Constant.good.append("<BType>\n");
+}
+```
+
+In `<syntax/Decl.java>`:
+```java
+public Decl(ConstDecl constDecl) {
+    this.constDecl = Objects.requireNonNull(constDecl);
+    this.varDecl = null;
+//        Constant.good.append("<Decl>\n");
+}
+
+public Decl(VarDecl varDecl) {
+    this.constDecl = null;
+    this.varDecl = Objects.requireNonNull(varDecl);
+//        Constant.good.append("<Decl>\n");
+}
+```
+
+However, looking more carefully at the expected output, I notice that `<BType>` is NOT included in the expected output (as mentioned in the problem: "except for <BlockItem>, <Decl>, <BType>"). So the issue isn't with BType not being logged.
+
+The real issue is in the `Parser.java` file in the `parseCompUnit()` method. The logic for parsing declarations is flawed. Let me examine the problematic section:
+
+<Parser.java>
+...
+    public CompUnit parseCompUnit() {
+        lexer.next();
+
+        ArrayList<Decl> decls = new ArrayList<>();
+        boolean hasDecl;
+        do {
+            hasDecl = false;
+            if (lexer.getLexType() == LexType.CONSTTK) {
+                decls.add(parseDecl());
+                hasDecl = true;
+            } else {
+                lexer.nextNoPrint();
+                lexer.nextNoPrint();
+                if (lexer.getLexType() != LexType.LPARENT) {
+                    lexer.prev();
+                    lexer.prev();
+                    decls.add(parseDecl());
+                    hasDecl = true;
+                } else {
+                    lexer.prev();
+                    lexer.prev();
+                }
+            }
+        } while (hasDecl);
+...
+```
+
+The issue is that the parser is calling `lexer.next()` at the beginning of `parseCompUnit()`, which consumes the first token ("int" in the test case) and logs it via the `next()` method. However, when parsing the first declaration, the logic tries to look ahead by calling `nextNoPrint()` twice and then checking if it's not LPARENT, but this approach is flawed because it's consuming tokens without proper handling.
+
+The main problem is that the initial `lexer.next()` call in `parseCompUnit()` is consuming the first token and logging it, but then the declaration parsing logic is not correctly handling the token stream, leading to missing outputs or incorrect parsing state.
+
+Looking more closely at the expected output, I see that the first lines should be:
+```
+INTTK int
+IDENFR a
+<VarDef>
+SEMICN ;
+<VarDecl>
+```
+
+But the current parsing logic in `parseCompUnit()` is not correctly identifying the first `VarDecl` because of the flawed lookahead mechanism.
+
+However, there's another critical issue. In the `Lexer.java` class, the `next()` method logs the previous token, not the current one:
+
+<Lexer.java>
+...
+    public boolean next() {
+        if (lexType != null) {
+            Logger.logGood(getLexType() + " " + getToken() + "\n");
+        }
+        return nextNoPrint();
+    }
+...
+```
+
+This means that when `parseCompUnit()` calls `lexer.next()` initially, it logs whatever was previously parsed (which is null initially), and then parses the first token. But the first token never gets logged because there's no subsequent `next()` call to trigger its logging.
+
+The fundamental issue is in the lexer's logging mechanism combined with the parser's token consumption pattern. The lexer only logs a token when the NEXT token is requested, meaning the last token of the entire input never gets logged.
+
+But looking at the test case more carefully, the program produces "No output file", which suggests that either `Logger.getGood()` returns empty string or there's an exception being thrown.
+
+Looking at the `parseStmt()` method, there's a problematic section:
+
+<Parser.java>
+...
+            // 可能的四种情况：
+            //     LVal '=' Exp ';'
+            //     Exp ';'
+            //     LVal '=' 'getint' '(' ')' ';'
+            //     LVal '=' 'getchar' '(' ')' ';'
+            // 先解析一个 Exp
+            Exp expOrLVal = parseExp();
+            if (lexer.getLexType() == LexType.ASSIGN) {
+                LVal lVal = expOrLVal.getAddExp().getMulExp().getUnaryExp().getPrimaryExp().getlVal();
+                while (!Logger.getLastGood().equals("<LVal>\n")) {
+                    Logger.removeLastGood();
+                }
+...
+```
+
+This code assumes that `expOrLVal` is actually an `LVal`, but it parsed it as an `Exp`. The chain of method calls `getAddExp().getMulExp().getUnaryExp().getPrimaryExp().getlVal()` will fail if the expression is not actually an LVal, because `getMulExp()` in `AddExp` throws an exception when `addExp != null`.
+
+In the test case, we have variable declarations like `int a = 5;`, which should be handled by the `VarDecl` parsing path, not the `Stmt` parsing path. But if the `parseCompUnit()` logic is flawed, it might be incorrectly routing these to statement parsing.
+
+Actually, looking at the test input again:
+```
+int a;
+int b = 114514;
+...
+int main() {
+    int a = 5;
+    ...
+}
+```
+
+The first two lines are global declarations, and the ones inside main are local declarations within a block. The global declarations should be parsed by the `parseCompUnit()` -> `parseDecl()` path, while the local ones should be parsed by `parseBlockItem()` -> `parseDecl()` path.
+
+The issue appears to be in the `parseCompUnit()` method's logic for detecting declarations. The current logic is overly complex and error-prone.
+
+But wait, looking at the expected output, I see that all the required syntax components ARE being output, including `<VarDef>`, `<VarDecl>`, etc. This suggests that the syntax classes ARE logging correctly (since `VarDef.java`, `VarDecl.java` etc. have `Logger.logGood("<...>\n")` calls that are NOT commented out).
+
+The real issue might be that an exception is being thrown during parsing, causing the program to terminate early without producing any output file.
+
+Looking at the `parseStmt()` method again, the problematic code is:
+
+```java
+LVal lVal = expOrLVal.getAddExp().getMulExp().getUnaryExp().getPrimaryExp().getlVal();
+```
+
+The `getMulExp()` method in `AddExp.java` has:
+
+```java
+public MulExp getMulExp() {
+    if (addExp != null) {
+        throw new RuntimeException();
+    }
+    return mulExp;
+}
+```
+
+This will throw an exception if the `AddExp` represents a binary addition/subtraction operation (i.e., when `addExp != null`). In our test case, expressions like `b - a` would create an `AddExp` with `addExp != null`, and if this somehow gets routed through the assignment parsing path incorrectly, it would cause a runtime exception.
+
+However, `b - a` appears in the context `int c = b - a;`, which is a variable declaration, not a statement assignment. So it should be parsed by `parseVarDecl()` -> `parseVarDef()` -> `parseInitVal()` -> `parseExp()`, which should work fine.
+
+Let me trace through what should happen for `int a;`:
+
+1. `parseCompUnit()` calls `lexer.next()` - this should parse "int" but not log it yet
+2. The do-while loop checks if it's CONSTTK (it's not)
+3. It calls `lexer.nextNoPrint()` twice - first gets "a", second gets ";"
+4. Since ";" != LPARENT, it calls `lexer.prev()` twice and then `parseDecl()`
+5. `parseDecl()` sees INTTK and calls `parseVarDecl()`
+6. `parseVarDecl()` calls `parseBType()` which consumes "int" and should log "INTTK int"
+7. Then `parseVarDef()` consumes "a" and should log "IDENFR a"
+
+But wait, step 6: `parseBType()` calls `lexer.next()`, which would log the current token ("int") and then consume the next token ("a"). 
+
+The issue is that the initial `lexer.next()` in `parseCompUnit()` already consumed "int" and should have logged it, but according to the lexer logic, it only logs when the NEXT token is requested.
+
+Actually, let's trace the lexer behavior precisely:
+
+Initial state: `lexType = null`, `token = null`
+- `parseCompUnit()` calls `lexer.next()`
+  - Since `lexType == null`, nothing is logged
+  - `nextNoPrint()` is called, which parses "int", sets `lexType = INTTK`, `token = "int"`
+  - Returns true
+
+Now the lexer has "int" as current token.
+
+Then in the do-while loop:
+- `lexer.getLexType() == LexType.CONSTTK`? No, it's INTTK
+- Enter else branch:
+  - `lexer.nextNoPrint()` - parses "a", sets current token to "a"  
+  - `lexer.nextNoPrint()` - parses ";", sets current token to ";"
+  - Check if ";" != LPARENT (true)
+  - Call `lexer.prev()` twice - now current token is back to "int"
+  - Call `parseDecl()`
+
+In `parseDecl()`:
+- Since `lexer.getLexType() == INTTK`, it goes to VarDecl path
+- Calls `parseVarDecl()`
+- `parseVarDecl()` calls `parseBType()`
+- `parseBType()` calls `lexer.next()` 
+  - This logs "INTTK int" (good!)
+  - Then calls `nextNoPrint()` which parses "a", sets current token to "a"
+
+So far so good.
+
+But there's another issue. In the `parseCompUnit()` method, after parsing declarations, it tries to parse function definitions:
+
+```java
+        ArrayList<FuncDef> funcDefs = new ArrayList<>();
+        boolean hasFuncDef;
+        do {
+            hasFuncDef = false;
+            lexer.nextNoPrint();
+            if (lexer.getLexType() != LexType.MAINTK) {
+                lexer.prev();
+                funcDefs.add(parseFuncDef());
+                hasFuncDef = true;
+            } else {
+                lexer.prev();
+            }
+        } while (hasFuncDef);
+```
+
+This logic calls `lexer.nextNoPrint()` to peek at the next token. If it's not MAINTK, it assumes it's a FuncDef. But after parsing the global declarations (`int a; int b = 114514;`), the next token should be "int" (from "int main()"), which is not MAINTK, so it would try to parse it as a FuncDef.
+
+In `parseFuncDef()`:
+- It calls `parseFuncType()` which expects VOIDTK, INTTK, or CHARTK - "int" is fine
+- Then it gets the function name token (should be "main")
+- Then it expects LPARENT
+
+But the issue is that "main" is MAINTK, not IDENFR. Looking at the lexer rules, "main" is recognized as MAINTK, not IDENFR.
+
+In `parseFuncDef()`, after parsing the FuncType ("int"), it does:
+```java
+        String string = lexer.getToken();
+        lexer.next();
+```
+
+This would consume "main" as MAINTK, but function names should be IDENFR, not MAINTK. However, "main" is a special keyword, but in the context of function definition, it should still be treated as an identifier.
+
+Wait, looking at the lexer patterns:
+```java
+private static final String MAINTK_FORMAT = "main\\b";
+private static final String IDENFR_FORMAT = "[A-Za-z_]\\w*";
+```
+
+Since MAINTK_FORMAT is checked before IDENFR_FORMAT in the `find` calls, "main" will always be recognized as MAINTK, not IDENFR.
+
+But in the grammar, MainFuncDef is specifically defined as `'int' 'main' '(' ')' Block`, so "main" should indeed be MAINTK in this context.
+
+However, for regular function definitions, the function name should be IDENFR. But since "main" is always tokenized as MAINTK, a regular function named "main" couldn't be defined, but that's probably by design.
+
+The real issue is likely in the `parseCompUnit()` logic. After parsing the global declarations, when it tries to parse function definitions, it sees "int" (INTTK) followed by "main" (MAINTK). The function definition parsing logic expects an IDENFR for the function name, but gets MAINTK instead.
+
+Looking at `parseFuncDef()`:
+```java
+    public FuncDef parseFuncDef() {
+        FuncType funcType = parseFuncType();
+        String string = lexer.getToken();
+        lexer.next();
+        lexer.next(); // LPARENT
+        ...
+```
+
+It doesn't check that the function name token is IDENFR; it just assumes whatever token is there is the function name. But according to the grammar, FuncDef should be `FuncType Ident '(' [FuncFParams] ')' Block`, where Ident should be IDENFR.
+
+However, in our case, we don't have any regular function definitions, only MainFuncDef. So the function definition parsing loop should NOT parse "int main()" as a FuncDef, but should leave it for MainFuncDef parsing.
+
+The condition in the function parsing loop is:
+```java
+if (lexer.getLexType() != LexType.MAINTK) {
+```
+
+But after the global declarations, the current token is "int" (INTTK), not MAINTK. So it calls `lexer.nextNoPrint()` which advances to "main" (MAINTK), then checks if MAINTK != MAINTK, which is false, so it calls `lexer.prev()` and exits the loop.
+
+Wait, let me trace this:
+
+After parsing global declarations, current token is "int" (from "int main()")
+- Enter funcDef loop:
+  - `hasFuncDef = false`
+  - `lexer.nextNoPrint()` - advances to "main" (MAINTK)
+  - Check if MAINTK != MAINTK? False
+  - So call `lexer.prev()` - back to "int"
+  - `hasFuncDef` remains false, exit loop
+- Then call `parseMainFuncDef()`
+
+In `parseMainFuncDef()`:
+```java
+    public MainFuncDef parseMainFuncDef() {
+        lexer.next(); // INTTK
+        lexer.next(); // MAINTK
+        lexer.next(); // LPARENT
+        ...
+```
+
+This should work correctly.
+
+Given all this analysis, I think the actual bug is in the lexer's logging mechanism. The problem is that the very last token of the input never gets logged because the lexer only logs a token when the next token is requested.
+
+In the test case, the last token is "}" (RBRACE). After parsing this token, there are no more tokens, so no subsequent `next()` call is made to trigger its logging.
+
+But looking at the expected output, the last few lines are:
+```
+RBRACE }
+<Block>
+<MainFuncDef>
+<CompUnit>
+```
+
+So the "RBRACE }" should be logged, followed by the syntax components.
+
+The issue is likely that the parser finishes parsing without making a final call to log the last token.
+
+However, looking more carefully at the expected output vs what should happen, I notice that in the `parseBlock()` method:
+
+<Parser.java>
+...
+    public Block parseBlock() {
+        ArrayList<BlockItem> blockItems = new ArrayList<>();
+        lexer.next();
+        while (lexer.getLexType() != LexType.RBRACE) {
+            blockItems.add(parseBlockItem());
+        }
+        lexer.next();
+        return new Block(blockItems.toArray(new BlockItem[0]));
+    }
+```
+
+When parsing the main function block:
+1. `lexer.next()` consumes "{" and logs "LBRACE {"
+2. Parse block items until RBRACE is encountered
+3. When RBRACE is the current token, exit loop
+4. `lexer.next()` consumes RBRACE and should log "RBRACE }"
+
+This should work correctly.
+
+Given the complexity, I suspect the real issue is in the initial token handling in `parseCompUnit()`. The current implementation is fragile.
+
+But looking back at the user's note: "Buggy Output: No output file", this suggests that either:
+1. An exception is thrown during parsing, or
+2. The `Logger.getGood()` returns empty string
+
+Given the `parseStmt()` method has that dangerous code that calls `getlVal()` on potentially non-LVal expressions, and given that the test case includes expressions like `b - a`, if this somehow gets misrouted to the assignment parsing path, it would throw an exception.
+
+However, `b - a` appears in a variable declaration context (`int c = b - a;`), which should be handled by `parseVarDecl()`, not `parseStmt()`.
+
+Wait, inside the main function, we have:
+```c
+    int a = 5;
+    int c = b - a;
+```
+
+These are BlockItems that should be parsed as Decl, not Stmt. In `parseBlockItem()`:
+
+```java
+    public BlockItem parseBlockItem() {
+        if (Arrays.asList(Decl.FIRST).contains(lexer.getLexType())) {
+            // Decl
+            return new BlockItem(parseDecl());
+        } else {
+            // Stmt
+            return new BlockItem(parseStmt());
+        }
+    }
+```
+
+`Decl.FIRST` includes `ConstDecl.FIRST` (CONSTTK) and `VarDecl.FIRST` (INTTK, CHARTK). So when the lexer sees "int", it should parse it as a Decl, not a Stmt.
+
+So the dangerous code in `parseStmt()` shouldn't be executed for these variable declarations.
+
+Given all this, I think the most likely issue is in the `parseCompUnit()` method's initial token handling. Let me look at it again:
+
+<Parser.java>
+...
+    public CompUnit parseCompUnit() {
+        lexer.next();
+
+        ArrayList<Decl> decls = new ArrayList<>();
+        boolean hasDecl;
+        do {
+            hasDecl = false;
+            if (lexer.getLexType() == LexType.CONSTTK) {
+                decls.add(parseDecl());
+                hasDecl = true;
+            } else {
+                lexer.nextNoPrint();
+                lexer.nextNoPrint();
+                if (lexer.getLexType() != LexType.LPARENT) {
+                    lexer.prev();
+                    lexer.prev();
+                    decls.add(parseDecl());
+                    hasDecl = true;
+                } else {
+                    lexer.prev();
+                    lexer.prev();
+                }
+            }
+        } while (hasDecl);
+...
+```
+
+The problem is that `lexer.nextNoPrint()` might reach the end of input and return false, but the code doesn't check the return value. If `nextNoPrint()` returns false (end of input), then `lexer.getLexType()` would be null, and the comparison `!= LexType.LPARENT` would be true, leading to attempting to parse a declaration when there isn't one.
+
+But in our test case, after the global declarations, we have "int main()", so there should be tokens available.
+
+Actually, I think I found the real issue. In the `parseCompUnit()` method, after the initial `lexer.next()`, if the first token is not CONSTTK, it does two `nextNoPrint()` calls. But what if there's only one token left? The second `nextNoPrint()` would fail.
+
+But more importantly, the logic is fundamentally flawed. It's trying to distinguish between a declaration (`int a;`) and a function definition (`int func(...)`) by looking at the token after the identifier. For a declaration, it would be ASSIGN or SEMICN, for a function definition, it would be LPARENT.
+
+However, the current code checks if the second token after the type is NOT LPARENT, then treats it as a declaration. But it's looking at the wrong position.
+
+For `int a;`:
+- Token 0: INTTK ("int")
+- Token 1: IDENFR ("a")  
+- Token 2: SEMICN (";")
+
+For `int func(...)`:
+- Token 0: INTTK ("int")
+- Token 1: IDENFR ("func")
+- Token 2: LPARENT ("(")
+
+So the logic should be: after seeing INTTK/CHARTK, look at the token after the next token (i.e., token 2) to see if it's LPARENT.
+
+But the current code does:
+```java
+lexer.nextNoPrint(); // gets token 1
+lexer.nextNoPrint(); // gets token 2
+if (lexer.getLexType() != LexType.LPARENT) { // checks token 2
+```
+
+This part is actually correct.
+
+However, there's a critical flaw: when it calls `lexer.prev()` twice, it restores the lexer state, but the initial `lexer.next()` at the start of `parseCompUnit()` has already advanced past the first token and logged it (or should have).
+
+Wait, no - the initial `lexer.next()` logs the PREVIOUS token (which is null) and then advances to the first token. So the first token is never logged by that initial call.
+
+Then, when `parseDecl()` is called, `parseBType()` calls `lexer.next()`, which logs the current token (first token) and advances to the second token.
+
+So the logging should work correctly.
+
+Given the time I've spent and the complexity, I believe the most likely location of the error is in the `parseCompUnit()` method's declaration parsing logic, specifically the lookahead mechanism that uses `nextNoPrint()` and `prev()`.
+
+But there's another possibility. Looking at the `Lexer.next()` method:
+
+```java
+    public boolean next() {
+        if (lexType != null) {
+            Logger.logGood(getLexType() + " " + getToken() + "\n");
+        }
+        return nextNoPrint();
+    }
+```
+
+This means that when you call `next()`, it logs the CURRENT token and then advances to the next token. So the sequence is:
+- Initially: lexType = null
+- Call next(): logs nothing, advances to token 0
+- Call next(): logs token 0, advances to token 1
+- Call next(): logs token 1, advances to token 2
+- etc.
+
+At the end of input, when you call next() and it returns false, the last token was already logged by the previous next() call.
+
+So the logging mechanism seems correct.
+
+Given all this, I think the issue might be that an exception is being thrown somewhere. Looking at the `parseStmt()` method again, there's this code:
+
+```java
+            Exp expOrLVal = parseExp();
+            if (lexer.getLexType() == LexType.ASSIGN) {
+                LVal lVal = expOrLVal.getAddExp().getMulExp().getUnaryExp().getPrimaryExp().getlVal();
+                while (!Logger.getLastGood().equals("<LVal>\n")) {
+                    Logger.removeLastGood();
+                }
+```
+
+The `while` loop assumes that `<LVal>\n` is in the log, but if the expression is complex, there might be many other syntax components logged after the LVal, and the loop could run indefinitely or throw an exception when the log becomes empty.
+
+For example, if we have `a = b;`, the parsing of `a` as an Exp would log:
+```
+IDENFR a
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+```
+
+Then the while loop looks for `<LVal>\n` starting from the end, and would need to remove 5 entries to find it.
+
+But if we have a more complex LVal like `arr[i]`, it would log even more components.
+
+However, in our test case, the only assignments are in printf and return statements, not simple assignments. The variable initializations are handled by VarDecl, not Stmt.
+
+Wait, looking at the test case again:
+```c
+    printf("%d\n%d %d\n", a, b, c);
+    return 0;
+```
+
+There are no assignment statements (`a = b;`) in the test case! All the assignments are in variable declarations.
+
+So the problematic code in `parseStmt()` for assignment handling should never be executed for this test case.
+
+This means the parser should never enter that branch of `parseStmt()`.
+
+Given all this analysis, I'm going to conclude that the error is in the `parseCompUnit()` method's logic for parsing declarations, specifically the lookahead mechanism that is causing incorrect parsing or exceptions.
+
+<Parser.java>
+...
+    public CompUnit parseCompUnit() {
+        lexer.next();
+
+        ArrayList<Decl> decls = new ArrayList<>();
+        boolean hasDecl;
+        do {
+            hasDecl = false;
+            if (lexer.getLexType() == LexType.CONSTTK) {
+                decls.add(parseDecl());
+                hasDecl = true;
+            } else {
+                lexer.nextNoPrint();
+                lexer.nextNoPrint();
+                if (lexer.getLexType() != LexType.LPARENT) {
+                    lexer.prev();
+                    lexer.prev();
+                    decls.add(parseDecl());
+                    hasDecl = true;
+                } else {
+                    lexer.prev();
+                    lexer.prev();
+                }
+            }
+        } while (hasDecl);
+...

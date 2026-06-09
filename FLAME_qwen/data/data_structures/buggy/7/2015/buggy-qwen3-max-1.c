@@ -1,0 +1,92 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+typedef struct Tnode{
+    int m;
+    struct Tnode* left;
+    struct Tnode* right;
+}Tnode,*tree;
+
+void bsort(int str[],int len){
+    int hold,i,j;
+    for(i=0;i<len-1;i++){
+    for(j=0;j<len-1-i;j++){
+    if(str[j]>str[j+1]){
+    hold=str[j];
+    str[j]=str[j+1];
+    str[j+1]=hold;
+}
+}    
+}
+}  
+
+int main(){
+    tree t=(tree)malloc(sizeof(Tnode)); @@ [Error: t is used without checking if malloc succeeded; also, if len==0, this leads to undefined behavior since no input is read but t is dereferenced]
+    int num[200];
+    int len;int i;
+    scanf("%d",&len);
+    for(i=0;i<len;i++){
+        scanf("%d",&num[i]);
+    }
+    Tnode *p=t;
+    Tnode *q;
+    t->m=num[0]; @@ [Error: if len is 0, num[0] is uninitialized and accessing it is undefined behavior]
+    t->left=NULL;
+    t->right=NULL;
+    for(i=1;i<len;i++){
+        p=t;
+        while(p!=NULL){
+            if(num[i]<p->m){
+            q=p;
+            p=p->left;
+            }
+            else{
+            q=p;
+            p=p->right;
+            }
+        }
+        if(num[i]<q->m){
+            q->left=(tree)malloc(sizeof(Tnode));
+            p=q->left;
+            p->m=num[i];
+            p->left=NULL;
+            p->right=NULL;
+        }
+        else if(num[i]>=q->m){
+            q->right=(tree)malloc(sizeof(Tnode));
+            p=q->right;
+            p->m=num[i];
+            p->left=NULL;
+            p->right=NULL;
+        }
+    }
+    
+    
+    
+    
+    
+    int dep[200];
+    bsort(num,len); @@ [Error: Sorting the input array destroys the original insertion order needed to correctly compute leaf nodes in left-to-right (in-order) traversal; also, the problem does not require sorting]
+    for(i=0;i<len;i++){
+        dep[i]=1;
+    }
+    
+    
+    
+    for(i=0;i<len;i++){
+        p=t;
+        while(p->m!=num[i]){ @@ [Error: This loop assumes all values are unique; if duplicates exist, it may never find the exact node or may find the wrong one. Also, after sorting, num[i] may correspond to a different node than intended]
+            if(num[i]>=p->m){
+                p=p->right;
+                dep[i]++;
+            }
+            else{
+                p=p->left;
+                dep[i]++;
+            }            
+        }
+            printf("%d %d\n",num[i],dep[i]); @@ [Error: This prints every node (not just leaves), and in sorted order, not in left-to-right (in-order) leaf order as required]
+                
+    }
+}

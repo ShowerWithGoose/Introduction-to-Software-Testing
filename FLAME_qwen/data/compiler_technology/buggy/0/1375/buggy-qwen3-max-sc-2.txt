@@ -1,0 +1,543 @@
+<frontend/TokenLexer.java>
+...
+    public void addToken(){
+        for(TokenType t : TokenType.values()){
+            Pattern p = t.getPattern();
+            String leftline = this.rf.getleftline();
+            //System.out.println(leftline);
+            Matcher m = p.matcher(leftline);
+            if(!m.find()){
+                continue;
+            }
+            else {
+                //System.out.println(t+" "+m.group(0));
+                Token token = new Token(t,rf.now_line_num,m.group(0));
+                //System.out.println(rf.now_column_num);
+                //System.out.println(rf.get_now_char());
+                this.rf.movehead(m.group(0).length());
+                //System.out.println(rf.now_column_num);
+                //System.out.println(rf.get_now_char());
+                if(t.equals(TokenType.ERROR_A)) {
+                    this.error_tokens.add(token);
+                    break;
+                }
+                else {
+                    this.tokens.add(token);
+                    break;
+                }
+            }
+        }
+    }
+...
+
+<TokenType enum in frontend/TokenLexer.java>
+...
+        ERROR_A(false,"[&|]"); @@ [The regex "[&|]" matches a single '&' or '|', but it will also match these characters when they appear as part of valid "&&" or "||" tokens, causing false error detection. The lexer checks tokens in enum order, and since ERROR_A appears after AND/OR, this might seem safe, but the matching is done on the remaining string without ensuring that longer valid tokens are prioritized correctly. However, the real issue is that the ERROR_A pattern should only match standalone '&' or '|' that are NOT followed by another '&' or '|', but the current pattern does not enforce that context. Moreover, the loop in addToken breaks at the first match, but enum order may not guarantee that longer tokens like "&&" are matched before single "&". In Java enum iteration order is declaration order, and since AND ("&&") comes before ERROR_A, it should be okay — BUT the ERROR_A pattern "[&|]" will match the first '&' in "&&", and if the matcher finds it (which it will), then even though AND also matches, the loop may pick ERROR_A first if the enum order were wrong. However, looking at the enum, AND and OR come before ERROR_A, so that’s not the issue. The actual bug is that the ERROR_A pattern matches any single & or | anywhere, including inside comments or strings — but more critically, the pattern "[&|]" will match a single & even if it's part of "&&", because the matcher looks at the start of the string: for input "&&", both AND (pattern "^&&") and ERROR_A (pattern "^[&|]") can match at position 0. But since AND is earlier in the enum, it should match first. So why does the test fail? The real problem is that the ERROR_A pattern is too broad and doesn't account for the fact that a single & or | should only be an error if it is not part of && or ||. However, the current design relies on ordering. But there's another issue: the ERROR_A pattern uses "[&|]", which in regex means one character that is either & or |. That is correct for detecting single occurrences. However, the critical flaw is that the lexer does not ensure that all possible tokens are matched with longest-match or proper precedence. But given the enum order is correct, the likely real bug is elsewhere. Wait — looking again: the test case input shows "/bin/sh: 1: javac: not found", which suggests the program didn't even compile. But the user says "Buggy Output:" is empty and expected output is also empty — but the actual issue is in the logic of ERROR_A detection. However, based on the problem description, error 'a' is for "&" and "|" appearing individually. The current ERROR_A pattern "[&|]" will match a single & or | at the start of the remaining string. But if the input is "&", it should be caught. However, the problem is that the pattern for ERROR_A is checked AFTER valid tokens like AND, so it should be safe. But what if the input is "&x"? Then AND ("&&") won't match, but ERROR_A will match "&", which is correct. So why the failure? Another possibility: the ERROR_A pattern matches inside character constants or strings? But those are handled by STRCON and CHRCON, which come before ERROR_A in the enum, so they should be matched first. So the logic seems okay. But wait — the enum order is: ... AND, OR, ..., ERROR_A. So AND and OR are before ERROR_A, so "&&" and "||" will be matched first. So the ERROR_A should only trigger on lone & or |. Then why the error? The real issue might be that the ERROR_A pattern "[&|]" matches a single & or |, but in the addToken loop, it iterates over ALL TokenType values, and the first one that matches is taken. Since AND is before ERROR_A, "&&" will be matched by AND, not ERROR_A. So that’s correct. However, there is a subtle bug: the pattern for ERROR_A is "[&|]", which matches exactly one character. But what if the input is "&"? Then ERROR_A matches. Correct. But what if the input is "&&"? AND matches. Correct. So the logic is sound. But wait — the problem says: "each erroneous example will contain only lexical analysis errors. Each erroneous example will have exactly one error." And error type 'a' is for individual & or |. Now, looking at the Compiler.java output code: it always outputs error category code "a" regardless of the actual error type: 
+    for (Token t : lexer.error_tokens) {
+        out.write(((t.linenum + 1) + " " + "a" + "\n").getBytes());
+    }
+@@ [This is the critical bug: the program hardcodes the error category code as "a" for all errors, but the lexer may detect other types of lexical errors in the future, and even if only error 'a' exists now, the Token stores the TokenType as ERROR_A, but the output ignores t.type and always prints "a". However, in this assignment, only error 'a' is defined, so this might be acceptable. But wait — the problem says: "output the line number of the error along with the corresponding error type code", and the only error type is 'a'. So this is actually correct. Then where is the bug?]
+
+Re-examining: the test case input is "/bin/sh: 1: javac: not found", which indicates the Java code failed to compile. But the user says "Buggy Output:" is empty. This suggests the provided source code has a compilation error. Looking at the code:
+
+In <frontend/TokenLexer.java>, the enum TokenType is defined inside the TokenLexer class. In Java, you cannot define a top-level enum inside a class and then use it in the same file without static context? Actually, it's allowed, but the real issue is in the pattern for CHRCON:
+
+In TokenType, CHRCON pattern:
+"('([ !#$%&()*+,\\-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ\\]\\[^_abcdefghijklmnopqrstuvwxyz{|}~])'|'(\\\\[\\\\abtn\"vf'0])')"
+
+This regex has unbalanced parentheses and incorrect escaping. Specifically:
+- The first alternative: '([ ... ])' — but inside the [...] there is "\\]\\[^_", which becomes after Java string unescaping: \]\[^_ — which in regex character class means: ] , \ , ^ , _ — but the backslash before ] is unnecessary, and the sequence "\[^" may be invalid.
+- More critically, the entire pattern has two groups, but the outer parentheses make it a capturing group, and the alternation is between two quoted strings.
+
+But the bigger issue: the pattern starts with "('" and ends with "')", so it's trying to match a full char literal. However, the way it's written may not compile or may not match correctly.
+
+But the immediate compilation error is likely due to the regex string containing an unescaped double quote inside: in the second alternative: "(\\\\[\\\\abtn\"vf'0])" — here, \" is used, which in a Java string becomes ", so the regex becomes: \\[\\abtn"vf'0] — which includes a " inside a regex character class, which is allowed, but the problem is that the Java string itself has a " that terminates the string early.
+
+Look: 
+"('(\\\\[\\\\abtn\"vf'0])')"
+
+Breaking down the Java string:
+- Starts with "
+- Then ('(\\\\[\\\\abtn
+- Then \" → this is an escaped quote, so it becomes " in the string
+- Then vf'0])')"
+
+So the full string is: 
+('([ !#$%&()*+,\-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ\]\[^_abcdefghijklmnopqrstuvwxyz{|}~])'|'(\\[\\abtn"vf'0])')
+
+This is syntactically valid Java string. So no compilation error from that.
+
+But the test environment says "javac: not found", which is a system error, not a code error. However, the problem states that the program failed on a test case, so we must assume the code compiles but produces wrong output.
+
+Given all that, the most likely bug is in the ERROR_A pattern and matching logic. But earlier analysis suggests it's correct.
+
+Wait — the problem says: "The symbols "&" and "|" appearing individually". The ERROR_A pattern is "[&|]", which matches one character: & or |. But what if the input has "&" at the end of file? It should match. But what if the input has " & "? Then after skipping space, leftline is "& ", and the pattern "^[&|]" matches "&", which is correct.
+
+However, there's a critical flaw in the addToken method: it iterates through TokenType.values() in declaration order, and takes the first match. But what if a shorter token matches before a longer one? For example, if ASSIGN ("=") came before EQL ("=="), then "=" would match the first character of "==", and EQL would never be matched. But in the enum, LEQ ("<=") comes before LSS ("<"), which is wrong! Because "<=" is longer than "<", but LSS ("<") comes after LEQ, so when input is "<=", LEQ will match first (good), but when input is "<", LEQ won't match, then LSS will match. That is correct.
+
+But look at the order for relational operators:
+        LEQ(false, "<="),
+        LSS(false, "<"),
+        GEQ(false, ">="),
+        GRE(false, ">"),
+        EQL(false, "=="),
+        NEQ(false, "!="),
+
+This is correct because longer tokens come before shorter ones.
+
+Now for AND and OR:
+        AND(false, "&&"),
+        OR(false, "\\|\\|"),
+
+And ERROR_A is at the very end.
+
+So "&&" will be matched by AND, not by ERROR_A.
+
+But what if the input is "&"? Then AND ("^&&") won't match, but ERROR_A ("^[&|]") will match. Correct.
+
+So why would the program fail?
+
+Another possibility: the ERROR_A pattern matches & or | even when they are part of identifiers? But identifiers are [_A-Za-z][_A-Za-z0-9]*, so & and | are not in identifiers, so no.
+
+Wait — the real bug is in the Compiler.java output for errors: it outputs (t.linenum + 1) because the problem says line numbers start from 1, and the lexer uses 0-based line numbers. But in readfile, now_line_num starts at 0, and when reading the first line, now_line_num=0. So when an error occurs on the first line, linenum=0, and output is 0+1=1, which is correct.
+
+But the problem says: "output the line number where the error occurs", and the lexer stores rf.now_line_num at the time of token creation. In addToken, when creating the token, it uses rf.now_line_num, which is the current line index (0-based). So adding 1 is correct.
+
+So where is the bug?
+
+Let me re-read the problem: "each erroneous example will have exactly one error", and the only error type is 'a'.
+
+Now, consider an input like:
+int main() {
+    if (1 & 2);
+}
+
+This should produce error 'a' on the line with "&".
+
+But what does the lexer do?
+- It skips spaces, then sees "if" -> IFTK
+- then '(', then '1' -> INTCON
+- then space skipped, then '&' — now, leftline is "& 2);"
+- The patterns:
+   AND: "^&&" -> doesn't match
+   OR: "^\\|\\|" -> doesn't match
+   ...
+   ERROR_A: "^[&|]" -> matches "&"
+
+So it creates an ERROR_A token with content "&", and adds to error_tokens.
+
+Then Compiler.java outputs: (linenum+1) + " a"
+
+Correct.
+
+But what if the input is "&&"? Then AND matches, no error.
+
+So the logic seems correct.
+
+Unless... the ERROR_A pattern is "[&|]", which in regex means one character that is & or |. But what if the input has "|" alone? Same thing.
+
+But wait — the problem says: "The symbols "&" and "|" appearing individually". Note: it's "&" and "|", meaning single ampersand or single vertical bar.
+
+So the pattern is correct.
+
+However, there is a bug in the skipComment method: it handles "//" and "/* */", but what if there is a single '*' or '/' outside comments? That's fine.
+
+Another possibility: the CHRCON pattern is so broken that it causes the lexer to misbehave, but the test case is about '&', so probably not.
+
+Given the above, the only remaining possibility is the order of token matching. But the enum order seems correct.
+
+Wait — look at the TokenType enum declaration order:
+
+It starts with keywords (MAINTK, etc.), then IDENFR, INTCON, STRCON, CHRCON, then operators.
+
+IDENFR is "[_A-Za-z][_A-Za-z0-9]*", which is correct.
+
+But what if the input is "mainn"? It should be IDENFR, not MAINTK, because MAINTK has a negative lookahead: "^main(?![_A-Za-z0-9])". So "mainn" won't match MAINTK, but will match IDENFR. Correct.
+
+So that's fine.
+
+After extensive analysis, the most likely actual bug is in the ERROR_A pattern: it matches any & or |, but it should only match them when they are not part of && or ||. However, because AND and OR are matched first, it should be okay.
+
+But what if the input is "&\n&"? On the first line, "&" is matched as ERROR_A. Correct.
+
+Unless... the matcher for ERROR_A matches, but the movehead moves by 1, which is correct.
+
+I think the code is logically correct, but the problem states that the program failed.
+
+Wait — the test case input provided is: "/bin/sh: 1: javac: not found"
+
+This is not a testfile.txt content, but a shell error indicating that javac is not installed. So the "Buggy Output" is empty because the program didn't run.
+
+But the problem says: "Based on the problem description, the test case inputs that the program failed, the program's output, and the expected output"
+
+So perhaps the actual test case input (testfile.txt) is something like:
+
+if (1 & 2)
+
+And the expected output is:
+
+2 a
+
+But the program outputs nothing in lexer.txt and nothing in error.txt, or outputs in lexer.txt.
+
+Why would that happen?
+
+Because the ERROR_A token is added to error_tokens, but what if the addToken method doesn't find any match? The for-loop goes through all TokenType, and if none matches, it doesn't add anything, and doesn't report an error.
+
+Ah! That's the bug.
+
+The addToken method assumes that one of the TokenType patterns will match. But if none matches, it silently continues, which means unrecognized characters are ignored.
+
+For example, if the input has '@', which is not in any token pattern, then addToken will loop through all TokenType, none will match, and it will not consume any character, leading to an infinite loop.
+
+But in the case of '&', it should be matched by ERROR_A.
+
+Unless... the ERROR_A pattern is not matching because of the way the regex is compiled.
+
+Let me check the ERROR_A pattern: "[&|]"
+
+In Java, this regex means: a character class containing & and |, so it matches one character that is either & or |.
+
+But what if the input is "&", then leftline = "&", and m.find() should return true.
+
+But in the addToken method, it uses m.find(), which searches anywhere in the string, but the pattern is anchored with "^" in the TokenType constructor.
+
+Look at TokenType constructor:
+
+        if(this.isGreed){
+            this.pattern = Pattern.compile("^"+this.patternString+"(?![_A-Za-z0-9])");
+        }else{
+            this.pattern = Pattern.compile("^"+this.patternString);
+        }
+
+For ERROR_A, isGreed=false, so pattern is "^" + "[&|]" -> "^[&|]"
+
+So it only matches at the beginning of the string.
+
+So for leftline = "& 2", it matches.
+
+So it should work.
+
+Unless... the ERROR_A is not the only error type, but the problem says only error 'a' exists.
+
+After re-examining everything, the only plausible explanation is that the ERROR_A pattern is correct, but the program has a different bug: in the Compiler.java, it writes to both lexer.txt and error.txt unconditionally.
+
+The problem says: for a correct program, output to lexer.txt; for an erroneous program, output to error.txt.
+
+But the current code outputs to lexer.txt always (all tokens), and to error.txt always (all error tokens).
+
+So if there is an error, it should ONLY output to error.txt, not to lexer.txt.
+
+But the problem says: "For an erroneous source program, the program should detect errors and output the line number of the error along with the corresponding error type code."
+
+It doesn't say to stop lexical analysis, but typically, you might continue, but the output should be only in error.txt.
+
+However, the problem's output format says:
+- For correct: output to lexer.txt
+- For erroneous: output to error.txt
+
+And "each erroneous example will have exactly one error."
+
+So the expected behavior is: if there is any error token, then only error.txt should be produced, and lexer.txt should not be produced.
+
+But the current code produces both files always.
+
+For example, if there is an error, it will write all valid tokens to lexer.txt, and the error to error.txt.
+
+But the expected output for an erroneous program is ONLY error.txt, and lexer.txt should be empty or not exist.
+
+However, the problem doesn't explicitly say that lexer.txt should be empty, but the output format specification implies mutual exclusion.
+
+Looking back: "For a correct source program, output ... into lexer.txt", "For an erroneous source program, output ... into error.txt".
+
+This suggests that only one file should be generated.
+
+In the test case with error 'a', the expected output is only in error.txt, but the program also generates lexer.txt with all the tokens before the error.
+
+So the judge compares only error.txt, but if the program outputs to lexer.txt as well, it might be considered wrong if the judge expects lexer.txt to be empty.
+
+But the problem doesn't say to suppress lexer.txt on error.
+
+However, typical compilers either stop on first error or continue, but the output specification here is clear: for erroneous program, output to error.txt.
+
+It doesn't say "also output tokens to lexer.txt", so likely, when there is an error, only error.txt should be written.
+
+Therefore, the bug is in Compiler.java: it should check if there are any error_tokens, and if so, only write to error.txt, and not write to lexer.txt.
+
+But the problem says: "each erroneous example will have exactly one error", so if error_tokens is not empty, then it's an erroneous program, and only error.txt should be produced.
+
+In the current code, it always writes to lexer.txt, even if there are errors.
+
+So for an erroneous program, lexer.txt will contain tokens, which is not expected.
+
+But the expected output for the test case is only the error in error.txt, and nothing in lexer.txt.
+
+However, the user says "Buggy Output:" is empty and "Expected Output:" is empty, which is confusing.
+
+Given the information, the most concrete bug is in the error output hardcoding and the unconditional file writing.
+
+But the immediate cause for the error 'a' not being reported might be elsewhere.
+
+Wait — another possibility: the ERROR_A pattern is "[&|]", but in the string, if there is a tab or space after, it's fine.
+
+I think the real bug is in the addToken method: it breaks after the first match, which is correct, but what if no match is found? It should report an error.
+
+For example, if the input has '@', then no TokenType matches, so addToken does nothing, and the rf doesn't advance, causing an infinite loop.
+
+But in the case of '&', it should match ERROR_A.
+
+Unless the ERROR_A is not in the TokenType.values() iteration? But it is.
+
+Perhaps the enum order is such that a later token matches first, but no.
+
+After careful thought, the only line that is definitely wrong is in Compiler.java where it hardcodes "a" as the error code. Even though currently only error 'a' exists, the Token object has a type, and it should use t.type.name() or something to get the error code. But the problem defines only error 'a', and the ERROR_A token is for error 'a', so hardcoding "a" is acceptable.
+
+But what if in the future there are more errors? The assignment only requires error 'a', so it's fine.
+
+Given the time, the most likely location of the bug is the unconditional writing to both files, but the problem states that the program failed on a test case with error 'a', so probably the error is not being detected.
+
+Let me simulate with input: "&"
+
+- rf.contents = ["&"]
+- now_line_num=0, now_column_num=0
+- skipspace: '&' is not space, so no skip.
+- skipComment: get_now_len_str(2) = "&" (len=1), so "//" and "/*" don't match.
+- addToken:
+   leftline = "&"
+   Iterate TokenType:
+      MAINTK: pattern "^main(?![_A-Za-z0-9])" -> doesn't match
+      ... until ERROR_A: pattern "^[&|]" -> matches "&"
+   So creates Token(ERROR_A, 0, "&")
+   movehead(1) -> now_line_num=0, now_column_num=1
+   if_end() returns 2 (end of line), then next iteration: if_end() returns 2, so skipspace: move to next line, now_line_num=1, now_column_num=0
+   then if_end() returns 1, so loop ends.
+
+Then Compiler.java writes to error.txt: "1 a" (because 0+1=1)
+
+Correct.
+
+So why would it fail?
+
+Unless the test case is different.
+
+Perhaps the input is " &", with a space, but that should work.
+
+Another idea: the ERROR_A pattern is "[&|]", but in regex, inside [...], the '|' is just a literal pipe, not alternation, so it's correct.
+
+I think the code is correct, but the problem might be in the CHRCON pattern causing a PatternSyntaxException at runtime, which would crash the program.
+
+For example, in the CHRCON pattern: 
+"('([ !#$%&()*+,\\-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ\\]\\[^_abcdefghijklmnopqrstuvwxyz{|}~])'|'(\\\\[\\\\abtn\"vf'0])')"
+
+The part: "\\]\\[^_" 
+
+After Java string unescaping: \]\[^_
+
+In regex character class, this is: ] , \ , ^ , _
+
+But the backslash before ] is not needed, and the sequence "\[^" might be interpreted as \ followed by [^, but inside a character class, [ has no special meaning, so it's literal [.
+
+Actually, in a regex character class, most metacharacters lose their meaning, so \]\[^_ is just the characters ], \, [, ^, _.
+
+So it should be fine.
+
+However, the double quote in the second part: \" is fine.
+
+But there's a mistake: in the second alternative, it has "vf'0", which includes a single quote, but the string is delimited by ', so it should be escaped? No, in the regex, it's inside a character class, and the single quote doesn't need escaping.
+
+But the bigger issue: the entire pattern has unbalanced parentheses.
+
+Let's count the parentheses in the CHRCON pattern string:
+
+"('(...)'|'(...)')"
+
+So:
+- Opening: "
+- Then (' -> two chars
+- Then ( -> this is a regex group
+- Then [...] 
+- Then )' -> closes the group and the quote
+- Then |
+- Then '(...)'
+- Then )
+
+So the regex is: 
+^('([^...]')|'(\\[\\abtn"vf'0])')$
+
+This has:
+- Outer: ( ... | ... )
+- First alternative: '([^...]') — wait, the first alternative is: '([ ... ])' — so the regex group is around the character class.
+
+But the character class is [ ... ], and then there's a ), so the group is ([...]), which is fine.
+
+So the regex should compile.
+
+Given all this, I think the intended bug is in the ERROR_A pattern matching, but it's correct.
+
+Perhaps the problem is that the ERROR_A pattern matches & or | even when they are in a comment, but skipComment should have removed comments.
+
+In skipComment, for "//", it calls nextline(), which advances to next line.
+
+For "/* */", it skips until "*/".
+
+So & inside comments should be skipped.
+
+So that's fine.
+
+After exhaustive analysis, the only remaining possibility is that the addToken method does not handle the case where no token matches, but for '&', it should match ERROR_A.
+
+Unless the ERROR_A is not the last resort.
+
+Wait — what if there is a token after ERROR_A in the enum? But ERROR_A is the last.
+
+In the TokenType enum, ERROR_A is the last entry.
+
+So it should be the fallback for & and |.
+
+I think the code is correct, but the problem might be in the line number calculation.
+
+In readfile, when movehead is called with steps, it advances the column and line.
+
+When creating the token, it uses rf.now_line_num, which is the line number before movehead.
+
+For example, on line 0 (first line), now_line_num=0.
+
+After movehead, if it goes to next line, now_line_num becomes 1.
+
+But the token is created with the line number before movehead, which is correct.
+
+So for "&" on first line, linenum=0, output as 1.
+
+Correct.
+
+Given the instructions, and since the problem states that the program failed, and the only error type is 'a', the most likely actual bug is that the ERROR_A pattern is not matching because of the way the regex is written.
+
+But "[&|]" is correct.
+
+Unless in Java regex, [&|] means something else? No, it's a character class with & and |.
+
+Perhaps the input has a tab or something, but skipspace removes whitespace.
+
+I think I have to conclude that the bug is in the Compiler.java file where it outputs the error code as hardcoded "a", but that's correct for this assignment.
+
+Perhaps the error is that the program should stop at the first error, but it doesn't, but the problem doesn't require that.
+
+After re-reading the problem: "each erroneous example will have exactly one error", so only one error token will be in error_tokens.
+
+So the output loop is fine.
+
+Given the time, I'll go with the initial suspicion: the ERROR_A pattern is correct, but the real bug is that the addToken method may not be called for the '&' because of comment handling or space skipping.
+
+But that seems unlikely.
+
+Another idea: in the skipComment method, for "/*", it does:
+            this.rf.movehead(2);
+            while(this.rf.if_end()!=1 && !"*/".equals(this.rf.get_now_len_str(2))){
+                this.rf.movehead(1);
+            }
+            if("*/".equals(this.rf.get_now_len_str(2))){
+                this.rf.movehead(2);
+                return true;
+            }
+
+If the file ends without "*/", then it doesn't skip the comment, and the rf is left at the end, so addToken is not called.
+
+But for a test case with '&', it's not in a comment.
+
+I think the intended error is in the ERROR_A pattern: it should be for single & or |, but the current pattern will also match & or | inside strings or character constants, but those are handled by STRCON and CHRCON, which come before ERROR_A, so they should be matched first.
+
+For example, in string: " & ", the STRCON pattern is "\"[^\"]*\"", which will match the whole string, so '&' inside is not seen by ERROR_A.
+
+Similarly for char: '&', the CHRCON should match.
+
+So that's fine.
+
+Unless the CHRCON pattern is so broken that it doesn't match, so '&' in a char constant is seen as ERROR_A.
+
+For example, input: '&'
+
+Should be CHRCON.
+
+But with the current CHRCON pattern, does it match?
+
+The pattern for CHRCON is:
+"^('([ !#$%&()*+,\\-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ\\]\\[^_abcdefghijklmnopqrstuvwxyz{|}~])'|'(\\\\[\\\\abtn\"vf'0])')"
+
+For input "&", leftline = "'&'"
+
+Does it match?
+
+First alternative: '([ ... ])'
+The character class includes &, so yes.
+
+So it should match as CHRCON, not ERROR_A.
+
+So if the input is "'&'", it should be CHRCON.
+
+If the input is "&", it should be ERROR_A.
+
+So correct.
+
+I think the code is correct, but since the problem states it failed, and given the only information, the bug must be in the error output hardcoding or the file writing strategy.
+
+But the user asks for the location of the error in the program below, and based on the test case.
+
+Perhaps the test case is: 
+&
+and the expected output is "1 a", but the program outputs nothing because of an exception.
+
+Why would there be an exception?
+
+In the CHRCON pattern, the part: "\\]\\[^_" 
+
+When compiled as regex, after Java string unescaping, the regex string becomes:
+'([ !#$%&()*+,\-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ\]\[^_abcdefghijklmnopqrstuvwxyz{|}~])'
+
+In regex, inside a character class, \] is not necessary, but is allowed. However, the sequence "\[^" might be interpreted as escape sequence, but in most regex engines, inside a character class, backslash is not special for most characters, so \[^ is just \, [, ^.
+
+But in Java regex, inside a character class, backslash is still an escape character.
+
+So "\[^" might be invalid because \[ is not a valid escape sequence.
+
+In Java regex, inside a character class, to include a backslash, you need "\\\\", and to include '[', you don't need to escape it.
+
+So the string "\\]\\[^_" in Java becomes the regex: \]\[^_
+
+When the regex engine sees \[, it may throw PatternSyntaxException because \[ is not a valid escape sequence.
+
+Yes! That's the bug.
+
+In the CHRCON pattern, the part "\\]\\[^_" contains "\[^", which in regex is an invalid escape sequence because \[ is not defined.
+
+So when the program tries to compile the pattern for CHRCON, it throws PatternSyntaxException, and the program crashes.
+
+Therefore, the lexer never runs, so no output.
+
+So the error is in the TokenType enum, in the CHRCON pattern string.
+
+Specifically, the "\[^" should be just "[^" or if they want to include the characters \, [, ^, _, then it should be "\\\\[\\^_", but it's messy.
+
+The correct way is to not escape [ inside a character class.
+
+So the pattern should have "\\]\\[^_" replaced with "\\]\\[^_" is not right.
+
+To include the characters: ], \, [, ^, _, in a regex character class, you can do: []\\[^_]
+
+Because in a character class, if ] is the first character, it is literal.
+
+So the character class should start with ].
+
+But in the current pattern, it's: [ ... \\]\\[^_ ... ]
+
+Which is: [ ... (then \] which is ]), then \\ (which is \), then \[ (which is invalid), etc.
+
+So the "\[^" is the problem.
+
+Therefore, the bug is in the CHRCON pattern string.
+
+So the line is:
+        CHRCON(false, "('([ !#$%&()*+,\\-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ\\]\\[^_abcdefghijklmnopqrstuvwxyz{|}~])'|'(\\\\[\\\\abtn\"vf'0])')");
+
+@@ [The substring "\\]\\[^_" contains "\[^", which results in an invalid escape sequence in the regex pattern, causing a PatternSyntaxException at runtime.]
+
+So the annotated code is:

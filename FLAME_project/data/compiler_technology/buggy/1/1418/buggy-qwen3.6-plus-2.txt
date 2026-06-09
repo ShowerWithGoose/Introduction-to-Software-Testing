@@ -1,0 +1,247 @@
+<Compiler.java>
+...
+        //输出错误结果到 error.txt
+        if(GlobalData.Errorflag) {
+            ErrorPrint.run(GlobalData.Errors);
+        }
+    }
+}
+...
+
+The provided code snippet for `Compiler.java` actually looks correct in terms of calling `ErrorPrint.run`. However, the issue "No output file" usually implies that the program terminated prematurely or an exception occurred before writing the file, or the logic leading to `GlobalData.Errorflag` being true is flawed.
+
+Let's look at `Lexer.java` again.
+In `Lexer.java`, the `run` method:
+```java
+    public void run() throws IOException {
+        Tokens tokens = Tokens.getInstance();
+        int ch;
+        while((ch = pr.read()) != -1) {
+            char c = (char) ch;
+            pr.unread(c);
+            Token token = this.next();
+            if (token != null) {
+                tokens.add(token);
+                colno++;
+            }
+        }
+
+    }
+```
+If `next()` returns `null` (e.g., for comments), it continues.
+If `next()` throws an exception, `run` throws it.
+
+In `Compiler.java`:
+```java
+        try {
+            lexer.run();
+        } catch (IOException e) {
+            System.out.println("Comiler.java Line-34: Lexer Error");
+            throw new RuntimeException(e);
+        }
+```
+If `lexer.run` throws an exception, the program crashes.
+
+However, the most likely cause for "No output file" in these types of assignments, when errors are expected but none are produced, is that the **Parser** is not correctly identifying the errors due to incorrect lookahead or consumption, OR the **Compiler** logic skips the error printing block because `GlobalData.Errorflag` is not set.
+
+Wait, I missed a crucial detail in `Compiler.java`.
+```java
+        //Parser成功结果输出到 parser.txt
+        String ParserPrintFilePath = "parser.txt";
+        try {
+            bw = new BufferedWriter(new FileWriter(ParserPrintFilePath));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        if(GlobalData.Parserflag) {
+            // ...
+            bw.close();
+        }
+
+        //输出错误结果到 error.txt
+        if(GlobalData.Errorflag) {
+            ErrorPrint.run(GlobalData.Errors);
+        }
+```
+If `GlobalData.Parserflag` is `false`, `bw` is opened but NOT closed. This is a resource leak but shouldn't prevent `error.txt` creation.
+
+Let's look at `ErrorSave.java` again.
+```java
+    public static void error(String process, int lineno, char errorType) {
+        GlobalData.Errorflag = true;
+
+        if(process.equals("Lexer")) {
+            GlobalData.Lexerflag = false;
+        }
+        if(process.equals("Parser")) {
+            GlobalData.Parserflag = false;
+        }
+
+        Error error = new Error(process, lineno, errorType);
+        GlobalData.Errors.add(error);
+    }
+```
+
+If the parser encounters an error, it calls `ErrorSave.error`.
+This sets `GlobalData.Errorflag = true`.
+
+So `if(GlobalData.Errorflag)` should be true.
+
+Is it possible that `GlobalData.Errors` is empty?
+I traced the parser logic and it seemed to call `ErrorSave.error`.
+
+Let's look at `StmtParser` for `printf` again.
+```java
+            tt = iterator.next();
+
+            if(tt.getType() != TokenType.SEMICN) {
+                iterator.unread(2);
+                tt = iterator.next();
+                ErrorSave.error("Parser", tt.getLineno(), 'i');
+            }
+```
+If `tt` is `null` (EOF), `tt.getType()` throws NPE.
+In the test case, after `printf("...")`, the next token is `if`. So `tt` is not null.
+
+However, there is a subtle bug in `TokensIterator.unread`.
+```java
+    public void unread(int n) {
+        while(n > 0) {
+            if(cursor > -1) {
+                cursor--;
+                n--;
+            }
+            else break;
+        }
+    }
+```
+If `cursor` is 0, `unread(1)` makes it -1.
+If `cursor` is -1, `unread(1)` does nothing.
+
+In `StmtParser` for `printf`:
+1. `tt = iterator.next()` gets `IFTK`. Cursor is at index of `IFTK`.
+2. `iterator.unread(2)`.
+   If `IFTK` is at index `k`, cursor becomes `k-2`.
+3. `tt = iterator.next()`. Cursor becomes `k-1`. `tt` is token at `k-1`.
+
+If `k` is small (e.g., 0 or 1), `unread(2)` might behave unexpectedly.
+But `printf` is inside `main`, so there are many tokens before it.
+
+The real issue might be in `CompUnitParser` or `MainFuncDefParser` failing to parse correctly due to previous errors, causing the parser to stop or crash before reaching the erroneous statements.
+
+But wait! Look at `MainFuncDefParser`.
+```java
+        //int main '('
+        children.add(leafParser.run(iterator.next()));
+        children.add(leafParser.run(iterator.next()));
+        children.add(leafParser.run(iterator.next()));
+        // ')'
+        Token tt = iterator.next();
+        if(tt.getType() != TokenType.RPARENT) {
+            iterator.unread(2);
+            tt = iterator.next();
+            ErrorSave.error("Parser", tt.getLineno(), 'j');
+        }
+        else children.add(leafParser.run(tt));
+        // Block
+        children.add(blockParser.run(iterator));
+```
+It assumes `int`, `main`, `(` are present. If they are, it parses `Block`.
+
+If `BlockParser` encounters an error, it records it.
+
+I suspect the issue is that `GlobalData.Errorflag` is NOT being set because the parser is **not** reaching the error detection code. Why?
+
+Maybe the `printf` statement is not being parsed as a `Stmt`?
+In `BlockItemParser`:
+```java
+        if(tt.getType() == TokenType.CONSTTK || tt.getType() == TokenType.INTTK || tt.getType() == TokenType.CHARTK) {
+            DeclParser declParser = new DeclParser();
+            children.add(declParser.run(iterator));
+        }
+        else {
+            StmtParser stmtParser = new StmtParser();
+            children.add(stmtParser.run(iterator));
+        }
+```
+`printf` is `PRINTFTK`. So it goes to `StmtParser`.
+
+In `StmtParser`:
+```java
+        else if(tt.getType() == TokenType.PRINTFTK) {
+            // ...
+        }
+```
+It matches.
+
+I will annotate `Compiler.java` where the `bw` for `parser.txt` is not closed if `Parserflag` is false, which is a bug, but likely not the cause of "No output file".
+
+Actually, looking at the provided solution format, I need to identify the location of the error.
+
+The most common reason for "No output file" in this context is that the program crashes with an unhandled exception.
+
+In `StmtParser`, line:
+```java
+                ErrorSave.error("Parser", tt.getLineno(), 'i');
+```
+If `tt` is `null`, this crashes.
+
+When can `tt` be `null`?
+If `iterator.next()` returns `null`.
+
+In `printf` case:
+`tt = iterator.next()` gets `IFTK`. Not null.
+
+In `int a` case:
+`tt = iterator.next()` gets `FORTK`. Not null.
+
+In `return 0` case:
+`tt = iterator.next()` gets `RBRACE`. Not null.
+
+So `tt` is not null.
+
+I will annotate the `Compiler.java` file where the `bw` is not closed, as it is a definite bug, although it might not be the primary cause of the missing output.
+
+However, there is another possibility. The `ErrorPrint.run` method creates `error.txt`. If the directory is not writable or something, it throws exception.
+
+Let's look at `Lexer.java` again.
+```java
+            //注释//
+            if(c == '/') {
+                int ch;
+                while((ch = pr.read()) != -1) {
+                    c = (char) ch;
+                    if (c == '\n'){
+                        lineno++;
+                        return null;
+                    }
+                }
+            }
+```
+If EOF is reached in a comment, it returns `null`.
+`Lexer.run` handles `null` token by continuing.
+
+I will annotate `Compiler.java` line 68 (approx) where `bw` is not closed.
+
+<Compiler.java>
+...
+        if(GlobalData.Parserflag) {
+            StringBuilder sb = new StringBuilder();
+            ParserSuccessPrint parserSuccessPrint = new ParserSuccessPrint();
+            parserSuccessPrint.run(GlobalData.CompUnitNode, sb, parserSuccessPrint);
+
+            try {
+                bw.write(sb.toString());
+                bw.close();
+            } catch (IOException e) {
+                System.out.println("Comiler.java Line-64: BufferWriter Error");
+                throw new RuntimeException(e);
+            }
+        }
+        // @@ [Bug] If GlobalData.Parserflag is false, the BufferedWriter 'bw' is opened but never closed. This can lead to resource leaks and potentially prevent subsequent file operations from completing correctly or flushing buffers, although the primary issue of 'No output file' for error.txt suggests GlobalData.Errorflag might not be set or GlobalData.Errors is empty. However, the unclosed writer is a definite error.]
+
+        //输出错误结果到 error.txt
+        if(GlobalData.Errorflag) {
+            ErrorPrint.run(GlobalData.Errors);
+        }
+...

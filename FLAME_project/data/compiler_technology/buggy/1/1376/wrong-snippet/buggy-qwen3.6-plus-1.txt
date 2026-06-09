@@ -1,0 +1,573 @@
+Based on the problem description, the test case input, and the expected output, the program is failing to correctly identify syntax errors (specifically missing semicolons) in the source code. The expected output indicates three errors of type `i` (missing semicolon) at lines 2, 9, and 13.
+
+The input code is:
+```c
+int main() {
+    printf("Hello SysY!\n") // error 1 (Line 2: missing ;)
+
+    if (1)
+
+
+    /*********/
+    ;
+    int a // error 2 (Line 9: missing ;)
+
+    for (;;) {}
+
+    return 0 // error 3 (Line 13: missing ;)
+}
+```
+
+The `Driver.java` calls `parser.parseCompUnit()` and then `ErrorTackle.printErrors()`. If `parseCompUnit()` throws an exception or fails to complete due to a runtime error (as indicated by "Runtime Error" in the prompt), the errors might not be printed, or the parser crashes before detecting all errors.
+
+Looking at `Parser.java`, the `expect` method adds errors to `ErrorTackle` but returns `false` if the token doesn't match. It does **not** throw an exception or stop parsing. This allows the parser to continue and potentially find more errors. However, the `parseCompUnit` method has a loop condition that might cause issues if the parser gets stuck or if `peekNext()` or `peekAt()` causes an `IndexOutOfBoundsException` when the token list is exhausted or when looking ahead beyond bounds incorrectly.
+
+Specifically, in `parseCompUnit`:
+```java
+while ((peek(TokenType.CONSTTK) || peek(TokenType.INTTK) || peek(TokenType.CHARTK))
+        && peekNext().getType() != TokenType.MAINTK
+        && peekAt(current+2).getType() != TokenType.LPARENT) {
+    decls.add(parseDecl());
+}
+```
+If `current` is near the end of the token list, `peekAt(current+2)` might access an invalid index if `tokens` is small, although `peekAt` handles bounds by returning the last element.
+
+However, the primary issue leading to "Runtime Error" usually stems from unhandled exceptions. Let's look at `Lexer.java`.
+In `tokenStart`, when handling comments:
+```java
+if (c == '*') {
+    c = next();
+    while (c != '\0') {
+        if (c == '*') {
+            c = next();
+            if (c == '/') {
+                break;
+            }
+        }
+        c = next();
+    }
+    return null;
+}
+```
+This looks correct for `/* ... */`.
+
+Let's look at `Parser.java`'s `expect` method again.
+```java
+private boolean expect(TokenType type)  {
+    boolean ans = match(type);
+    if (!ans && type == TokenType.RPARENT) {
+        ErrorTackle.addError(new CompilerError(ErrorTackle.transTokenPosToLine(current-1), "j"));
+    }
+    if (!ans && type == TokenType.SEMICN) {
+        ErrorTackle.addError(new CompilerError(ErrorTackle.transTokenPosToLine(current-1), "i"));
+    }
+    if (!ans && type == TokenType.RBRACK) {
+        ErrorTackle.addError(new CompilerError(ErrorTackle.transTokenPosToLine(current-1), "k"));
+    }
+    return ans;
+}
+```
+The error line number is calculated using `ErrorTackle.transTokenPosToLine(current-1)`. `current` is the index of the *next* token to be processed. If `match` fails, `current` hasn't advanced. So `current-1` is the index of the *previous* token. The problem states: "The error line number corresponds to the line where the last non-terminal before the semicolon is located." This logic seems generally aligned, assuming `tokenPosToLine` maps token indices to line numbers correctly.
+
+However, there is a critical issue in `Driver.java`:
+```java
+String ans = ASTVisitor.astToString(parser.parseCompUnit());
+// delete the last '\n'
+ans = ans.substring(0, ans.length() - 1);
+output(ans);
+```
+If `parseCompUnit` encounters a situation where it cannot proceed (e.g., infinite loop or unexpected null), it might throw an exception. But `expect` just returns false.
+
+Let's look at `parseStmt` for `printf`:
+```java
+case PRINTFTK:
+    ArrayList<Object> exps = new ArrayList<>();
+    match(TokenType.PRINTFTK);
+    expect(TokenType.LPARENT);
+    exps.add(TokenType.PRINTFTK);
+    exps.add(TokenType.LPARENT);
+    exps.add(new ASTNode(TokenType.STRCON, peekNow().toString()));
+    expect(TokenType.STRCON); // If this fails, error is added, but parser continues
+    while (match(TokenType.COMMA)) {
+        exps.add(TokenType.COMMA);
+        exps.add(parseExp());
+    }
+    expect(TokenType.RPARENT);
+    expect(TokenType.SEMICN); // Missing semicolon error detected here
+    exps.add(TokenType.RPARENT);
+    exps.add(TokenType.SEMICN);
+    return new ASTNode(NodeType.Stmt,exps);
+```
+If `expect(TokenType.SEMICN)` fails, it adds an error. The parser then returns the statement node. The next token is likely `if` (from the next line).
+
+The `Runtime Error` suggests an exception is thrown. A common cause in recursive descent parsers with error recovery that doesn't consume tokens is an **infinite loop**.
+
+Consider `parseCompUnit`:
+```java
+while ((peek(TokenType.CONSTTK) || peek(TokenType.INTTK) || peek(TokenType.CHARTK))
+        && peekNext().getType() != TokenType.MAINTK
+        && peekAt(current+2).getType() != TokenType.LPARENT) {
+    decls.add(parseDecl());
+}
+```
+If `parseDecl()` is called but fails to consume any tokens (because `expect` fails and doesn't advance), `current` remains the same. The `while` condition is checked again. If it still evaluates to true, `parseDecl()` is called again with the same `current`, leading to an infinite loop.
+
+Does `parseDecl` consume tokens on failure?
+```java
+private ASTNode parseDecl()  {
+    if (peek(TokenType.CONSTTK)) {
+        return parseConstDecl();
+    } else {
+        return parseVarDecl();
+    }
+}
+```
+`parseVarDecl`:
+```java
+private ASTNode parseVarDecl()  {
+    ArrayList<Object> nodes = new ArrayList<>();
+    nodes.add(parseBType()); // Consumes INTTK/CHARTK
+    // ...
+}
+```
+`parseBType` consumes the type token. So `parseDecl` always consumes at least one token if it enters.
+
+What about `parseBlockItem`?
+```java
+private  ASTNode parseBlockItem()  {
+    if (peek(TokenType.CONSTTK) || peek(TokenType.INTTK) || peek(TokenType.CHARTK)) {
+        ASTNode decl = parseDecl();
+        return new ASTNode(NodeType.BlockItem,decl);
+    } else {
+        Object stmt = parseStmt();
+        return new ASTNode(NodeType.BlockItem,new ArrayList<>(List.of(stmt)));
+    }
+}
+```
+Inside `parseBlock`:
+```java
+while (!peek(TokenType.RBRACE)) {
+    blockItems.add(parseBlockItem());
+}
+```
+If `parseBlockItem` calls `parseStmt`, and `parseStmt` fails to consume any tokens (e.g., in the `default` case or if `parseExp` loops infinitely), we get an infinite loop.
+
+Let's look at `parseExp` -> `parseAddExp`.
+The implementation of `parseAddExp`, `parseMulExp`, etc., uses a complex backtracking mechanism (`peekReset`, `peekDisable`, `peekEnable`). This is highly prone to errors. If `peekDisable` sets a token to `EOF`, and `peekEnable` restores it, but the logic inside the `while` loop or the recursive call doesn't advance `current` properly in all error paths, it can loop.
+
+However, the most likely cause of a **Runtime Error** in this specific context, given the "missing semicolon" errors, is that the parser enters an infinite loop when it encounters an unexpected token because `expect` fails but doesn't advance, and the calling loop doesn't handle the "no progress" scenario.
+
+But wait, looking at `parseCompUnit` again. The condition `peekAt(current+2).getType() != TokenType.LPARENT` is used to distinguish `Decl` from `FuncDef`.
+If we have `int main()`, `peek` is `INTTK`. `peekNext` is `MAINTK`. `peekAt(current+2)` is `LPARENT`.
+The condition `peekNext().getType() != TokenType.MAINTK` is FALSE. So the loop terminates. This is correct.
+
+Let's look at the `Lexer` again.
+```java
+case '&':
+    c = next();
+    if (c == '&') {
+        return new Token(TokenType.AND, "&&");
+    }
+    ErrorTackle.addError(new CompilerError(getLine(position), "a"));
+    back();
+    return new Token(TokenType.AND, "&&");
+```
+This handles error `a`.
+
+The problem states "Runtime Error".
+In `Driver.java`:
+```java
+String ans = ASTVisitor.astToString(parser.parseCompUnit());
+// delete the last '\n'
+ans = ans.substring(0, ans.length() - 1);
+```
+If `parseCompUnit` returns `null` or throws an exception, this crashes.
+If `astToString` receives a malformed tree, it might crash.
+
+However, the most suspicious part is the **backtracking logic** in `parseAddExp`, `parseMulExp`, `parseLOrExp`, etc.
+For example, in `parseAddExp`:
+```java
+if (peek(TokenType.PLUS) || peek(TokenType.MINU)) {
+    int index2 = current;
+    TokenType addOp = peek(TokenType.PLUS) ? TokenType.PLUS : TokenType.MINU;
+    while(peek(TokenType.PLUS) || peek(TokenType.MINU))
+    {
+        index2 = current;
+        addOp = peek(TokenType.PLUS) ? TokenType.PLUS : TokenType.MINU;
+        advance();
+        parseMulExp(); // Result ignored?
+    }
+    peekReset(index1);
+    peekDisable(index2);
+    ASTNode addExp = parseAddExp(); // Recursive call
+    peekEnable(index2);
+    advance();
+    ASTNode mulExpTemp = parseMulExp();
+    return new ASTNode(NodeType.AddExp,new ArrayList<>(List.of(addExp, addOp, mulExpTemp)));
+}
+```
+This logic is extremely flawed. It advances through all `+`/`-` operators, discarding the parsed `MulExp`s. Then it resets to `index1`, disables the token at `index2` (the last operator?), recursively calls `parseAddExp`, then enables the token, advances, and parses one `MulExp`. This does not correctly implement left-recursion elimination or precedence. It is likely causing infinite recursion or incorrect state, leading to a stack overflow or logical error.
+
+Standard recursive descent for `AddExp -> MulExp | AddExp ('+' | '-') MulExp` should be:
+```java
+ASTNode parseAddExp() {
+    ASTNode left = parseMulExp();
+    while (peek(PLUS) || peek(MINU)) {
+        TokenType op = advance().getType();
+        ASTNode right = parseMulExp();
+        left = new ASTNode(AddExp, left, op, right);
+    }
+    return left;
+}
+```
+The provided code attempts a different strategy that seems broken. Given the complexity and likelihood of error, this is the primary suspect for "Runtime Error" (StackOverflowError due to infinite recursion in `parseAddExp` calling `parseAddExp` via `peekReset` logic if not careful, or just logical failure).
+
+However, the prompt asks to identify the location of the errors based on the failed test case. The test case expects error reporting. If the parser crashes (Runtime Error), it produces no output or incomplete output. The fact that it's a "Runtime Error" suggests the code throws an exception.
+
+Let's look at `ASTVisitor.astToString`.
+```java
+public static String astToString(ASTNode node) {
+    if (node.getType() instanceof TokenType) {
+        return node.getType().toString()+" "+node.getValue()+"\n";
+    }
+    StringBuilder sb = new StringBuilder();
+    for (Object child : node.getChildren()) {
+        if (child instanceof ASTNode) {
+            sb.append(astToString((ASTNode) child));
+        }
+        else {
+            sb.append(child.toString()).append(" ").append(getWordName((TokenType) child)).append("\n");
+        }
+    }
+    // ...
+}
+```
+If `child` is `null`, `child instanceof ASTNode` is false, and it goes to `else`, where `child.toString()` is called. If `child` is `null`, this throws `NullPointerException`.
+
+In `Parser.java`, many places add `null` or incomplete objects?
+In `parsePrimaryExp`:
+```java
+} else {
+    return new ASTNode(TokenType.VOIDTK, "");
+//            return null;
+    //throw error("Unexpected primary expression: " + peekType());
+}
+```
+It returns a dummy node.
+
+In `parseUnaryExp`:
+```java
+} else {
+    ASTNode primaryExp = parsePrimaryExp();
+    return new ASTNode(NodeType.UnaryExp,new ArrayList<>(List.of(primaryExp)));
+}
+```
+
+The backtracking logic in `parseAddExp` is the most dangerous.
+`peekDisable(index2)` sets the token type to `EOF`.
+`parseAddExp()` is called recursively.
+If the recursive call encounters `EOF` where it expects something, it might fail or return dummy nodes.
+Then `peekEnable(index2)` restores it.
+`advance()` consumes the operator.
+`parseMulExp()` consumes the right operand.
+
+If the input is `1 + 2`, `index1` is at `1`. `parseMulExp` consumes `1`. `peek` sees `+`. Enters `if`.
+`index2` becomes position of `+`. `advance()` consumes `+`. `parseMulExp()` consumes `2`. Loop ends.
+`peekReset(index1)` goes back to `1`.
+`peekDisable(index2)` makes `+` look like `EOF`.
+`parseAddExp()` is called. It sees `1`. `parseMulExp` consumes `1`. Sees `EOF` (was `+`). Returns `AddExp(1)`.
+`peekEnable(index2)` restores `+`.
+`advance()` consumes `+`.
+`parseMulExp()` consumes `2`.
+Returns `AddExp(AddExp(1), +, 2)`.
+This actually seems to work for simple cases, but it's very fragile.
+
+However, the **Runtime Error** is likely due to **StackOverflowError** caused by infinite recursion in these parsing methods if the grammar isn't matched correctly and the reset logic doesn't make progress. Or, more simply, the `Driver` tries to substring an empty string if `ans` is empty? No, `parseCompUnit` should return a node.
+
+Let's look at `ErrorTackle.transTokenPosToLine`.
+```java
+public static int transTokenPosToLine(int pos) {
+    if (tokenPosToLine.containsKey(pos)) {
+        return tokenPosToLine.get(pos);
+    }
+    return -1;
+}
+```
+If `pos` is `-1` (from `current-1` when `current` is `0`), it returns `-1`.
+`CompilerError` stores `-1`.
+Output: `-1 i`.
+Expected: `2 i`.
+
+In `parseCompUnit`, `current` starts at 0.
+If the first token is `int`, `parseDecl` is called? No, `isFuncDefStart` checks.
+Actually, `int main()` is parsed by `parseMainFuncDef`.
+The loop `while (...)` checks `peek(INTTK)` (true), `peekNext() != MAINTK` (false, it IS MAINTK). So loop doesn't run.
+`parseMainFuncDef` is called.
+`expect(INTTK)`, `expect(MAINTK)`, `expect(LPARENT)`, `expect(RPARENT)`.
+Then `parseBlock()`.
+
+Inside `parseBlock`:
+`expect(LBRACE)`.
+Loop `while (!peek(RBRACE))`.
+`parseBlockItem()`.
+
+First item: `printf(...)`.
+`parseStmt()` -> `case PRINTFTK`.
+`match(PRINTFTK)`. `expect(LPARENT)`. `expect(STRCON)`. `expect(RPARENT)`. `expect(SEMICN)`.
+Here, `SEMICN` is missing. `expect` adds error `i` at line `transTokenPosToLine(current-1)`.
+`current` is at the token after `RPARENT` (which is `if` on line 4? No, `printf` is line 2. `)` is line 2. Next token is `if` on line 4?
+Wait, the input:
+```
+    printf("Hello SysY!\n") // error 1
+
+    if (1)
+```
+Tokens: `PRINTFTK`, `LPARENT`, `STRCON`, `RPARENT`, `IFTK`...
+When `expect(SEMICN)` is called, `current` points to `IFTK`. `current-1` points to `RPARENT`.
+`tokenPosToLine` for `RPARENT` (index 3) should be line 2.
+So error `2 i` is generated. This matches expected output.
+
+Why Runtime Error?
+Maybe `parseStmt` for `if`?
+`case IFTK`:
+`match(IFTK)`. `expect(LPARENT)`. `parseCond()`. `expect(RPARENT)`. `parseStmt()`.
+`parseCond` -> `parseLOrExp`.
+Input: `1`. `parseLOrExp` -> `parseLAndExp` -> `parseEqExp` -> `parseRelExp` -> `parseAddExp` -> `parseMulExp` -> `parseUnaryExp` -> `parsePrimaryExp`.
+`parsePrimaryExp` sees `INTCON` (1). Returns `Number`.
+Back up. `parseCond` returns.
+`expect(RPARENT)`. Input has `)`. Matches.
+`parseStmt()`. Next token is `;`?
+Input:
+```
+    if (1)
+
+
+    /*********/
+    ;
+```
+After `)`, there are newlines and comments. Lexer skips them. Next token is `SEMICN`.
+`parseStmt()` sees `SEMICN`.
+`case SEMICN`: `match(SEMICN)`. Returns empty stmt.
+So `if` statement is parsed.
+
+Next item in block: `int a`.
+`parseBlockItem` -> `parseDecl` -> `parseVarDecl`.
+`parseBType` consumes `INTTK`.
+`parseVarDef`. `expect(IDENFR)` consumes `a`.
+`match(ASSIGN)`? No.
+`match(LBRACK)`? No.
+Returns `VarDef`.
+`parseVarDecl` continues. `match(COMMA)`? No.
+`expect(SEMICN)`.
+Next token is `for` (after comment `/******/` and `;`? Wait.
+Input:
+```
+    int a // error 2
+
+    for (;;) {}
+```
+There is NO semicolon after `a`.
+So `expect(SEMICN)` fails. `current` points to `FORTK`.
+Error `i` added at line of `a` (line 9).
+`parseVarDecl` returns.
+`parseBlockItem` returns.
+Back in `parseBlock` loop. `peek(RBRACE)`? No, it's `FORTK`.
+`parseBlockItem`.
+`peek(CONSTTK/INTTK/CHARTK)`? No (`FOR`).
+`parseStmt`.
+`case FORTK`.
+`match(FORTK)`. `expect(LPARENT)`.
+`if (!peek(SEMICN))` -> `parseForStmt`.
+`parseForStmt`: `parseLVal`.
+`parseLVal` expects `IDENFR`. But current is `;`?
+Input: `for (;;) {}`.
+Tokens: `FORTK`, `LPARENT`, `SEMICN`, `SEMICN`, `RPARENT`, `LBRACE`, `RBRACE`.
+`parseForStmt` is called because `peek(SEMICN)` is TRUE?
+Wait. `if (!peek(TokenType.SEMICN))`.
+Current is `SEMICN`. So `peek(SEMICN)` is TRUE. `!TRUE` is FALSE.
+So `parseForStmt` is NOT called.
+`nodes.add(TokenType.SEMICN)`.
+`expect(TokenType.SEMICN)`. Matches.
+`if (!peek(TokenType.SEMICN))`. Current is second `SEMICN`. True.
+`parseCond()`?
+`parseCond` -> `parseLOrExp` ...
+`parseLOrExp` sees `SEMICN`.
+`parseLAndExp` sees `SEMICN`.
+...
+`parsePrimaryExp` sees `SEMICN`.
+`else { return new ASTNode(TokenType.VOIDTK, ""); }`
+Returns dummy.
+Back up. `parseCond` returns dummy.
+`nodes.add(TokenType.SEMICN)`.
+`expect(TokenType.SEMICN)`. Matches.
+`if (!peek(TokenType.RPARENT))`. Current is `RPARENT`. False.
+`nodes.add(TokenType.RPARENT)`.
+`expect(TokenType.RPARENT)`. Matches.
+`parseStmt()`. Current is `LBRACE`.
+`case LBRACE`: `parseBlock()`.
+`expect(LBRACE)`.
+`while (!peek(RBRACE))`. Empty.
+`expect(RBRACE)`.
+Returns.
+
+So `for` loop parsed.
+
+Next item: `return 0`.
+`parseStmt`. `case RETURNTK`.
+`match(RETURNTK)`.
+`if (!peek(SEMICN))`. Current is `INTCON` (0). True.
+`parseExp()`. Parses `0`.
+`expect(SEMICN)`.
+Next token is `RBRACE`.
+`expect(SEMICN)` fails.
+Error `i` added at line of `0` (line 13).
+`parseStmt` returns.
+`parseBlockItem` returns.
+`parseBlock` loop. `peek(RBRACE)`? Yes.
+`expect(RBRACE)`. Matches.
+`parseMainFuncDef` returns.
+`parseCompUnit` returns.
+
+No infinite loop detected in this trace.
+So why Runtime Error?
+
+Check `Lexer` for `getLine`.
+```java
+public int getLine(int position) {
+    int line = 1;
+    for (int i = 0; i < position; i++) {
+        if (i > input.length() - 1) {
+            return line;
+        }
+        if (input.charAt(i) == '\n') {
+            line++;
+        }
+    }
+    return line;
+}
+```
+If `position` is `input.length() + 1` (due to `next()` going past end), `input.charAt(i)` might throw `StringIndexOutOfBoundsException` if `i` equals `input.length()`.
+The check `if (i > input.length() - 1)` handles `i >= input.length()`.
+Wait. `i > input.length() - 1` is equivalent to `i >= input.length()`.
+If `i == input.length()`, it returns.
+So `charAt(i)` is only called if `i < input.length()`. Safe.
+
+Check `Driver.java` again.
+```java
+ans = ans.substring(0, ans.length() - 1);
+```
+If `ans` is empty, `substring(0, -1)` throws `StringIndexOutOfBoundsException`.
+Does `astToString` return empty string?
+Only if `node` is null? No, `parseCompUnit` returns a node.
+If the tree is built, `astToString` traverses it.
+If `parseCompUnit` fails to build a tree and returns null?
+`parseCompUnit` doesn't return null.
+
+Is it possible `ErrorTackle.printErrors` crashes?
+No, it just writes to file.
+
+Let's look at `ASTVisitor.astToString` again.
+```java
+if (node.getType() instanceof TokenType) {
+    return node.getType().toString()+" "+node.getValue()+"\n";
+}
+```
+If `node.getValue()` is null? `ASTNode` constructor initializes `value`?
+```java
+public ASTNode(TokenType type, String value) {
+    this.type = type;
+    this.value = value;
+}
+```
+If `value` is null, `node.getValue()` calls `value.length()`. **NullPointerException**.
+
+Where are `ASTNode` created with null value?
+`new ASTNode(NodeType.CompUnit, decls)` -> `value` is null?
+Constructor:
+```java
+public ASTNode(NodeType type, List<Object> children) {
+    this.type = type;
+    this.children = children;
+}
+```
+`value` is not initialized, so it is `null`.
+`astToString` checks `if (node.getType() instanceof TokenType)`. `NodeType` is not `TokenType`.
+Goes to `else`. Iterates children.
+If a child is `ASTNode`, recurses.
+If a child is `TokenType`, `child.toString()` and `getWordName`.
+
+If a leaf node is created with `NodeType` and null value?
+`parseBType` returns `TokenType`.
+`parseFuncType` returns `TokenType`.
+
+In `parsePrimaryExp`:
+```java
+} else {
+    return new ASTNode(TokenType.VOIDTK, "");
+}
+```
+Value is `""`. Safe.
+
+In `parseUnaryOp`:
+```java
+return new ASTNode(NodeType.UnaryOp,List.of(type));
+```
+Child is `TokenType`. Safe.
+
+It seems `astToString` should handle the structure.
+
+However, there is one subtle bug in `Lexer.tokenStart` for `CHARCON`.
+```java
+case '\'':
+    c = next();
+    if (c == '\\') {
+        c = next();
+        next(); // Skips the closing quote?
+        return switch (c) {
+            // ...
+        };
+    }
+    if (c == '\'') {
+        c=next();
+        return null;
+    }
+    char temp = c;
+    c = next();
+    return new Token(TokenType.CHRCON, String.valueOf(temp));
+```
+If `c == '\\'`, it reads the escape char, then `next()` reads the closing quote.
+If the input is `'\n'`, `c` becomes `n`. `next()` consumes `'`. Returns `CHRCON`. Correct.
+
+I will bet on the **Runtime Error** being caused by the **backtracking logic in `parseAddExp`** (and similar methods) causing a **StackOverflowError** or infinite loop on certain inputs, or potentially a `NullPointerException` in `astToString` if a node is constructed unexpectedly. Given the specific test case, the parser *should* work logically, but the implementation is fragile.
+
+However, the prompt asks to identify the location of the errors. The most likely candidate for a crash in this specific code structure, aside from the backtracking, is the `Driver` trying to process the result.
+
+<front_end/parser/Parser.java>
+...
+    // 解析加减表达式
+    private ASTNode parseAddExp()  {
+        int index1=current;
+        ASTNode mulExp = parseMulExp();
+        if (peek(TokenType.PLUS) || peek(TokenType.MINU)) {
+            int index2 = current;
+            TokenType addOp = peek(TokenType.PLUS) ? TokenType.PLUS : TokenType.MINU;
+            while(peek(TokenType.PLUS) || peek(TokenType.MINU))
+            {
+                index2 = current;
+                addOp = peek(TokenType.PLUS) ? TokenType.PLUS : TokenType.MINU;
+                advance();
+                parseMulExp();
+            }
+            peekReset(index1);
+            peekDisable(index2);
+            ASTNode addExp = parseAddExp();
+            peekEnable(index2);
+            advance();
+            ASTNode mulExpTemp = parseMulExp();
+            return new ASTNode(NodeType.AddExp,new ArrayList<>(List.of(addExp, addOp, mulExpTemp)));
+        }
+        else {
+            return new ASTNode(NodeType.AddExp,new ArrayList<>(List.of(mulExp)));
+        }
+    }
+...

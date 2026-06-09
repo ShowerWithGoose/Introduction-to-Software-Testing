@@ -1,0 +1,637 @@
+Based on the problem description, test case input, expected output, and actual buggy behavior (no output file generated while expecting three "missing semicolon" errors of type 'i' on lines 2, 9, and 13), the issue appears to be in how the parser detects and reports missing semicolons.
+
+The key observation is that the program **fails to generate any error.txt**, which suggests either:
+1. Errors are not being collected properly, or
+2. The condition for detecting missing semicolons is flawed — specifically in the `handleError` method and its usage in statement parsing.
+
+Looking at the test input:
+
+- Line 2: `printf("Hello SysY!\n") // error 1` → missing `;`
+- Line 9: `int a // error 2` → missing `;`
+- Line 13: `return 0 // error 3` → missing `;`
+
+All these correspond to **error type 'i': Missing semicolon**.
+
+In `<frontend/Parser.java>`, the `handleError(i, ...)` calls are made **after synthesizing a fake SEMICN token**, but only if the next token is **not** actually a semicolon. However, the logic inside `handleError` checks:
+
+```java
+if (next(0).getType() != SEMICN) {
+    Error error = new Error(i, token.getLine());
+    errors.add(error);
+} else {
+    move();
+}
+```
+
+This seems correct at first glance. But note: in many places like `stmt()` for `printf`, `return`, etc., the code **adds a fake SEMICN node unconditionally**, then calls `handleError(i, next(-1))`.
+
+However, the real issue lies in **when** `handleError` is called and what `next(0)` actually is **at that moment**.
+
+But more critically: **the parser may crash or throw an exception before reaching those points**, because it tries to parse beyond EOF or invalid tokens, and since there's no bounds checking in `next(int n)`, it may throw an exception (e.g., `IndexOutOfBoundsException`) when accessing `tokens.get(current + n)` when `current + n >= tokens.size()`.
+
+Looking at the `next(int n)` method:
+
+```java
+private Token next(int n) {
+    return tokens.get(current + n);
+}
+```
+
+This will crash if `current + n >= tokens.size()`. In the test case, after the last token (which is `}` from line 14), the parser may try to look ahead beyond the token list while processing the incomplete statements (like `return 0` without `;`), causing an unhandled exception → program terminates → no output files written.
+
+However, the expected behavior is to **report errors**, not crash.
+
+But wait: the test input ends with:
+
+```c
+    return 0 // error 3
+}
+```
+
+So the lexer would tokenize up to `}` (RBRACE), and the `return 0` has no semicolon. When parsing `return 0`, the parser will:
+
+- Parse `RETURNTK`
+- Parse `Exp` (`0`)
+- Then expect `SEMICN`, but next token is `RBRACE` (from `}`)
+
+So in `stmt()` under `RETURNTK` branch:
+
+```java
+Node semicolonNode = new Node(new Token(SEMICN, ";", next(-1).getLine()));
+node.addChild(semicolonNode);
+handleError(i, next(-1));
+```
+
+At this point, `next(-1)` is the token for `0` (INTCON), line 13.
+
+Then in `handleError(i, token)`:
+
+```java
+if (next(0).getType() != SEMICN) { ... }
+```
+
+Here, `next(0)` is `RBRACE` (not SEMICN), so it should add error `(13, i)`.
+
+Similarly for `printf(...)` on line 2: after parsing the string, it expects `)` then `;`. It will synthesize `)` and `;`, but the next token after `STRCON` is likely `IFTK` (`if (1)`), so `next(0)` during `handleError(i, ...)` for semicolon will not be `SEMICN`, so error should be added.
+
+Same for `int a` — in `varDecl`, after `VarDef`, it synthesizes `;` and calls `handleError(i, ...)`. Next token is probably `FORTK` (`for (;;){}`), so again, not `SEMICN` → error added.
+
+So why no output?
+
+Ah! Look at the main method in `Compiler.java`:
+
+```java
+List<String> nodeList = parser.inorder(root, new ArrayList<>());
+writeToFile("parser.txt", nodeList);
+List<Error> errorsFromParser = parser.getErrors();
+List<Error> errorsFromLexer = lexer.getErrors();
+List<String> errors = mergeErrors(errorsFromParser, errorsFromLexer);
+writeToFile("error.txt", errors);
+```
+
+It **always writes both parser.txt and error.txt**, regardless of whether there are errors.
+
+But the problem says: for **erroneous** programs, output to `error.txt`; for **correct** ones, output to `parser.txt`.
+
+However, the specification also says: **output the line number and error category code to `error.txt`**, implying that if there are errors, only `error.txt` should exist (and `parser.txt` should not be produced).
+
+But the current code writes both.
+
+However, the **buggy output is "No output file"**, meaning neither file was created.
+
+That suggests an **exception occurred during parsing**, preventing the write steps.
+
+And the most likely cause is **unbounded access in `next(n)`**.
+
+For example, in `compUnit()`:
+
+```java
+while (next(1).getType() != MAINTK && next(2).getType() != LPARENT) {
+```
+
+If the token list is short (e.g., only a few tokens), `next(2)` may go out of bounds.
+
+In the test case, the tokens end with `RBRACE` (from final `}`). After parsing `MainFuncDef`, the parser may still be in `compUnit()` and try to check `next(1)` and `next(2)` when `current` is near the end.
+
+Suppose `tokens.size() == N`, and `current == N - 1`. Then `next(1)` → `tokens.get(N)` → **IndexOutOfBoundsException**.
+
+This exception is not caught in `Compiler.main()`, so the program crashes → no files written.
+
+Thus, the root cause is **lack of bounds checking in `next(n)`**.
+
+But the question asks for the **location of the error in the program** based on the failure to output expected errors.
+
+However, looking again: the expected output is **only error.txt with three lines**, but the program produces **no output file**, which implies crash.
+
+But the assignment says: "identify the location of the errors in the program below" based on the test case.
+
+Given that, the immediate suspect is the **`next(int n)` method** which does not check bounds.
+
+But the problem might also be in **error reporting logic**: perhaps errors are added, but due to crash, not written.
+
+However, the instructions say: "In the first round... output the code snippet where the error is likely to be located."
+
+Given the test case has missing semicolons, and the parser uses `handleError(i, ...)` to detect them, but if the parser crashes before finishing, errors aren't written.
+
+But there's another possibility: the `hasAssign()` method in `Parser.java` may loop indefinitely or incorrectly.
+
+Look at `hasAssign()`:
+
+```java
+private boolean hasAssign() {
+    int i = current;
+    while (i < tokens.size() && tokens.get(i).getLine() == next(0).getLine()) {
+        if (tokens.get(i).getType() == ASSIGN) {
+            return true;
+        }
+        ++i;
+    }
+    return false;
+}
+```
+
+Here, `next(0)` is `tokens.get(current)`, so it's comparing tokens on the same line.
+
+But if `current >= tokens.size()`, `next(0)` will crash.
+
+However, `hasAssign()` is only called when `next(0).getType() == IDENFR`, so `current < tokens.size()`.
+
+But during parsing of `int a` (line 9), after `a`, the next token is `FORTK` on line 11, so different line → `hasAssign()` returns false → goes to `[Exp] ';'` branch.
+
+Then it tries to parse `Exp` starting at `FORTK`? That would fail.
+
+But more importantly, in the `stmt()` method, the fallback else branch:
+
+```java
+} else {
+    if (next(0).getType() == SEMICN) {
+        ...
+    } else {
+        Node expNode = exp();
+        node.addChild(expNode);
+        Node semicolonNode = new Node(new Token(SEMICN, ";", next(-1).getLine()));
+        node.addChild(semicolonNode);
+        handleError(i, next(-1));
+    }
+}
+```
+
+But if the current token is `FORTK`, `exp()` will fail to parse, possibly leading to infinite recursion or crash.
+
+However, the grammar says `Exp → AddExp`, and `AddExp` starts with `MulExp` → `UnaryExp` → ... which requires a valid expression. `FORTK` is not a valid start, so the parser will try to parse it as an expression and fail.
+
+But the parser doesn't have error recovery — it just keeps going, and eventually accesses out of bounds.
+
+Thus, the core issue is **no bounds checking in token lookahead**.
+
+But the problem asks for the **code snippet where the error is likely located**, and given the expected errors are all type 'i', and they are not being output, the most direct issue is in the **`handleError` method or its invocation**.
+
+Wait: look at the `handleError` method for type 'i':
+
+```java
+private void handleError(ErrorType type, Token token) {
+    if (type == i) {
+        if (next(0).getType() != SEMICN) {
+            Error error = new Error(i, token.getLine());
+            errors.add(error);
+        } else {
+            move();
+        }
+    } ...
+}
+```
+
+This is correct.
+
+But now consider: in the test case, after `printf("Hello SysY!\n")`, the next token is `IFTK` (from `if (1)`), which is on line 4.
+
+But the `printf` call is on line 2.
+
+When parsing `printf`, after reading `STRCON`, it expects `)` then `;`.
+
+But the next token after `STRCON` is `IFTK` (since the `// error 1` comment is skipped by lexer).
+
+So:
+
+- After `STRCON`, parser creates fake `RPARENT` and calls `handleError(j, ...)` → since next token is `IFTK` ≠ `RPARENT`, adds error j? But expected is error i.
+
+Wait, no: for `printf`, the parser does:
+
+```java
+Node rparenNode = new Node(new Token(RPARENT, ")", next(-1).getLine()));
+node.addChild(rparenNode);
+handleError(j, next(-1));   // <-- this checks for missing ')'
+...
+Node semicolonNode = new Node(new Token(SEMICN, ";", next(-1).getLine()));
+node.addChild(semicolonNode);
+handleError(i, next(-1));   // <-- this checks for missing ';'
+```
+
+So it should add error 'i' for missing semicolon.
+
+But why isn't it?
+
+Because after synthesizing the fake `RPARENT`, the parser hasn't consumed any real token, so `next(0)` is still `IFTK`.
+
+Then `handleError(j, ...)` is called with `next(-1)` = `STRCON` (line 2). It checks: is `next(0)` == `RPARENT`? No → adds error j on line 2.
+
+But the expected error is **i**, not j.
+
+However, the test case says the error is missing semicolon, not missing parenthesis.
+
+But in the input: `printf("Hello SysY!\n")` — this is missing `;`, but has balanced parentheses.
+
+So the parser should **not** report error j, because the real token after `STRCON` is not `RPARENT`, but the grammar requires `)` after the format string.
+
+Wait! The `printf` syntax is:
+
+`'printf''('StringConst {','Exp}')'';'`
+
+So after `STRCON`, it expects either `,` or `)`.
+
+In the input: `printf("Hello SysY!\n")` — so after `"..."`, it should see `)`.
+
+But in the token stream, after `STRCON`, the next token is `IFTK` (from `if (1)`), not `RPARENT`.
+
+So the parser **should** report **missing ')'** (error j) on the line of the `STRCON` (line 2), **before** even checking for semicolon.
+
+But the expected output is error **i** (missing semicolon), not j.
+
+This is a contradiction.
+
+Unless... the problem considers that the `printf` statement is **not terminated by ;**, and that is the **first** error.
+
+But according to the grammar, the `printf` must have `)` before `;`.
+
+So if `)` is missing, that's error j.
+
+However, looking at the test input:
+
+```c
+    printf("Hello SysY!\n") // error 1
+```
+
+There **is** a `)`! Wait, no — in the input as given:
+
+> printf("Hello SysY!\n") // error 1
+
+Yes, there **is** a closing parenthesis.
+
+So the token stream should be:
+
+`PRINTFTK`, `LPARENT`, `STRCON`, `RPARENT`, ... but then no `SEMICN`.
+
+But the comment says "// error 1", implying the only error is missing semicolon.
+
+So the lexer should produce:
+
+- PRINTFTK
+- LPARENT
+- STRCON ("Hello SysY!\n")
+- RPARENT
+- IFTK (from next line)
+
+So when parsing `printf`, after reading `STRCON`, it sees `RPARENT` → consumes it (via `move()`), then expects `SEMICN`.
+
+But in the code for `printf`:
+
+```java
+Node stringConstNode = new Node(next(0));
+node.addChild(stringConstNode);
+move();
+while (next(0).getType() == COMMA) { ... }
+Node rparenNode = new Node(new Token(RPARENT, ")", next(-1).getLine()));
+node.addChild(rparenNode);
+handleError(j, next(-1));
+```
+
+Wait! This is wrong.
+
+The parser **does not consume the real `RPARENT`**. Instead, it **synthesizes a fake one** and calls `handleError(j, ...)`.
+
+But if the real next token **is** `RPARENT`, it should consume it.
+
+The current code **always synthesizes a fake `RPARENT`**, even if the real one is present.
+
+That's the bug!
+
+In `printf` parsing:
+
+```java
+Node stringConstNode = new Node(next(0));
+node.addChild(stringConstNode);
+move();
+while (next(0).getType() == COMMA) {
+    Node commaNode = new Node(next(0));
+    node.addChild(commaNode);
+    move();
+    Node expNode = exp();
+    node.addChild(expNode);
+}
+Node rparenNode = new Node(new Token(RPARENT, ")", next(-1).getLine()));
+node.addChild(rparenNode);
+handleError(j, next(-1));
+```
+
+It never checks if the next token is `RPARENT`. It just assumes it's missing and synthesizes it.
+
+But if the real token is `RPARENT`, it should consume it.
+
+The correct approach is:
+
+- After parsing the format string and optional expressions, check if next token is `RPARENT`.
+- If yes, consume it.
+- If not, report error j and do not consume.
+
+But the current code **always** creates a fake `RPARENT` and calls `handleError`, which will:
+- If next token is `RPARENT`, call `move()` (consume it)
+- Else, add error
+
+So that part is actually correct.
+
+Similarly for semicolon.
+
+So why no errors reported?
+
+Back to the crash theory.
+
+Given the program produces **no output file**, it must have crashed.
+
+The most likely place is `next(1)` or `next(2)` in `compUnit()` when near end of token list.
+
+In `compUnit()`:
+
+```java
+while (next(1).getType() != MAINTK && next(2).getType() != LPARENT) {
+    Node declNode = decl();
+    node.addChild(declNode);
+}
+```
+
+If there are fewer than 2 tokens ahead, this will crash.
+
+For example, if only 1 token remains, `next(2)` → index out of bounds.
+
+So the error is in **`compUnit()` method's lookahead without bounds checking**.
+
+Similarly, other parts use `next(0)`, `next(1)`, etc., without ensuring `current + n < tokens.size()`.
+
+Therefore, the program crashes with `IndexOutOfBoundsException` before completing parsing, so no errors are written.
+
+Thus, the error is in the **`next(int n)` method and its unsafe usage**.
+
+But the question asks for the code snippet where the error is likely located.
+
+Given the test case fails to output anything, and the parser uses unsafe lookahead, the primary location is:
+
+<frontend/Parser.java>
+...
+    private Token next(int n) {
+        return tokens.get(current + n);
+    }
+...
+
+But also, the `compUnit` method uses `next(1)` and `next(2)` without checking if enough tokens exist.
+
+However, the instructions say to output the code snippet where the error is likely located.
+
+Given the expected errors are not produced due to crash, and crash is caused by unguarded `next(n)`, the core issue is the `next` method and its usage.
+
+But to match the expected answer format, and since the problem is about missing semicolon errors not being reported, but the real issue is crash, we focus on the unsafe lookahead.
+
+However, looking at the provided code, another possibility: in the `stmt()` method, when handling `IDENFR`, it calls `hasAssign()`, which may not work correctly across lines, but that's less likely.
+
+Given all, the most critical error location is the **`next(int n)` method** which allows out-of-bounds access.
+
+But the problem might expect the error in `handleError` or statement parsing.
+
+Wait: the expected output is three error 'i' on lines 2, 9, 13.
+
+In the test input:
+- Line 2: `printf(...)` missing `;`
+- Line 9: `int a` missing `;`
+- Line 13: `return 0` missing `;`
+
+For `int a` — this is a `VarDecl`, which is a `Decl`, which is a `BlockItem`.
+
+In `varDecl()`:
+
+```java
+Node semicolonNode = new Node(new Token(SEMICN, ";", next(-1).getLine()));
+node.addChild(semicolonNode);
+handleError(i, next(-1));
+```
+
+At this point, after parsing `VarDef` (`a`), the next token is `FORTK` (line 11), so `next(0) != SEMICN` → error added with line = line of `next(-1)` = line of `a` = 9. Correct.
+
+Similarly for `return 0`: next token is `RBRACE`, so error added with line 13.
+
+For `printf`: after `RPARENT`, next token is `IFTK`, so error added with line 2.
+
+So errors should be added.
+
+Unless... the parser never reaches those points because it crashes earlier.
+
+When does it crash?
+
+After parsing `printf(...)`, it parses the `if (1)` statement.
+
+`if (1)` is incomplete: no body.
+
+So when parsing `if (1)`, the parser will:
+
+- Parse `IFTK`
+- Parse `LPARENT`
+- Parse `Cond` (`1`)
+- Synthesize `RPARENT` and call `handleError(j, ...)` — next token is `FORTK` or newline, not `RPARENT`? But in input, after `1` comes `)`? Let's see:
+
+Input:
+    if (1)
+
+
+    /*********/
+    ;
+
+So after `1`, there is a `)` on the next non-empty line? No, the input is:
+
+    if (1)
+
+
+    /*********/
+    ;
+
+So tokens: `IFTK`, `LPARENT`, `INTCON(1)`, then `SEMICN` (from the `;` after `/*********/`)? No, the `;` is on line 7.
+
+Actually, between `1` and `;`, there are empty lines and a comment.
+
+So token stream after `1` is: `SEMICN` (from line 7).
+
+So when parsing `if (1)`, after `1`, next token is `SEMICN`, not `RPARENT`.
+
+So parser will synthesize `RPARENT` and call `handleError(j, ...)` with `next(-1) = INTCON(1)` (line 4), and since next token is `SEMICN` ≠ `RPARENT`, it adds error j on line 4.
+
+But the expected errors are only i on 2,9,13.
+
+However, the problem states the test case input has only three errors: the missing semicolons.
+
+This suggests that the `if (1)` is not considered erroneous because it's followed by a `;` later? No, the `if` statement requires a `Stmt` after the condition.
+
+The input has:
+
+    if (1)
+
+
+    /*********/
+    ;
+
+So after `if (1)`, there is a `;` (empty statement), which is valid.
+
+So token stream:
+
+- IFTK
+- LPARENT
+- INTCON 1
+- RPARENT  [but is it there?]
+
+Wait, the input is:
+
+    if (1)
+
+So there **is** a `)`! Because it's `if (1)`, then blank lines, then `;`.
+
+So tokens: `IFTK`, `LPARENT`, `INTCON`, `RPARENT`, `SEMICN`.
+
+So the `if` statement is: `if (1) ;` which is valid.
+
+So no error there.
+
+Then why would the parser crash?
+
+Perhaps it doesn't crash, but the errors are not written because the program thinks it's a correct program.
+
+But the three statements are missing semicolons, so errors should be added.
+
+Unless the `handleError` method is not called for those cases.
+
+Let's simulate `printf` parsing:
+
+Tokens for line 2: `PRINTFTK`, `LPARENT`, `STRCON`, `RPARENT` (because the source has `)`), then next token is `IFTK` (line 4).
+
+In `stmt()` for `PRINTFTK`:
+
+- Consume `PRINTFTK`
+- Consume `LPARENT`
+- Consume `STRCON`
+- Then, since next token is `RPARENT`, the while loop (for commas) is skipped.
+- Then, the code does:
+
+```java
+Node rparenNode = new Node(new Token(RPARENT, ")", next(-1).getLine()));
+node.addChild(rparenNode);
+handleError(j, next(-1));
+```
+
+Here, `next(-1)` is `STRCON` (line 2).
+
+In `handleError(j, token)`:
+
+```java
+if (next(0).getType() != RPARENT) {
+    // add error
+} else {
+    move();
+}
+```
+
+But `next(0)` is `RPARENT` (real token), so it calls `move()`, consuming the real `RPARENT`.
+
+Then:
+
+```java
+Node semicolonNode = new Node(new Token(SEMICN, ";", next(-1).getLine()));
+node.addChild(semicolonNode);
+handleError(i, next(-1));
+```
+
+Now, `next(-1)` is the `RPARENT` token, which is on line 2.
+
+`next(0)` is `IFTK` (not `SEMICN`), so it adds error i on line 2.
+
+Correct.
+
+Similarly for others.
+
+So errors should be added.
+
+Then why no output file?
+
+Perhaps because after parsing, the `inorder` traversal fails.
+
+Or because the `writeToFile` is not called if there are errors? But the code calls it unconditionally.
+
+Unless the `parser.parse()` throws an exception.
+
+Given the above, the only remaining possibility is that the `next(-1)` call when `current == 0` causes `tokens.get(-1)`.
+
+In `handleError`, it calls `next(-1)`, which is `tokens.get(current - 1)`.
+
+If `current == 0`, `next(-1)` crashes.
+
+When could `current == 0` in `handleError`?
+
+Unlikely, because `handleError` is called after at least one token has been consumed.
+
+For example, in `printf`, after consuming `STRCON`, `current` is at `RPARENT`, so `next(-1)` is safe.
+
+So perhaps the crash is elsewhere.
+
+Given the time, and since the expected answer is likely related to the missing semicolon detection, and the only logical conclusion is that the errors are not being added because the parser doesn't reach those points, but the provided code for `handleError` seems correct, I think the error is in the **condition for when to call handleError for semicolon in the context of [Exp] ';'**.
+
+Look at the `stmt()` method for the `[Exp] ';'` case:
+
+```java
+} else {
+    if (next(0).getType() == SEMICN) {
+        Node semicolonNode = new Node(new Token(SEMICN, ";", next(-1).getLine()));
+        node.addChild(semicolonNode);
+        handleError(i, next(-1));
+    } else {
+        Node expNode = exp();
+        node.addChild(expNode);
+        Node semicolonNode = new Node(new Token(SEMICN, ";", next(-1).getLine()));
+        node.addChild(semicolonNode);
+        handleError(i, next(-1));
+    }
+}
+```
+
+In the case of `int a`, this is not in `stmt()`! `int a` is a `Decl`, specifically a `VarDecl`.
+
+So it's parsed in `blockItem()` -> `decl()` -> `varDecl()`.
+
+In `varDecl()`:
+
+```java
+Node semicolonNode = new Node(new Token(SEMICN, ";", next(-1).getLine()));
+node.addChild(semicolonNode);
+handleError(i, next(-1));
+```
+
+So that should work.
+
+Similarly, `return 0` is in `stmt()` -> `RETURNTK` branch.
+
+So all three should be caught.
+
+Given that, and the fact that the program outputs nothing, the only explanation is a crash due to out-of-bounds access.
+
+Therefore, the error is in the `next` method and its usage without bounds checking.
+
+So the code snippet is:
+
+<frontend/Parser.java>
+...
+    private Token next(int n) {
+        return tokens.get(current + n);
+    }
+...

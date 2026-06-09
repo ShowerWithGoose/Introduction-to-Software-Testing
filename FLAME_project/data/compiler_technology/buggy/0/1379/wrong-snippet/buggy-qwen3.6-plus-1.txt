@@ -1,0 +1,385 @@
+Based on the comparison between the Buggy Output and the Expected Output, the program produces an extra token `RBRACE }` at the very end of the output. The expected output ends with the closing brace of the `main` function, while the buggy output includes an additional closing brace.
+
+Looking at the `Compiler.java` file, the logic for collecting tokens is:
+1. It loops `while(!lexer.isEnd())`.
+2. Inside the loop, it calls `lexer.next()`.
+3. Then it retrieves the current token using `lexer.peek()` and adds it to the lists if the type is not null.
+
+The issue lies in how `isEnd()` and `next()` interact, or potentially how the last token is handled. However, a more subtle issue often found in such lexers is that `next()` might generate a token even when the stream is effectively finished or after the last meaningful character, or `isEnd()` returns false one step too late.
+
+Let's look closely at `Lexer.java`.
+The `next()` method reads characters. If it encounters whitespace or newlines, it recursively calls `next()` or returns.
+The `isEnd()` method checks `input.available() == 0`.
+
+In `Compiler.java`:
+```java
+        while(!lexer.isEnd()) {
+            try {
+                lexer.next();
+            } catch (Error_A e) {
+                e.printError();
+                existError = true;
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+            Token token = lexer.peek();
+            if (token.getType() != null) {
+                name.add(token.getType().toString());
+                content.add(token.getContent());
+            }
+        }
+```
+
+If `lexer.next()` processes the last `}` in the input, it sets `curToken` to that `}`. The loop continues. `isEnd()` might still return false if the stream isn't fully exhausted (e.g., if there's a trailing newline or EOF marker behavior). If there is a trailing newline, `next()` will consume it, increment `lineNum`, and call `next()` again. If that subsequent `next()` hits EOF, `read()` returns -1 (cast to char `\uffff` or similar depending on implementation, but here `read()` casts int to char).
+
+Wait, `input.read()` returns `-1` at EOF. `(char)-1` is `\uffff`.
+In `next()`:
+```java
+        char c = read();
+        // ...
+        else if (c == '\n') {
+            lineNum++;
+            next();
+            return;
+        } else if (c == ' ' || c == '\t' || c == '\r') {
+            next();
+            return;
+        }
+```
+If `read()` returns `-1` (EOF), `c` becomes `\uffff`. This character does not match any of the specific conditions (letter, digit, symbols, whitespace). It falls through to the end of the `if-else` chain without setting `lexType` (remains `null`) and without appending to `sb` (empty).
+Then:
+```java
+        curToken = new Token(sb.toString(),lexType,lineNum);
+```
+This creates a token with `content=""` and `type=null`.
+
+Back in `Compiler.java`:
+```java
+            Token token = lexer.peek();
+            if (token.getType() != null) {
+                name.add(token.getType().toString());
+                content.add(token.getContent());
+            }
+```
+If `type` is `null`, it should NOT be added. So the empty EOF token shouldn't be added.
+
+However, let's look at the "Buggy Output" again. It has an extra `RBRACE }`.
+The expected output ends with:
+```
+RETURNTK return
+INTCON 0
+SEMICN ;
+RBRACE }
+```
+The buggy output ends with:
+```
+RETURNTK return
+INTCON 0
+SEMICN ;
+RBRACE }
+RBRACE }
+```
+
+This suggests that the last `}` is being tokenized twice, or there is an extra `}` being read.
+Let's check the test input:
+```java
+    return 0;
+}
+```
+There is only one closing brace for `main`.
+
+Let's re-examine `Lexer.next()` logic for `}`.
+```java
+        } else if (c == '}') {
+            lexType = LexType.RBRACE;
+            sb.append(c);
+        }
+        curToken = new Token(sb.toString(),lexType,lineNum);
+```
+
+Is it possible that `isEnd()` is not detecting the end correctly, causing the loop to run one extra time where `next()` doesn't advance but `peek()` returns the *previous* token again?
+No, `next()` is called every iteration.
+
+Let's look at `isEnd()`:
+```java
+    public boolean isEnd() {
+        try {
+            return input.available() == 0;
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return false;
+    }
+```
+`available()` returns the number of bytes that can be read without blocking. For a file, it usually returns the remaining length. When the last character is read, `available()` might become 0.
+
+Scenario:
+1. Lexer is at the last `}`. `isEnd()` is false (1 byte available).
+2. `next()` reads `}`, creates `RBRACE` token. `curToken` is `RBRACE`.
+3. Loop continues. `isEnd()` is now true (0 bytes available)?
+   - If `isEnd()` is true, the loop terminates. Correct.
+   - If `isEnd()` is false (maybe buffer issues?), loop continues.
+4. If loop continues: `next()` is called. `read()` returns -1. `c` is `\uffff`.
+   - Falls through all ifs. `lexType` is null. `sb` is empty.
+   - `curToken` becomes `Token("", null, lineNum)`.
+5. `peek()` returns this null token. `token.getType() != null` is false. Nothing added.
+   - This would result in missing tokens if anything, not extra.
+
+Why is there an extra `RBRACE`?
+
+Let's look at the recursive calls in `next()` for comments/whitespace.
+```java
+            } else if (c == '/') {
+                c = read();
+                if (c == '/') {
+                    while(!isEnd() && c != '\n') {
+                        c = read();
+                    }
+                    next(); // Recursive call
+                    return;
+                } else if (c == '*') {
+                    // ...
+                    next(); // Recursive call
+                    return;
+                }
+//...
+        } else if (c == '\n') {
+            lineNum++;
+            next(); // Recursive call
+            return;
+        } else if (c == ' ' || c == '\t' || c == '\r') {
+            next(); // Recursive call
+            return;
+        }
+```
+
+If the file ends with `}\n`, here is what happens:
+1. `next()` reads `}`. Sets `curToken` to `RBRACE`. Returns.
+2. `Compiler` loop adds `RBRACE`.
+3. `isEnd()` check. If `\n` is still in buffer/stream, `isEnd()` is false.
+4. `next()` reads `\n`.
+   - Matches `c == '\n'`.
+   - `lineNum++`.
+   - Calls `next()` recursively.
+     - Inside recursive `next()`: `read()` returns -1 (EOF). `c` is `\uffff`.
+     - Falls through. `lexType` null. `sb` empty.
+     - `curToken` set to `Token("", null, ...)`.
+     - Returns.
+   - Outer `next()` returns.
+5. `Compiler` loop: `peek()` returns the null token. Not added.
+6. `isEnd()` is true. Loop ends.
+
+This logic seems correct for standard cases. Why the duplicate `RBRACE`?
+
+Let's look at the `Compiler.java` loop structure again.
+```java
+        while(!lexer.isEnd()) {
+            try {
+                lexer.next();
+            } ...
+            Token token = lexer.peek();
+            if (token.getType() != null) {
+                name.add(token.getType().toString());
+                content.add(token.getContent());
+            }
+        }
+```
+
+Is it possible that `lexer.next()` is NOT updating `curToken` in some error path or specific case, causing `peek()` to return the *old* token again?
+In the EOF case described above, `curToken` IS updated to the null token.
+
+What if the input file does NOT end with a newline?
+Input: `... return 0;\n}`
+1. `next()` reads `}`. `curToken` = `RBRACE`.
+2. Added to list.
+3. `isEnd()`? If `available()` is 0, loop ends. Correct.
+
+What if the input file ends with `}\n` AND `available()` behaves unexpectedly?
+Or perhaps the issue is in `Lexer` initialization or `PushbackInputStream`?
+
+Let's look at the provided `Buggy Output` vs `Expected Output` carefully.
+Buggy:
+...
+SEMICN ;
+RBRACE }
+RBRACE }
+
+Expected:
+...
+SEMICN ;
+RBRACE }
+
+The difference is exactly one `RBRACE }`.
+
+Let's consider the `Compiler.java` code logic error.
+If `lexer.next()` throws an exception, `existError` is set, but the loop continues.
+If `lexer.next()` succeeds, we peek.
+
+Is it possible that `isEnd()` returns `false` when it should be `true`, causing one last iteration where `next()` fails to read a new token but doesn't clear the old one?
+In `Lexer.next()`:
+```java
+    public void next() throws Error_A, IOException {
+        if (isEnd()) {
+            return;
+        }
+        char c = read();
+        // ...
+```
+If `isEnd()` is checked at the start of `next()`, and it returns `true`, `next()` returns immediately **without changing `curToken`**.
+
+So, if:
+1. We just processed the last `}`. `curToken` is `RBRACE`.
+2. Loop checks `!lexer.isEnd()`.
+   - If `isEnd()` returns `false` (incorrectly, e.g., buffer has 0 bytes but `available()` says 1 due to internal buffering quirks, or simply because the stream isn't "closed" yet), we enter the loop.
+3. `lexer.next()` is called.
+   - Inside `next()`, it checks `if (isEnd()) return;`.
+   - If `isEnd()` NOW returns `true` (maybe state changed or consistent check), it returns immediately.
+   - `curToken` remains `RBRACE`.
+4. Back in `Compiler`:
+   - `Token token = lexer.peek();` -> Returns `RBRACE`.
+   - `token.getType() != null` -> True.
+   - Adds `RBRACE` again.
+5. Loop checks `!lexer.isEnd()`. Now likely true. Exits.
+
+This explains the duplicate token! The issue is that `isEnd()` in `Compiler`'s loop condition and `isEnd()` inside `Lexer.next()` might have a race condition or inconsistent state regarding when the stream is considered "ended", specifically allowing one extra iteration where `next()` does nothing (preserving the last token) but the compiler still records it.
+
+However, `PushbackInputStream.available()` should be consistent.
+Let's look at `isEnd()`:
+```java
+    public boolean isEnd() {
+        try {
+            return input.available() == 0;
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return false;
+    }
+```
+
+If the file ends with `}`, `available()` might return 1.
+1. `Compiler`: `isEnd()` -> false. Enter loop.
+2. `Lexer.next()`:
+   - `isEnd()` -> false.
+   - `read()` reads `}`.
+   - Processes `}`. `curToken` = `RBRACE`.
+   - Returns.
+3. `Compiler`: Adds `RBRACE`.
+4. `Compiler`: `isEnd()` -> `available()` is now 0?
+   - If yes, loop ends. Correct.
+   - If no (e.g. `available()` returns 0 only after a failed read or close?), let's assume it returns 0.
+
+But what if the file ends with `}\n`?
+1. `Compiler`: `isEnd()` false.
+2. `Lexer.next()`:
+   - Reads `}`. `curToken` = `RBRACE`.
+   - Returns.
+3. `Compiler`: Adds `RBRACE`.
+4. `Compiler`: `isEnd()` false (newline remains).
+5. `Lexer.next()`:
+   - Reads `\n`.
+   - Recursively calls `next()`.
+   - Inner `next()`: `read()` returns -1. `isEnd()` inside inner `next()`?
+     - The inner `next()` does NOT check `isEnd()` at the very beginning before reading?
+     - Yes it does: `if (isEnd()) return;`.
+     - But `read()` was already called in the outer `next()`? No, `read()` is called at start of `next()`.
+     
+     Let's trace `next()` on `\n`:
+     ```java
+     public void next() ... {
+         if (isEnd()) return; // Check 1
+         char c = read(); // Reads \n
+         // ...
+         else if (c == '\n') {
+             lineNum++;
+             next(); // Recursive Call
+             return;
+         }
+     }
+     ```
+     Recursive `next()`:
+     ```java
+     public void next() ... {
+         if (isEnd()) return; // Check 2. If EOF, returns immediately.
+         char c = read(); // If not EOF, reads.
+         // ...
+     }
+     ```
+     
+     If `available()` is 0 at Check 2:
+     - Inner `next()` returns immediately.
+     - `curToken` is NOT updated in inner `next()`.
+     - BUT, `curToken` was ALREADY set to `RBRACE` in the previous iteration.
+     - Wait, `curToken` is a field. It persists.
+     - In the iteration where we read `\n`, `curToken` is NOT set to a new valid token. It remains whatever it was before?
+     - No, `curToken` is set at the END of `next()`.
+     
+     Let's trace carefully.
+     Iteration N (reads `}`):
+     - `next()` sets `curToken` = `RBRACE`.
+     
+     Iteration N+1 (reads `\n`):
+     - `Compiler` calls `next()`.
+     - `isEnd()` false.
+     - `read()` gets `\n`.
+     - Enters `if (c == '\n')`.
+     - Calls `next()` recursively.
+       - Recursive `next()`:
+         - `isEnd()` true (EOF).
+         - Returns immediately.
+       - Back to outer `next()`.
+       - `return;`
+     - **Crucial Point**: The outer `next()` (that read `\n`) returns WITHOUT reaching the line `curToken = new Token(...)`.
+     - Therefore, `curToken` remains `RBRACE` from the previous iteration!
+     
+     Back in `Compiler`:
+     - `peek()` returns `curToken` which is still `RBRACE`.
+     - `getType()` is not null.
+     - Adds `RBRACE` again.
+     
+     This confirms the bug. When `next()` encounters a trailing newline (or whitespace) that leads to EOF via recursion, and the recursive call hits EOF and returns early, the outer call also returns early (via its own `return` statement in the whitespace block) without updating `curToken` to a null/empty token. Thus, the previous token is duplicated.
+
+     The fix should ensure that `curToken` is cleared or set to a null token if no new token is found, OR the loop in `Compiler` should handle this, OR `Lexer` should handle EOF consistently.
+
+     The most robust fix in `Lexer` is to ensure that if we consume whitespace/comments and hit EOF, we don't leave the old token hanging. However, modifying `Compiler` is also possible. Given the prompt asks to identify the location of errors in the program, and `Compiler.java` contains the logic that blindly trusts `peek()` after `next()`, while `Lexer.java` has the flaw of not resetting `curToken` on certain paths, both are involved. But the root cause is `Lexer` failing to update `curToken` when it consumes trailing whitespace/newline leading to EOF.
+
+     Specifically, in `Lexer.java`, the branches for whitespace, newlines, and comments call `next()` recursively and then `return`. If the recursive call hits `isEnd()` and returns without setting `curToken` (or sets it to null), the current call returns without setting `curToken` either. If the recursive call *did* set `curToken` (e.g. found a token after whitespace), it would be fine. But if it hits EOF, it returns early.
+
+     Actually, looking at `next()`:
+     ```java
+        if (isEnd()) {
+            return;
+        }
+     ```
+     If `isEnd()` is true, it returns without changing `curToken`.
+     
+     So if we have `}\n`:
+     1. Read `}`. Set `curToken` = `RBRACE`.
+     2. Read `\n`. Recursive `next()`.
+     3. Recursive `isEnd()` is true. Returns.
+     4. Outer `next()` returns.
+     5. `curToken` is still `RBRACE`.
+     
+     The error is in `Lexer.java` because it allows `curToken` to remain stale when the stream ends with whitespace/newlines.
+
+<frontend/Lexer.java>
+...
+    public void next() throws Error_A, IOException {
+        if (isEnd()) {
+            return;
+        }
+        char c = read();
+        StringBuilder sb = new StringBuilder();
+        LexType lexType = null;
+        if (isLetter(c) || c == '_') {
+...
+        } else if (c == '\n') {
+            lineNum++;
+            next();
+            return;
+        } else if (c == ' ' || c == '\t' || c == '\r') {
+            next();
+            return;
+        }
+        curToken = new Token(sb.toString(),lexType,lineNum);
+    }
+...

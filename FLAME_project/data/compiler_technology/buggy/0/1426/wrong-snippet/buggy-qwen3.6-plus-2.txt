@@ -1,0 +1,521 @@
+Based on the problem description and the provided code, the issue is a **Time Limit Exceeded (TLE)** error. This typically indicates an infinite loop or extremely inefficient processing in the lexical analysis phase.
+
+Looking at `frontend/Lexer.java`, specifically the `addToken` method:
+
+1.  The method first checks for identifiers (`IDENFR`). If it matches, it consumes the characters and returns.
+2.  If it's not an identifier, it iterates through `TokenType.values()` to find a match using `matcher.lookingAt()`.
+3.  The `ERROR` token type is defined as `[&|]` in `TokenType.java`.
+4.  However, there is a logical flaw in how single-character errors like `&` or `|` are handled versus valid tokens like `&&` or `||`.
+5.  More critically, if `addToken` fails to match *any* token (falls through to the `System.err.println`), it does **not** advance `currentIndex`. Since `handletoken` calls `addToken` in a loop without checking if progress was made when `addToken` fails to find a token (though it prints an error), if the logic for identifying tokens misses a case or if the `ERROR` token isn't matched correctly before other partial matches cause issues, it could loop.
+6.  Let's look closer at `TokenType` order and regexes. `AND` is `\\&\\&` and `OR` is `\\|\\|`. `ERROR` is `[&|]`.
+7.  In `addToken`, the loop iterates through `TokenType.values()`. The order of enum constants matters. `MAINTK`... `INTCON`, `AND`, `OR` ... `ERROR`.
+8.  If the input contains `&`, `AND` (`&&`) will not match `lookingAt` because the next char is not `&`. Then `OR` won't match. Eventually `ERROR` (`[&|]`) will match `&`. It creates an `ERROR` token, advances `currentIndex` by 1, and returns. This seems correct for error handling.
+9.  However, look at `skipComment`.
+    ```java
+    while (!FileEnd() && !blockComment2.equals(FileValue.substring(currentIndex, currentIndex + 2))) {
+        if (FileValue.charAt(currentIndex) == '\n') {
+            currentLine++;
+        }
+        currentIndex++;
+    }
+    ```
+    If `blockComment2` (`*/`) is never found, `currentIndex` goes to `FileValue.length()`. `FileEnd()` becomes true. Loop terminates. `skipComment` returns `false` (because the inner `if` checking for `blockComment2` after the loop fails? No, wait).
+    
+    Actually, let's look at `skipComment` again:
+    ```java
+    } else if (currentIndex + 1 < FileValue.length() && blockComment1.equals(FileValue.substring(currentIndex, currentIndex + 2))) {
+        currentIndex += blockComment1.length();
+        while (!FileEnd() && !blockComment2.equals(FileValue.substring(currentIndex, currentIndex + 2))) {
+             // ... increments currentIndex
+        }
+        if (!FileEnd() && blockComment2.equals(FileValue.substring(currentIndex, currentIndex + 2))) {
+            currentIndex += blockComment2.length();
+            return true;
+        }
+    }
+    return false;
+    ```
+    If a block comment is opened but never closed, `currentIndex` reaches the end. The `if` condition `!FileEnd()` fails. It returns `false`.
+    Back in `handletoken`:
+    ```java
+    if (skipComment()) {
+        continue;
+    }
+    addToken();
+    ```
+    If `skipComment` returns `false` because it consumed the rest of the file looking for a closing comment that doesn't exist, `currentIndex` is now at `FileValue.length()`.
+    `handletoken` loops: `while (!FileEnd())`. Now `FileEnd()` is true. The loop terminates. This is safe.
+
+    Let's re-examine `addToken` for potential infinite loops.
+    If `addToken` finds no match, it prints an error but **does not increment `currentIndex`**.
+    ```java
+    System.err.println("No valid token found at line " + currentLine + " at index " + currentIndex);
+    ```
+    The method returns. Back in `handletoken`, the loop continues. `skipWhiteSpace` is called. If the character at `currentIndex` is not whitespace, `skipWhiteSpace` does nothing. `skipComment` is called. If it's not a comment, it returns false. `addToken` is called again. It fails again. Infinite loop.
+
+    Why would `addToken` fail to find a token?
+    The `ERROR` token `[&|]` should catch standalone `&` or `|`.
+    What about other invalid characters? E.g., `@`, `#`, `$`?
+    The `TokenType` enum does **not** have a catch-all pattern for any other invalid character.
+    If the input contains a character like `@`, none of the patterns will match:
+    - Identifiers: `[A-Za-z_]...` -> No.
+    - Keywords/Operators: Specific strings or chars. `@` is not among them.
+    - `ERROR`: `[&|]` -> No.
+    
+    So, if the test case contains any character that is not whitespace, not part of a comment, not a valid token, and not `&` or `|`, `addToken` will fail to match anything, print an error, and return without advancing `currentIndex`. This causes an infinite loop in `handletoken`.
+
+    Although the problem statement says "Each erroneous example will contain only lexical analysis errors... error category code a: The symbols "&" and "|" appearing individually", it implies these are the *only* errors we need to report. However, a robust lexer shouldn't hang on unexpected input. But more importantly, does the provided test case contain such characters?
+    
+    Looking at the test case input provided in the prompt:
+    It looks like a standard C-like program.
+    Wait, look at `CHRCON` definition: `'[^']*'`.
+    And `STRCON`: `"[^"]*"`.
+    
+    Let's look at `TokenType` order again.
+    `AND` (`&&`) comes before `ERROR` (`[&|]`).
+    `OR` (`||`) comes before `ERROR` (`[&|]`).
+    
+    If the input is `&`, `AND` matcher `lookingAt` fails. `ERROR` matcher `lookingAt` succeeds. Token `ERROR` is created. `currentIndex` advances. Correct.
+    
+    Is there a case where `addToken` matches nothing?
+    What if the input has a character like `\` (backslash) not inside a string/char?
+    Or `?`?
+    The provided test case seems clean regarding standard tokens.
+    
+    However, there is a subtle bug in `skipComment` for block comments if the file ends immediately after `/*`.
+    `currentIndex` advances past `/*`.
+    `while (!FileEnd() ...)`
+    If `FileEnd()` is true immediately (file is just `/*`), the loop doesn't run.
+    Then `if (!FileEnd() ...)` checks. `FileEnd()` is true. Condition fails.
+    Returns `false`.
+    `currentIndex` is at end. `handletoken` loop ends. Safe.
+
+    Let's look at `readFromStream`.
+    It appends `\n` to each line.
+    If the file ends with a newline, it removes the last `\n`.
+    
+    Let's look at `CHRCON` regex: `'[^']*'`.
+    This regex requires a closing quote.
+    If we have `'a'`, it matches.
+    If we have `'` (single quote) followed by newline?
+    `[^']*` matches empty string? No, `*` allows zero or more.
+    So `'` followed by `'` matches `''`.
+    What if we have just `'`?
+    Regex `'[^']*'` tries to match.
+    It sees `'`. Then `[^']*` matches as much non-quote as possible.
+    If next char is newline, it matches newline.
+    It keeps going until it finds a `'` or end of string.
+    If it reaches end of string without finding `'`, `lookingAt` might fail?
+    Actually, `Matcher.lookingAt()` attempts to match the pattern against the beginning of the region.
+    If the pattern is `'[^']*'`, it needs a closing `'`.
+    If there is no closing `'`, `lookingAt` returns `false`.
+    
+    If we have an unterminated char constant `'a`, `CHRCON` fails.
+    Does any other token match `'`?
+    `ERROR` is `[&|]`. No.
+    So `addToken` fails to match `'`.
+    It prints error.
+    It does NOT advance `currentIndex`.
+    Infinite loop.
+
+    The problem states: "For an erroneous source program... output the line number... error type code".
+    Error type `a` is specifically for `&` and `|`.
+    It does **not** specify error types for unterminated strings or chars.
+    However, the test case provided in the prompt is:
+    `char str[10] = {'3', '\''};`
+    
+    Let's analyze `'\''.`
+    The source text is `'\''.`
+    The regex for `CHRCON` is `'[^']*'`.
+    The content inside is `\'`.
+    The backslash `\` is not a quote `'`. So `[^']*` matches `\'`.
+    Then it expects a closing `'`.
+    The string is `'\''.`
+    Char 0: `'`
+    Char 1: `\`
+    Char 2: `'`  <- This is matched by `[^']*`? Yes, because it's not a quote? Wait.
+    The regex `[^']` means "any character except single quote".
+    So `\'` consists of `\` and `'`.
+    The `'` inside is a single quote. So `[^']` does **not** match `'`.
+    So `[^']*` matches only `\`.
+    Then the regex expects `'`.
+    The next character in input is `'`.
+    So `'\'` matches `'` + `\` + `'`.
+    So `CHRCON` matches `'\''.`
+    This is correct.
+
+    So why TLE?
+    
+    Let's look at `IDENFR` matching in `addToken`.
+    ```java
+    Pattern idenfrPattern = Pattern.compile("[_A-Za-z][_A-Za-z0-9]*");
+    Matcher idenfrMatcher = idenfrPattern.matcher(remainingString);
+    if (idenfrMatcher.lookingAt()) {
+        String tokenStr = idenfrMatcher.group();
+        Token token = new Token(tokenStr, TokenType.IDENFR, currentLine);
+        currentIndex += tokenStr.length();
+
+        for (TokenType tokenType : TokenType.values()) {
+            Pattern pattern = tokenType.getPattern();
+            Matcher matcher = pattern.matcher(tokenStr);
+            if (matcher.matches()) {
+                token.setType(tokenType);
+                break;
+            }
+        }
+        this.tokens.add(token);
+        return;
+    }
+    ```
+    This logic identifies an identifier-like string, then checks if it's a keyword.
+    
+    What if the input starts with a digit? `123`.
+    `idenfrPattern` `[A-Za-z_]...` does not match.
+    Falls through to loop.
+    `INTCON` `[0-9]+` matches.
+    Token created. Index advanced. OK.
+
+    What if the input starts with `"`?
+    `STRCON` `"[^"]*"`. Matches. OK.
+
+    Is it possible that `skipWhiteSpace` or `skipComment` is causing the TLE?
+    
+    Let's look at `skipComment` again.
+    ```java
+    if (currentIndex + 1 < FileValue.length() && lineComment.equals(FileValue.substring(currentIndex, currentIndex + 2))) {
+        currentIndex = FileValue.indexOf('\n', currentIndex);
+        if (currentIndex == -1) {
+            currentIndex = FileValue.length();
+        } else {
+            currentIndex++;
+            currentLine++;
+        }
+        return true;
+    }
+    ```
+    If `//` is at the very end of the file, with no newline.
+    `indexOf` returns -1.
+    `currentIndex` set to length.
+    Returns true.
+    Loop ends. OK.
+
+    There is a known issue with `Matcher.lookingAt()` vs `matches()` and regex performance, but usually not TLE unless catastrophic backtracking occurs.
+    `[^']*` and `[^"]*` are safe.
+    
+    Let's look at the `ERROR` token definition again.
+    `ERROR("[&|]")`
+    
+    If the code encounters a character that is NOT matched by ANY token type, it enters an infinite loop.
+    Are there any such characters in the test file?
+    The test file contains standard ASCII.
+    However, look at `CHRCON` again: `'[^']*'`.
+    And `STRCON`: `"[^"]*"`.
+    
+    What if there is a backslash `\` outside of strings?
+    Example: `int a = 1 \ 2;`
+    `\` is not an identifier start.
+    Not a number.
+    Not `&` or `|`.
+    Not any operator.
+    `addToken` fails. Infinite loop.
+    
+    But the test case provided doesn't seem to have stray backslashes.
+    
+    Wait, look at `frontend/TokenType.java`.
+    The enum values are compiled into Patterns.
+    
+    Is it possible the TLE is due to the `isError` check or output? No, that's linear.
+    
+    Let's look closely at `Lexer.java` -> `addToken`.
+    
+    ```java
+    private void addToken() {
+        String remainingString = FileValue.substring(currentIndex);
+        // ...
+    }
+    ```
+    `FileValue.substring(currentIndex)` creates a new String every time. For large files, this is O(N^2) memory/time. But for a small test case, it shouldn't TLE unless the loop is infinite.
+    
+    If the loop is infinite, it must be because `currentIndex` is not advancing.
+    This happens if `addToken` doesn't match anything.
+    
+    Does the test case contain any character that doesn't match?
+    
+    Let's check the test case content carefully.
+    `char str[10] = {'3', '\''};`
+    
+    When parsing `'\'':`
+    1. `skipWhiteSpace` skips spaces.
+    2. `skipComment` returns false.
+    3. `addToken` called.
+    4. `idenfrPattern` checks `'`. No match.
+    5. Loop through TokenTypes.
+       - `MAINTK`... `INTCON`: No.
+       - `AND`: `&&`. No.
+       - ...
+       - `CHRCON`: `'[^']*'`.
+         Input: `'\'', ...`
+         Matcher `lookingAt`.
+         Matches `'`.
+         Then `[^']*`. Matches `\` (backslash is not quote).
+         Next char is `'`. Quote. Stop `[^']*`.
+         Expects `'`. Next char is `'`. Match.
+         Group is `'\''.`
+         Token created. `currentIndex` advances by 4.
+         
+    This seems fine.
+
+    What about `printf("22373040\n");`?
+    String `"22373040\n"`.
+    `STRCON`: `"[^"]*"`.
+    Matches `"`.
+    `[^"]*` matches `22373040\n` (literal backslash n? No, in source file it is two chars `\` and `n`).
+    Backslash is not quote. `n` is not quote.
+    Matches until closing `"`.
+    OK.
+
+    Is there a hidden character?
+    
+    Let's look at `Compiler.java`.
+    ```java
+    public void analyze() {
+        for (Token token : lexer.getTokens()) {
+            if (isError(token)) {
+                String errorMessage = token.getLine() + " " + "a";
+                errorMessages.add(errorMessage);
+                error = 1;
+            }
+        }
+    }
+    ```
+    This runs AFTER lexing. So lexing must finish.
+    
+    If lexing hangs, it's in `handletoken`.
+    
+    Hypothesis: The `ERROR` token `[&|]` is defined, but what if the input contains `&` or `|` and the `AND`/`OR` patterns interfere?
+    No, `lookingAt` is prefix match.
+    `&&` matches `AND`.
+    `&` does not match `AND`. Matches `ERROR`.
+    
+    What if the input contains a character like `~` or `^`?
+    Not in the token list.
+    If the test file provided in the prompt is the EXACT input, I don't see `~` or `^`.
+    
+    However, there is one very common cause for TLE in student lexers: **Catastrophic Backtracking** in Regex or **Infinite Loop on Unmatched Character**.
+    
+    Given the constraint "Each erroneous example will contain exactly one error" and "error category code a", it implies the test cases might be valid programs OR programs with `&`/`|` errors.
+    
+    If the test case is the one provided in the prompt, it looks like a **correct** program (except maybe for some semantic errors, but lexically it should be fine).
+    Wait, look at this line in the test case:
+    `char str[10] = {'3', '\''};`
+    
+    And this line:
+    `const char _str[10] = "str";`
+    
+    And:
+    `printf("Input integer: %d\n", i);`
+    
+    Everything looks lexically valid.
+    
+    So why TLE?
+    
+    Let's look at `skipComment` again.
+    
+    ```java
+    private boolean skipComment() {
+        if (currentIndex + 1 < FileValue.length() && lineComment.equals(FileValue.substring(currentIndex, currentIndex + 2))) {
+            // ...
+        } else if (currentIndex + 1 < FileValue.length() && blockComment1.equals(FileValue.substring(currentIndex, currentIndex + 2))) {
+            currentIndex += blockComment1.length();
+            while (!FileEnd() && !blockComment2.equals(FileValue.substring(currentIndex, currentIndex + 2))) {
+                if (FileValue.charAt(currentIndex) == '\n') {
+                    currentLine++;
+                }
+                currentIndex++;
+            }
+            if (!FileEnd() && blockComment2.equals(FileValue.substring(currentIndex, currentIndex + 2))) {
+                currentIndex += blockComment2.length();
+                return true;
+            }
+        }
+        return false;
+    }
+    ```
+    
+    If we have `/* ... */`, it works.
+    
+    What if we have nested comments? C doesn't support them, but if the input has `/* /* */`, the first `*/` closes it.
+    
+    Is it possible that `FileValue.substring` is causing performance issues?
+    In Java, `substring` used to share the char array (pre-Java 7u6), but now copies.
+    Calling `substring` in a loop for every token is O(N^2).
+    For a small file, this is fast.
+    
+    Let's look at the `IDENFR` check again.
+    
+    ```java
+    Pattern idenfrPattern = Pattern.compile("[_A-Za-z][_A-Za-z0-9]*");
+    Matcher idenfrMatcher = idenfrPattern.matcher(remainingString);
+    if (idenfrMatcher.lookingAt()) {
+        String tokenStr = idenfrMatcher.group();
+        // ...
+        for (TokenType tokenType : TokenType.values()) {
+             // ...
+        }
+    }
+    ```
+    
+    This loop iterates ALL token types for EVERY identifier to check if it's a keyword.
+    There are ~30 token types.
+    This is inefficient but not TLE for small inputs.
+    
+    **Crucial Observation:**
+    
+    Look at `TokenType.ERROR`.
+    `ERROR("[&|]")`
+    
+    Look at `TokenType.AND`.
+    `AND("\\&\\&")`
+    
+    Look at `TokenType.OR`.
+    `OR("\\|\\|")`
+    
+    In `addToken`, the loop iterates through `TokenType.values()`.
+    The order is defined in the enum.
+    `AND` appears before `ERROR`.
+    `OR` appears before `ERROR`.
+    
+    If the input is `&`, `AND` fails. `ERROR` matches.
+    
+    However, what if the input is `&&`?
+    `AND` matches.
+    
+    What if the input is `&` followed by EOF?
+    `AND` fails. `ERROR` matches.
+    
+    There is a subtle bug in `skipComment` regarding `blockComment2` check.
+    `blockComment2.equals(FileValue.substring(currentIndex, currentIndex + 2))`
+    If `currentIndex` is at `length - 1`, `currentIndex + 2` is `length + 1`.
+    `substring` throws `StringIndexOutOfBoundsException`?
+    No, the `while` condition checks `!FileEnd()`.
+    `FileEnd()` is `currentIndex >= length`.
+    Inside the loop:
+    `currentIndex` is `< length`.
+    `substring(currentIndex, currentIndex + 2)` requires `currentIndex + 2 <= length`.
+    If `currentIndex == length - 1`, then `currentIndex + 2 == length + 1`.
+    This will throw an exception!
+    
+    Let's trace:
+    File: `/* a` (length 4). Indices 0,1,2,3.
+    `skipComment` detects `/*` at 0.
+    `currentIndex` becomes 2.
+    Loop:
+    `currentIndex` (2) < 4. True.
+    `substring(2, 4)` is ` a`. Not `*/`.
+    `charAt(2)` is ` `. Not `\n`.
+    `currentIndex` becomes 3.
+    Loop:
+    `currentIndex` (3) < 4. True.
+    `substring(3, 5)` -> **Exception!** Index 5 out of bounds for length 4.
+    
+    So, if a block comment is not terminated and ends at the last character of the file, `substring` crashes.
+    But the error is TLE, not Runtime Error.
+    
+    Unless... the exception is caught somewhere? No try-catch in `handletoken`.
+    
+    Wait, if the program crashes, it's not TLE.
+    
+    Let's look at `lineComment` handling.
+    `currentIndex = FileValue.indexOf('\n', currentIndex);`
+    
+    If the file ends with `//` and no newline.
+    `indexOf` returns -1.
+    `currentIndex` set to `length`.
+    Returns true.
+    
+    Okay, look at `addToken` again.
+    
+    If `addToken` encounters a character it cannot match, it loops infinitely.
+    
+    Does the test case contain such a character?
+    
+    Maybe the issue is simpler.
+    
+    In `Compiler.java`:
+    ```java
+    public void outputResults(String lexerOutputPath, String errorOutputPath) throws IOException {
+        if(error == 0) {
+            // ... writes lexer.txt
+        }
+        else {
+            // ... writes error.txt
+        }
+    }
+    ```
+    
+    If `error` is 0, it writes tokens.
+    
+    If the lexer hangs, `outputResults` is never called.
+    
+    The most likely cause of TLE in a lexer is an **infinite loop due to an unmatched character**.
+    
+    Even if the provided test case *looks* clean, if there is ANY character not covered by the regexes, it hangs.
+    
+    Covered:
+    - Identifiers/Keywords
+    - Integers
+    - Strings/Chars
+    - Operators (`+`, `-`, etc.)
+    - `&`, `|` (via ERROR)
+    
+    NOT Covered:
+    - `~`, `^`, `?`, `:`, `.`, `@`, `#`, `$`, `` ` ``, etc.
+    
+    If the test file contains any of these, it hangs.
+    
+    However, I must identify the error location based on the code.
+    
+    The code snippet where the error is likely located is the `addToken` method in `Lexer.java`, specifically the part where it fails to advance the index if no token is matched.
+
+<frontend/Lexer.java>
+...
+    private void addToken() {
+        String remainingString = FileValue.substring(currentIndex);
+
+        // 首先检测是否为 IDENFR
+        Pattern idenfrPattern = Pattern.compile("[_A-Za-z][_A-Za-z0-9]*");
+        Matcher idenfrMatcher = idenfrPattern.matcher(remainingString);
+        if (idenfrMatcher.lookingAt()) {
+            String tokenStr = idenfrMatcher.group();
+            Token token = new Token(tokenStr, TokenType.IDENFR, currentLine);
+            //System.out.println(tokenStr);
+            currentIndex += tokenStr.length();
+
+            for (TokenType tokenType : TokenType.values()) {
+                Pattern pattern = tokenType.getPattern();
+                Matcher matcher = pattern.matcher(tokenStr);
+                if (matcher.matches()) {
+                    token.setType(tokenType);
+                    break;
+                }
+            }
+            this.tokens.add(token);
+            return;
+        }
+
+        // 接下来检测其他符号和常量
+        for (TokenType tokenType : TokenType.values()) {
+            Matcher matcher = tokenType.getPattern().matcher(remainingString);
+            if (matcher.lookingAt()) {
+                String tokenStr = matcher.group();
+
+                // 创建 Token 对象
+                Token token = new Token(tokenStr, tokenType, currentLine);
+                currentIndex += tokenStr.length();
+                this.tokens.add(token);
+                return; // 找到匹配后返回
+            }
+        }
+        System.err.println("No valid token found at line " + currentLine + " at index " + currentIndex);
+    }
+...

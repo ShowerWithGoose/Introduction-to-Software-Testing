@@ -1,0 +1,312 @@
+<frontend/Lexer.java>
+...
+    public String getLetter(){
+        //用来获取字母
+        StringBuilder sb = new StringBuilder();
+        while (positionNum < inputLine.length() && Character.isLetter(inputLine.charAt(positionNum))){
+            sb.append(inputLine.charAt(positionNum));
+            positionNum++;
+        }
+        return sb.toString();
+    }
+    public void sortLetter(String letter){
+...
+        }else {
+            //Letter属于Ident，需要匹配后面是否有数字
+            String temNum="";
+            if (positionNum < inputLine.length() && Character.isDigit(inputLine.charAt(positionNum))){ @@ The code does not check if positionNum is out of bounds before accessing inputLine.charAt(positionNum), which can cause an IndexOutOfBoundsException if the identifier is at the end of the input. Additionally, the logic for handling identifiers is flawed because it only checks for digits immediately following letters, but identifiers in many languages (and likely this one given the test case `i=0` vs `i=4`) can contain underscores or other characters, or more importantly, the current implementation fails to correctly tokenize numbers that are part of an identifier context if not handled carefully. However, the primary issue revealed by the diff is that `getNumber` is called and appended to the identifier. In the test case `i=4`, `i` is read as a letter. Then `sortLetter` is called with "i". It checks if the next char is a digit. The next char is `=`. So `temNum` remains empty. Token `IDENFR i` is created. This part seems correct for `i`. Let's look at `i=4;`. `i` is IDENFR. `=` is ASSIGN. `4` is INTCON. The buggy output shows `ASSIGN =` then `SEMICN ;` for `i=4;`? No, looking at the buggy output:
+`IDENFR i`
+`ASSIGN =`
+`SEMICN ;`
+It missed `INTCON 4`.
+Wait, let's look at `int x[10],i=0;`.
+Buggy: `IDENFR i`, `ASSIGN =`, `SEMICN ;`. It missed `INTCON 0`.
+Expected: `IDENFR i`, `ASSIGN =`, `INTCON 0`, `SEMICN ;`.
+
+Let's look at `i=4;`.
+Buggy: `IDENFR i`, `ASSIGN =`, `SEMICN ;`. Missed `INTCON 4`.
+Expected: `IDENFR i`, `ASSIGN =`, `INTCON 4`, `SEMICN ;`.
+
+The problem is in how numbers are parsed.
+In `initProcess`:
+```java
+            } else if (Character.isDigit(curToken)) {
+                //如果是数字类型的开头
+                String temNum = getNumber();
+                Token token = new Token(TokenType.INTCON,temNum,lineNum);
+                tokenList.addToken(token);
+            }
+```
+This looks correct for standalone numbers.
+
+Why are numbers after `=` missing?
+Let's trace `i=0;`.
+1. `i` is letter. `getLetter()` returns "i". `positionNum` is at `=`.
+2. `sortLetter("i")`. Checks `inputLine.charAt(positionNum)` which is `=`. Not a digit. Creates `IDENFR i`.
+3. Back to `initProcess`. Loop continues. `curToken` is `=`.
+4. `=` branch. `positionNum++` (now at `0`). Next char is `;`. Not `=`. Creates `ASSIGN =`. `positionNum++` (now at `;`).
+5. Back to `initProcess`. Loop continues. `curToken` is `;`.
+6. `;` branch. Creates `SEMICN ;`. `positionNum++`.
+
+Wait, where did the `0` go?
+Ah, look at `getLetter`.
+```java
+    public String getLetter(){
+        //用来获取字母
+        StringBuilder sb = new StringBuilder();
+        while (positionNum < inputLine.length() && Character.isLetter(inputLine.charAt(positionNum))){
+            sb.append(inputLine.charAt(positionNum));
+            positionNum++;
+        }
+        return sb.toString();
+    }
+```
+This stops when it hits a non-letter. So for `i=0`, it reads `i`, stops at `=`. Correct.
+
+Let's look at the `sortLetter` again.
+```java
+        }else {
+            //Letter属于Ident，需要匹配后面是否有数字
+            String temNum="";
+            if (Character.isDigit(inputLine.charAt(positionNum))){
+                temNum = getNumber();
+            }
+            Token token = new Token(TokenType.IDENFR,letter+temNum,lineNum);
+            tokenList.addToken(token);
+        }
+```
+If the identifier is just `i`, and next is `=`, it creates `IDENFR i`. Correct.
+
+So why is `0` skipped?
+Let's re-read the `initProcess` loop structure.
+```java
+        while (positionNum < inputLine.length()){
+            //拿到了curToken
+            char curToken = inputLine.charAt(positionNum);
+            //进行分类
+            if (Character.isLetter(curToken)){
+                //如果是字母类型的开头，需要分类
+                String temLetter = getLetter();
+                sortLetter(temLetter);
+            } else if (Character.isDigit(curToken)) {
+                //如果是数字类型的开头
+                String temNum = getNumber();
+                Token token = new Token(TokenType.INTCON,temNum,lineNum);
+                tokenList.addToken(token);
+            } 
+...
+```
+If `i=0;` is processed:
+1. `i` is letter. `getLetter` consumes `i`. `positionNum` points to `=`. `sortLetter` creates `IDENFR i`.
+2. Loop continues. `curToken` is `=`.
+3. `=` branch. `positionNum` increments to point to `0`. Checks next char `;`. Not `=`. Creates `ASSIGN =`. `positionNum` increments to point to `;`. **WAIT**.
+In the `=` branch:
+```java
+            } else if (curToken == '=') {
+                //如果是等于开头，需要分类区分=和==
+                positionNum++;
+                char nextToken = inputLine.charAt(positionNum);
+                if (nextToken == '='){
+                    Token token = new Token(TokenType.EQL,"==",lineNum);
+                    tokenList.addToken(token);
+                    positionNum++;
+                }else {
+                    Token token = new Token(TokenType.ASSIGN,"=",lineNum);
+                    tokenList.addToken(token);
+                    positionNum++;
+                }
+            }
+```
+If `nextToken` is not `=`, it creates `ASSIGN`, then `positionNum++`.
+So if we were at `=` (index k), `positionNum` becomes k+1 (pointing to `0`). `nextToken` is `0`. Not `=`. Creates `ASSIGN`. `positionNum` becomes k+2 (pointing to `;`).
+The digit `0` at k+1 was SKIPPED. It was read into `nextToken` but not consumed as a token start. The `positionNum` was incremented past it.
+
+This is the bug. When checking for two-character operators like `==`, `!=`, `<=`, `>=`, `&&`, `||`, the code reads the next character to decide. If it's NOT a two-character operator, it treats the current character as a single-character operator. However, it has already advanced `positionNum` to read the next character. If that next character is not part of the operator (e.g., it's a digit or letter starting a new token), the code simply increments `positionNum` again, effectively skipping the character at `positionNum` (the one read into `nextToken`).
+
+For example, in `i=0`:
+1. At `=`. `positionNum` is index of `=`.
+2. Enter `=` branch. `positionNum++`. Now points to `0`.
+3. `nextToken` = `0`.
+4. `nextToken != '='`.
+5. Create `ASSIGN`.
+6. `positionNum++`. Now points to `;`.
+7. The `0` was never processed as a digit token.
+
+The fix should be: if it's not a two-char operator, we should NOT have advanced `positionNum` past the next character, OR we should handle the fact that `positionNum` is now pointing to the next character.
+Actually, the standard way is:
+1. Peek at next char.
+2. If it forms a 2-char token, consume both.
+3. If not, treat current char as 1-char token, and do NOT consume the next char (it will be processed in the next iteration).
+
+In the current code:
+```java
+            } else if (curToken == '=') {
+                positionNum++; // Advance to next char
+                char nextToken = inputLine.charAt(positionNum);
+                if (nextToken == '='){
+                    // ...
+                    positionNum++; // Consume second char
+                }else {
+                    // ...
+                    positionNum++; // Consume the next char?? NO. The next char is not part of the token.
+                }
+            }
+```
+The `positionNum++` in the `else` block is wrong. It skips the character that was just peeked.
+
+This applies to `!`, `&`, `|`, `<`, `>`, `=`, `/` (comments handled differently).
+
+Let's check `/`.
+```java
+            } else if (curToken == '/') {
+                //如果是除号开头，需要分类
+                positionNum++;
+                char nextToken = inputLine.charAt(positionNum);
+                if (nextToken == '/'){
+                    //单行注释
+                    positionNum++;
+                    while (inputLine.charAt(positionNum) != '\n'){
+                        positionNum++;
+                    }
+                    lineNum++;
+                } else if (nextToken == '*') {
+                    //多行注释
+                    positionNum++;
+                    while (inputLine.charAt(positionNum) != '*' || inputLine.charAt(positionNum + 1) != '/'){
+                        if (inputLine.charAt(positionNum) == '\n'){
+                            lineNum++;
+                        }
+                        positionNum++;
+                    }
+                    positionNum = positionNum + 2;
+                } else {
+                    //除号
+                    Token token = new Token(TokenType.DIV,"/",lineNum);
+                    tokenList.addToken(token);
+                    positionNum++;
+                }
+            }
+```
+Same bug here. If it's just `/`, `positionNum` was advanced to peek. Then in `else`, it advances again. Skips the char after `/`.
+
+So the error is in all these two-char operator checks. The `positionNum++` in the `else` branches (where it's a single char operator) is incorrect because `positionNum` was already incremented to peek. It should be decremented, or the peek should be done without incrementing, or the increment should only happen if it's a match.
+
+The easiest fix is to remove the `positionNum++` in the `else` blocks of these operators, BUT since `positionNum` was already incremented at the start of the block, we need to decrement it back so the next loop iteration processes that character. Or, better yet, don't increment `positionNum` until we know what we're doing.
+
+However, the prompt asks to identify the location. The locations are the `else` blocks inside the two-char operator handling.
+
+Let's annotate the `=` case as representative, or all of them. The prompt asks for the code snippet where the error is likely to be located. I will provide the `Lexer.java` file with annotations on the problematic lines.
+
+<frontend/Lexer.java>
+...
+            } else if (curToken == '!') {
+                //如果是感叹号开头，需要分类来区分!和!=
+                positionNum++;
+                char nextToken = inputLine.charAt(positionNum);
+                if (nextToken == '='){
+                    Token token = new Token(TokenType.NEQ,"!=",lineNum);
+                    tokenList.addToken(token);
+                    positionNum++;
+                }else {
+                    Token token = new Token(TokenType.NOT,"!",lineNum);
+                    tokenList.addToken(token);
+                    positionNum++; // @@ Incorrectly increments positionNum, skipping the character peeked (nextToken). Should decrement positionNum or not increment it here.
+                }
+            } else if (curToken == '&') {
+                //如果是和符号开头，需要分类来区分&&和error
+                positionNum++;
+                char nextToken = inputLine.charAt(positionNum);
+                if (nextToken == '&'){
+                    Token token = new Token(TokenType.AND,"&&",lineNum);
+                    tokenList.addToken(token);
+                    positionNum++;
+                }else {
+                    isFail = true;
+                    failLine.add(lineNum);
+                    positionNum++; // @@ Incorrectly increments positionNum, skipping the character peeked (nextToken).
+                }
+            } else if (curToken == '|') {
+                //如果是或符号开头，需要分类来区分||和error
+                positionNum++;
+                char nextToken = inputLine.charAt(positionNum);
+                if (nextToken == '|'){
+                    Token token = new Token(TokenType.OR,"||",lineNum);
+                    tokenList.addToken(token);
+                    positionNum++;
+                }else {
+                    isFail = true;
+                    failLine.add(lineNum);
+                    positionNum++; // @@ Incorrectly increments positionNum, skipping the character peeked (nextToken).
+                }
+            } else if (curToken == '+') {
+...
+            } else if (curToken == '/') {
+                //如果是除号开头，需要分类
+                positionNum++;
+                char nextToken = inputLine.charAt(positionNum);
+                if (nextToken == '/'){
+                    //单行注释
+                    positionNum++;
+                    while (inputLine.charAt(positionNum) != '\n'){
+                        positionNum++;
+                    }
+                    lineNum++;
+                } else if (nextToken == '*') {
+                    //多行注释
+                    positionNum++;
+                    while (inputLine.charAt(positionNum) != '*' || inputLine.charAt(positionNum + 1) != '/'){
+                        if (inputLine.charAt(positionNum) == '\n'){
+                            lineNum++;
+                        }
+                        positionNum++;
+                    }
+                    positionNum = positionNum + 2;
+                } else {
+                    //除号
+                    Token token = new Token(TokenType.DIV,"/",lineNum);
+                    tokenList.addToken(token);
+                    positionNum++; // @@ Incorrectly increments positionNum, skipping the character peeked (nextToken).
+                }
+            } else if (curToken == '%') {
+...
+            } else if (curToken == '<') {
+                //如果是小于开头，需要分类区分<和<=
+                positionNum++;
+                char nextToken = inputLine.charAt(positionNum);
+                if (nextToken == '='){
+                    Token token = new Token(TokenType.LEQ,"<=",lineNum);
+                    tokenList.addToken(token);
+                    positionNum++;
+                }else {
+                    Token token = new Token(TokenType.LSS,"<",lineNum);
+                    tokenList.addToken(token);
+                    positionNum++; // @@ Incorrectly increments positionNum, skipping the character peeked (nextToken).
+                }
+            } else if (curToken == '>') {
+                //如果是大于开头，需要分类区分>和>=
+                positionNum++;
+                char nextToken = inputLine.charAt(positionNum);
+                if (nextToken == '='){
+                    Token token = new Token(TokenType.GEQ,">=",lineNum);
+                    tokenList.addToken(token);
+                    positionNum++;
+                }else {
+                    Token token = new Token(TokenType.GRE,">",lineNum);
+                    tokenList.addToken(token);
+                    positionNum++; // @@ Incorrectly increments positionNum, skipping the character peeked (nextToken).
+                }
+            } else if (curToken == '=') {
+                //如果是等于开头，需要分类区分=和==
+                positionNum++;
+                char nextToken = inputLine.charAt(positionNum);
+                if (nextToken == '='){
+                    Token token = new Token(TokenType.EQL,"==",lineNum);
+                    tokenList.addToken(token);
+                    positionNum++;
+                }else {
+                    Token token = new Token(TokenType.ASSIGN,"=",lineNum);
+                    tokenList.addToken(token);
+                    positionNum++; // @@ Incorrectly increments positionNum, skipping the character peeked (nextToken).
+                }
+            } else if (curToken == ';') {
+...

@@ -1,0 +1,222 @@
+Based on the comparison between the buggy output and the expected output, the error occurs in the parsing of the statement `n = getint();;`.
+
+**Analysis:**
+1.  **Input:** `n = getint();;` inside `main`.
+2.  **Expected Behavior:** The parser should recognize `n = getint()` as an assignment statement involving a function call to `getint`. It should output the tokens for `n`, `=`, `getint`, `(`, `)`, `;` and then the non-terminal `<Stmt>`. The subsequent `;` should be parsed as an empty statement (or handled appropriately depending on grammar strictness, but here it seems to generate another `<Stmt>` or just consume the semicolon). Looking at the expected output, after the first `<Stmt>` corresponding to `n = getint();`, there is another `SEMICN ;` and `<Stmt>`. This implies the double semicolon results in two statements: one assignment and one empty statement.
+3.  **Buggy Behavior:** The buggy output shows:
+    ```
+    IDENFR n
+    <LVal>
+    ASSIGN =
+    SEMICN ;
+    <Character>  <-- Error starts here
+    <PrimaryExp>
+    ...
+    <Exp>
+    SEMICN ;
+    <Stmt>
+    ```
+    It seems the parser failed to recognize `getint` as a keyword/token in the context of the assignment. Instead, it likely treated `getint` incorrectly or skipped it, and then tried to parse the rest. Wait, looking closely at the buggy output around that area:
+    ```
+    IDENFR n
+    <LVal>
+    ASSIGN =
+    SEMICN ;   <-- It printed semicolon immediately after Assign? No, look at the input tokens.
+    ```
+    Actually, let's look at the `Stmt` parsing logic in `SytaxParser.java`.
+    
+    In the `else` block of `Stmt()`:
+    ```java
+    else { //LVAL
+        asdNodes.add(Lval());
+        /*Assign*/
+        tokenIndex++;
+        /*getInt*/
+        if (tokens.get(tokenIndex).getOringinStr().equals("getint")) {
+            tokenIndex+=2; // Skips 'getint' and '('
+
+            if(!tokens.get(tokenIndex).getOringinStr().equals(")"))
+            {
+                errorj();
+            }
+            else {
+                tokenIndex++;
+            }
+            if(!tokens.get(tokenIndex).getOringinStr().equals(";"))
+            {
+                errori();
+            }
+            else {
+                tokenIndex++;
+            }
+        }
+
+        /*getChar*/
+        if (tokens.get(tokenIndex).getOringinStr().equals("getchar")) {
+             // ... similar logic
+            return new Stmt(Stmt.Type.intputChar, asdNodes);
+        }
+
+        asdNodes.add(Exp()); // <--- This is executed if it's not getint/getchar specific handling?
+        // ...
+        return new Stmt(Stmt.Type.Assign, asdNodes);
+    }
+    ```
+    
+    The issue is in how `getint` is handled. The code checks `if (tokens.get(tokenIndex).getOringinStr().equals("getint"))`.
+    However, `getint` is a keyword. In the `LexicalAnalyzer`, `getint` is mapped to `GETINTTK`. The `Token` object stores `oringinStr` as "getint". So the check `tokens.get(tokenIndex).getOringinStr().equals("getint")` should work.
+    
+    Let's look at the Buggy Output again carefully:
+    ```
+    IDENFR n
+    <LVal>
+    ASSIGN =
+    SEMICN ; 
+    <Character>
+    ...
+    ```
+    This output sequence is very strange. `ASSIGN =` is printed. Then `SEMICN ;`. Then `<Character>`.
+    
+    If we look at `Stmt.Type.Assign` printing in `Stmt.java`:
+    ```java
+    case Assign:
+        asdNodeArrayList.get(0).printInfo(); // LVal
+        System.out.println("ASSIGN =");
+        asdNodeArrayList.get(1).printInfo(); // Exp
+        System.out.println("SEMICN ;");
+        break;
+    ```
+    
+    In the buggy code's `Stmt()` method:
+    ```java
+    else { //LVAL
+        asdNodes.add(Lval());
+        /*Assign*/
+        tokenIndex++; // Consumes '='
+        
+        /*getInt*/
+        if (tokens.get(tokenIndex).getOringinStr().equals("getint")) {
+             // ... handles getint ...
+             // BUT IT DOES NOT RETURN! It falls through.
+        }
+
+        /*getChar*/
+        if (tokens.get(tokenIndex).getOringinStr().equals("getchar")) {
+             // ...
+             return new Stmt(Stmt.Type.intputChar, asdNodes);
+        }
+
+        asdNodes.add(Exp()); // <--- Problematic line
+        // ...
+        return new Stmt(Stmt.Type.Assign, asdNodes);
+    }
+    ```
+    
+    If the token is `getint`, the `if` block executes. It advances `tokenIndex` past `getint`, `(`, `)`, `;`.
+    Then it exits the `if`.
+    Then it checks `getchar`. It is not `getchar`.
+    Then it executes `asdNodes.add(Exp())`.
+    
+    At this point, `tokenIndex` is pointing to the token *after* the semicolon of `getint();`. In the input `n = getint();;`, after consuming `getint();`, the next token is the second `;`.
+    So `Exp()` is called on `;`.
+    
+    Let's trace `Exp()`:
+    `Exp()` calls `AddExp()`.
+    `AddExp()` calls `MulExp()`.
+    `MulExp()` calls `UnaryExp()`.
+    `UnaryExp()` checks for unary ops, then func call, then `PrimaryExp()`.
+    `PrimaryExp()` checks `(`, `IDENFR`, `INTCON`, else `Character`.
+    
+    The current token is `;` (SEMICN).
+    It is not `(`, not `IDENFR`, not `INTCON`.
+    So it goes to `else { character=Character(); }`.
+    `Character()` calls `CharConst()`.
+    `CharConst()` takes `tokens.get(tokenIndex++)`.
+    So it consumes `;` and treats it as a CharConst.
+    This explains why `<Character>` appears in the output after `ASSIGN =`.
+    
+    So the bug is that when `getint` is detected, the code consumes the tokens for the function call and the semicolon, but **does not return**. It falls through to the standard `Exp()` parsing logic, which tries to parse the next token (the second `;`) as an expression, leading to incorrect parsing and output.
+    
+    Additionally, even if it didn't fall through, the `Stmt.Type.Assign` case expects an `Exp` node in `asdNodeArrayList.get(1)`. The special `getint` handling doesn't add an `Exp` node representing the `getint()` call to `asdNodes`. It just consumes tokens. So if it returned `Stmt.Type.Assign`, `asdNodes` would only have the `LVal`. `asdNodeArrayList.get(1)` would throw an IndexOutOfBoundsException or print nothing/wrong thing.
+    
+    However, the specific error type "Wrong Answer" and the output showing `<Character>` suggests the fall-through behavior described above.
+    
+    To fix this, the `getint` (and `getchar`) blocks should construct the appropriate AST nodes (likely treating `getint()` as a `UnaryExp` or `Exp`) and add them to `asdNodes`, OR return a specific `Stmt` type like `inputInt` which handles the printing correctly.
+    
+    Looking at `Stmt.java`, there are `inputInt` and `intputChar` types:
+    ```java
+    case inputInt:
+        asdNodeArrayList.get(0).printInfo();
+        System.out.println("ASSIGN =");
+        System.out.println("GETINTTK getint");
+        System.out.println("LPARENT (");
+        System.out.println("RPARENT )");
+        System.out.println("SEMICN ;");
+        break;
+    ```
+    
+    So the parser *should* return `new Stmt(Stmt.Type.inputInt, asdNodes)` after handling `getint`.
+    
+    The code currently is:
+    ```java
+    /*getInt*/
+    if (tokens.get(tokenIndex).getOringinStr().equals("getint")) {
+        tokenIndex+=2;
+        // ... checks and increments ...
+        // MISSING RETURN STATEMENT
+    }
+    ```
+    
+    It should return `new Stmt(Stmt.Type.inputInt, asdNodes)` inside that block.
+
+<FrontEnd/SytaxParser.java>
+...
+            else { //LVAL
+                asdNodes.add(Lval());
+                /*Assign*/
+                tokenIndex++;
+                /*getInt*/
+                if (tokens.get(tokenIndex).getOringinStr().equals("getint")) {
+                    tokenIndex+=2;
+
+                    if(!tokens.get(tokenIndex).getOringinStr().equals(")"))
+                    {
+                        errorj();
+                    }
+                    else {
+                        tokenIndex++;
+                    }
+                    if(!tokens.get(tokenIndex).getOringinStr().equals(";"))
+                    {
+                        errori();
+                    }
+                    else {
+                        tokenIndex++;
+                    }
+                    return new Stmt(Stmt.Type.inputInt, asdNodes);
+                }
+
+                /*getChar*/
+                if (tokens.get(tokenIndex).getOringinStr().equals("getchar")) {
+                    tokenIndex+=2;
+
+                    if(!tokens.get(tokenIndex).getOringinStr().equals(")"))
+                    {
+                        errorj();
+                    }
+                    else {
+                        tokenIndex++;
+                    }
+
+                    if(!tokens.get(tokenIndex).getOringinStr().equals(";"))
+                    {
+                        errori();
+                    }
+                    else {
+                        tokenIndex++;
+                    }
+                    return new Stmt(Stmt.Type.intputChar, asdNodes);
+                }
+
+                asdNodes.add(Exp());
+...

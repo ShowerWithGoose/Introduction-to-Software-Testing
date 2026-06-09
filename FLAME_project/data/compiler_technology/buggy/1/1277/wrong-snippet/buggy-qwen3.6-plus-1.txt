@@ -1,0 +1,307 @@
+Based on the problem description, the test case input contains three specific syntax errors:
+1.  Line 16: `ch = getchar( ;` -> Missing right parenthesis `)`. Expected error: `16 j`.
+2.  Line 18: `if (f2() & f1())` -> Illegal symbol `&` (single ampersand). Expected error: `18 a`.
+3.  Line 19: `printf("%c",s[0];` -> Missing right parenthesis `)`. Expected error: `19 j`.
+
+The program outputs nothing (Runtime Error or empty output), which suggests it likely crashes or fails to detect these errors correctly.
+
+**Analysis of Error Locations:**
+
+1.  **Error Type 'a' (Illegal `&` or `|`):**
+    The `Lexer.java` handles `&` and `|`. In `tokenizeSeparator`, if it encounters `&` not followed by `&`, it creates an `ErrorToken` and sets `this.error`. However, the `Compiler.java` checks `lexer.getError()`. If this is set, it writes to `error.txt`. But looking at `Lexer.tokenizeSeparator`:
+    ```java
+    if (c == '&') {
+        if (next == '&') {
+            tokens.add(new Token(TokenType.AND, "&&", curLine));
+        } else {
+            error = new ErrorToken(TokenType.AND, "&&", curLine); // Sets error
+            processor.backward();
+        }
+    }
+    ```
+    The issue here is that `tokenizeSeparator` continues to execute subsequent `if` blocks for `<`, `>`, `=` etc. because they are not `else if`. More critically, after detecting an error like `&`, the lexer might still try to process the next character or get into an inconsistent state if `processor.backward()` isn't handled perfectly in conjunction with the main loop. However, the bigger issue is likely in how the parser interacts with these tokens or if the lexer crashes.
+
+    Actually, looking closely at `Lexer.tokenizeSeparator`:
+    ```java
+    if (c == '!') { ... }
+    if (c == '&') { ... }
+    if (c == '|') { ... }
+    if (c == '<') { ... }
+    // ...
+    ```
+    These are independent `if` statements. If `c` is `&`, it enters the `&` block. It does *not* enter the others. This part seems logically okay for single char detection, provided `c` is indeed `&`.
+
+    However, there is a subtle bug in `Lexer.tokenizeDigit` and `Lexer.tokenizeAlphabet`. They call `processor.backward()` if `hasNext()` is true. But `tokenizeSeparator` also calls `processor.forward()` to peek `next`. If `next` is not part of a multi-char token, it calls `processor.backward()`.
+
+    Let's look at **Error Type 'j' (Missing `)`)**.
+    The test case has `getchar( ;`.
+    In `BlockParser.parseHead()`:
+    ```java
+    if (t.getType() == TokenType.GETCHARTK || t.getType() == TokenType.GETINTTK) {
+        children.add(new SynLeaf(t));
+        children.add(new SynLeaf(lexer.getAndNext())); // (
+        t = lexer.getAndNext();
+        if (t.getType() == TokenType.RPARENT) { // )
+            children.add(new SynLeaf(t));
+        } else {
+            lexer.move(-1);
+            addError(new ErrorSyntax(children.get(1).getLine(), ErrorType.j)); // Error reported at '(' line
+        }
+        // ... check for semicolon
+    }
+    ```
+    If the input is `getchar( ;`, `lexer.getAndNext()` after `(` returns `;`. `t.getType()` is `SEMICN`. It is not `RPARENT`. So it adds error `j` at the line of `(`. This matches the expected behavior for line 16.
+
+    Now consider `printf("%c",s[0];`.
+    In `BlockParser.parsePrintfStmt()`:
+    ```java
+    t = lexer.getAndNext();
+    if (t.getType() == TokenType.RPARENT) {
+        children.add(new SynLeaf(t));
+    } else {
+        lexer.move(-1);
+        addError(new ErrorSyntax(children.get(0).getLine(), ErrorType.j)); // Error at printf line
+    }
+    ```
+    This also seems correct for reporting error `j`.
+
+    **Why Runtime Error?**
+    The prompt says "Runtime Error". This usually implies an exception like `IndexOutOfBoundsException` or `NullPointerException`.
+
+    Let's look at `Lexer.tokenizeDigit`:
+    ```java
+    private void tokenizeDigit(char c) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(c);
+        while(processor.hasNext() && Character.isDigit(c)) { // BUG: c is not updated inside loop condition check properly?
+            processor.forward();
+            c = processor.getChar();
+            if (Character.isDigit(c)) {
+                sb.append(c);
+            }
+        }
+        if (processor.hasNext()) {
+            processor.backward();
+        }
+        tokens.add(new Token(TokenType.INTCON, sb.toString(), curLine));
+    }
+    ```
+    The `while` condition checks `Character.isDigit(c)`. `c` is the character *before* the loop starts. Inside the loop, `c` is updated. If the next char is not a digit, the loop terminates. Then `processor.backward()` is called. This seems okay.
+
+    Let's look at `Lexer.tokenizeAlphabet`:
+    Similar structure.
+
+    Let's look at `Lexer.skip()`:
+    ```java
+    private int skip() {
+        char c = processor.getChar();
+        if (c == '\n') {
+            curLine++;
+        }
+        while(Character.isWhitespace(c) && processor.hasNext()) {
+            processor.forward();
+            c = processor.getChar();
+            if (c == '\n') {
+                curLine++;
+            }
+        }
+        if (!processor.hasNext() && Character.isWhitespace(processor.getChar())) {
+            return 1;
+        } else {
+            return 0;
+        }
+    }
+    ```
+    If `processor.hasNext()` is false, `processor.getChar()` might throw an exception if `curChar` is at the end of the string. `Processor.getChar()` does `fileLines.charAt(curChar)`. If `curChar` equals `fileLines.length()`, this throws `StringIndexOutOfBoundsException`.
+
+    In `tokenize()`:
+    ```java
+    while(processor.hasNext()) {
+        processor.forward();
+        char c;
+        if (skip() == 1) {
+            break;
+        } else {
+            c = processor.getChar();
+        }
+        // ...
+    }
+    ```
+    `processor.forward()` moves `curChar`. If `curChar` becomes `fileLines.length()`, `processor.hasNext()` (which checks `curChar + 1 < length`) would have been false in the previous iteration? No.
+    `hasNext()` returns `(curChar + 1) < fileLines.length()`.
+    If we are at the last character, `hasNext()` is false. The loop terminates.
+    
+    However, inside `skip()`:
+    `while(Character.isWhitespace(c) && processor.hasNext())`
+    If `c` is whitespace and `hasNext()` is true, it forwards.
+    After the loop, if `!processor.hasNext()` is true, it means we are at the last character (or past it?).
+    If we are at the last character, `processor.getChar()` is valid.
+    
+    Let's look at `Processor` initialization.
+    `curChar = -1`.
+    `file2str` reads lines.
+    
+    Potential Crash in `Lexer.tokenizeSeparator`:
+    ```java
+    char next;
+    if (processor.hasNext()) {
+        processor.forward();
+        next = processor.getChar();
+    } else {
+        processor.forward(); // CRASH HERE?
+        next = '\0';
+    }
+    ```
+    If `processor.hasNext()` is false, it means `curChar + 1 >= fileLines.length()`.
+    Calling `processor.forward()` increments `curChar`.
+    Then `next = '\0'` is assigned.
+    But later, code like `processor.backward()` is called.
+    
+    If `processor.forward()` is called when `hasNext()` is false, `curChar` might become `fileLines.length()`.
+    If subsequent code calls `processor.getChar()`, it will crash.
+    
+    In the `else` branch:
+    ```java
+    } else {
+        processor.forward();
+        next = '\0';
+    }
+    ```
+    It unconditionally forwards. If we were at the last char, `curChar` becomes `length`.
+    Then later:
+    ```java
+    if (c == '!') {
+       // ...
+       processor.backward();
+    }
+    ```
+    `backward()` decrements `curChar`. So it goes back to `length - 1`. This is safe.
+    
+    However, look at `tokenizeDigit` and `tokenizeAlphabet`.
+    They call `processor.backward()` only if `processor.hasNext()` is true.
+    
+    Let's look at `CompileUnitParser.parseDecl()`:
+    ```java
+    for (int i = 0; i < 3; i++) { // pre-read
+        if (lexer.hasNext()) {
+            t = lexer.getAndNext();
+        } else {
+            lexer.move(-i);
+            break;
+        }
+    }
+    lexer.move(-3);
+    ```
+    If `hasNext()` becomes false during the loop, it breaks and moves back `-i`.
+    Then it executes `lexer.move(-3)`.
+    If `i` was 0, it moves -3. If `curIdx` was 0, it becomes -3.
+    Later `lexer.get()` or `getAndNext()` will throw `IndexOutOfBoundsException`.
+
+    In `parseDecl`:
+    ```java
+    while (true) {
+        Token t = null;
+        for (int i = 0; i < 3; i++) { 
+            if (lexer.hasNext()) {
+                t = lexer.getAndNext();
+            } else {
+                lexer.move(-i);
+                break;
+            }
+        }
+        lexer.move(-3); // ALWAYS moves -3
+        if (t == null || t.getType() == TokenType.LPARENT) {
+            break;
+        }
+        // ...
+    }
+    ```
+    If the file ends or we are near the end, `hasNext()` might return false.
+    Suppose `curIdx` is `size - 1` (last token). `hasNext()` returns `false` (since `curIdx < size - 1` is false).
+    Loop `i=0`: `hasNext()` is false. `lexer.move(0)`. Break.
+    Then `lexer.move(-3)`. `curIdx` becomes `size - 4`.
+    If `size` is small (e.g., 2), `curIdx` becomes negative.
+    Next iteration `lexer.getAndNext()` crashes.
+
+    This logic in `parseDecl` and `parseFunc` is flawed. It assumes there are always at least 3 tokens to look ahead or that moving back -3 is safe relative to the number of tokens consumed.
+
+    Specifically, `parseDecl` is called first.
+    Input: `const char Ch='c', s[20] = "hello world"; int global; ...`
+    It consumes declarations.
+    When it finishes declarations, it should stop.
+    The condition `t.getType() == TokenType.LPARENT` is used to break? No, `t` is the 3rd token looked ahead?
+    The logic tries to distinguish `Decl` from `FuncDef`.
+    `Decl` starts with `const`, `int`, `char`.
+    `FuncDef` starts with `void`, `int`, `char` followed by `Ident` and `(`.
+    
+    If `t` is null (end of file reached during lookahead), it breaks.
+    But `lexer.move(-3)` is executed regardless.
+    
+    If the input has fewer than 3 tokens remaining, `curIdx` can go negative.
+
+    **Location of Error:**
+    `fronted/parser/parse/CompileUnitParser.java` in `parseDecl` and `parseFunc`.
+
+    Also, `Lexer.java` has a potential issue in `tokenizeSeparator` where `processor.forward()` is called even if `!hasNext()`, but it's immediately followed by assignment to `\0` and later `backward()`. However, if `getChar()` is called elsewhere while `curChar` is out of bounds, it crashes. But the `move(-3)` issue in Parser is more likely to cause immediate IndexOutOfBounds on `ArrayList` access in `Lexer.get()`.
+
+    Let's verify the `parseDecl` crash scenario.
+    Test input ends with `return 0; }`.
+    Tokens: ..., `return`, `0`, `;`, `}`.
+    Suppose we are parsing `MainFuncDef`. `parseDecl` should have finished.
+    `parseDecl` loops.
+    Inside `parseDecl`, if it reads a `Decl`, it continues.
+    When it encounters `int main`, `t` (the 3rd token?) might be `main` or `(`.
+    
+    Actually, the crash is likely due to `lexer.move(-3)` when fewer than 3 tokens were read.
+
+<fronted/parser/parse/CompileUnitParser.java>
+...
+    private ArrayList<SynNode> parseDecl() {
+        ArrayList<SynNode> res = new ArrayList<>();
+        while (true) {
+            Token t = null;
+            for (int i = 0; i < 3; i++) { // pre-read
+                if (lexer.hasNext()) {
+                    t = lexer.getAndNext();
+                } else {
+                    lexer.move(-i);
+                    break;
+                }
+            }
+            lexer.move(-3);
+            if (t == null || t.getType() == TokenType.LPARENT) {
+                break;
+            }
+            // must a Decl
+            DeclParser declParser = new DeclParser(lexer);
+            res.add(declParser.parse());
+            updateError(declParser.getErrorList());
+        }
+        return res;
+    }
+
+    private ArrayList<SynNode> parseFunc() {
+        ArrayList<SynNode> res = new ArrayList<>();
+        while(true) {
+            Token t = null;
+            for (int i = 0; i < 2; i++) { // pre-read
+                if (lexer.hasNext()) {
+                    t = lexer.getAndNext();
+                } else {
+                    lexer.move(-i);
+                    break;
+                }
+            }
+            lexer.move(-2);
+            if (t.getType() == TokenType.MAINTK) {
+                break;
+            } else {
+                // must a FuncDef
+                FuncDefParser funcDefParser = new FuncDefParser(lexer);
+                res.add(funcDefParser.parse());
+                updateError(funcDefParser.getErrorList());
+            }
+        }
+        return res;
+    }
+...

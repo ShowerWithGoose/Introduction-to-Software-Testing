@@ -1,0 +1,740 @@
+Based on the comparison between the buggy output and the expected output, the error occurs during the parsing of a function call within an expression (specifically `func_p()` inside the `printf` arguments).
+
+In the **Buggy Output**:
+```text
+IDENFR func_p
+LPARENT (
+<UnaryExp>   <-- Missing RPARENT ) here
+<MulExp>
+...
+<FuncRParams>
+RPARENT )    <-- This RPARENT corresponds to the closing of printf, not func_p
+```
+
+In the **Expected Output**:
+```text
+IDENFR func_p
+LPARENT (
+RPARENT )    <-- The closing parenthesis of func_p() is correctly identified and consumed
+<UnaryExp>
+...
+```
+
+The issue lies in the `parseUnaryExp` method in `Parser.java`. When identifying a function call (`Ident '(' ... ')'`), the code parses the identifier and the left parenthesis, then calls `parseFuncRParams()`. However, it fails to consume and output the right parenthesis `)` immediately after `parseFuncRParams()` returns. Instead, it seems to rely on the caller or subsequent logic to handle it, or simply misses adding the node for `)`. Looking closely at the code:
+
+```java
+            } else if (curToken.getType() == LexType.IDENFR) {
+                if (look(0).getType() == LexType.LPARENT) { // Note: look(0) is curToken, this check is slightly redundant but implies IDENFR is current
+                    unaryExp.addChildNode(createEndNode()); // ident
+                    unaryExp.addChildNode(createEndNode()); // '('
+                    unaryExp.addChildNode(parseFuncRParams());
+                    if (curToken.getType() == LexType.RPARENT) {
+                        unaryExp.addChildNode(createEndNode()); // ')'
+                    } else {
+                        errors.put(look(-2).getLineno(), 'j');
+                    }
+                } else {
+                    unaryExp.addChildNode(parseLVal("Primary"));
+                }
+```
+
+Wait, looking at the code provided in `Parser.java`:
+```java
+        } else if (curToken.getType() == LexType.IDENFR) {
+            if (look(0).getType() == LexType.LPARENT) { // This condition is actually checking if CURRENT token is LPARENT? No, look(0) is curToken. 
+                                                        // But we just entered this block because curToken is IDENFR.
+                                                        // So look(0) is IDENFR. This condition `look(0).getType() == LexType.LPARENT` will ALWAYS be false here.
+```
+
+Let's re-read `Parser.java` carefully.
+```java
+    public Node parseUnaryExp() {
+        Node unaryExp = new Node(SyntaxType.UnaryExp, curToken);
+        if (curToken.getType() == LexType.LPARENT) {
+            unaryExp.addChildNode(parsePExp());
+        } else if (curToken.getType() == LexType.INTCON) {
+            unaryExp.addChildNode(parseNumber());
+        } else if (curToken.getType() == LexType.CHRCON) {
+            unaryExp.addChildNode(parseCharacter());
+        } else if (curToken.getType() == LexType.IDENFR) {
+            if (look(0).getType() == LexType.LPARENT) { // BUG: look(0) is the current token (IDENFR). It checks if IDENFR == LPARENT, which is false.
+                unaryExp.addChildNode(createEndNode()); // ident
+                unaryExp.addChildNode(createEndNode()); // '('
+                unaryExp.addChildNode(parseFuncRParams());
+                if (curToken.getType() == LexType.RPARENT) {
+                    unaryExp.addChildNode(createEndNode()); // ')'
+                } else {
+                    errors.put(look(-2).getLineno(), 'j');
+                }
+            } else {
+                unaryExp.addChildNode(parseLVal("Primary"));
+            }
+        } 
+        // ...
+    }
+```
+
+Because `look(0)` returns the current token (`IDENFR`), the condition `look(0).getType() == LexType.LPARENT` is **false**. Therefore, the code executes the `else` branch: `unaryExp.addChildNode(parseLVal("Primary"));`.
+
+`parseLVal` consumes the `IDENFR`. Then control returns to `parseUnaryExp`, which returns. The `LPARENT` (`(`) is still the current token in the stream relative to the next higher level parser? No, `parseLVal` only consumes the Ident and optional `[Exp]`. It does not consume `(`.
+
+So, after `parseUnaryExp` returns (having parsed `func_p` as an LVal/PrimaryExp), the parser is back in `parseMulExp` or `parseAddExp` or `parseFuncRParams`.
+
+Let's trace `printf("%d,%d,%d",5,func_p(),9);`:
+1. `parseStmt` sees `PRINTFTK`. Consumes `printf`, `(`, `StringConst`.
+2. Enters loop for `, Exp`.
+3. Sees `,`. Consumes `,`. Calls `parseExp()`.
+4. `parseExp` -> `parseAddExp` -> `parseMulExp` -> `parseUnaryExp`.
+5. `parseUnaryExp` sees `INTCON 5`. Parses it. Returns.
+6. Back in `parseStmt` loop. Sees `,`. Consumes `,`. Calls `parseExp()`.
+7. `parseExp` -> ... -> `parseUnaryExp`.
+8. `parseUnaryExp` sees `IDENFR func_p`.
+   - Checks `look(0) == LPARENT`. False (it's IDENFR).
+   - Goes to `else`: `parseLVal("Primary")`.
+   - `parseLVal` creates node, adds `func_p` (consumes it via `createEndNode`).
+   - Checks for `[`. None.
+   - Returns `LVal` node.
+9. `parseUnaryExp` returns this `LVal` node wrapped in `UnaryExp`.
+10. Back in `parseMulExp`, `parseAddExp`, `parseExp`. They return.
+11. Back in `parseStmt`. The current token is now `LPARENT (` (from `func_p(`).
+12. The `parseExp` call finished. The code in `parseStmt` continues to the next iteration of the `while` loop checking for `COMMA`.
+13. Current token is `LPARENT`. It is not `COMMA`. Loop ends.
+14. Checks for `RPARENT`. Current token is `LPARENT`. Error? Or does it proceed?
+    The code expects `RPARENT` for the `printf` call. But it encounters `LPARENT`.
+    
+Actually, looking at the Buggy Output again:
+```text
+IDENFR func_p
+LPARENT (
+<UnaryExp>
+```
+This implies that `LPARENT (` *was* consumed and printed. And `<UnaryExp>` was printed.
+If `parseLVal` was called, it wouldn't consume `(`. So who consumed `(`?
+
+Let's look at `parseFuncRParams` in the buggy output context.
+The output shows:
+```text
+IDENFR func_p
+LPARENT (
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+<FuncRParams>
+RPARENT )
+```
+This structure suggests that `func_p()` WAS parsed as a function call, but the `RPARENT` of `func_p` is missing from the output between `LPARENT` and `<UnaryExp>`.
+
+If the condition `look(0).getType() == LexType.LPARENT` was intended to check the *next* token, it should be `look(1)`.
+If we change `look(0)` to `look(1)`:
+1. `curToken` is `IDENFR`.
+2. `look(1)` is `LPARENT`. Condition is True.
+3. `createEndNode()` consumes `IDENFR`. Output: `IDENFR func_p`.
+4. `createEndNode()` consumes `LPARENT`. Output: `LPARENT (`.
+5. `parseFuncRParams()` is called.
+   - Inside `parseFuncRParams`, `curToken` is `RPARENT` (since `func_p()` has no args).
+   - Wait, `parseFuncRParams` implementation:
+     ```java
+     public Node parseFuncRParams() {
+         Node funcRParams = new Node(SyntaxType.FuncRParams, curToken);
+         funcRParams.addChildNode(parseExp()); // This will try to parse an Exp starting with RPARENT!
+         // ...
+     }
+     ```
+     If `func_p()` has no arguments, `curToken` is `)`. `parseExp` will likely fail or produce empty/error.
+     
+     Let's check `parseFuncRParams` usage in `parseUnaryExp`:
+     ```java
+                 unaryExp.addChildNode(parseFuncRParams());
+     ```
+     If `func_p()` has no params, `parseFuncRParams` should probably handle the empty case or not be called if the next token is `)`.
+     
+     In the provided code:
+     ```java
+     public Node parseFuncRParams() {
+         Node funcRParams = new Node(SyntaxType.FuncRParams, curToken);
+         funcRParams.addChildNode(parseExp()); // Assumes at least one param
+         while (curToken.getType() == LexType.COMMA) {
+             funcRParams.addChildNode(createEndNode());
+             funcRParams.addChildNode(parseExp());
+         }
+         return funcRParams;
+     }
+     ```
+     This implementation requires at least one parameter. For `func_p()`, this is incorrect grammar-wise according to standard C-like grammars where params are optional. However, the grammar provided says:
+     `UnaryExp → ... | Ident '(' [FuncRParams] ')' ...`
+     So `FuncRParams` is optional.
+     
+     The parser code in `parseUnaryExp` does:
+     ```java
+                 unaryExp.addChildNode(createEndNode()); // ident
+                 unaryExp.addChildNode(createEndNode()); // '('
+                 unaryExp.addChildNode(parseFuncRParams()); // Always calls it!
+     ```
+     It should check if `curToken != RPARENT` before calling `parseFuncRParams`.
+
+     BUT, let's look at the Buggy Output for `func_p()`:
+     ```text
+     IDENFR func_p
+     LPARENT (
+     <UnaryExp>
+     <MulExp>
+     <AddExp>
+     <Exp>
+     <FuncRParams>
+     RPARENT )
+     ```
+     The presence of `<UnaryExp> ... <Exp>` inside suggests that `parseFuncRParams` DID call `parseExp`, which eventually parsed... what?
+     If `curToken` was `)`, `parseExp` -> `parseAddExp` -> `parseMulExp` -> `parseUnaryExp`.
+     `parseUnaryExp` sees `)`. It doesn't match any case. It returns an empty/uninitialized node? Or crashes?
+     
+     Actually, look at the expected output for `func_p()`:
+     ```text
+     IDENFR func_p
+     LPARENT (
+     RPARENT )
+     <UnaryExp>
+     ...
+     ```
+     Here, `RPARENT )` is output immediately after `LPARENT (`. This means the `)` belonging to `func_p` was consumed and printed.
+     Then `<UnaryExp>` starts. This `<UnaryExp>` is part of the outer expression context? No, `func_p()` IS the UnaryExp.
+     
+     Let's re-examine the Expected Output structure around `func_p`:
+     ```text
+     COMMA ,
+     IDENFR func_p
+     LPARENT (
+     RPARENT )
+     <UnaryExp>
+     <MulExp>
+     <AddExp>
+     <Exp>
+     COMMA ,
+     ```
+     The tags `<UnaryExp>`, `<MulExp>`, etc., appear AFTER `RPARENT )`.
+     This implies that the `UnaryExp` node corresponding to `func_p()` is printed *after* its children (Ident, LPARENT, RPARENT) are printed.
+     
+     In the Buggy Output:
+     ```text
+     IDENFR func_p
+     LPARENT (
+     <UnaryExp>   <-- Printed here?
+     <MulExp>
+     <AddExp>
+     <Exp>
+     <FuncRParams>
+     RPARENT )    <-- This RPARENT is likely the one closing printf, NOT func_p
+     ```
+     
+     If the code executed the `else` branch (`parseLVal`), it would consume `func_p`. Then `parseUnaryExp` returns. The `(` is still next.
+     The caller `parseMulExp` returns. `parseAddExp` returns. `parseExp` returns.
+     Back in `parseStmt` (inside `printf` handling):
+     It expects `COMMA` or `RPARENT`.
+     It sees `(`. This doesn't match `COMMA`.
+     It checks `if (curToken.getType() == LexType.RPARENT)`. It is `(`. So it goes to `else` error `j`.
+     
+     This contradicts the buggy output which shows successful parsing of subsequent tokens and final `RPARENT )`.
+     
+     Let's look closer at `parseUnaryExp` again.
+     
+     ```java
+         } else if (curToken.getType() == LexType.IDENFR) {
+             if (look(0).getType() == LexType.LPARENT) { 
+     ```
+     As established, `look(0)` is `IDENFR`. This is FALSE.
+     So it goes to `else`: `parseLVal("Primary")`.
+     
+     Is it possible `look(0)` behaves differently?
+     ```java
+     public Token look(int num) {
+         if (curPos + num >= length) {
+             return null;
+         }
+         return tokens.get(curPos + num);
+     }
+     ```
+     `curPos` is index of current token. `tokens.get(curPos)` is current token.
+     So `look(0)` is indeed current token.
+     
+     Why does the buggy output show `LPARENT (`?
+     If `parseLVal` was called, it consumes `IDENFR`.
+     Then `parseUnaryExp` returns.
+     Who consumes `LPARENT`?
+     
+     Maybe the bug is in `parseFuncRParams` being called unconditionally, AND the condition for entering the function call block is wrong, BUT the output suggests the function call block WAS entered partially?
+     
+     Let's look at the `parseFuncRParams` in the buggy output again.
+     ```text
+     <FuncRParams>
+     ```
+     This tag is printed. This node is created in `parseFuncRParams`.
+     This means `parseFuncRParams` WAS called.
+     This means the `if` block in `parseUnaryExp` WAS entered.
+     
+     How can `if (look(0).getType() == LexType.LPARENT)` be true when `curToken` is `IDENFR`?
+     It can't.
+     
+     UNLESS... `look(1)` was intended, AND there is another bug.
+     
+     Let's assume the code *should* have been `look(1)`.
+     If it were `look(1)`, it enters the block.
+     1. `createEndNode()` -> consumes `IDENFR`. Output `IDENFR func_p`.
+     2. `createEndNode()` -> consumes `LPARENT`. Output `LPARENT (`.
+     3. `parseFuncRParams()` called.
+        - `curToken` is `RPARENT`.
+        - `parseFuncRParams` creates node.
+        - Calls `parseExp()`.
+        - `parseExp` fails to parse `RPARENT` as an expression?
+        
+     If `parseExp` encounters `RPARENT`, it goes to `parseAddExp` -> `parseMulExp` -> `parseUnaryExp`.
+     `parseUnaryExp` sees `RPARENT`. None of the `if/else if` match.
+     It reaches the end and returns `unaryExp` (which has no children added effectively, or just the initial empty node).
+     
+     If `parseUnaryExp` returns an empty/malformed node, `parseMulExp` wraps it. `parseAddExp` wraps it. `parseExp` wraps it.
+     These nodes are added to `FuncRParams`.
+     Then `parseFuncRParams` returns.
+     Back in `parseUnaryExp`:
+     ```java
+                 if (curToken.getType() == LexType.RPARENT) {
+                     unaryExp.addChildNode(createEndNode()); // ')'
+                 }
+     ```
+     At this point, `curToken` is STILL `RPARENT` (because `parseFuncRParams` failed to consume it, as `parseExp` couldn't parse it).
+     So `createEndNode()` consumes `RPARENT`. Output `RPARENT )`.
+     
+     If this were the case, the output would be:
+     ```text
+     IDENFR func_p
+     LPARENT (
+     ... (nodes from failed parseExp) ...
+     RPARENT )
+     <UnaryExp> (wrapper for the whole thing)
+     ```
+     
+     The Buggy Output is:
+     ```text
+     IDENFR func_p
+     LPARENT (
+     <UnaryExp>
+     <MulExp>
+     <AddExp>
+     <Exp>
+     <FuncRParams>
+     RPARENT )
+     ```
+     
+     Notice that `<UnaryExp>` appears *before* `<FuncRParams>`.
+     In the code:
+     ```java
+                 unaryExp.addChildNode(createEndNode()); // ident
+                 unaryExp.addChildNode(createEndNode()); // '('
+                 unaryExp.addChildNode(parseFuncRParams()); // Adds FuncRParams node
+                 if (curToken.getType() == LexType.RPARENT) {
+                     unaryExp.addChildNode(createEndNode()); // ')'
+                 }
+     ```
+     The `unaryExp` node itself is returned to the caller. The `toString` / post-order printing prints children first.
+     Children of `unaryExp`:
+     1. Ident Node (Leaf) -> Prints `IDENFR func_p`
+     2. LPARENT Node (Leaf) -> Prints `LPARENT (`
+     3. FuncRParams Node (Subtree) -> Prints its contents
+     4. RPARENT Node (Leaf) -> Prints `RPARENT )`
+     
+     So the order should be:
+     `IDENFR`
+     `LPARENT`
+     [Contents of FuncRParams]
+     `RPARENT`
+     `<UnaryExp>` (The node itself)
+     
+     The Buggy Output shows:
+     `IDENFR`
+     `LPARENT`
+     `<UnaryExp>`  <-- This is out of place. It looks like the UnaryExp tag is printed HERE.
+     `<MulExp>`
+     `<AddExp>`
+     `<Exp>`
+     `<FuncRParams>`
+     `RPARENT )`
+     
+     This specific sequence `<UnaryExp> <MulExp> <AddExp> <Exp>` appearing *between* `LPARENT` and `FuncRParams` strongly suggests that these nodes belong to the parsing of the arguments inside `FuncRParams`, BUT the `<UnaryExp>` tag printed there is actually the one wrapping the `func_p` call itself? No, that would be printed at the end.
+     
+     Wait, look at `SyntaxType.UnaryExp`.
+     In `parseUnaryExp`, `Node unaryExp = new Node(SyntaxType.UnaryExp, curToken);`
+     
+     If the code entered the `else` branch (`parseLVal`), `parseLVal` returns a node.
+     `unaryExp.addChildNode(parseLVal("Primary"));`
+     
+     If `parseLVal` is called:
+     It consumes `IDENFR`.
+     Returns `PLVal` (which prints `<LVal>\n<PrimaryExp>`).
+     
+     Then `parseUnaryExp` returns `unaryExp`.
+     `unaryExp` contains `PLVal`.
+     Post-order:
+     1. `PLVal` children (Ident). Print `IDENFR`.
+     2. `PLVal` itself. Print `<LVal>\n<PrimaryExp>`.
+     3. `unaryExp` itself. Print `<UnaryExp>`.
+     
+     This matches the start of the buggy output IF `LPARENT` wasn't there. But `LPARENT` IS there.
+     
+     There is a contradiction in my analysis of the buggy output vs the code path.
+     
+     Let's look at the `look(0)` vs `look(1)` again.
+     If the code uses `look(1)`, it enters the function call block.
+     If it uses `look(0)`, it enters the LVal block.
+     
+     The Buggy Output HAS `LPARENT (`.
+     The LVal block does NOT consume `LPARENT`.
+     Therefore, the code MUST have entered the function call block.
+     Therefore, the condition `look(0).getType() == LexType.LPARENT` MUST have evaluated to TRUE.
+     
+     How?
+     Only if `curToken` was `LPARENT`.
+     But we are in the `else if (curToken.getType() == LexType.IDENFR)` block.
+     
+     Is it possible `curToken` was advanced before the check?
+     No.
+     
+     Is it possible `look(0)` is implemented as `look(1)` in the student's mind but coded as `look(0)`?
+     If they coded `look(0)`, it should fail.
+     
+     Let's check `parseFuncRParams` again.
+     
+     Actually, look at the Buggy Output for the `printf` arguments `5`:
+     ```text
+     INTCON 5
+     <Number>
+     <PrimaryExp>
+     <UnaryExp>
+     <MulExp>
+     <AddExp>
+     <Exp>
+     ```
+     This is correct.
+     
+     Now for `func_p()`:
+     ```text
+     IDENFR func_p
+     LPARENT (
+     <UnaryExp>
+     <MulExp>
+     <AddExp>
+     <Exp>
+     <FuncRParams>
+     RPARENT )
+     ```
+     
+     Compare to `5`:
+     `5` produces `INTCON`, then `Number`, `PrimaryExp`, `UnaryExp`, `MulExp`, `AddExp`, `Exp`.
+     
+     `func_p()` produces `IDENFR`, `LPARENT`, then `UnaryExp`, `MulExp`, `AddExp`, `Exp`, `FuncRParams`, `RPARENT`.
+     
+     The sequence `UnaryExp`, `MulExp`, `AddExp`, `Exp` appears in both.
+     In `5`, they wrap the `5`.
+     In `func_p()`, they appear BEFORE `FuncRParams`.
+     
+     This implies that `parseFuncRParams` contains an `Exp` which contains `AddExp`... which contains `UnaryExp`.
+     And THAT `UnaryExp` is being printed.
+     
+     If `parseFuncRParams` is called, it calls `parseExp()`.
+     `parseExp` calls `parseAddExp`.
+     `parseAddExp` calls `parseMulExp`.
+     `parseMulExp` calls `parseUnaryExp`.
+     
+     Inside this nested `parseUnaryExp` (called from within `parseFuncRParams`):
+     `curToken` is `RPARENT` (since `func_p()` has no args).
+     
+     If `curToken` is `RPARENT`, `parseUnaryExp` does nothing valid.
+     
+     HOWEVER, look at the Buggy Output again.
+     Where is the `RPARENT` of `func_p`?
+     The output shows `RPARENT )` at the end of the sequence.
+     And then later `RPARENT )` for `printf`.
+     
+     Wait, the Expected Output has:
+     ```text
+     LPARENT (
+     RPARENT )
+     <UnaryExp>
+     ```
+     The Buggy Output has:
+     ```text
+     LPARENT (
+     <UnaryExp>
+     ...
+     <FuncRParams>
+     RPARENT )
+     ```
+     
+     It seems the Buggy Code is treating `func_p()` as:
+     1. `IDENFR`
+     2. `LPARENT`
+     3. An Empty Expression? (Producing the Unary/Exp chain?)
+     4. `FuncRParams` tag?
+     5. `RPARENT`
+     
+     If the condition was `look(1)`, and `parseFuncRParams` was called:
+     `parseFuncRParams` tries to parse `Exp` from `)`.
+     
+     There is a known issue in some parsers where if `parseExp` fails to match, it might return an empty node or consume nothing.
+     
+     But the key difference is the missing `RPARENT )` line immediately after `LPARENT (`.
+     
+     In the code:
+     ```java
+                 unaryExp.addChildNode(createEndNode()); // ident
+                 unaryExp.addChildNode(createEndNode()); // '('
+                 unaryExp.addChildNode(parseFuncRParams());
+                 if (curToken.getType() == LexType.RPARENT) {
+                     unaryExp.addChildNode(createEndNode()); // ')'
+                 }
+     ```
+     
+     If `parseFuncRParams` consumes the `RPARENT` (incorrectly), then the `if` check fails, and the `)` is not added as a child of `UnaryExp` explicitly, or is missing.
+     
+     But `parseFuncRParams` in the code:
+     ```java
+     public Node parseFuncRParams() {
+         Node funcRParams = new Node(SyntaxType.FuncRParams, curToken);
+         funcRParams.addChildNode(parseExp());
+         // ...
+     }
+     ```
+     It does NOT consume `RPARENT`.
+     
+     So, if `curToken` is `)` when `parseFuncRParams` is called:
+     `parseExp` is called.
+     `parseExp` -> ... -> `parseUnaryExp`.
+     `parseUnaryExp` sees `)`.
+     
+     If `parseUnaryExp` handles `)` gracefully by returning an empty node, then `parseExp` returns.
+     Then `parseFuncRParams` returns.
+     Then `curToken` is STILL `)`.
+     Then `if (curToken.getType() == LexType.RPARENT)` is TRUE.
+     Then `createEndNode()` consumes `)`.
+     
+     So the `)` SHOULD be there.
+     
+     Why is it missing in the Buggy Output between `(` and `<UnaryExp>`?
+     
+     Ah! Look at the Buggy Output indentation/structure.
+     
+     ```text
+     LPARENT (
+     <UnaryExp>
+     <MulExp>
+     <AddExp>
+     <Exp>
+     <FuncRParams>
+     RPARENT )
+     ```
+     
+     The `<UnaryExp>` here is likely the one INSIDE `FuncRParams`'s `Exp`.
+     And the `RPARENT )` at the bottom is the one consumed by the `if` check in `parseUnaryExp`.
+     
+     So the structure IS:
+     `UnaryExp(func_p)`
+       `Ident`
+       `(`
+       `FuncRParams`
+          `Exp`
+             `AddExp`
+                `MulExp`
+                   `UnaryExp`  <-- This is the empty one parsed from `)`?
+       `)`
+       
+     If this is the case, the output order (Post-order) would be:
+     1. `Ident`
+     2. `(`
+     3. Contents of `FuncRParams`:
+        a. Contents of `Exp`:
+           i. Contents of inner `UnaryExp` (Empty?)
+           ii. `<UnaryExp>`
+           iii. `<MulExp>`
+           iv. `<AddExp>`
+           v. `<Exp>`
+        b. `<FuncRParams>`
+     4. `)`
+     5. `<UnaryExp>` (Outer)
+     
+     The Buggy Output shows:
+     `IDENFR`
+     `LPARENT`
+     `<UnaryExp>`
+     `<MulExp>`
+     `<AddExp>`
+     `<Exp>`
+     `<FuncRParams>`
+     `RPARENT )`
+     
+     It is MISSING the final `<UnaryExp>` (Outer) in the snippet provided?
+     No, the snippet continues:
+     ```text
+     RPARENT )
+     <UnaryExp>
+     <MulExp>
+     ...
+     ```
+     Wait, the Buggy Output snippet in the prompt ends with:
+     ```text
+     RPARENT )
+     <UnaryExp>
+     <MulExp>
+     <AddExp>
+     <Exp>
+     COMMA ,
+     ```
+     
+     So the Outer `<UnaryExp>` IS printed, but AFTER the `RPARENT )`.
+     
+     The Expected Output is:
+     ```text
+     LPARENT (
+     RPARENT )
+     <UnaryExp>
+     <MulExp>
+     ...
+     ```
+     
+     The difference is:
+     Buggy: `(` ... `Exp` ... `FuncRParams` ... `)` ... `UnaryExp`
+     Expected: `(` `)` `UnaryExp` ...
+     
+     The Expected Output implies that `FuncRParams` is EMPTY and NOT printed?
+     Grammar: `UnaryExp → ... Ident '(' [FuncRParams] ')' ...`
+     
+     If `FuncRParams` is empty, should it be printed?
+     In `parseUnaryExp`:
+     ```java
+                 unaryExp.addChildNode(parseFuncRParams());
+     ```
+     It always adds it.
+     
+     However, look at `Node.toString()`:
+     ```java
+            if (name == SyntaxType.BlockItem || name == SyntaxType.BType) {
+                return "";
+            }
+     ```
+     `FuncRParams` is not excluded.
+     
+     But wait! In the Expected Output, `<FuncRParams>` is NOT present for `func_p()`.
+     
+     This implies that `parseFuncRParams` should NOT be called if there are no parameters, OR its output should be suppressed if empty.
+     
+     The code calls it unconditionally.
+     
+     So, the fix involves two parts:
+     1. Check `look(1)` instead of `look(0)` to correctly identify function calls.
+     2. Only call `parseFuncRParams` if `curToken` (after `(`) is not `)`.
+     
+     The primary error causing the "Wrong Answer" regarding the structure is likely the `look(0)` bug which prevents entering the function call block correctly?
+     
+     NO. If `look(0)` prevented entering the block, `LPARENT` would not be consumed.
+     The fact that `LPARENT` IS consumed means the block WAS entered.
+     
+     How?
+     Maybe `look(0)` is NOT `curToken`?
+     
+     ```java
+     public Token look(int num) {
+         if (curPos + num >= length) {
+             return null;
+         }
+         return tokens.get(curPos + num);
+     }
+     ```
+     
+     If `curPos` points to the NEXT token (i.e., `next()` increments `curPos` then gets token)?
+     
+     ```java
+     public void next() {
+         if (curPos >= length) {
+             curToken = null;
+         } else {
+             curToken = tokens.get(curPos++);
+         }
+     }
+     ```
+     `curPos` is incremented AFTER getting the token.
+     So `curToken` is `tokens.get(old_curPos)`.
+     `curPos` now points to the NEXT token.
+     
+     So `look(0)` returns `tokens.get(curPos + 0)` which is the NEXT token.
+     
+     AHA!
+     
+     If `next()` has just been called, `curToken` is the current token, but `curPos` is the index of the NEXT token.
+     
+     So `look(0)` returns the token AFTER `curToken`.
+     
+     Therefore, `if (look(0).getType() == LexType.LPARENT)` checks if the NEXT token is `(`.
+     
+     If `curToken` is `IDENFR func_p`, the next token IS `LPARENT`.
+     So the condition is TRUE.
+     The code ENTERS the function call block.
+     
+     So the logic for entering the block is CORRECT given the `curPos` behavior.
+     
+     So why is the output wrong?
+     
+     Because `parseFuncRParams` is called unconditionally.
+     
+     ```java
+                 unaryExp.addChildNode(parseFuncRParams());
+     ```
+     
+     For `func_p()`, `curToken` is now `LPARENT`? No.
+     Inside the block:
+     1. `createEndNode()` consumes `IDENFR`. `curPos` advances. `curToken` becomes `LPARENT`.
+     2. `createEndNode()` consumes `LPARENT`. `curPos` advances. `curToken` becomes `RPARENT`.
+     3. `parseFuncRParams()` is called.
+     
+     Inside `parseFuncRParams`:
+     `curToken` is `RPARENT`.
+     `funcRParams.addChildNode(parseExp());`
+     
+     `parseExp` tries to parse `RPARENT` as an expression.
+     It fails to match terminals.
+     It returns an empty/partial tree.
+     
+     This results in the extra `<UnaryExp><MulExp>...` nodes in the output, and the `<FuncRParams>` node itself.
+     
+     The Expected Output does NOT have `<FuncRParams>` for empty params.
+     
+     So the error is that `parseFuncRParams` is called even when empty.
+     
+     Fix:
+     ```java
+                 if (curToken.getType() != LexType.RPARENT) {
+                     unaryExp.addChildNode(parseFuncRParams());
+                 }
+     ```
+     
+     This matches the pattern used in `parseFuncDef`:
+     ```java
+         if (curToken.getType() != LexType.RPARENT) {
+             funcDef.addChildNode(parseFuncFParams());
+         }
+     ```
+     
+     So the error location is in `Parser.java`, inside `parseUnaryExp`.
+
+<frontend/Parser.java>
+...
+        } else if (curToken.getType() == LexType.IDENFR) {
+            if (look(0).getType() == LexType.LPARENT) {
+                unaryExp.addChildNode(createEndNode()); // ident
+                unaryExp.addChildNode(createEndNode()); // '('
+                unaryExp.addChildNode(parseFuncRParams());
+                if (curToken.getType() == LexType.RPARENT) {
+                    unaryExp.addChildNode(createEndNode()); // ')'
+                } else {
+                    errors.put(look(-2).getLineno(), 'j');
+                }
+            } else {
+                unaryExp.addChildNode(parseLVal("Primary"));
+            }
+        } else if (curToken.getType() == LexType.PLUS || curToken.getType() == LexType.MINU ||
+...

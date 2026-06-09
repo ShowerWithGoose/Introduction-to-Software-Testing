@@ -1,0 +1,636 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The task is to implement a recursive descent parser for a specific grammar. It must output lexical tokens and non-terminal syntax components for correct programs, or error codes for incorrect ones.
+2.  **Test Case & Error**: The provided test case is a valid C-like source code. The program fails with "Time Limit Exceeded" (TLE). The expected output shows a complete and correct parse tree. The buggy output is empty, suggesting the program hangs or enters an infinite loop before producing significant output or completing.
+3.  **Code Analysis**:
+    *   The `Parser` class uses a global static instance (`instance`) in `getInstance`. If `Compiler.java` calls `Parser.getInstance` multiple times or if the state isn't reset, it might cause issues, but here it's called once.
+    *   The core logic lies in the recursive parsing methods.
+    *   Looking at `CompUnit()`:
+        ```java
+        while(curSym.tokenType == CONSTTK ||((curSym.tokenType == INTTK || curSym.tokenType == CHARTK) &&
+                CheckTools.isIdent(getNextNSym(1)) && getNextNSym(2).tokenType != LPARENT)) {
+            if (curSym.tokenType == CONSTTK) {
+                ConstDecl();
+            } else {
+                VarDecl();
+            }
+        }
+        ```
+        This loop handles global declarations. It checks if the current token starts a `ConstDecl` or `VarDecl`.
+    *   Looking at `FuncDef()` and `MainFuncDef()`:
+        ```java
+        while (curSym.tokenType == VOIDTK || ((curSym.tokenType == INTTK || curSym.tokenType == CHARTK) &&
+                CheckTools.isIdent(getNextNSym(1)) && getNextNSym(2).tokenType == LPARENT)) {
+            FuncDef();
+        }
+
+        if ((curSym.tokenType == INTTK || curSym.tokenType == CHARTK) && getNextNSym(1).tokenType == MAINTK) {
+            MainFuncDef();
+        }
+        ```
+    *   The issue likely resides in how `getNextNSym` behaves when `curIndex` is near the end of the token list, or more critically, in the parsing logic itself causing infinite recursion or loops.
+    *   Let's look at `Stmt()` and `Exp()`.
+    *   In `Stmt()`, there is a lookahead check `checkLVal()` which modifies `checkSym` and `checkIndex` but does *not* modify `curSym` or `curIndex`. This is correct for lookahead.
+    *   However, consider the `while` loops in expression parsing like `MulExp`, `AddExp`, etc. They rely on `curSym` changing via `TerminalSym()` inside the loop.
+    *   Let's look closely at `CompUnit` again. If `VarDecl` or `ConstDecl` fails to consume tokens properly (e.g., due to an error or mismatch), `curSym` might not advance, causing the `while` loop in `CompUnit` to run infinitely.
+    *   But the input is correct. So the parsers should work.
+    *   Let's look at `getNextNSym(int n)`.
+        ```java
+        private Token getNextNSym(int n) {
+            if (curIndex + n >= tokens.size()) {
+                System.out.println("Notice: Get a sym out of range.");
+                return tokens.get(tokens.size() - 1);
+            } ...
+        }
+        ```
+        If `curIndex` is at the last token, `getNextNSym(1)` returns the last token. If the logic expects a different token to break a loop, it might get stuck.
+    *   However, the most common cause for TLE in recursive descent parsers with correct input is **left recursion** or **failure to advance** in a loop.
+    *   The grammar provided is LL(1) compatible (after eliminating left recursion, which the code seems to have done by using `while` loops for right-recursive parts like `MulExp -> UnaryExp | MulExp ('*' | '/' | '%') UnaryExp`).
+    *   Let's look at `Block()`:
+        ```java
+        while(curSym.tokenType != RBRACE) {
+            if (curSym.tokenType == INTTK || curSym.tokenType == CHARTK) {
+                VarDecl();
+            } else if (curSym.tokenType == CONSTTK) {
+                ConstDecl();
+            } else {
+                Stmt();
+            }
+        }
+        ```
+        If `Stmt()` or `VarDecl()` or `ConstDecl()` does not consume any token (perhaps due to an empty match or error recovery that doesn't advance), this loop becomes infinite.
+    *   In `VarDecl()`:
+        ```java
+        private void VarDecl() {
+            if (CheckTools.isBType(curSym)) {
+                TerminalSym(); // Consumes int/char
+                VarDef();
+                while (curSym.tokenType == COMMA) {
+                    TerminalSym();
+                    VarDef();
+                }
+                errorCheckAndOutput(SEMICN, 'i'); // Consumes ; or reports error
+            }
+            output("<VarDecl>");
+        }
+        ```
+        If `CheckTools.isBType(curSym)` is false, `VarDecl` returns without consuming anything. But `Block` only calls `VarDecl` if `curSym` is `INTTK` or `CHARTK`. So `TerminalSym()` will execute.
+    *   What if `VarDef()` fails to consume?
+        ```java
+        private void VarDef() {
+            if (CheckTools.isIdent(curSym)) {
+                TerminalSym();
+                // ...
+            }
+            output("<VarDef>");
+        }
+        ```
+        If `curSym` is not an identifier, `VarDef` returns without consuming. But `VarDecl` just called `TerminalSym()` for the type. The next token *should* be an identifier. If it's not, `VarDef` does nothing. Then `errorCheckAndOutput(SEMICN, 'i')` checks for semicolon. If it's not a semicolon, it records an error but **does not advance `curSym`**.
+        Wait, `errorCheckAndOutput`:
+        ```java
+        private void errorCheckAndOutput(Token.TokenType checkType, char errorCode) {
+            if (curSym.tokenType == checkType) {
+                TerminalSym();
+            } else {
+                errorHandler.addErrorMessage(getNextNSym(-1).lineNumber, errorCode);
+            }
+        }
+        ```
+        If the token is not the expected one, it adds an error but **does not consume the token**.
+        In a correct program, this path shouldn't happen. But if it does, or if there's a subtle bug in matching, it could hang.
+        
+    *   However, the input is correct. So why TLE?
+    *   Let's look at `CompUnit`'s first `while` loop condition again.
+        ```java
+        while(curSym.tokenType == CONSTTK ||((curSym.tokenType == INTTK || curSym.tokenType == CHARTK) &&
+                CheckTools.isIdent(getNextNSym(1)) && getNextNSym(2).tokenType != LPARENT))
+        ```
+        If we have a function definition `int func() {...}`, `getNextNSym(1)` is `func` (IDENFR), `getNextNSym(2)` is `(` (LPARENT). The condition `getNextNSym(2).tokenType != LPARENT` is false. So the loop terminates. Correct.
+        
+    *   Let's look at the second `while` loop in `CompUnit`:
+        ```java
+        while (curSym.tokenType == VOIDTK || ((curSym.tokenType == INTTK || curSym.tokenType == CHARTK) &&
+                CheckTools.isIdent(getNextNSym(1)) && getNextNSym(2).tokenType == LPARENT)) {
+            FuncDef();
+        }
+        ```
+        If we have `int main() {...}`, `getNextNSym(1)` is `main` (MAINTK). `CheckTools.isIdent(main)`?
+        ```java
+        public static boolean isIdent(Token token) {
+            return token.tokenType == Token.TokenType.IDENFR;
+        }
+        ```
+        `MAINTK` is NOT `IDENFR`. So `CheckTools.isIdent(getNextNSym(1))` is false. The loop terminates. Correct.
+        Then `MainFuncDef()` is called.
+
+    *   Is there an issue with `getNextNSym` when `curIndex` is large?
+        If `curIndex` is `tokens.size() - 1`, `getNextNSym(1)` accesses `tokens.get(tokens.size())` which is out of bounds?
+        No:
+        ```java
+        if (curIndex + n >= tokens.size()) {
+             return tokens.get(tokens.size() - 1);
+        }
+        ```
+        It handles bounds.
+
+    *   Let's look at `Stmt()` again.
+        ```java
+        if (CheckTools.isIdent(curSym)) {
+            // ...
+            checkLVal();
+            if (checkSym.tokenType == ASSIGN) {
+                 // ...
+            } else {
+                Exp();
+                errorCheckAndOutput(SEMICN, 'i');
+            }
+        }
+        ```
+        If `curSym` is an identifier, it calls `checkLVal`. `checkLVal` advances `checkIndex` and `checkSym`. It does NOT advance `curSym`.
+        Then if `checkSym` is NOT `ASSIGN`, it goes to `else { Exp(); ... }`.
+        `Exp()` calls `AddExp()`.
+        `AddExp()` calls `MulExp()`.
+        `MulExp()` calls `UnaryExp()`.
+        `UnaryExp()` checks:
+        ```java
+        if (CheckTools.isIdent(curSym) && getNextNSym(1).tokenType == LPARENT) {
+             // Function call
+        } else if (...) {
+             // Unary Op
+        } else {
+             PrimaryExp();
+        }
+        ```
+        If it's just an identifier variable access (e.g., `a;`), `getNextNSym(1)` is likely `SEMICN`. So it goes to `PrimaryExp()`.
+        `PrimaryExp()` calls `LVal()`.
+        `LVal()` consumes the identifier.
+        Then `Exp()` returns.
+        Then `errorCheckAndOutput(SEMICN, 'i')` consumes the semicolon.
+        This seems correct.
+
+    *   Wait, look at `checkLVal` implementation:
+        ```java
+        private void checkLVal() {
+            moveToNextCheckSym();
+            if (checkSym.tokenType == LBRACK) {
+                moveToNextCheckSym();
+                checkExp();
+                if (checkSym.tokenType == RBRACK) {
+                    moveToNextCheckSym();
+                }
+            }
+        }
+        ```
+        `checkExp` calls `checkMulExp`, etc. These `check` functions advance `checkIndex` but never reset it.
+        `checkIndex` is initialized to 0? No, `checkIndex` is a member variable.
+        Where is `checkIndex` initialized?
+        In `Parser` constructor:
+        ```java
+        public Parser(ArrayList<Token> tokens) {
+            this.tokens = tokens;
+            curSym = tokens.get(0);
+            curIndex = 0;
+            errorHandler = CompileErrorHandler.getInstance();
+        }
+        ```
+        `checkIndex` is NOT initialized. It defaults to 0.
+        `checkSym` is NOT initialized. It defaults to null.
+        
+        In `Stmt()`:
+        ```java
+        checkSym = curSym;
+        checkIndex = curIndex;
+        checkLVal();
+        ```
+        It resets `checkSym` and `checkIndex` before use. This is good.
+
+    *   Is there a case where `checkExp` or similar causes an infinite loop?
+        `checkExp`:
+        ```java
+        private void checkExp() {
+            checkMulExp();
+            while (checkSym.tokenType == PLUS || checkSym.tokenType == MINU) {
+                moveToNextCheckSym();
+                checkMulExp();
+            }
+        }
+        ```
+        If `checkSym` is `PLUS`, it advances. If `checkMulExp` doesn't advance `checkSym` (because it hits a base case that doesn't consume?), it might loop?
+        `checkMulExp` calls `checkUnaryExp`.
+        `checkUnaryExp` calls `checkPrimaryExp`.
+        `checkPrimaryExp`:
+        ```java
+        private void checkPrimaryExp() {
+            if (checkSym.tokenType == LPARENT) {
+                moveToNextCheckSym();
+                checkExp();
+                if (curSym.tokenType == RPARENT) { // BUG HERE?
+                    moveToNextCheckSym();
+                }
+            } else if (CheckTools.isIntCon(checkSym)) {
+                moveToNextCheckSym();
+            } else if (CheckTools.isCharCon(checkSym)) {
+                moveToNextCheckSym();
+            } else {
+                checkLVal();
+            }
+        }
+        ```
+        Look at the `LPARENT` branch: `if (curSym.tokenType == RPARENT)`. It checks `curSym` instead of `checkSym`.
+        `curSym` is the global parser cursor. `checkSym` is the lookahead cursor.
+        If `curSym` is not `RPARENT`, it doesn't advance `checkSym`.
+        If the expression inside parentheses is valid, `checkExp` will have advanced `checkSym` past the expression. The next token *should* be `RPARENT`.
+        If `curSym` happens to be `RPARENT` (coincidentally), it advances `checkSym`.
+        If `curSym` is NOT `RPARENT`, it does NOT advance `checkSym`.
+        So `checkSym` remains pointing to whatever token followed the inner expression (likely `RPARENT` in the token stream, but `checkSym` wasn't advanced to it if the condition failed? No, `checkExp` inside would have consumed tokens up to the end of the expression. The token *after* the expression is `RPARENT`. `checkSym` should be pointing to it.
+        Wait, `checkExp` processes tokens. When it finishes, `checkSym` points to the token *after* the last token of the expression.
+        If the expression was `( 1 + 2 )`, `checkPrimaryExp` sees `(`, advances to `1`. `checkExp` processes `1 + 2`. `checkSym` ends up at `)`.
+        Then back in `checkPrimaryExp`, it checks `if (curSym.tokenType == RPARENT)`.
+        `curSym` is the *current* token of the main parser. It is likely still at `(` or wherever `Stmt` started.
+        This condition `curSym.tokenType == RPARENT` is almost certainly wrong. It should be `checkSym.tokenType == RPARENT`.
+        
+        If `curSym` is not `RPARENT`, `moveToNextCheckSym()` is NOT called.
+        So `checkSym` remains at `)`.
+        This doesn't cause an infinite loop in `checkPrimaryExp` itself, as it returns.
+        
+        However, let's look at `checkUnaryExp`:
+        ```java
+        if (CheckTools.isIdent(checkSym) && getNextNCheckSym(1).tokenType == LPARENT) {
+            moveToNextCheckSym();
+            if (checkSym.tokenType == LPARENT) {
+                moveToNextCheckSym();
+                if (checkSym.tokenType != RPARENT && CheckTools.isFirstExp(checkSym)) {
+                    checkFuncRParams();
+                }
+            }
+        }
+        ```
+        If it's a function call `func()`, `checkSym` is `func`. `getNextNCheckSym(1)` is `(`.
+        Enters block. `moveToNextCheckSym()` -> `checkSym` is `(`.
+        Enters `if`. `moveToNextCheckSym()` -> `checkSym` is `)`.
+        `if (checkSym.tokenType != RPARENT ...)` -> False. Skips params.
+        Returns.
+        `checkSym` is `)`.
+        Back in `checkPrimaryExp` (if it was called from somewhere)? No, this was `checkUnaryExp`.
+        
+        The bug `if (curSym.tokenType == RPARENT)` in `checkPrimaryExp` means that if we have nested parentheses or complex expressions in the lookahead, the `checkSym` pointer might not advance past the closing parenthesis of the sub-expression if `curSym` (the main parser's current token) doesn't match.
+        
+        Does this cause TLE?
+        If `checkSym` doesn't advance, does a loop depend on it?
+        In `checkExp`:
+        ```java
+        while (checkSym.tokenType == PLUS || checkSym.tokenType == MINU) {
+             moveToNextCheckSym();
+             checkMulExp();
+        }
+        ```
+        If `checkMulExp` doesn't advance `checkSym`, and `checkSym` is `+`, it loops infinitely.
+        `checkMulExp` calls `checkUnaryExp`.
+        If `checkUnaryExp` fails to advance `checkSym` (e.g. gets stuck in a state where it matches nothing and consumes nothing), then yes.
+        
+        But the primary suspect for TLE in the *main* parsing logic (not lookahead) is usually a failure to advance `curSym`.
+        
+        Let's look at `CompUnit` again.
+        If the input is correct, `VarDecl` and `ConstDecl` should consume tokens.
+        
+        Is it possible `getNextNSym` is slow? No, it's O(1).
+        
+        Let's look at `Lexer`.
+        `analyze()` reads characters.
+        
+        Actually, there is a very subtle bug in `Parser.java` in the `CompUnit` method or `Block` method if `Stmt` doesn't consume.
+        
+        But wait, look at `checkPrimaryExp` again.
+        ```java
+        if (curSym.tokenType == RPARENT) {
+            moveToNextCheckSym();
+        }
+        ```
+        This is definitely a bug. It should be `checkSym`.
+        Does this cause TLE?
+        If we have `for(i=0; i<10; i++)`, the condition `i<10` involves `RelExp`.
+        `Cond()` -> `LOrExp()` -> ... -> `PrimaryExp()`.
+        If `PrimaryExp` has `(exp)`, `checkPrimaryExp` is used in `checkLVal`? No, `checkLVal` is only used in `Stmt` lookahead.
+        
+        The lookahead is only used in `Stmt` to distinguish `LVal = ...` from `Exp;`.
+        
+        If the TLE is happening, it's likely in the main parsing.
+        
+        Let's look at `Block()`:
+        ```java
+        while(curSym.tokenType != RBRACE) {
+            if (curSym.tokenType == INTTK || curSym.tokenType == CHARTK) {
+                VarDecl();
+            } else if (curSym.tokenType == CONSTTK) {
+                ConstDecl();
+            } else {
+                Stmt();
+            }
+        }
+        ```
+        If `Stmt()` is called and it matches `if (CheckTools.isIdent(curSym))`, it executes the body.
+        If it matches `else if (curSym.tokenType == LBRACE)`, it calls `Block()`.
+        
+        What if `Stmt()` falls through to the final `else`?
+        ```java
+        } else {
+            // rest of Exp
+            Exp();
+            errorCheckAndOutput(SEMICN, 'i');
+        }
+        ```
+        
+        There is a potential issue in `UnaryExp`:
+        ```java
+        if (CheckTools.isIdent(curSym) && getNextNSym(1).tokenType == LPARENT) {
+            TerminalSym(); // Consumes Ident
+            if (curSym.tokenType == LPARENT) {
+                TerminalSym(); // Consumes (
+                if (curSym.tokenType != RPARENT && CheckTools.isFirstExp(curSym)) {
+                    FuncRParams();
+                }
+                errorCheckAndOutput(RPARENT, 'j');
+            }
+        }
+        ```
+        If `getNextNSym(1)` is `LPARENT`, it enters.
+        It consumes `Ident`. `curSym` is now `(`.
+        It enters `if`. Consumes `(`. `curSym` is now next.
+        If it's `)`, `FuncRParams` is skipped. `errorCheckAndOutput` consumes `)`.
+        
+        This looks correct.
+        
+        Let's look at the `checkPrimaryExp` bug again.
+        File: `<Syntax/Parser.java>`
+        
+        <Syntax/Parser.java>
+        ...
+        private void checkPrimaryExp() {
+            if (checkSym.tokenType == LPARENT) {
+                moveToNextCheckSym();
+                checkExp();
+                if (curSym.tokenType == RPARENT) {  // ERROR: should be checkSym
+                    moveToNextCheckSym();
+                }
+            } else if (CheckTools.isIntCon(checkSym)) {
+                moveToNextCheckSym();
+            } else if (CheckTools.isCharCon(checkSym)) {
+                moveToNextCheckSym();
+            } else {
+                checkLVal();
+            }
+        }
+        ...
+
+        While this is a bug, does it cause TLE?
+        If `checkSym` is `(`, it advances. `checkExp` runs.
+        If `checkExp` completes, `checkSym` is at the token after the expression.
+        If that token is `)`, `checkSym` is `)`.
+        The code checks `curSym`. If `curSym` is not `)`, it does NOT advance `checkSym`.
+        So `checkSym` stays at `)`.
+        The function returns.
+        
+        This leaves `checkSym` at `)`.
+        The caller `checkUnaryExp` returns.
+        The caller `checkMulExp` returns.
+        The caller `checkExp` checks `while (checkSym.tokenType == PLUS ...)`.
+        If `checkSym` is `)`, the loop terminates.
+        So it doesn't infinite loop there.
+        
+        However, if `checkPrimaryExp` is called recursively?
+        `checkExp` -> `checkMulExp` -> `checkUnaryExp` -> `checkPrimaryExp`.
+        If we have `((1))`.
+        1. `checkPrimaryExp` sees `(`. Advances to `(`.
+        2. `checkExp` calls `checkMulExp`... -> `checkPrimaryExp`.
+        3. Inner `checkPrimaryExp` sees `(`. Advances to `1`.
+        4. `checkExp` processes `1`. `checkSym` is `)`.
+        5. Inner `checkPrimaryExp` checks `curSym`. If `curSym` != `)`, it doesn't advance. `checkSym` is `)`.
+        6. Returns to outer `checkExp`.
+        7. Outer `checkExp` finishes. `checkSym` is `)`.
+        8. Outer `checkPrimaryExp` checks `curSym`. If `curSym` != `)`, it doesn't advance. `checkSym` is `)`.
+        
+        It seems consistent. It doesn't cause an infinite loop by itself.
+        
+        Where is the TLE?
+        
+        Look at `CompUnit` again.
+        
+        ```java
+        while(curSym.tokenType == CONSTTK ||((curSym.tokenType == INTTK || curSym.tokenType == CHARTK) &&
+                CheckTools.isIdent(getNextNSym(1)) && getNextNSym(2).tokenType != LPARENT)) {
+        ```
+        
+        If `getNextNSym(1)` or `getNextNSym(2)` triggers the "out of range" notice and returns the last token repeatedly, and the condition remains true, it loops.
+        
+        But the real issue might be simpler.
+        
+        In `Lexer.java`:
+        ```java
+        while ((ch = reader.read()) != -1) {
+            if (!(ch == ' ' || ch == '\t' || ch == '\n')) {
+                reader.unread(ch);
+                next();
+            } else if (ch == '\n') {
+                lineNo++;
+            }
+        }
+        ```
+        If `next()` throws an exception or hangs?
+        
+        Let's look at `next()` in `Lexer`.
+        If it encounters a character it doesn't handle, it falls to the end.
+        ```java
+        } else {
+            nameBuilder.append((char)ch);
+            token.tokenType = checkReverse(nameBuilder.toString());
+            if (token.tokenType != Token.TokenType.IDENFR) {
+                token.name = nameBuilder.toString();
+            } else {
+                // error
+            }
+        }
+        token.lineNumber = lineNo;
+        tokens.add(token);
+        ```
+        It always adds a token. So `analyze()` terminates.
+        
+        Back to `Parser`.
+        
+        Is it possible `getInstance` is creating a new parser but reusing old static state?
+        ```java
+        private static Parser instance;
+        public static Parser getInstance(ArrayList<Token> tokens) {
+            if (instance == null) {
+                instance = new Parser(tokens);
+            }
+            return instance;
+        }
+        ```
+        If `Compiler.java` runs, it creates `instance`.
+        If the test harness runs multiple tests in the same JVM, `instance` is not null.
+        It returns the OLD parser with the OLD tokens.
+        The new tokens are passed in but IGNORED because `instance` is not null.
+        The parser analyzes the OLD tokens (from the previous test case or empty).
+        If the old parser state is "finished" or inconsistent, it might loop or terminate quickly.
+        But TLE suggests looping.
+        
+        If the previous test case left `curIndex` at the end, and `isEnd` is true.
+        `moveToNextSym`:
+        ```java
+        if (curIndex == tokens.size()) {
+            if (isEnd) {
+                System.out.println("Error: Syntax analysis not finished.");
+            } else {
+                isEnd = true;
+            }
+        } else {
+            curSym = tokens.get(curIndex);
+        }
+        ```
+        If `isEnd` is true, it prints error but does NOT change `curIndex` or `curSym`.
+        If a loop relies on `curSym` changing, it will loop infinitely printing "Error: Syntax analysis not finished."
+        
+        This fits the TLE symptom perfectly if the test harness runs multiple cases.
+        Even if it's a single case, if `Parser` is instantiated once, and then `analyze()` is called, it works.
+        But if the environment reuses the class...
+        
+        The fix is to reset the state in `getInstance` or create a new instance every time.
+        
+        File: `<Syntax/Parser.java>`
+        
+        <Syntax/Parser.java>
+        ...
+        private static Parser instance;
+
+        public static Parser getInstance(ArrayList<Token> tokens) {
+            if (instance == null) {
+                instance = new Parser(tokens);
+            }
+            return instance;
+        }
+        ...
+
+        The `instance` is static and never reset. If the testing framework calls `Parser.getInstance` with new tokens, it ignores them and uses the old parser state. If the old parser state is at the end of the previous file, `curSym` doesn't advance, causing infinite loops in `CompUnit` or `Block` while loops which check `curSym` but `moveToNextSym` fails to advance because `isEnd` is true.
+
+        To fix this, `instance` should be set to `null` or a new parser should be created each time, or the state should be reset. Given the singleton pattern is used, it's likely intended to be single-use or needs reset. The safest fix for a student assignment that might be tested in a loop is to remove the singleton or reset it.
+
+        However, looking at `Compiler.java`:
+        ```java
+        Parser parserInstance = Parser.getInstance(lexerInstance.tokens);
+        ```
+        It's called once per `main` execution.
+        If the "Test Case Input" implies a single run, why TLE?
+        
+        Maybe the input file `testfile.txt` is huge? No, it's small.
+        
+        Let's look at `checkPrimaryExp` again.
+        If `curSym` check is wrong, does it cause infinite loop in `checkExp`?
+        No, as analyzed before.
+        
+        Is there another singleton?
+        `Lexer.getInstance()`.
+        `CompileErrorHandler.getInstance()`.
+        
+        In `Compiler.java`:
+        ```java
+        Lexer lexerInstance = Lexer.getInstance();
+        lexerInstance.setReader(reader);
+        lexerInstance.analyze();
+        ```
+        `Lexer` also uses a singleton.
+        `tokens` is a member of `Lexer`.
+        `analyze()` clears `tokens`? No!
+        ```java
+        public ArrayList<Token> tokens = new ArrayList<>();
+        public void analyze() throws IOException {
+            // ...
+            Token.setData(tokens);
+        }
+        ```
+        It does NOT clear `tokens`. It appends to the existing list.
+        If `Lexer` is reused, `tokens` grows.
+        But `Compiler` creates a new `FileReader`.
+        
+        If `Lexer` is reused, `tokens` contains old tokens + new tokens.
+        `Parser.getInstance(lexerInstance.tokens)` passes the WHOLE list.
+        
+        If `Parser` is also reused (singleton), it uses the OLD `curIndex`.
+        
+        So both `Lexer` and `Parser` are singletons that accumulate state.
+        
+        In `Compiler.java`, if this `main` is run once, it's fine.
+        But if the evaluation system runs `main` multiple times in the same JVM (common in some online judges for efficiency), the static instances persist.
+        
+        `Lexer`: `tokens` keeps growing.
+        `Parser`: `instance` persists. `curIndex` persists.
+        
+        If `Parser` is reused, `curIndex` is at the end of the previous parse.
+        `CompUnit` starts. `curSym` is the last token of the previous file.
+        The `while` loop in `CompUnit` checks `curSym`.
+        If `curSym` is `RBRACE` or something that doesn't match `CONSTTK` etc, the loop terminates.
+        Then `FuncDef` loop. Terminates.
+        Then `MainFuncDef`. Fails.
+        `output("<CompUnit>")`.
+        Returns.
+        
+        It wouldn't TLE, it would just produce wrong output or crash.
+        
+        Unless... `moveToNextSym` is called and `isEnd` is true.
+        
+        If the previous parse finished, `isEnd` is true.
+        If the new parse starts, `curIndex` is old.
+        If `CompUnit` calls `TerminalSym()`, `moveToNextSym()` is called.
+        `curIndex` increments.
+        If `curIndex >= tokens.size()` (which now includes old + new tokens), it might be valid?
+        
+        Actually, if `Lexer` appends, `tokens.size()` is larger.
+        But `Parser`'s `curIndex` is from the old run.
+        
+        This is a mess of state leakage.
+        
+        The most direct cause of TLE in a *single* run with correct code logic is usually an infinite loop.
+        
+        Let's look at `checkPrimaryExp` again.
+        
+        <Syntax/Parser.java>
+        ...
+        private void checkPrimaryExp() {
+            if (checkSym.tokenType == LPARENT) {
+                moveToNextCheckSym();
+                checkExp();
+                if (curSym.tokenType == RPARENT) {
+                    moveToNextCheckSym();
+                }
+            }
+        ...
+        
+        If this bug causes `checkSym` to not advance past `)`, and this `checkPrimaryExp` was called from `checkUnaryExp` which was called from `checkMulExp`...
+        
+        Wait, if `checkSym` is `)` and returns, the caller `checkExp` sees `)` and stops.
+        
+        I will bet on the Singleton state leakage causing issues if the runner reuses the class, OR the `checkPrimaryExp` bug causing incorrect lookahead which might trigger error recovery loops if errors were present (but input is correct).
+        
+        However, there is one more possibility.
+        
+        In `Lexer`, `next()` handles comments.
+        
+        I will provide the `Parser.java` singleton fix and the `checkPrimaryExp` fix.
+
+<Syntax/Parser.java>
+...
+    private static Parser instance;
+
+    public static Parser getInstance(ArrayList<Token> tokens) {
+        instance = new Parser(tokens);
+        return instance;
+    }
+...
+    private void checkPrimaryExp() {
+        if (checkSym.tokenType == LPARENT) {
+            moveToNextCheckSym();
+            checkExp();
+            if (checkSym.tokenType == RPARENT) {
+                moveToNextCheckSym();
+            }
+        } else if (CheckTools.isIntCon(checkSym)) {
+...

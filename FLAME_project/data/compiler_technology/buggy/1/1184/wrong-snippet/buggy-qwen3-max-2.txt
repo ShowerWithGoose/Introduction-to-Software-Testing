@@ -1,0 +1,473 @@
+Based on the problem description and comparing the expected output with the buggy behavior (no output file generated), the issue appears to be in the error handling logic. The program should generate parser.txt for correct code, but it's not producing any output file.
+
+Looking at the expected output, we can see that `<BType>` should NOT be printed (as mentioned in the problem: "Syntax components that are not required to be output should still be analyzed but not displayed" and specifically mentions `<BlockItem>`, `<Decl>`, `<BType>` as exceptions).
+
+However, examining the `BTypeNode.java` file, we can see that it only prints the token but has the println for `<BType>` commented out, which is correct.
+
+The real issue is in the `Compiler.java` file. The program is checking `tokenErrors.isEmpty()` but the parser might be generating errors incorrectly, causing it to try to write to error.txt instead of parser.txt. 
+
+Looking more closely at the Parser's `isDecl` method in `Parser.java`, there's a problematic logic that could cause incorrect parsing:
+
+<Parser.java>
+...
+    public boolean isDecl(Token token) {
+        if (token.getTokenType() == TokenType.CONSTTK) {
+            return true;
+        }
+        Token token1 = tokens.getNext();
+        Token token2 = tokens.getNext();
+        if (token2.getTokenType() == TokenType.LPARENT) {
+            tokens.backLast();
+            tokens.backLast();
+            return false;
+        }
+        /*
+        if (token1.getTokenType() == TokenType.MAINTK) {
+            tokens.backLast();
+            tokens.backLast();
+            return false;
+        }*/
+        tokens.backLast();
+        tokens.backLast();
+        return true;
+    }
+...
+
+This method has flawed logic for determining if a token sequence represents a declaration. It peeks ahead two tokens and if the second token is LPARENT '(', it assumes it's a function definition. However, this doesn't properly handle all cases and could consume tokens incorrectly, leading to parsing errors that shouldn't exist.
+
+But the most critical issue is actually in the `Lexer.java` file in the Symbol method for handling '&' and '|' characters:
+
+<Lexer.java>
+...
+            case '&':
+                if (content.charAt(index + 1) != '&') {
+                    tokenError error = new tokenError(numLine,"a");
+                    tokenErrors.add(error);
+                    index ++;
+                    tokens.add(new Token("&&",TokenType.AND,numLine));
+                } else {
+                    index++;
+                    index++;
+                    tokens.add(new Token("&&",TokenType.AND,numLine));
+                }
+                break;
+            case '|':
+                if (content.charAt(index + 1) != '|') {
+                    tokenError error = new tokenError(numLine,"a");
+                    tokenErrors.add(error);
+                    index ++;
+                    tokens.add(new Token("||",TokenType.OR,numLine));
+                } else {
+                    index++;
+                    index++;
+                    tokens.add(new Token("||",TokenType.OR,numLine));
+                }
+                break;
+...
+
+The bug here is that when a single '&' or '|' is encountered (which should be an error), the code still adds an AND or OR token to the token list, but with the wrong string representation. For single '&', it should either not add a token or add a single '&' token, but instead it's adding "&&" as the token content while only consuming one character. This corrupts the token stream.
+
+However, looking at the test input, there are no '&' or '|' characters, so this might not be the direct cause.
+
+The actual issue causing "No output file" is likely in the `Compiler.java` file where it checks `tokenErrors.isEmpty()`. If there are any token errors from the lexer (even if they shouldn't be there), it will go to the error branch.
+
+But examining the test case input carefully, I notice that the main issue is probably in the parser's handling of the grammar rules. Looking at the expected output, we can see that after processing variable declarations like `int a1[10];`, it should output `<VarDef>` and then `<VarDecl>`.
+
+The problem appears to be in the `parseVarDef` method in `Parser.java`:
+
+<Parser.java>
+...
+    public TreeNode parseVarDef(Token token) {
+        ArrayList<TreeNode> nodes = new ArrayList<>();
+        if (token.getTokenType() == TokenType.IDENFR) {
+            nodes.add(token);
+            Token t = tokens.getNext();
+            if (t.getTokenType() == TokenType.LBRACK) {
+                nodes.add(t);
+                nodes.add(parseConstExp(tokens.getNext()));
+                t = tokens.getNext();
+                if (t.getTokenType() != TokenType.RBRACK) {
+                    tokens.backLast();
+                    tokenErrors.add(new tokenError(getErrorLine('k',nodes),"k"));
+                } else {
+                    nodes.add(t);
+                }
+                t = tokens.getNext();
+            }
+            if (t.getTokenType() == TokenType.ASSIGN) {
+                nodes.add(t);
+                nodes.add(parseInitVal(tokens.getNext()));
+                t = tokens.getNext();
+            }
+            tokens.backLast();
+            return new VarDefNode(nodes);
+        }
+        else {
+            return null;
+        }
+    }
+...
+
+The issue is `tokens.backLast();` at the end. This causes the parser to put back the last token it read, which means when parsing multiple VarDefs separated by commas, it won't advance properly through the token stream. This would cause infinite loops or incorrect parsing, leading to errors being generated.
+
+But wait, looking at the expected output again, the real smoking gun is that the program produces "No output file" which suggests that the `compUnitNode.print()` is never called because `tokenErrors` is not empty.
+
+Looking at the Lexer's comment handling in `Symbol` method:
+
+<Lexer.java>
+...
+            case '/':
+                if (content.charAt(index + 1) == '/') {
+                    index++;
+                    index++;
+                    while (index < content.length() && content.charAt(index) != '\n') {
+                        index++;
+                    }
+                    numLine++;
+                    index++;
+                } else if (content.charAt(index + 1) == '*'){
+                    index++;
+                    index++;
+                    int pre_index3 = index;
+                    index++;
+                    while (content.charAt(index) != '/'  || content.charAt(pre_index3) != '*') {
+                        if (content.charAt(pre_index3) == '\n') {
+                            numLine++;
+                        }
+                        pre_index3 = index;
+                        index++;
+                    }
+                    index++;
+                }
+                else {
+                    index++;
+                    tokens.add(new Token("/",TokenType.DIV,numLine));
+
+                }
+                break;
+...
+
+The block comment handling has a bug. The condition `while (content.charAt(index) != '/'  || content.charAt(pre_index3) != '*')` should be `while (!(content.charAt(index) == '/' && content.charAt(pre_index3) == '*'))` or similar. The current logic will exit the loop as soon as either condition is false, meaning it could exit prematurely.
+
+However, the test input doesn't contain block comments, so this isn't the issue.
+
+After careful analysis, the most likely culprit is in the `isLValBegin` method in `Parser.java`:
+
+<Parser.java>
+...
+    public boolean isLValBegin(Token token) {
+        int index = tokens.getIndex();
+        Token t = tokens.getNext();
+        int check = 0;
+        while (t.getTokenType() != TokenType.ASSIGN) {
+            if (t.getTokenType() == TokenType.SEMICN) {
+                tokens.setIndex(index);
+                return false;
+            }
+            if (t.getTokenType() == TokenType.LBRACK ){
+                check = 1;
+            }
+
+            if (t.getTokenType() != TokenType.LBRACK && t.getTokenType() != TokenType.RBRACK && check == 0) {
+                tokens.setIndex(index);
+                return false;
+            }
+            if (t.getTokenType() == TokenType.RBRACK ){
+                check = 0;
+            }
+            t = tokens.getNext();
+        }
+        tokens.setIndex(index);
+        return true;
+    }
+...
+
+This method tries to look ahead to see if an identifier is followed by an assignment (indicating it's an LVal). However, if there's no ASSIGN token in the entire remaining token stream, this will cause an infinite loop or IndexOutOfBoundsException when `tokens.getNext()` runs out of tokens.
+
+Since the test input is valid and should not produce errors, but the program generates no output file, this suggests that the parser is encountering an error due to this faulty lookahead logic, adding errors to `tokenErrors`, and thus writing to error.txt instead of parser.txt.
+
+But actually, looking at the Compiler.java main method more carefully:
+
+<Compiler.java>
+...
+        List<tokenError> tokenErrors = parser.getTokenErrors();
+
+        //symbolHandler symbolHandler = new symbolHandler(compUnitNode,parser.getTokenErrors());
+        //symbolHandler.compHandler();
+        //List<tokenError> tokenErrors = symbolHandler.getErrors();
+        if (tokenErrors.isEmpty()) {
+...
+        } else {
+...
+        }
+...
+
+The issue is that even if parsing completes successfully, if there are any token errors collected during parsing, it will go to the error branch. The `isLValBegin` method could be causing issues that result in error tokens being added.
+
+However, the most definitive evidence comes from comparing what should happen vs what does happen. The expected output shows proper parsing of all constructs, but the actual program produces no output file, meaning `tokenErrors` is not empty.
+
+Looking at the Lexer's handling of character constants:
+
+<Lexer.java>
+...
+            case '\'':
+                StringBuilder temp = new StringBuilder();
+                int pre_index = index;
+                temp.append(content.charAt(index));
+                index++;
+                int check = 0;
+                while (content.charAt(index) != '\'' || (content.charAt(pre_index) == '\\' && check == 0)) {
+                    temp.append(content.charAt(index));
+                    if ((content.charAt(pre_index) == '\\' && content.charAt(index) == '\\')) {
+                        check = 1;
+                    }
+                    pre_index = index;
+                    index++;
+                }
+                temp.append(content.charAt(index));
+                index++;
+                tokens.add(new Token(temp.toString(),TokenType.CHRCON,numLine));
+                break;
+...
+
+This has a potential infinite loop if there's an unclosed character constant. But the test input has properly closed character constants like `'\0'`.
+
+After thorough analysis, I believe the core issue is in the `Parser.java` file in the `parseCompUnit` method:
+
+<Parser.java>
+...
+    public TreeNode parseCompUnit() {
+        ArrayList<TreeNode> nodes = new ArrayList<>();
+        Token token = tokens.getNext();
+        while (isDecl(token)) {
+            nodes.add(parseDecl(token));
+            token = tokens.getNext();
+        }
+        while (!isMain(token)) {
+            nodes.add(parseFuncDef(token));
+            token = tokens.getNext();
+        }
+        nodes.add(parseMainFuncDef(token));
+        return new CompUnitNode(nodes);
+
+    }
+...
+
+The problem is that `tokens.getNext()` at the beginning might return null or cause issues if the token list is empty, but more importantly, the `isMain` method has a bug:
+
+<Parser.java>
+...
+    public boolean isMain(Token token) {
+        Token t = tokens.getNext();
+        if (token.getTokenType() == TokenType.INTTK && t.getTokenType() == TokenType.MAINTK) {
+            tokens.backLast();
+            return true;
+        }
+        tokens.backLast();
+        return false;
+    }
+...
+
+If `tokens.getNext()` returns null (end of tokens), then `t.getTokenType()` will throw a NullPointerException. This would cause the program to crash silently or generate an exception that prevents output file creation.
+
+But the test input ends with a proper main function, so this should work.
+
+Given all this analysis, the most likely location of the error that causes "No output file" is actually in the error handling in `Compiler.java` where it processes token errors. Specifically, this section:
+
+<Compiler.java>
+...
+                Iterator<tokenError> iterator = tokenErrors.iterator();
+                tokenError last = null;
+                while (iterator.hasNext()) {
+                    tokenError t = iterator.next();
+                    if (last == null) {
+                        last = t;
+                    } else {
+                        if (last.getLineNum() == t.getLineNum()) {
+                            iterator.remove();
+                        }
+                    }
+
+
+                }
+...
+
+This logic for removing duplicate errors on the same line is flawed. It only compares consecutive errors, not all errors on the same line. But more critically, if `tokenErrors` contains any errors (even spurious ones from parser bugs), it will write to error.txt.
+
+However, since the test input is valid, there should be no errors. The fact that there's no output suggests the parser is generating errors incorrectly.
+
+Looking back at the expected output, I notice that for array initializers like `{1, 2, 3}`, it shows:
+```
+LBRACE {
+INTCON 1
+<Number>
+...
+RBRACE }
+<InitVal>
+```
+
+But in the `parseInitVal` method:
+
+<Parser.java>
+...
+    public TreeNode parseInitVal(Token token) {
+        ArrayList<TreeNode> nodes = new ArrayList<>();
+        if (token.getTokenType() == TokenType.STRCON) {
+            nodes.add(token);
+        } else if (token.getTokenType() == TokenType.LBRACE ){
+            nodes.add(token);
+            Token t = tokens.getNext();
+            if (t.getTokenType() != TokenType.RBRACE) {
+                nodes.add(parseExp(t));
+                t = tokens.getNext();
+                while (t.getTokenType() == TokenType.COMMA) {
+                    nodes.add(t);
+                    nodes.add(parseExp(tokens.getNext()));
+                    t = tokens.getNext();
+                }
+            }
+            nodes.add(t);
+        } else {
+            nodes.add(parseExp(token));
+        }
+        return new InitValNode(nodes);
+    }
+...
+
+The issue is that after the while loop, `t` might not be RBRACE, but the code assumes it is and adds it to nodes anyway. This could cause parsing errors.
+
+But honestly, after extensive analysis, the most probable cause is in the `isDecl` method's flawed lookahead logic, which is causing the parser to misidentify function definitions as declarations or vice versa, leading to parsing errors.
+
+However, given the constraint to identify the most likely error location based on the symptoms, I'll go with the `isLValBegin` method as it's a common source of infinite loops or index errors in recursive descent parsers with lookahead.
+
+Actually, let me reconsider. The program produces "No output file" which means neither parser.txt nor error.txt is created. Looking at the Compiler.java code:
+
+```java
+if (tokenErrors.isEmpty()) {
+    // write to parser.txt
+} else {
+    // write to error.txt  
+}
+```
+
+If neither file is created, it suggests that an exception occurred before reaching either branch, or during file writing.
+
+But the problem states "Buggy Output: No output file" which likely means the program ran to completion but didn't create the expected parser.txt file, implying it went into the error branch but maybe error.txt wasn't properly written either.
+
+Wait, looking more carefully at the expected output format: for correct programs, output goes to parser.txt. The test input is correct, so parser.txt should be created.
+
+The fact that it's not suggests that `tokenErrors` is not empty, so the program thinks there are errors.
+
+Given the complexity, I think the most likely specific bug is in the Lexer's handling of the minus sign. In the test input, there are expressions like `n - 1` and `n - 2`. 
+
+In `Lexer.java`, the minus sign is handled as:
+
+```java
+case '-':
+    index++;
+    tokens.add(new Token("-",TokenType.MINU,numLine));
+    break;
+```
+
+This is correct.
+
+After careful reconsideration, I believe the issue is in the `Parser.java` file in the `parseUnaryExp` method. Looking at the expected output, unary minus should produce `<UnaryOp>` then `<UnaryExp>`, but the current implementation might not handle this correctly.
+
+<Parser.java>
+...
+    public TreeNode parseUnaryExp(Token token) {
+        ArrayList<TreeNode> nodes = new ArrayList<>();
+        if (token.getTokenType() == TokenType.LPARENT || token.getTokenType() == TokenType.CHRCON||token.getTokenType() == TokenType.INTCON) {
+            nodes.add(parsePrimaryExp(token));
+            return new UnaryExpNode(nodes);
+        }
+        else if (token.getTokenType() == TokenType.IDENFR) {
+            Token t =  tokens.getNext();
+            if (t.getTokenType() == TokenType.LPARENT) {
+                tokens.backLast();
+                nodes.add(token);
+                t = tokens.getNext();
+                if (t.getTokenType() == TokenType.LPARENT) {
+                    nodes.add(t);
+                    t = tokens.getNext();
+                    if (t.getTokenType() == TokenType.LPARENT || t.getTokenType() == TokenType.IDENFR || t.getTokenType() == TokenType.PLUS || t.getTokenType() == TokenType.MINU || t.getTokenType() == TokenType.NOT || t.getTokenType() == TokenType.INTCON || t.getTokenType() == TokenType.CHRCON) {
+                        nodes.add(parseFuncRParams(t));
+                        t = tokens.getNext();
+                    }
+                    if (t.getTokenType() != TokenType.RPARENT) {
+                        tokens.backLast();
+                        tokenErrors.add(new tokenError(getErrorLine('j',nodes),"j"));
+                    } else {
+                        nodes.add(t);
+                    }
+                    return new UnaryExpNode(nodes);
+                }
+            }
+            else {
+                tokens.backLast();
+                nodes.add(parsePrimaryExp(token));
+                return new UnaryExpNode(nodes);
+            }
+        } else {
+            nodes.add(parseUnaryOp(token));
+            nodes.add(parseUnaryExp(tokens.getNext()));
+            return new UnaryExpNode(nodes);
+        }
+        return null;
+    }
+...
+
+The issue is in the final else clause. When token is PLUS, MINU, or NOT, it calls `parseUnaryOp(token)` and then `parseUnaryExp(tokens.getNext())`. This is correct for the grammar.
+
+But looking at the expected output for `-1`:
+```
+MINU -
+<UnaryOp>
+INTCON 1
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+```
+
+This shows two `<UnaryExp>` nodes, which matches the recursive structure.
+
+I think I need to focus on why the program produces no output file. The most likely explanation is that an unhandled exception occurs during parsing, preventing either file from being written.
+
+Looking at the `parseCompUnit` method again:
+
+```java
+Token token = tokens.getNext();
+```
+
+If the token list is empty, `getNext()` would throw an exception. But the test input is not empty.
+
+Given the time I've spent, I'll identify the most suspicious code section as the `isDecl` method in Parser.java, as its lookahead logic is fragile and could easily cause parsing errors on valid input.
+
+<Parser.java>
+...
+    public boolean isDecl(Token token) {
+        if (token.getTokenType() == TokenType.CONSTTK) {
+            return true;
+        }
+        Token token1 = tokens.getNext();
+        Token token2 = tokens.getNext();
+        if (token2.getTokenType() == TokenType.LPARENT) {
+            tokens.backLast();
+            tokens.backLast();
+            return false;
+        }
+        /*
+        if (token1.getTokenType() == TokenType.MAINTK) {
+            tokens.backLast();
+            tokens.backLast();
+            return false;
+        }*/
+        tokens.backLast();
+        tokens.backLast();
+        return true;
+    }
+...
