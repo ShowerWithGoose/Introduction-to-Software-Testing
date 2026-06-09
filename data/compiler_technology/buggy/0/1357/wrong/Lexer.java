@@ -1,0 +1,209 @@
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class Lexer {
+    private static final String IDENFR_FORMAT = "[A-Za-z_]\\w*";
+    private static final String INTCON_FORMAT = "[1-9]\\d*|0";
+    private static final String STRCON_FORMAT = "\"([ !#-&(-\\[\\]-~]|\\\\[abtnvf\"'\\\\0])*\"";
+    private static final String CHRCON_FORMAT = "'([ !#-&(-\\[\\]-~]|\\\\[abtnvf\"'\\\\0])'";
+    private static final String MAINTK_FORMAT = "main\\b";
+    private static final String CONSTTK_FORMAT = "const\\b";
+    private static final String INTTK_FORMAT = "int\\b";
+    private static final String CHARTK_FORMAT = "char\\b";
+    private static final String BREAKTK_FORMAT = "break\\b";
+    private static final String CONTINUETK_FORMAT = "continue\\b";
+    private static final String IFTK_FORMAT = "if\\b";
+    private static final String ELSETK_FORMAT = "else\\b";
+    private static final String NOT_FORMAT = "!";
+    private static final String AND_FORMAT = "&&";
+    private static final String OR_FORMAT = "\\|\\|";
+    private static final String FORTK_FORMAT = "for\\b";
+    private static final String GETINTTK_FORMAT = "getint\\b";
+    private static final String GETCHARTK_FORMAT = "getchar\\b";
+    private static final String PRINTFTK_FORMAT = "printf\\b";
+    private static final String RETURNTK_FORMAT = "return\\b";
+    private static final String PLUS_FORMAT = "\\+";
+    private static final String MINU_FORMAT = "-";
+    private static final String VOIDTK_FORMAT = "void\\b";
+    private static final String MULT_FORMAT = "\\*";
+    private static final String DIV_FORMAT = "/";
+    private static final String MOD_FORMAT = "%";
+    private static final String LSS_FORMAT = "<";
+    private static final String LEQ_FORMAT = "<=";
+    private static final String GRE_FORMAT = ">";
+    private static final String GEQ_FORMAT = ">=";
+    private static final String EQL_FORMAT = "==";
+    private static final String NEQ_FORMAT = "!=";
+    private static final String ASSIGN_FORMAT = "=";
+    private static final String SEMICN_FORMAT = ";";
+    private static final String COMMA_FORMAT = ",";
+    private static final String LPARENT_FORMAT = "\\(";
+    private static final String RPARENT_FORMAT = "\\)";
+    private static final String LBRACK_FORMAT = "\\[";
+    private static final String RBRACK_FORMAT = "\\]";
+    private static final String LBRACE_FORMAT = "\\{";
+    private static final String RBRACE_FORMAT = "\\}";
+
+    private static final String ERR_SINGLE_AND_FORMAT = "&";
+    private static final String ERR_SINGLE_OR_FORMAT = "\\|";
+
+
+    private static final String SPACE_FORMAT = "\\s+";
+    private static final String SINGLE_LINE_COMMENT_FORMAT = "//.*?\n";
+    private static final String MULTI_LINE_COMMENT_FORMAT = "/\\*[\\s\\S]*\\*/";
+
+    private String input;
+    private LexType lexType;
+    private String token;
+    private int pos;
+    private int lineno;
+
+    public Lexer(String input) {
+        this.input = input;
+        this.lexType = null;
+        this.token = null;
+        this.pos = 0;
+        this.lineno = 1;
+    }
+
+    public boolean next() {
+        while (skip(SPACE_FORMAT) || skip(SINGLE_LINE_COMMENT_FORMAT) || skip(MULTI_LINE_COMMENT_FORMAT)) {}
+        if (find(LexType.MAINTK, MAINTK_FORMAT)) {
+            return true;
+        } else if (find(LexType.CONSTTK, CONSTTK_FORMAT)) {
+            return true;
+        } else if (find(LexType.INTTK, INTTK_FORMAT)) {
+            return true;
+        } else if (find(LexType.CHARTK, CHARTK_FORMAT)) {
+            return true;
+        } else if (find(LexType.BREAKTK, BREAKTK_FORMAT)) {
+            return true;
+        } else if (find(LexType.CONTINUETK, CONTINUETK_FORMAT)) {
+            return true;
+        } else if (find(LexType.IFTK, IFTK_FORMAT)) {
+            return true;
+        } else if (find(LexType.ELSETK, ELSETK_FORMAT)) {
+            return true;
+        } else if (find(LexType.AND, AND_FORMAT)) {
+            return true;
+        } else if (find(LexType.OR, OR_FORMAT)) {
+            return true;
+        } else if (find(LexType.FORTK, FORTK_FORMAT)) {
+            return true;
+        } else if (find(LexType.GETINTTK, GETINTTK_FORMAT)) {
+            return true;
+        } else if (find(LexType.GETCHARTK, GETCHARTK_FORMAT)) {
+            return true;
+        } else if (find(LexType.PRINTFTK, PRINTFTK_FORMAT)) {
+            return true;
+        } else if (find(LexType.RETURNTK, RETURNTK_FORMAT)) {
+            return true;
+        } else if (find(LexType.PLUS, PLUS_FORMAT)) {
+            return true;
+        } else if (find(LexType.MINU, MINU_FORMAT)) {
+            return true;
+        } else if (find(LexType.VOIDTK, VOIDTK_FORMAT)) {
+            return true;
+        } else if (find(LexType.MULT, MULT_FORMAT)) {
+            return true;
+        } else if (find(LexType.DIV, DIV_FORMAT)) {
+            return true;
+        } else if (find(LexType.MOD, MOD_FORMAT)) {
+            return true;
+        } else if (find(LexType.LEQ, LEQ_FORMAT)) {
+            return true;
+        } else if (find(LexType.GEQ, GEQ_FORMAT)) {
+            return true;
+        } else if (find(LexType.EQL, EQL_FORMAT)) {
+            return true;
+        } else if (find(LexType.NEQ, NEQ_FORMAT)) {
+            return true;
+        } else if (find(LexType.LSS, LSS_FORMAT)) {
+            return true;
+        } else if (find(LexType.GRE, GRE_FORMAT)) {
+            return true;
+        } else if (find(LexType.NOT, NOT_FORMAT)) {
+            return true;
+        } else if (find(LexType.ASSIGN, ASSIGN_FORMAT)) {
+            return true;
+        } else if (find(LexType.SEMICN, SEMICN_FORMAT)) {
+            return true;
+        } else if (find(LexType.COMMA, COMMA_FORMAT)) {
+            return true;
+        } else if (find(LexType.LPARENT, LPARENT_FORMAT)) {
+            return true;
+        } else if (find(LexType.RPARENT, RPARENT_FORMAT)) {
+            return true;
+        } else if (find(LexType.LBRACK, LBRACK_FORMAT)) {
+            return true;
+        } else if (find(LexType.RBRACK, RBRACK_FORMAT)) {
+            return true;
+        } else if (find(LexType.LBRACE, LBRACE_FORMAT)) {
+            return true;
+        } else if (find(LexType.RBRACE, RBRACE_FORMAT)) {
+            return true;
+        } else if (find(LexType.IDENFR, IDENFR_FORMAT)) {
+            return true;
+        } else if (find(LexType.INTCON, INTCON_FORMAT)) {
+            return true;
+        } else if (find(LexType.STRCON, STRCON_FORMAT)) {
+            return true;
+        } else if (find(LexType.CHRCON, CHRCON_FORMAT)) {
+            return true;
+        } else if (find(LexType.ERR_SINGLE_AND, ERR_SINGLE_AND_FORMAT)) {
+            return true;
+        } else if (find(LexType.ERR_SINGLE_OR, ERR_SINGLE_OR_FORMAT)) {
+            return true;
+        } else {
+            lexType = null;
+            token = null;
+            return false;
+        }
+    }
+
+    private boolean find(LexType lexType, String format) {
+        Pattern pattern = Pattern.compile(format);
+        Matcher matcher = pattern.matcher(input.substring(pos));
+        if (matcher.lookingAt()) {
+            this.lexType = lexType;
+            token = matcher.group();
+            for (int i = pos; i < pos + matcher.group().length(); i++) {
+                if (input.charAt(i) == '\n') {
+                    lineno++;
+                }
+            }
+            pos += matcher.group().length();
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    private boolean skip(String format) {
+        Pattern pattern = Pattern.compile(format);
+        Matcher matcher = pattern.matcher(input.substring(pos));
+        if (matcher.lookingAt()) {
+            for (int i = pos; i < pos + matcher.group().length(); i++) {
+                if (input.charAt(i) == '\n') {
+                    lineno++;
+                }
+            }
+            pos += matcher.group().length();
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    public String getToken() {
+        return token;
+    }
+
+    public LexType getLexType() {
+        return lexType;
+    }
+
+    public int getLineno() {
+        return lineno;
+    }
+}

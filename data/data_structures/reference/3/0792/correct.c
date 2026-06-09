@@ -1,0 +1,61 @@
+#include<stdio.h>
+#include<string.h>
+#include<math.h>
+char a[10000],b[10000];
+int main()
+{
+	int i,j=0,m=0,n=0,p=0,q=0,flag=0,flag2=0;
+	gets(a);
+	for(i=0;a[i]!='\0';i++)
+	{
+		if(a[i]=='.')
+		flag=i;
+	}
+	for(i=0;a[i]!='\0';i++)
+	{
+		if(a[i]!='0'&&a[i]!='.')
+		{
+		flag2=i;
+		break;
+	    }
+	}
+	if(flag<flag2)
+	{
+		for(i=0;a[i]!='\0';i++)
+		{
+			if(a[i]!='0'&&a[i]!='.')
+			{
+				printf("%c",a[i]);
+				break;
+			}
+		}
+			if(a[i+1]=='\0')
+			{
+				printf("e-%d",flag2-flag);
+			}
+			else
+			{
+				printf(".");
+				for(i=i+1;a[i]!='\0';i++)
+				{
+					printf("%c",a[i]);
+				}
+				printf("e-%d",flag2-flag);
+			}
+	}
+	if(flag>flag2)
+	{
+		for(i=0;a[i]!='\0';i++)
+		{
+			{
+				if(i==1)
+				printf(".");
+				if(a[i]!='.')
+				printf("%c",a[i]);
+			}
+		}
+		printf("e%d",flag-flag2-1);
+	}
+	
+} 
+

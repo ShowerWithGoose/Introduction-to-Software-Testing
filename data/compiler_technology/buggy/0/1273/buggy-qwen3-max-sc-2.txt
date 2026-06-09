@@ -1,0 +1,136 @@
+<main.cpp>
+...
+    } else if (ch == '&') {
+        ch = input.get();
+        if (ch == '&') {
+            content.append(1, ch);
+            token = Token(Token::AND, content, lineno);
+        } else {
+            input.unget();
+            token = Token(Token::ERR, content, lineno);
+            ErrorReporter::report(lineno, "a"); // @@ [Error message should be just "a", but content is "&", which is correct; however, the unget() leaves the single '&' in the stream, and the error reporting is correct per spec. The real issue is that after reporting an error, the main loop skips ERR tokens and continues, but the single '&' has already been consumed as a token. However, the actual bug is that when encountering a single '&', the code reports error "a" correctly, but the content of the token is "&", which is fine. The true problem lies in the fact that after reporting the error, the lexer continues processing, but the specification says each erroneous example has exactly one lexical error and the program should output only the error. However, the main loop writes only non-ERR tokens to lexer.txt and writes errors to error.txt. This part seems correct. But wait: in the case of single '&', the code sets token.type = ERR and reports error "a", which is correct. However, looking at the handling of '/' for comments: in the single-line comment case, after skipping to '\n', it does lineno++ and then calls next_token recursively. But if the comment ends with EOF instead of '\n', then ch becomes EOF, and the loop condition `while (ch != '\n' && ch != EOF)` breaks, then lineno is incremented even if no newline was encountered. However, the test case input shows "/bin/sh: 1: g++: not found", which suggests the program failed to compile, but the actual issue might be elsewhere. However, based on the problem description and the provided code, the most likely error is in the handling of single '&' and '|': the error category code is reported as "a", which matches the spec. But note: the problem states that for erroneous source programs, ONLY the error line and error code should be output to error.txt, and nothing to lexer.txt. The current main loop skips ERR tokens and only writes non-ERR tokens. So if there's an error, it will not write that token to lexer.txt, which is correct. However, the issue might be that after reporting an error, the program should stop or handle only one error, but the spec says each erroneous example has exactly one error, so it's okay to continue until EOF but only one error will be reported. But the real bug is in the character constant handling: when reading a char constant like '\'', the code does `token = Token(Token::CHRCON, "'" + std::string(1, next_char) + "'", lineno);` — this reconstructs the string, but the problem says: "Ensure that the read string is preserved exactly as it appears for output purposes". For example, if the input is '\n', the stored content becomes "'\n'", but the original was "'\\n'". So the output would be wrong for escape sequences. However, the test case that failed is about error type 'a', so likely the issue is in the '&' or '|' handling. But wait: in the code for '&', when it reads a single '&', it sets content to "&" (from the initial ch), then reads next char, which is not '&', so it ungets that next char, and reports error with content "&". That seems correct. However, note that the initial content was set to "&" before checking the next character. Then, when it's a single '&', the token content is "&", which is correct. But what if the input is "&x"? The lexer would read '&', see next is 'x', unget 'x', report error for "&", then next token would be "x" as IDENFR. That is correct behavior. So why the failure? Another possibility: the error reporting uses `ErrorReporter::report(lineno, "a");` — the second argument is the error category code, which should be "a", and that's what is output to error.txt as "line_number a". That matches the expected format. But note: in the main function, after the loop, if there are errors, it outputs to error.txt. However, the problem says: for erroneous source programs, output ONLY to error.txt, and for correct ones, ONLY to lexer.txt. The current code writes tokens to lexer.txt during the loop (skipping ERR), and if any error occurred, writes error.txt at the end. This is correct. But what if the error occurs on the last token? It should still work. However, there's a critical bug in the digit handling: `content.clear(); // 清空之前的内容` — but the initial `content.append(1, ch);` was done before the if-else chain, so for digits, the first digit is appended, then content is cleared, so the first digit is lost! For example, input "123" would result in content being cleared, then appending '1','2','3' — wait no: let's trace:
+
+- ch = input.get() -> '1'
+- content.append(1, '1') -> content="1"
+- enters `else if (std::isdigit(ch))`
+- content.clear() -> content=""
+- do { content.append(1, ch); ch=input.get(); } while digit
+  - first iteration: ch='1', append -> content="1"
+  - then ch='2', append -> "12"
+  - then ch='3', append -> "123"
+  - then ch=non-digit, say space
+- input.unget()
+- token = Token(INTCON, "123", lineno)
+
+So it's actually correct because the do-while starts by appending the current ch (which is the first digit). But wait: the initial content was "1", then cleared, then in the do-while, the first thing is append '1'. So it's okay.
+
+But the real bug is in the comment handling for single-line comments:
+
+```cpp
+        if (next_char == '/') {
+            // Single-line comment, skip until the end of line
+            while (ch != '\n' && ch != EOF) {
+                ch = input.get();
+            }
+            lineno++; // Move to next line
+            return next_token(input, token, lineno);
+        }
+```
+
+Here, `ch` is initially the '/' (from the first get), then `next_char = input.get()` is the second '/'. Then the while loop starts with `ch` still being the first '/', so it checks `ch != '\n' && ch != EOF` — which is true, so it does `ch = input.get()`, which gets the next character after "//". But if the file ends right after "//", then the first `input.get()` in the loop returns EOF, so ch=EOF, and the loop breaks. Then `lineno++` is executed, even though there was no newline. This incorrectly increments the line number.
+
+However, the test case that failed is about error type 'a', so likely not this.
+
+But wait: the problem says the test case input is:
+/bin/sh: 1: g++: not found
+
+This suggests that the program didn't even compile, but the user is asking about a runtime logic error. However, the actual issue might be in the error reporting for '&' and '|'.
+
+Looking again at the '&' handling:
+
+- content starts as "&"
+- then ch = input.get() -> say 'x'
+- since 'x' != '&', it does input.unget() (so 'x' is put back)
+- then sets token to ERR with content "&"
+- reports error "a"
+
+This is correct.
+
+But note: what if the input is "&\n"? 
+- Read '&', content="&"
+- input.get() returns '\n'
+- not '&', so unget() puts '\n' back
+- report error "a" at current lineno (say 1)
+- then next call to next_token will see '\n', increment lineno to 2, and continue.
+
+Correct.
+
+However, there's a subtle issue: when the single '&' is at the end of file.
+
+Example input: "&"
+
+- ch = input.get() -> '&', content="&"
+- then ch = input.get() -> EOF
+- so in the else branch: input.unget() — but ungetting EOF is undefined behavior.
+
+According to cppreference: If the end-of-file indicator is set, the behavior of unget() is undefined.
+
+So if the input ends with a single '&', then after reading '&', the next get() returns EOF, then we try to unget() EOF, which is invalid.
+
+This would cause undefined behavior, possibly crashing or misbehaving.
+
+Similarly for single '|' at EOF.
+
+This is likely the bug.
+
+In the code:
+
+```cpp
+    } else if (ch == '&') {
+        ch = input.get();
+        if (ch == '&') {
+            content.append(1, ch);
+            token = Token(Token::AND, content, lineno);
+        } else {
+            input.unget(); // @@ [If ch is EOF, unget() is undefined behavior]
+            token = Token(Token::ERR, content, lineno);
+            ErrorReporter::report(lineno, "a");
+        }
+    }
+```
+
+Same for '|'.
+
+So the error is that when the single '&' is at the end of the file, `input.get()` returns EOF, and then `input.unget()` is called on EOF, which is invalid.
+
+The fix would be to check if ch is EOF before unget.
+
+But the problem says: identify the location of the error.
+
+So the lines with `input.unget();` after reading a single '&' or '|' are problematic when the next character is EOF.
+
+Therefore, the annotated code:
+<main.cpp>
+...
+    } else if (ch == '&') {
+        ch = input.get();
+        if (ch == '&') {
+            content.append(1, ch);
+            token = Token(Token::AND, content, lineno);
+        } else {
+            input.unget(); // @@ [Calling unget() when ch is EOF leads to undefined behavior]
+            token = Token(Token::ERR, content, lineno);
+            ErrorReporter::report(lineno, "a");
+        }
+    } else if (ch == '|') {
+        ch = input.get();
+        if (ch == '|') {
+            content.append(1, ch);
+            token = Token(Token::OR, content, lineno);
+        } else {
+            input.unget(); // @@ [Calling unget() when ch is EOF leads to undefined behavior]
+            token = Token(Token::ERR, content, lineno);
+            ErrorReporter::report(lineno, "a");
+        }
+    }
+...

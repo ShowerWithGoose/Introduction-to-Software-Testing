@@ -1,0 +1,451 @@
+<frontend/Lexer.java>
+...
+                } else {
+                    //是其余标识符
+                    switch (c){
+                        case '&':
+                            c=(char)reader.read();
+                            if(c=='&'){
+                                currentToken.append(c);
+                                writer.write(tokenType.getTokenType(currentToken.toString())+" "+currentToken+"\n");
+                            }else {
+                                //单个&，a类错误
+                                errorWriter.write(lineNum+" a\n");
+                                reader.unread(c);
+                            }
+                            break;
+                        case '|':
+                            c=(char)reader.read();
+                            if(c=='|'){
+                                currentToken.append(c);
+                                writer.write(tokenType.getTokenType(currentToken.toString())+" "+currentToken+"\n");
+                            }else {
+                                //单个|，a类错误
+                                errorWriter.write(lineNum+" a\n"); @@ [When encountering a single '|', the program correctly writes an error, but it does not stop processing; however, more critically, if the read character is -1 (EOF), casting to char and then unread may cause incorrect behavior or miss EOF handling. Additionally, after reporting the error, the lexer continues parsing, which violates the requirement that each erroneous example has exactly one error and should likely terminate or avoid further token output. But the primary lexical issue is that when `reader.read()` returns -1 (EOF), `c = (char)-1` becomes '\uffff', which is not '|', so it reports error 'a' even at EOF after a single '&'/ '|', which is correct per spec. However, the real bug is: **after writing the error, the code does not skip the rest of the input**, but the problem states each test has only one error, so this may be acceptable. The actual critical flaw is elsewhere: **the `tokenType.getTokenType(...)` returns null for operators like "&&", because in the enum, AND is defined with representation "&&", but `getTokenType` is called with the string "&&", which matches — so that’s fine. Wait — look at the default case and other single-char symbols: for example, '+' is handled in default, and `tokenType.getTokenType("+")` returns PLUS? No! Because in the enum, PLUS is defined as PLUS("+"), so getRepresentation() returns "+", and getTokenType("+") returns PLUS — that works. Then why failure?
+
+But note: in the cases for '!', '>', '<', '=', the code handles two-character tokens. However, what if after reading '!' we hit EOF? Then c = (char)reader.read() is (char)(-1) → '\uffff', which is not '=', so it writes token for "!" — which is correct.
+
+Now consider the test input that failed: the system says "Test Case Input: /bin/sh: 1: javac: not found" — this suggests the test environment couldn't compile Java, but that's external. However, the real issue must be in logic.
+
+Wait: look at the **CharConst** handling:
+
+                } else if (c=='\'') {
+                    //是CharConst
+                    c=(char) reader.read();
+                    currentToken.append(c);
+                    if(c=='\\'){
+                        c=(char) reader.read();
+                        currentToken.append(c);
+                    }
+                    c=(char) reader.read();
+                    currentToken.append(c);
+                    writer.write("CHRCON "+currentToken+"\n");
+
+This assumes every CharConst has exactly two more characters after the opening quote: one for the char (possibly escaped) and one for closing quote. But what if the file ends after the opening quote? Or after the first char? Then `reader.read()` returns -1, and appending (char)-1 corrupts the token, and it still writes CHRCON even if unterminated. That would be a lexical error, but the problem says error type 'a' is only for single & or |. So perhaps not.
+
+But the key insight: **in the '&' and '|' cases, when a single '&' or '|' is found, the code writes an error to error.txt, but it does NOT stop tokenizing. However, the problem states: "each erroneous example will have exactly one error", and the output should go to error.txt. But the lexer might also output tokens before or after, which violates the spec: for erroneous programs, ONLY error info should be output (to error.txt), and nothing to lexer.txt.
+
+However, looking at the code: it opens both writers, and if an error occurs, it writes to errorWriter, but may have already written tokens to writer. That’s a problem. But the problem says: “each erroneous example will contain only lexical analysis errors” and “exactly one error”. So upon detecting the first lexical error, the program should output the error and terminate (or at least not output any tokens). But the current code continues.
+
+But wait — the test case that fails might be one with a single '&'. The expected behavior is to output only to error.txt, but the buggy code might have already output some tokens to lexer.txt before encountering '&', and then writes error to error.txt. However, the problem says: for erroneous source program, output ONLY to error.txt. So if any token was written to lexer.txt before the error, that’s wrong.
+
+But the provided code doesn’t clear lexer.txt or prevent prior writes. However, the problem says “each erroneous example will have exactly one error”, implying the error is the only issue, but tokens before the error are valid? Actually, no: in standard compilers, lexical errors don’t invalidate prior tokens, but this problem’s output spec says: for erroneous program, output ONLY the error line and code to error.txt. That implies: if there's any lexical error, the entire output should be in error.txt, and lexer.txt should be empty or not used.
+
+But the problem says: “output the line number of the error along with the corresponding error type code” into error.txt. It doesn’t explicitly say not to output tokens, but the examples and context imply mutually exclusive outputs.
+
+However, looking back at the problem statement:
+
+> For a correct source program, ... output ... into **lexer.txt**.  
+> For an erroneous source program, ... output ... into **error.txt**.
+
+This suggests only one file is written. So if an error is found, nothing should be written to lexer.txt.
+
+But in the current code, tokens are written to lexer.txt as they are recognized, and only when an error is found is something written to error.txt. So if the error occurs after some valid tokens, both files get content — which is wrong.
+
+But the problem says: “each erroneous example will have exactly one error”, but doesn’t say the error is at the beginning. So the program must not output any tokens if there's an error anywhere.
+
+Therefore, the correct approach is to buffer all tokens until the end, and if no error, write to lexer.txt; if error, write only error to error.txt.
+
+However, the current code writes tokens immediately. So that’s a design flaw.
+
+But wait — the problem says: “In the first round... identify the location of the errors”. And the test case input shows a compilation error in the environment, but that’s likely a red herring.
+
+Looking again at the '&' and '|' handling: when a single '&' is found, it writes the error, but **does not consume the next character if it's not '&'?** Actually, it reads one char, and if it's not '&', it unreads it. That’s correct.
+
+But here’s the real bug: **in the case of a single '&', after writing the error, the code breaks out of the switch and clears currentToken, then continues. But the single '&' itself was already appended to currentToken before entering the switch. Then in the '&' case, it reads the next char. If it's not '&', it reports error, unreads the next char, but **the currentToken still contains "&"**, and then after the switch, currentToken is cleared. So no token is output for "&", which is good.
+
+But what about the character that was unread? It will be processed in the next iteration. That’s correct.
+
+So why would the program fail?
+
+Another possibility: **the tokenType.getTokenType() returns null for some operators**, and then writer.write(null + " ...") would write "null ...", which is invalid.
+
+Look at the enum: AND is defined as AND("&&"), so tokenType.getTokenType("&&") returns AND, and AND.name() is "AND", but the output requires the category code, which is the enum name.
+
+But in the code: writer.write(tokenType.getTokenType(currentToken.toString())+" "+currentToken+"\n");
+
+tokenType.getTokenType(...) returns a tokenType enum value, and when concatenated with string, it uses .toString(), which by default is the enum constant name. So for "&&", it returns AND, and AND.toString() is "AND", but the expected output is "AND", which matches the table (category code is AND). So that’s correct.
+
+But wait: in the table, the category code for "&&" is AND, and the code outputs "AND &&\n", which is correct.
+
+Now consider a single '+': it goes to default, currentToken is "+", tokenType.getTokenType("+") returns PLUS, so outputs "PLUS +\n" — correct.
+
+But what about the error case: when a single '&' is encountered, the code writes "lineNum a\n" to error.txt — correct.
+
+However, there is a critical flaw in the **CharConst** and **StrConst** handling regarding EOF.
+
+But the immediate suspect from the problem's error type 'a' is the '&' and '|' handling.
+
+Wait: what if the input ends with a single '&'? Then:
+
+- c = '&'
+- currentToken = "&"
+- enter switch, case '&'
+- read next char → returns -1
+- c = (char)(-1) = '\uffff'
+- since c != '&', go to else
+- write error: lineNum a\n
+- reader.unread(c): unread(-1)? But PushbackReader.unread(int) — if you unread -1, that’s invalid. According to Java docs, PushbackReader.unread(int) throws IOException if the argument is not a valid char (i.e., not in 0..0xFFFF). But -1 is not a valid char, so unread(-1) may throw an exception or behave unexpectedly.
+
+But in the code: currentChar = reader.read() returns -1, then c = (char)currentChar → (char)(-1) = 65535 (0xFFFF). Then reader.unread(c) → unread(65535), which is valid (since char is unsigned 16-bit). So that’s okay.
+
+But the real bug is this: **after reporting the error for single '&' or '|', the lexer continues processing, and may produce more tokens or errors. But the problem states each test has exactly one error, so maybe that’s acceptable. However, the bigger issue is that the program might output tokens to lexer.txt AND an error to error.txt, which violates the output specification.**
+
+But the problem says: “For an erroneous source program, output ... into error.txt”. It doesn’t explicitly forbid writing to lexer.txt, but the examples and typical interpretation imply only error.txt should be written.
+
+However, the assignment’s special reminder doesn’t clarify this.
+
+But looking at the provided code structure, the most likely immediate bug that causes incorrect output for error type 'a' is not in the error reporting itself, but in the fact that **the single '&' or '|' is not consumed as a token, which is correct, but what if the next character is part of another token?** That should be fine due to unread.
+
+Wait — another possibility: **the line number is not updated correctly when the error occurs on a line that has been partially read.**
+
+But the line number is incremented only on '\n', which is correct.
+
+After careful analysis, the actual bug is in the **handling of the single '&' and '|' cases: after writing the error, the code does not exit or stop, but more importantly, it leaves the input stream in a state where the next character (which was unread) will be processed. However, the critical flaw is that **the currentToken contains "&" when entering the switch, and in the error branch, it does not output a token (good), but after the switch, currentToken is cleared. So far so good.**
+
+But here’s the catch: **what if the single '&' is the last character in the file?** Then after reading '&', currentToken="&", then read next char → -1, so c = (char)-1, not '&', so report error, unread((char)-1) → which is 65535, then loop ends because next read will be -1. So it works.
+
+However, there is a different bug: **in the case of a single '&', the code reports the error, but does not account for the fact that the '&' itself is an invalid token, and according to the problem, that’s error 'a'. That part is correct.**
+
+But wait — look at the **default case**: it handles all other single-character symbols by looking up their token type. But what if an invalid symbol appears, like '@'? Then tokenType.getTokenType("@") returns null, and writer.write(null + " @\n") would output "null @", which is wrong. But the problem says the only lexical error is type 'a' (single & or |), so other invalid symbols won’t appear in test cases.
+
+Given all this, the most probable location of the error that causes the test to fail is actually **not in the '&'/'|' handling, but in the fact that when an error is detected, the program should not output anything to lexer.txt, but the current code may have already output tokens before the error.**
+
+However, the problem states: “each erroneous example will have exactly one error”, but doesn’t specify whether tokens before the error are allowed. In standard practice, they are, but this problem’s output format suggests mutually exclusive files.
+
+But the assignment’s sample outputs aren’t provided, so we must rely on logic.
+
+Re-examining the code: in the '&' error case, after writing the error, the code continues. If the input is just "&", then no tokens were written before, so only error.txt gets content — correct. If the input is "int a;&", then "INTTK int", "IDENFR a", "SEMICN ;" are written to lexer.txt, and then error to error.txt — which is likely incorrect per problem spec.
+
+Therefore, the program should buffer all tokens and only write to lexer.txt if no error occurred.
+
+But the current code doesn’t do that.
+
+However, the problem says: “In the first round of the conversation, please first summarize... and output the code snippet where the error is likely to be located.” And based on the error type 'a', the handling of '&' and '|' is the relevant part.
+
+But there’s a subtle bug in the **'|' case**: identical to '&', so same issue.
+
+However, upon closer inspection of the provided code for the '&' and '|' cases, there is **no immediate logical error in the error reporting itself**.
+
+Wait — look at this line in the '&' case:
+
+writer.write(tokenType.getTokenType(currentToken.toString())+" "+currentToken+"\n");
+
+But currentToken at this point is "&&", and tokenType.getTokenType("&&") returns AND, so it writes "AND &&\n" — correct.
+
+But in the error case, it writes to errorWriter, which is correct.
+
+But here’s the real bug: **after reporting the error for a single '&', the code does not skip the '&' character in any way — but it shouldn't, because the '&' is invalid and we've reported it. However, the '&' was already read and added to currentToken, and then the next character was read and unread. The '&' itself is not reprocessed, which is correct because it's consumed as part of the error.**
+
+So why would the test fail?
+
+Another possibility: **the line number is not correct when the error occurs right after a newline.**
+
+But the line number is incremented when '\n' is read, so if the '&' is on line 5, and the previous char was '\n', then lineNum is already 5 when '&' is processed — correct.
+
+Given the information, the most likely explanation is that **when a single '&' or '|' is encountered, the program writes the error, but then continues and may encounter EOF or other issues, but the critical flaw is that the program does not terminate after the first error, and the problem expects only the error to be reported and nothing else. However, the code as written may work for isolated '&' at the end.**
+
+But there’s a different bug: in the **CharConst** handling, if the char const is empty (''), then:
+
+- c = '\''
+- read next: '\'' → currentToken = "''"
+- then read next: suppose it's 'a', then currentToken = "''a", then read next for closing quote — but this is malformed.
+
+But the problem states only error type 'a' exists in erroneous examples, so CharConst errors won’t occur.
+
+After re-evaluating, the actual bug is in the **handling of the single '&' and '|' cases: the code reports the error, but does not account for the fact that the single '&' or '|' might be followed by a character that is part of a valid token, but due to unread, it should be fine.
+
+However, there is a critical omission: **what if the single '&' is followed by EOF?** As discussed, it works.
+
+But wait — in the code, after reporting the error, it does `reader.unread(c);` where c is the character after '&'. But if that character is '\n', then in the next iteration, when '\n' is read, lineNum is incremented. But the error was reported on the current lineNum, which is correct because the '&' was on the current line, and the '\n' hasn't been processed yet.
+
+So that’s correct.
+
+Given all this, the only remaining possibility is that **the program outputs the error message, but also, because of the way the loop continues, it might process the unread character and output additional tokens, but for a test case with only a single '&', there are no additional tokens.**
+
+But the test environment error "/bin/sh: 1: javac: not found" suggests the code wasn't even compiled, so perhaps the real issue is elsewhere.
+
+However, focusing on the code logic for error type 'a', the implementation seems correct.
+
+Unless... in the '|' case, the code is identical, but what if the input has a single '|'? Same as '&'.
+
+But here’s the catch: **in the switch statement, for '&', it reads the next character. If it's not '&', it reports error 'a'. Similarly for '|'. But what if the next character is '&' or '|'? For example, input "&|". Then:
+
+- Read '&', currentToken="&"
+- Read next char '|'
+- Since '|' != '&', report error 'a' for the '&' on current line.
+- Unread '|'
+- Next iteration: c = '|', currentToken="|"
+- Read next char: suppose EOF or 'a'
+- Report another error 'a' for '|'
+
+But the problem states: "each erroneous example will have exactly one error". So this input "&|" would have two errors, which won't be tested.
+
+Therefore, the code should be correct for the given constraints.
+
+But the program failed, so there must be a bug.
+
+Let’s look at the **output statement in the error case**:
+
+errorWriter.write(lineNum+" a\n");
+
+This writes, for example, "5 a\n", which matches the expected format.
+
+But what if the error occurs on line 1? It writes "1 a\n" — correct.
+
+Now, consider the **token output for valid tokens**: for IDENFR, it writes "IDENFR identifier\n", but the problem says: "output the word category code and the character/string form of the word". The category code for identifier is IDENFR, and the string form is the identifier — correct.
+
+But in the enum, IDENFR is defined as IDENFR("Ident"), so tokenType.getTokenType("someId") returns null, because "someId" != "Ident". Ah! Here’s the bug!
+
+Look at the enum definition:
+
+    IDENFR("Ident"),
+    INTCON("IntConst"),
+    STRCON("StringConst"),
+    CHRCON("CharConst");
+
+And the getTokenType method:
+
+    public static tokenType getTokenType(String str) {
+        for (tokenType tokenType : tokenType.values()) {
+            if (tokenType.getRepresentation().equals(str)) {
+                return tokenType;
+            }
+        }
+        return null; // 未找到对应的 tokenType  
+    }
+
+This means:
+- For a keyword like "main", representation is "main", so getTokenType("main") returns MAINTK — correct.
+- For an identifier like "abc", getTokenType("abc") compares "abc" with all representations, including "Ident", which doesn't match, so returns null.
+
+But in the identifier handling code:
+
+                    while ((currentChar=reader.read())!=-1){
+                        c=(char) currentChar;
+                        if(Character.isLetterOrDigit(c)||c=='_'){
+                            currentToken.append(c);
+                        }else {
+                            writer.write("IDENFR "+currentToken+"\n");
+                            reader.unread(c);
+                            break;
+                        }
+                    }
+
+It **hard-codes "IDENFR"** instead of using the enum. Similarly for INTCON, STRCON, CHRCON.
+
+Whereas for operators and keywords, it uses tokenType.getTokenType(...).
+
+This is inconsistent, but for identifiers, it's correct to output "IDENFR".
+
+However, for the '&' and '|' double-character tokens, it uses:
+
+writer.write(tokenType.getTokenType(currentToken.toString())+" "+currentToken+"\n");
+
+Which for "&&" returns AND, and AND.toString() is "AND", so it writes "AND &&\n", but the expected category code is "AND", which matches the table.
+
+But wait — the table says the category code for "&&" is AND, so output should be "AND &&", which is what the code does.
+
+So that’s correct.
+
+But then why would the test fail?
+
+Unless... in the error case, the code is correct, but the problem is that **after writing the error, the program should terminate immediately**, but it doesn't. However, the problem doesn't specify that.
+
+Given the time, the most plausible explanation is that the **handling of the single '&' and '|' is correct, but there's a bug in the line number tracking**.
+
+How is lineNum updated?
+- When a '\n' is read, lineNum++.
+- The error is reported with the current lineNum.
+
+But what if the error occurs on a line that ends with the error character, and there's no '\n' after? That’s fine.
+
+What if the error character is read, and the next character is '\n'? For example: "&\n"
+
+- Read '&', currentToken="&", lineNum=1
+- Read next char '\n'
+- Since '\n' != '&', report error with lineNum=1
+- Unread '\n'
+- Next iteration: read '\n', lineNum becomes 2
+
+So the error is reported on line 1 — correct.
+
+So line number is correct.
+
+After exhaustive analysis, the only remaining possibility is that **when a single '&' is encountered at the very end of the file (no newline), the code reports the error, but then the loop ends, which is correct.**
+
+Given that the test environment shows "javac: not found", it's possible the code wasn't run, but assuming it was, the bug must be in the logic.
+
+Wait! Look at the **StrConst handling**:
+
+                if (c=='\"') {
+                    //是StrConst
+                    while ((currentChar = reader.read())!=-1){
+                        c = (char) currentChar;
+                        currentToken.append(c);
+                        if(c=='"') {
+//                         Token token=new Token(currentToken.toString(),tokenType.getTokenType(currentToken.toString()),lineNum);
+                            writer.write("STRCON "+currentToken+"\n");
+                            break;
+                        }
+                    }
+                }
+
+If the string is not terminated (no closing "), then the loop exits when currentChar==-1, and it **does not write anything**, and currentToken is cleared. So no error is reported for unterminated string. But the problem says only error type 'a' exists, so this won't occur.
+
+Similarly for CharConst: it assumes exactly two more characters, so if the file ends early, it appends -1 chars and writes CHRCON anyway, which is wrong, but again, not error type 'a'.
+
+Therefore, for error type 'a', the code should work.
+
+But the program failed, so there must be a bug in the '&'/'|' handling.
+
+Let’s simulate input "&":
+
+- currentChar = reader.read() -> '&' (not whitespace, not '/', etc.)
+- currentToken = "&"
+- enter else (not ", not ', not letter, not digit)
+- switch(c) -> case '&'
+- c = (char)reader.read() -> -1 -> c = '\uffff'
+- c != '&' -> else branch
+- errorWriter.write(lineNum + " a\n") -> say "1 a\n"
+- reader.unread(c) -> unread('\uffff')
+- currentToken.setLength(0)
+- next iteration: currentChar = reader.read() -> '\uffff' (65535)
+- c = '\uffff'
+- not whitespace, not '/', etc.
+- currentToken = "\uffff"
+- enter else
+- switch('\uffff') -> default
+- writer.write(tokenType.getTokenType("\uffff") + " \uffff\n")
+- tokenType.getTokenType("\uffff") returns null
+- so writer.write("null \uffff\n")
+
+This is invalid output! The program outputs "null ..." to lexer.txt, and also wrote to error.txt.
+
+This is the bug!
+
+When a single '&' is at the end of file, after reporting the error, it unreads (char)-1, which is '\uffff', and then in the next iteration, it tries to tokenize '\uffff' as a symbol, fails to find its token type, and outputs "null ...", which is incorrect.
+
+Moreover, the problem states that for erroneous programs, only error.txt should be written, but here lexer.txt gets "null ...".
+
+So the root cause is that **after reporting the error for single '&' or '|', if the next character is EOF (represented as '\uffff' after cast), it gets processed as an invalid symbol, leading to null output.**
+
+To fix this, after reporting the error, the lexer should not continue processing if the next character is EOF, but more generally, the design should avoid processing invalid characters.
+
+But specifically, in the error branch for '&' and '|', after unread, if the unread character is EOF (i.e., the read returned -1), then there's nothing more to process, but the loop will read the '\uffff' and try to tokenize it.
+
+The solution is to check if the read after '&' or '|' returned -1, and if so, after reporting the error, break out of the loop.
+
+But in the current code, it doesn't.
+
+Therefore, the error is in the '&' and '|' cases when the single symbol is at the end of file.
+
+So the annotated code is:
+
+<frontend/Lexer.java>
+...
+                } else {
+                    //是其余标识符
+                    switch (c){
+                        case '&':
+                            c=(char)reader.read();
+                            if(c=='&'){
+                                currentToken.append(c);
+                                writer.write(tokenType.getTokenType(currentToken.toString())+" "+currentToken+"\n");
+                            }else {
+                                //单个&，a类错误
+                                errorWriter.write(lineNum+" a\n");
+                                if (c != (char)(-1)) { // Only unread if not EOF
+                                    reader.unread(c);
+                                }
+                            }
+                            break;
+                        case '|':
+                            c=(char)reader.read();
+                            if(c=='|'){
+                                currentToken.append(c);
+                                writer.write(tokenType.getTokenType(currentToken.toString())+" "+currentToken+"\n");
+                            }else {
+                                //单个|，a类错误
+                                errorWriter.write(lineNum+" a\n");
+                                if (c != (char)(-1)) { // Only unread if not EOF
+                                    reader.unread(c);
+                                }
+                            }
+                            break;
+...
+But the current code unreads unconditionally.
+
+However, in Java, (char)(-1) is '\uffff', and c is always a char, so we can't directly compare to -1. Instead, we should save the int result of reader.read().
+
+So the real fix is to not cast to char immediately.
+
+But in the current code, it does:
+
+c=(char)reader.read();
+
+So if reader.read() returns -1, c becomes '\uffff'.
+
+Then later, unread(c) unreads '\uffff', which is valid, but then the next read gets '\uffff', which is not a valid token.
+
+To prevent this, after reporting the error, if the read returned -1, we should not unread, and break out of the loop.
+
+But the current code doesn't do that.
+
+Therefore, the bug is that **when a single '&' or '|' is at the end of the file, the code reports the error, unreads the EOF (as '\uffff'), and then processes '\uffff' as an invalid token, outputting "null ...".**
+
+So the error is in the unconditional unread and continuation.
+
+Thus, the location is in the '&' and '|' error branches.
+
+Annotated code:
+
+
+<frontend/Lexer.java>
+...
+                } else {
+                    //是其余标识符
+                    switch (c){
+                        case '&':
+                            c=(char)reader.read();
+                            if(c=='&'){
+                                currentToken.append(c);
+                                writer.write(tokenType.getTokenType(currentToken.toString())+" "+currentToken+"\n");
+                            }else {
+                                //单个&，a类错误
+                                errorWriter.write(lineNum+" a\n");
+                                reader.unread(c); @@ [If the read returned -1 (EOF), c becomes '\uffff', and unreading it causes the next iteration to process an invalid character, leading to "null" output in lexer.txt. This violates the requirement that erroneous programs should only output to error.txt.]
+                            }
+                            break;
+                        case '|':
+                            c=(char)reader.read();
+                            if(c=='|'){
+                                currentToken.append(c);
+                                writer.write(tokenType.getTokenType(currentToken.toString())+" "+currentToken+"\n");
+                            }else {
+                                //单个|，a类错误
+                                errorWriter.write(lineNum+" a\n");
+                                reader.unread(c); @@ [Same issue as above: unreading EOF as '\uffff' leads to invalid token processing and incorrect output to lexer.txt.]
+                            }
+                            break;
+...

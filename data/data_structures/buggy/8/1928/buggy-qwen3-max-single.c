@@ -1,0 +1,10 @@
+#include<stdio.h>
+
+int main()
+{
+    int x;
+    while(scanf("%d",&x)!=EOF)
+    
+    printf("%d\n",x); // @@ [Missing braces around the loop body causes only the next statement to be inside the loop; however, the real issue is that the program logic does not implement graph traversal (DFS/BFS), vertex deletion, or handle the specified input format at all. Additionally, the code structure fails to read edges and the vertex to delete as required by the problem, leading to incorrect behavior. But based on the test environment error "/bin/sh: 1: gcc: not found", this appears to be a compilation setup issue, yet the actual code is logically incorrect for the problem. However, per instructions focusing on code errors: the loop lacks braces and the overall implementation is completely missing required functionality.]
+    return 0;
+}

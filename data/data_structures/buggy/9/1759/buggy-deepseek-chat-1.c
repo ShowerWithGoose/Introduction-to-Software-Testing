@@ -1,0 +1,53 @@
+#define MAXN 110
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <iso646.h>
+int max(int a,int b)
+{
+    return a>b?a:b;
+}
+int n;
+struct Node
+{
+    int stx,sty,edx,edy;
+}l[MAXN]={};
+int cmp(const void *a,const void *b)
+{
+    return ((struct Node *)a)->stx-((struct Node *)b)->stx;
+}
+int ans=0,px=0,py=0;
+int dfs(int now)
+{
+    //printf("%d : %d %d\n",now,l[now].stx,l[now].sty);
+    int ret=0;
+    for(int i=1;i<=n;i++)
+    {
+        if(l[i].stx==l[now].edx) // @@ The condition only checks if the x-coordinates match, but does not verify that the y-coordinates also match (i.e., the segments share an endpoint). According to the problem, two segments share an endpoint only if both x and y coordinates are equal.
+        {
+            ret=max(ret,dfs(i)+1);
+        }
+    }
+    return ret;
+}
+int main()
+{
+    scanf("%d",&n);
+    for(int i=1;i<=n;i++)
+    {
+        scanf("%d%d%d%d",&l[i].stx,&l[i].sty,&l[i].edx,&l[i].edy);
+    }
+    //qsort(l+1,n,sizeof(struct Node),cmp); // @@ The sorting is commented out, so the segments are not sorted by starting x-coordinate. The problem requires that for a continuous line, x-coordinates must be in increasing order, and the reference program sorts by starting x. Without sorting, the DFS may not correctly find the longest chain because it may process segments out of order.
+    for(int i=1;i<=n;i++)
+    {
+        int cnt=dfs(i)+1;
+        if(ans<cnt)
+        {
+            ans=cnt;
+            px=l[i].stx;
+            py=l[i].sty;
+        }
+    }
+    printf("%d %d %d\n",ans,px,py);
+    return 0;
+}

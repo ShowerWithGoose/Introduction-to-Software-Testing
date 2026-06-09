@@ -1,0 +1,60 @@
+#include<stdio.h>
+#include<string.h>
+char a[1005];
+int main()
+{
+    int sum,flag=0,b,c,d;
+    gets(a); // @@ [Using gets() is unsafe and deprecated; may cause compilation error with modern compilers due to removal from C11 standard]
+    for(int i=0;i<strlen(a);i++)
+    {    
+        if(flag==0&&a[i]!='0'&&a[i]!='.')
+        {
+            flag=1;
+            b=i;
+        }
+        if(a[i]=='.')
+        {
+            c=i;
+        }
+    }
+//    i=strlen(a)
+//    while(i>0&&a[i]==0)
+//    {
+//        
+//    }
+    for(int i=strlen(a)-1;i>c;i--) // @@ [If input has no decimal point, 'c' is uninitialized, leading to undefined behavior]
+    {
+        if(a[i]!='0'&&a[i]!='.')
+        {
+            d=i;
+            break;
+        }
+    }
+    //printf("%d",d);
+    if(flag==1)
+    {
+        for(int i=b;i<=b+d;i++) // @@ [Loop bound 'b+d' is incorrect; should iterate over actual significant digits, not based on sum of indices]
+        {
+            if(i==b+1&&i!=strlen(a))
+            printf(".");
+            //printf("$");
+            if(a[i]!='.')
+            printf("%c",a[i]);
+        }
+        int p;
+        if(a[0]=='0')
+        p=c-b; // @@ [Exponent calculation is flawed; for numbers like "0.00123", this gives wrong exponent]
+        else
+        p=c-b-1; // @@ [Exponent calculation fails for numbers without leading zero, e.g., "123.45"]
+        if(p>=0)
+        printf("e%d\n",p);
+        else
+        {
+            p=-p;
+            printf("e-%d\n",p);
+        }
+        
+    }
+    else
+    printf("0e0\n"); // @@ [Problem states input always has significant digits before and after decimal, so "0e0" case shouldn't occur, but logic mishandles valid inputs]
+}

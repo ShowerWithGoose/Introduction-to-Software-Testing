@@ -1,0 +1,42 @@
+#include <stdio.h>
+#include <stdbool.h>
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
+#include <ctype.h>
+typedef struct{
+    int x1;
+    int y1;
+    int x2;
+    int y2;
+}coordinate;
+coordinate coor[105];
+void digui(int *len,coordinate mem,int n){
+    for(int j=0;j<n;j++){ // @@ [The loop will explore all matching segments, but since multiple branches could exist (e.g., two segments starting at the same point), the recursion continues to iterate and adds the lengths of all branches to the same 'len', resulting in a sum instead of the longest chain.]
+        if(mem.x2==coor[j].x1&&mem.y2==coor[j].y1){
+            (*len)++; // @@ [Incrementing len for each found match leads to accumulating counts from different branches rather than tracking the maximum chain length from the current segment.]
+            mem=coor[j];
+            digui(len,mem,n); // @@ [Recursive call after increment; however, after returning, the loop may find another match and increment again, combining lengths from disjoint chains incorrectly.]
+        }
+    }
+}
+int main()
+{
+    int n;
+    scanf("%d",&n);
+    for(int i=0;i<n;i++){
+        scanf("%d %d %d %d",&coor[i].x1,&coor[i].y1,&coor[i].x2,&coor[i].y2);
+    }
+    int max=1;
+    coordinate result;
+    for(int i=0;i<n;i++){
+        int count=1;
+        digui(&count,coor[i],n); // @@ [The digui function does not return the length of a single chain; it modifies count by summing lengths from all reachable branches, so count after the call is not the chain length starting from coor[i].]
+        if(count>max){
+            max=count;
+            result=coor[i];
+        }
+    }
+    printf("%d %d %d\n",max,result.x1,result.y1);
+    return 0;
+}

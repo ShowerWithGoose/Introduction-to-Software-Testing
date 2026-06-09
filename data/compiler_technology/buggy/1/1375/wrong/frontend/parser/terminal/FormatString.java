@@ -1,0 +1,30 @@
+package frontend.parser.terminal;
+
+import frontend.lexer.Token;
+import frontend.lexer.TokenType;
+import frontend.parser.SyntaxNode;
+
+/**
+ * 格式字符串终结符 FormatString
+ */
+public class FormatString implements SyntaxNode {
+    public Token token; // STRCON
+
+    public FormatString(Token token) {
+        this.token = token;
+    }
+
+    public FormatString(String str, int lineNum) {
+        this.token = new Token(TokenType.STRCON, lineNum, str);
+    }
+
+    @Override
+    public String syntaxOutput() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(this.token.syntaxOutput());
+        return sb.toString();
+    }
+    public int my_line_num(){
+        return this.token.linenum;
+    }
+}

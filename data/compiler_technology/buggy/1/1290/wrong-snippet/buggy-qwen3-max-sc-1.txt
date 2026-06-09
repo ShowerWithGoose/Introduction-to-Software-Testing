@@ -1,0 +1,559 @@
+Looking at the problem description and the provided code, I need to identify where the syntax analysis program is failing. The key issue appears to be in the output format requirements.
+
+According to the problem description:
+- For correct source programs, the program should output "the word category code and the word's character/string form" OR "syntax component name" 
+- Syntax components that should be output are all except `<BlockItem>`, `<Decl>`, `<BType>`
+- The output should be in the order they are read/recognized
+
+However, looking at the `Symbol.toString()` method in the `ast/Symbol.java` file:
+
+```java
+public String toString() {
+    return "<" + getClass().getName().substring(4) + ">\n";
+}
+```
+
+This method outputs ALL non-terminal symbols with angle brackets, but according to the requirements, `<BlockItem>`, `<Decl>`, and `<BType>` should NOT be output.
+
+Looking at these specific classes:
+
+<ast/BType.java>
+...
+    @Override
+    public String toString() {
+        return "";
+    }
+...
+
+<ast/BlockItem.java>
+...
+    @Override
+    public String toString() {
+        return "";
+    }
+...
+
+<ast/Decl.java>
+...
+    @Override
+    public String toString() {
+        return "";
+    }
+...
+```
+
+These three classes correctly override `toString()` to return an empty string, which means they won't be output. However, the issue might be elsewhere.
+
+Looking more carefully at the test case input, it shows:
+```
+/bin/sh: 1: javac: not found
+```
+
+This suggests the test environment doesn't have Java compiler, but that's not relevant to the code logic.
+
+The real issue appears to be in the `AbstractSyntaxTree.printAns()` method. Let me examine it:
+
+<ast/AbstractSyntaxTree.java>
+...
+    public void printAns(Ele ele) {
+        StringBuilder sb = new StringBuilder();
+        if (ele instanceof Symbol) {
+            Symbol symbol1 = (Symbol) ele;
+            ArrayList<Ele> list = symbol1.getList();
+            for (Ele e : list) {
+                printAns(e);
+            }
+        }
+        sb.append(ele.toString());
+        logger.log(sb.toString());
+    }
+...
+```
+
+The problem is that this method logs `ele.toString()` for EVERY element, including tokens. But tokens should output their category code and value, not just be converted to string.
+
+Looking at the `Token.toString()` method in `lexical/Token.java`:
+
+<lexical/Token.java>
+...
+    @Override
+    public String toString() {
+        return type + " " + value + "\n";
+    }
+...
+```
+
+This actually looks correct - it outputs the token type and value.
+
+However, the main issue might be in the order of processing. The `printAns` method does a post-order traversal (processes children first, then the parent), but the requirement is to output "in the order recognized by lexical analysis" for tokens, and syntax components should be output before completing their analysis.
+
+Looking at the grammar rule processing, the syntax components should be output BEFORE processing their contents, not after.
+
+The fundamental issue is in the `printAns` method logic. It should:
+1. For tokens: output the token (category code + value)
+2. For syntax components (except the three excluded ones): output the component name BEFORE processing its children
+
+But the current implementation processes children first, then outputs the parent, which is incorrect.
+
+However, looking more carefully at the problem statement: "Before completing the analysis of any syntax components in the grammar (except for <BlockItem>, <Decl>, <BType>), output the name of the current syntax component on a new line"
+
+This suggests that the syntax component name should be output at the beginning of analyzing that component, not at the end.
+
+The error is likely in how and when the syntax component names are being logged. The current approach using `toString()` in a post-order traversal is fundamentally wrong.
+
+But wait, let me check if there's logging happening during parsing. Looking at the parsing methods, I don't see explicit logging of syntax component names during the parsing process.
+
+The issue is that the program is only logging via the `printAns` method at the end, but according to requirements, syntax component names should be output DURING the parsing process, before completing the analysis of that component.
+
+However, looking at the `AbstractSyntaxTree.parse()` method:
+
+<ast/AbstractSyntaxTree.java>
+...
+    @Override
+    public void parse() {
+        Symbol.lexer = this.lexer;
+        Symbol.logger = this.logger;
+        Symbol.token = lexer.nextToken();
+        symbol = CompUnit.of();
+        if (symbol == null) {
+            throw new ParsingException("parsing error");
+        }
+    }
+...
+```
+
+And then `printAns()` is called separately. This suggests that all logging happens after parsing is complete.
+
+But the requirement says syntax components should be output "before completing the analysis", which implies during parsing.
+
+Actually, re-reading the problem: "Output the information of each word line by line in the order recognized by lexical analysis. Before completing the analysis of any syntax components... output the name of the current syntax component"
+
+This could mean that the final output should interleave tokens and syntax component names in the correct order.
+
+The current `printAns` method does a depth-first traversal that may not produce the correct order.
+
+Looking at the traversal more carefully:
+- For a Symbol, it recursively calls `printAns` on all children, then logs the symbol's toString()
+- For a Token, it just logs the token's toString()
+
+This produces a post-order traversal, but we need something closer to the order of recognition.
+
+For example, for a simple assignment `a = 1;`, the expected output should be:
+```
+<IDENFR> a
+<ASSIGN> =
+<INTCON> 1  
+<SEMICN> ;
+<Stmt>
+```
+
+But with post-order traversal, we'd get the tokens first, then the Stmt.
+
+Actually, that might be correct. Let me think about this more.
+
+Wait, the problem says: "Output the information of each word line by line in the order recognized by lexical analysis. Before completing the analysis of any syntax components... output the name of the current syntax component"
+
+This suggests that tokens are output in lexical order, and syntax component names are output at the point where their analysis completes (but the name is output before completion, so essentially when starting or during).
+
+But looking at examples from similar problems, typically the syntax tree is traversed in a way that outputs tokens as they appear, and non-terminals are output after their children (which represents the completion of their analysis).
+
+Given the complexity and the fact that the three excluded components (`BlockItem`, `Decl`, `BType`) properly return empty strings, the issue might be elsewhere.
+
+Let me look at the `CompUnit.of()` method more carefully, as it's the entry point:
+
+<ast/CompUnit.java>
+...
+    public static Symbol of() {
+        Symbol symbol = null;
+        Symbol ans = new CompUnit();
+        SymbolTable table = SemanticAnalyser.newSymbolTable(SymbolTable.getDir());
+        String dir = SymbolTable.getDir();
+
+        /*
+            {Decl}
+         */
+        while (true) {
+...
+```
+
+There's a potential infinite loop issue here. The first `while(true)` loop has a `break` statement inside the FuncDef handling, but what if there are no function definitions? It might loop infinitely.
+
+Looking at the structure:
+1. First while loop handles `{Decl}` and then expects either FuncDef or MainFuncDef
+2. Inside, when it finds a BType followed by IDENFR and LPARENT, it handles FuncDef and breaks
+3. But if there are only declarations and no functions, it will keep looping
+
+Actually, looking more carefully, the first while loop has conditions that should eventually exit:
+
+- If it finds CONSTTK, it handles ConstDecl and continues
+- If it finds BType, it checks the next token:
+  - If next is IDENFR and then LPARENT → FuncDef, break
+  - If next is IDENFR and not LPARENT → VarDecl, continue  
+  - If next is MAINTK → MainFuncDef, return
+  - Otherwise return null
+
+But there's a problem: after handling VarDecl, it continues the loop, but what if there are no more declarations? The next token might not be CONSTTK or BType, so it would go to the `else` clause and return null, which would cause parsing to fail.
+
+Actually, the structure seems flawed. The first while loop should handle zero or more Decl, then handle FuncDef and MainFuncDef.
+
+But the current code has:
+- First while(true) for {Decl}
+- Then another while(true) for FuncDef/MainFuncDef
+
+The issue is in the transition between these two phases.
+
+Looking at the first while loop, when it encounters something that's not a declaration, it returns null instead of breaking out to handle functions.
+
+Specifically, in the BType handling section:
+```java
+} else {
+    return null;
+}
+```
+
+And in the final else:
+```java
+} else {
+    return null;
+}
+```
+
+This means if there are no more declarations, it returns null instead of proceeding to parse functions.
+
+The correct approach should be to break out of the first loop when no more declarations are found, then proceed to the second loop.
+
+But looking at the code again, I see that after the first while loop, there's no proper exit condition. The first while loop can only exit via `break` (when FuncDef is found) or `return` (when MainFuncDef is found or error occurs).
+
+This suggests the parsing logic in `CompUnit.of()` is fundamentally flawed.
+
+However, given the test case shows a compilation error about javac not found, this might not be the actual issue.
+
+Let me reconsider. The user mentioned "Test Case Input" shows "/bin/sh: 1: javac: not found", which suggests the test environment issue, but the actual program input would be in testfile.txt.
+
+Since we don't have the actual testfile.txt content, I need to focus on the most likely error based on common issues.
+
+Looking back at the output requirements, the key issue might be that the program is not outputting syntax component names at all, or is outputting them incorrectly.
+
+Wait, I notice that in the `AbstractSyntaxTree.printAns()` method:
+
+```java
+public void printAns(Ele ele) {
+    StringBuilder sb = new StringBuilder();
+    if (ele instanceof Symbol) {
+        Symbol symbol1 = (Symbol) ele;
+        ArrayList<Ele> list = symbol1.getList();
+        for (Ele e : list) {
+            printAns(e);
+        }
+    }
+    sb.append(ele.toString());
+    logger.log(sb.toString());
+}
+```
+
+The `sb` is created inside the method, but it's appending `ele.toString()` and then logging it. However, for tokens, `ele.toString()` includes a newline (`\n`), and for symbols, it also includes a newline.
+
+But the bigger issue is the order. This does post-order traversal, which means for a statement like `a = 1;`, we get:
+1. Process 'a' (token) → log "IDENFR a\n"
+2. Process '=' (token) → log "ASSIGN =\n"  
+3. Process '1' (token) → log "INTCON 1\n"
+4. Process ';' (token) → log "SEMICN ;\n"
+5. Process Stmt (symbol) → log "<Stmt>\n"
+
+This actually seems correct.
+
+But what about nested structures? For example, in an expression `a + b`, we have:
+- AddExp contains MulExp('a'), PLUS, MulExp('b')
+- Post-order would output: 'a', 'b', '+', '<AddExp>'
+
+But the lexical order should be: 'a', '+', 'b'
+
+Ah! That's the issue! The post-order traversal doesn't preserve the original token order.
+
+For `a + b`, the tokens appear in order: IDENFR a, PLUS +, IDENFR b
+But post-order traversal of the parse tree would process left operand, right operand, then operator, giving: a, b, +
+
+This is incorrect.
+
+The solution is to do an in-order traversal that respects the original sequence.
+
+Looking at how the symbols store their elements, they use an `ArrayList<Ele> list` that maintains the order of addition.
+
+So instead of recursively processing all children first, we should iterate through the list in order and process each element.
+
+The correct `printAns` should be:
+
+```java
+public void printAns(Ele ele) {
+    if (ele instanceof Symbol) {
+        Symbol symbol1 = (Symbol) ele;
+        ArrayList<Ele> list = symbol1.getList();
+        for (Ele e : list) {
+            printAns(e);
+        }
+        // Only log the symbol name if it's not one of the excluded ones
+        // But since excluded ones return "", this is handled automatically
+        if (!ele.toString().isEmpty()) {
+            logger.log(ele.toString());
+        }
+    } else {
+        // It's a Token
+        logger.log(ele.toString());
+    }
+}
+```
+
+Wait, but the current code already does something similar, except it logs the parent after processing children.
+
+Actually, looking again at the current code:
+
+```java
+public void printAns(Ele ele) {
+    StringBuilder sb = new StringBuilder();
+    if (ele instanceof Symbol) {
+        Symbol symbol1 = (Symbol) ele;
+        ArrayList<Ele> list = symbol1.getList();
+        for (Ele e : list) {
+            printAns(e);
+        }
+    }
+    sb.append(ele.toString());
+    logger.log(sb.toString());
+}
+```
+
+The issue is that it's logging the symbol AFTER processing all children, but for the token order to be correct, we need to interleave properly.
+
+However, since the `list` maintains the insertion order, and we process each element in the list in order, this should actually preserve the token sequence.
+
+For `a + b` stored as [MulExp(a), PLUS, MulExp(b)]:
+1. Process MulExp(a) → outputs "IDENFR a\n"  
+2. Process PLUS → outputs "PLUS +\n"
+3. Process MulExp(b) → outputs "IDENFR b\n"
+4. Then outputs "<AddExp>\n"
+
+This would be correct!
+
+So why is there a problem?
+
+Let me check the MulExp class:
+
+<ast/MulExp.java>
+...
+        mulExp.add(symbol); // UnaryExp
+        while (token.getType().equals(TokenType.MULT) ||
+                token.getType().equals(TokenType.DIV) ||
+                token.getType().equals(TokenType.MOD)) {
+            // TODO 输出Mul结束
+            symbol1 = new MulExp();
+            symbol1.add(mulExp);
+            symbol1.type = mulExp.type;
+            symbol1.idType = mulExp.idType;
+            mulExp = symbol1;
+            mulExp.add(token);
+            token = lexer.nextToken();
+            if ((symbol = UnaryExp.of(table)) == null) {
+                return null;
+            }
+            mulExp.add(symbol);
+        }
+...
+```
+
+The way it builds the tree is left-recursive, creating nested structures. For `a * b * c`, it would create:
+- MulExp1 containing [MulExp2, MULT(*), UnaryExp(c)]
+- MulExp2 containing [UnaryExp(a), MULT(*), UnaryExp(b)]
+
+When traversing this with the current `printAns`, for MulExp1:
+1. Process MulExp2 → which outputs a, *, b
+2. Process MULT(*) → outputs *
+3. Process UnaryExp(c) → outputs c  
+4. Output <MulExp>
+
+This gives: a, *, b, *, c, <MulExp> which is correct.
+
+So the traversal order seems fine.
+
+Given all this, the most likely issue is actually in the `CompUnit.of()` method's control flow, which could cause parsing to fail on valid inputs.
+
+Looking specifically at this part:
+
+<ast/CompUnit.java>
+...
+        // FuncDef, MainFuncDef
+        while (true) {
+
+            // MainFuncDef
+            // TODO 报错差了一行
+            if (token.getType().equals(TokenType.INTTK)) {
+                token = lexer.previewToken();
+                if (token.getType().equals(TokenType.MAINTK)) {
+                    token = lexer.getToken();
+                    String mainDir = SymbolTable.getDir(dir, SymbolTable.SymbolType.Function, "main");
+                    SymbolTable mainTable = SemanticAnalyser.newSymbolTable(mainDir);
+                    if ((symbol = MainFuncDef.of(mainDir, mainTable)) == null) {
+                        return null;
+                    }
+                    ans.add(symbol);
+                    return ans;
+                }
+                token = lexer.getToken();
+            }
+
+            // FuncDef
+            if ((symbol = FuncDef.of(dir, table)) == null) {
+                return null;
+            }
+            ans.add(symbol);
+        }
+...
+```
+
+The problem is that this second while loop will always try to parse a FuncDef, even if there are no more functions. If `FuncDef.of()` returns null (because there's no function definition), it returns null, causing the entire parse to fail.
+
+But according to the grammar, `CompUnit → {Decl} {FuncDef} MainFuncDef`, the `{FuncDef}` part can be zero or more, so if there are no more FuncDefs, it should proceed to look for MainFuncDef or finish.
+
+However, the code structure suggests that MainFuncDef should have been handled in the first loop.
+
+Actually, looking at the first loop, MainFuncDef is handled when BType is INTTK and next token is MAINTK.
+
+But what if the program ends after declarations with no functions? The grammar requires a MainFuncDef, so that would be invalid.
+
+Given the complexity and without specific test cases, the most suspicious area is the `CompUnit.of()` method's control flow logic.
+
+However, there's another possibility. Looking at the error handling in various places, when an error is detected (like missing semicolon), the code logs the error but sometimes continues parsing instead of stopping.
+
+For example, in `ConstDecl.of()`:
+
+```java
+if (!token.getType().equals(TokenType.SEMICN)) {
+    logger.log(new ParserError(symbol.getLine(), "i"));
+    return constDecl;
+}
+```
+
+It returns the partially built constDecl instead of null, which might cause issues downstream.
+
+But the problem description says for erroneous programs, output error line and code, which suggests this might be correct behavior.
+
+Given all the analysis, I think the most likely location of the error is in the `CompUnit.of()` method's parsing logic, specifically in how it transitions between parsing declarations and function definitions.
+
+But there's one more thing to check. Looking at the `AbstractSyntaxTree.printAns()` method again:
+
+```java
+public void printAns(Ele ele) {
+    StringBuilder sb = new StringBuilder();
+    if (ele instanceof Symbol) {
+        Symbol symbol1 = (Symbol) ele;
+        ArrayList<Ele> list = symbol1.getList();
+        for (Ele e : list) {
+            printAns(e);
+        }
+    }
+    sb.append(ele.toString());
+    logger.log(sb.toString());
+}
+```
+
+The `StringBuilder sb` is created but only used to append `ele.toString()`. This is equivalent to just `logger.log(ele.toString())`. The StringBuilder is unnecessary but not harmful.
+
+However, the real issue might be that for tokens, `toString()` includes a newline, and for symbols, it also includes a newline, which is correct.
+
+After careful analysis, I believe the primary issue is in the `CompUnit.of()` method's control flow logic that could cause it to fail on valid inputs or enter infinite loops.
+
+But looking at the very beginning of the conversation, the test case input shows a system error about javac not found, which suggests the actual issue might be environmental. However, since we're asked to find code errors, I'll focus on the most likely logical error.
+
+Actually, let me look at one more thing. In the `Stmt` class, for the printf statement:
+
+<ast/Stmt.java>
+...
+            // )
+            if (!token.getType().equals(TokenType.RPARENT)) {
+                logger.log(new ParserError(symbol.getLine(), "j"));
+            } else {
+                stmt.add(token);
+                token = lexer.nextToken();
+            }
+
+            // ;
+            if (!(token.getType().equals(TokenType.SEMICN))) {
+                logger.log(new ParserError(symbol.getLine(), "i"));
+                return stmt;
+            }
+...
+```
+
+If there's a missing right parenthesis, it logs the error but continues to check for semicolon. However, `symbol` at this point might be null or invalid, causing `symbol.getLine()` to fail.
+
+But more importantly, in many places, when an error is logged, the code continues parsing instead of returning null, which might lead to cascading errors or incorrect output.
+
+However, the specification says to output errors and continue, so this might be intentional.
+
+Given the time and complexity, I'll identify the most likely problematic area as the `CompUnit.of()` method's parsing logic.
+
+<ast/CompUnit.java>
+...
+        /*
+            {Decl}
+         */
+        while (true) {
+
+            // ConstDecl
+            if ((symbol = ConstDecl.of(table)) != null) {
+                Decl decl = new Decl();
+                decl.add(symbol);
+                ans.add(decl);
+                continue;
+            }
+
+            DecType decType;
+
+            // VarDecl, MainFuncDef, FuncDef(int char)
+            if ((symbol = BType.of()) != null) {
+
+                // VarDecl, FuncDef
+                if (token.getType().equals(TokenType.IDENFR)) {
+                    token = lexer.previewToken();
+
+                    // FuncDef
+                    if (token.getType().equals(TokenType.LPARENT)) {
+...
+                        ans.add(funcDef);
+                        break;
+
+                    }
+
+                    // VarDecl
+                    else {
+...
+                        Decl decl = new Decl();
+                        decl.add(varDecl);
+                        ans.add(decl);
+                    }
+
+                    // MainFuncDef
+                } else if (token.getType().equals(TokenType.MAINTK)) {
+...
+                        ans.add(mainFuncDef);
+                        return ans;
+                } else {
+                    return null;
+                }
+
+                // FuncDef
+            } else {
+                if (token.getType().equals(TokenType.VOIDTK)) {
+...
+                    ans.add(symbol);
+                    break;
+                } else {
+                    return null;
+                }
+            }
+        }
+
+        // FuncDef, MainFuncDef
+        while (true) {
+...
+        }
+...

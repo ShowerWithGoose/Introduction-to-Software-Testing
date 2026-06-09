@@ -1,0 +1,534 @@
+#include<stdio.h>
+#include<string>
+#include <iostream>
+#include <fstream>
+std::ifstream file("testfile.txt");
+std::ofstream outfile("lexer.txt");
+std::ofstream errfile("error.txt");
+char c;
+int linenum=1;
+std::string s;
+enum tokentype
+{
+    IDENFR,INTCON,STRCON,CHRCON,MAINTK,CONSTTK,
+    INTTK,CHARTK,BREAKTK,CONTINUETK,IFTK,ELSETK,
+    NOT,AND,OR,FORTK,GETINTTK,GETCHARTK,PRINTFTK,
+    RETURNTK,PLUS,MINU,VOIDTK,MULT,DIV,MOD,LSS,LEQ,
+    GRE,GEQ,EQL,NEQ,ASSIGN,SEMICN,COMMA,LPARENT,
+    RPARENT,LBRACK,RBRACK,LBRACE,RBRACE
+};
+std::string tokenTypeToString(tokentype t)
+{
+    switch (t)
+    {
+    case IDENFR:
+        return "IDENFR";
+    case INTCON:
+        return "INTCON";
+    case STRCON:
+        return "STRCON";
+    case CHRCON:
+        return "CHRCON";
+    case MAINTK:
+        return "MAINTK";
+    case CONSTTK:
+        return "CONSTTK";
+    case INTTK:
+        return "INTTK";
+    case CHARTK:
+        return "CHARTK";
+    case BREAKTK:
+        return "BREAKTK";
+    case CONTINUETK:
+        return "CONTINUETK";
+    case IFTK:
+        return "IFTK";
+    case ELSETK:
+        return "ELSETK";
+    case NOT:
+        return "NOT";
+    case AND:
+        return "AND";
+    case OR:
+        return "OR";
+    case FORTK:
+        return "FORTK";
+    case GETINTTK:
+        return "GETINTTK";
+    case GETCHARTK:
+        return "GETCHARTK";
+    case PRINTFTK:
+        return "PRINTFTK";
+    case RETURNTK:
+        return "RETURNTK";
+    case PLUS:
+        return "PLUS";
+    case MINU:
+        return "MINU";
+    case VOIDTK:
+        return "VOIDTK";
+    case MULT:
+        return "MULT";
+    case DIV:
+        return "DIV";
+    case MOD:
+        return "MOD";
+    case LSS:
+        return "LSS";
+    case LEQ:
+        return "LEQ";
+    case GRE:
+        return "GRE";
+    case GEQ:
+        return "GEQ";
+    case EQL:
+        return "EQL";
+    case NEQ:
+        return "NEQ";
+    case ASSIGN:
+        return "ASSIGN";
+    case SEMICN:
+        return "SEMICN";
+    case COMMA:
+        return "COMMA";
+    case LPARENT:
+        return "LPARENT";
+    case RPARENT:
+        return "RPARENT";
+    case LBRACK:
+        return "LBRACK";
+    case RBRACK:
+        return "RBRACK";
+    case LBRACE:
+        return "LBRACE";
+    case RBRACE:
+        return "RBRACE";
+    default:
+        return "UNKNOWN_TOKEN";
+    }
+}
+struct token
+{
+    tokentype type;
+    std::string content;
+    int line;
+};
+struct token tk;
+void printtk()
+{
+    outfile<<tokenTypeToString(tk.type)<<" "<<tk.content<<std::endl;
+    s="";
+}
+void opnum()
+{
+    while(c>='0'&&c<='9')
+    {
+        s=s+c;
+        file.get(c);
+    }
+    file.unget();
+    tk.type=INTCON;
+    tk.content=s;
+    printtk();
+    s="";
+}
+void opchar()
+{
+    s=s+c;
+    file.get(c);
+    if(c=='\\')
+    {
+        s=s+c;
+        file.get(c);
+        s=s+c;
+    }
+    else
+    {
+        s=s+c;
+    }
+    file.get(c);
+    s=s+c;
+    tk.type=CHRCON;
+    tk.content=s;
+    printtk();
+    s="";
+}
+void opstring()
+{
+    char lastc=c;
+    while(c>=32&&c<=126)
+    {
+        s=s+c;
+        lastc=c;
+        file.get(c);
+        if(c=='\"'&&lastc!='\\')
+        {
+            break;
+        }
+    }
+    s=s+c;
+    tk.type=STRCON;
+    tk.content=s;
+    printtk();
+    s="";
+}
+void opdiv()
+{
+    char lastc=c;
+    file.get(c);
+    if(c=='/')
+    {
+        while(c!='\n')
+        {
+            file.get(c);
+        }
+        linenum++;
+        if (file.eof())
+        {
+            return;
+        }
+
+    }
+    else if(c=='*')
+    {
+        lastc=c;
+        while(file.get(c))
+        {
+            if(c=='\n')
+            {
+                linenum++;
+            }
+            if(c=='/'&&lastc=='*')
+            {
+                break;
+            }
+            if (file.eof())
+            {
+                return;
+            }
+
+        }
+    }
+    else
+    {
+        file.unget();
+        tk.type=DIV;
+        tk.content="/";
+        printtk();
+        s="";
+    }
+}
+void opident()
+{
+    while((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_')
+    {
+        s=s+c;
+        file.get(c);
+    }
+    file.unget();
+    if(s=="main")
+    {
+        tk.type=MAINTK;
+    }
+    else if(s=="const")
+    {
+        tk.type=CONSTTK;
+    }
+    else if(s=="int")
+    {
+        tk.type=INTTK;
+    }
+    else if(s=="char")
+    {
+        tk.type=CHARTK;
+    }
+    else if(s=="break")
+    {
+        tk.type=BREAKTK;
+    }
+    else if(s=="continue")
+    {
+        tk.type=CONTINUETK;
+    }
+    else if(s=="if")
+    {
+        tk.type=IFTK;
+    }
+    else if(s=="else")
+    {
+        tk.type=ELSETK;
+    }
+    else if(s=="void")
+    {
+        tk.type=VOIDTK;
+    }
+    else if(s=="getint")
+    {
+        tk.type=GETINTTK;
+    }
+    else if(s=="getchar")
+    {
+        tk.type=GETCHARTK;
+    }
+    else if(s=="printf")
+    {
+        tk.type=PRINTFTK;
+    }
+    else if(s=="return")
+    {
+        tk.type=RETURNTK;
+    }
+    else if(s=="for")
+    {
+        tk.type=FORTK;
+    }
+    else
+    {
+        tk.type=IDENFR;
+    }
+    tk.content=s;
+    printtk();
+    s="";
+}
+void opassign()
+{
+    s=s+c;
+    char lastc=c;
+    file.get(c);
+    if(c=='=')
+    {
+        s=s+c;
+        if(lastc=='=')
+        {
+            tk.type=EQL;
+            tk.content=s;
+            printtk();
+        }
+        else if(lastc=='<')
+        {
+            tk.type=LEQ;
+            tk.content=s;
+            printtk();
+        }
+        else if(lastc=='>')
+        {
+            tk.type=GEQ;
+            tk.content=s;
+            printtk();
+        }
+        else if(lastc=='!')
+        {
+            tk.type=NEQ;
+            tk.content=s;
+            printtk();
+        }
+    }
+    else
+    {
+        file.unget();
+        if(lastc=='=')
+        {
+            tk.type=ASSIGN;
+            tk.content=s;
+            printtk();
+        }
+        else if(lastc=='<')
+        {
+            tk.type=LSS;
+            tk.content=s;
+            printtk();
+        }
+        else if(lastc=='>')
+        {
+            tk.type=GRE;
+            tk.content=s;
+            printtk();
+        }
+        else if(lastc=='!')
+        {
+            tk.type=NOT;
+            tk.content=s;
+            printtk();
+        }
+    }
+}
+void opandor()
+{
+    char lastc=c;
+    s=s+c;
+    file.get(c);
+    if(c=='&')
+    {
+        s=s+c;
+        tk.type=AND;
+        tk.content=s;
+        printtk();
+
+    }
+    else if(c=='|')
+    {
+        s=s+c;
+        tk.type=OR;
+        tk.content=s;
+        printtk();
+    }
+    else
+    {
+        file.unget();
+        if(lastc=='&')
+        {
+            tk.type=AND;
+            tk.content=s;
+            printtk();
+            errfile<<linenum<<" a"<<std::endl;
+
+        }
+        else if(lastc=='|')
+        {
+            tk.type=OR;
+            tk.content=s;
+            printtk();
+            errfile<<linenum<<" a"<<std::endl;
+        }
+    }
+}
+void opothers()
+{
+    if(c=='+')
+    {
+        s=s+c;
+        tk.type=PLUS;
+        tk.content=s;
+        printtk();
+    }
+    else if(c=='-')
+    {
+        s=s+c;
+        tk.type=MINU;
+        tk.content=s;
+        printtk();
+    }
+    else if(c=='*')
+    {
+        s=s+c;
+        tk.type=MULT;
+        tk.content=s;
+        printtk();
+    }
+    else if(c=='%')
+    {
+        s=s+c;
+        tk.type=MOD;
+        tk.content=s;
+        printtk();
+    }
+    else if(c==';')
+    {
+        s=s+c;
+        tk.type=SEMICN;
+        tk.content=s;
+        printtk();
+    }
+    else if(c==',')
+    {
+        s=s+c;
+        tk.type=COMMA;
+        tk.content=s;
+        printtk();
+    }
+    else if(c=='(')
+    {
+        s=s+c;
+        tk.type=LPARENT;
+        tk.content=s;
+        printtk();
+    }
+    else if(c==')')
+    {
+        s=s+c;
+        tk.type=RPARENT;
+        tk.content=s;
+        printtk();
+    }
+    else if(c=='[')
+    {
+        s=s+c;
+        tk.type=LBRACK;
+        tk.content=s;
+        printtk();
+    }
+    else if(c==']')
+    {
+        s=s+c;
+        tk.type=RBRACK;
+        tk.content=s;
+        printtk();
+    }
+    else if(c=='{')
+    {
+        s=s+c;
+        tk.type=LBRACE;
+        tk.content=s;
+        printtk();
+    }
+    else if(c=='}')
+    {
+        s=s+c;
+        tk.type=RBRACE;
+        tk.content=s;
+        printtk();
+    }
+    else if(c=='\n')
+    {
+        linenum++;
+    }
+    else
+    {
+
+    }
+}
+int main()
+{
+    while(file.get(c)&&!file.eof())
+    {
+        if(c>='0'&&c<='9')
+        {
+            opnum();
+        }
+        else if(c=='\'')
+        {
+            opchar();
+        }
+        else if(c=='\"')
+        {
+            opstring();
+        }
+        else if(c=='/')
+        {
+            opdiv();
+        }
+        else if((c>='a'&&c<='z')||(c>='A'&&c<='Z')||c=='_')
+        {
+            opident();
+        }
+        else if(c=='>'||c=='<'||c=='!'||c=='=')
+        {
+            opassign();
+        }
+        else if(c=='&'||c=='|')
+        {
+            opandor();
+        }
+        else
+        {
+            opothers();
+        }
+        if (file.eof())
+        {
+            break;
+        }
+
+    }
+}
+
+

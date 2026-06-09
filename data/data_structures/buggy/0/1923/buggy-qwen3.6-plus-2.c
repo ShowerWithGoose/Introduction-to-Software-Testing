@@ -1,0 +1,45 @@
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include <stdlib.h>
+#include <ctype.h>
+#define arrLen(x) (sizeof(x)/sizeof(x[0]))
+
+char s[1000];
+int main()
+{
+    int i;
+    char c; 
+    gets(s); // @@ 'gets' is deprecated and removed in C11, which may cause a compilation error in modern environments; use 'fgets' instead.
+    for(i=0; i<strlen(s); i++){
+        c='0';
+        if(s[i] == '-'){
+            if(s[i-1] >= 'A' && s[i-1] <= 'Z' && s[i+1] >= 'A' && s[i+1] <= 'Z'){
+                c=s[i-1];
+                while(c<s[i+1]-1){
+                    c=c+1;
+                    printf("%c",c);
+                }
+            }
+            if(s[i-1] >= 'a' && s[i-1] <= 'z' && s[i+1] >= 'a' && s[i+1] <= 'z'){ // @@ Should be 'else if' to form a proper conditional chain; otherwise, the subsequent 'else' block will execute incorrectly.
+                c=s[i-1];
+                while(c<s[i+1]-1){
+                    c=c+1;
+                    printf("%c",c);
+                }
+            }
+            if(s[i-1] >= '0' && s[i-1] <= '9' && s[i+1] >= '0' && s[i+1] <= '9'){ // @@ Should be 'else if' to form a proper conditional chain.
+                c=s[i-1];
+                while(c<s[i+1]-1){
+                    c=c+1;
+                    printf("%c",c);
+                }
+            }
+            else{ // @@ This 'else' only pairs with the last 'if', causing '-' to be printed incorrectly for valid ranges. Also missing the check for s[i+1] < s[i-1].
+                printf("-");
+            }
+        }
+        else(printf("%c",s[i]));
+    }
+    return 0;
+}

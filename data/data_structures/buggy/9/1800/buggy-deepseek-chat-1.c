@@ -1,0 +1,81 @@
+#define _CRT_SECURE_NO_WARNINGS 1
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
+int main()
+{
+    int n = 0, a[100][5] = { 0 },p=0;
+    scanf("%d", &n);
+    while (n--)
+    {
+        int a1=0, a2=0, b1=0, b2 = 0, i = 0;
+        scanf("%d %d %d %d", &a1, &a2, &b1, &b2);
+        while (1)
+        {
+            if (!a[i][4])
+            {
+                a[i][0] = a1, a[i][1] = a2, a[i][2] = b1, a[i][3] = b2, a[i][4] = 1;
+                p++;
+                break;
+            }
+            else
+            {
+                if ((a[i][0] == b1) && (a[i][1] == b2))
+                {
+                    a[i][0] = a1, a[i][1] = a2;
+                    a[i][4]++;
+                    break;
+                }
+                else if ((a[i][2] == a1) && (a[i][3] == a2))
+                {
+                    a[i][2] = b1, a[i][3] = b2;
+                    a[i][4]++;
+                    break;
+                }
+                else
+                {
+                    i++;
+                }
+            }
+        }
+    }
+    
+    while (p--)
+    {
+        int g = p;
+        while (g--)
+        {
+            if (!a[g][4])
+                continue;
+            if ((a[g][0] == a[p][3]) && (a[g][1] == a[p][2])) // @@ [Error: The condition checks a[g][0] against a[p][3] and a[g][1] against a[p][2], but a[p][3] is the y-coordinate of the second endpoint and a[p][2] is the x-coordinate of the second endpoint, mixing x and y coordinates incorrectly. Should compare x with x and y with y, e.g., a[g][0] == a[p][2] and a[g][1] == a[p][3] to check if the start of g matches the end of p.]
+            {
+                a[g][0] = a[p][0], a[g][1] = a[p][1];
+                a[g][4]+=a[p][4];
+                break;
+            }
+            else if ((a[g][2] == a[p][0]) && (a[g][3] == a[p][1])) // @@ [Error: Similarly, this condition checks a[g][2] (x of second endpoint) against a[p][0] (x of first endpoint) and a[g][3] (y of second endpoint) against a[p][1] (y of first endpoint), which is correct for matching end of g to start of p, but the previous error may cause incorrect merging.]
+            {
+                a[g][2] = a[p][2], a[g][3] = a[p][3];
+                a[g][4] += a[p][4];
+                break;
+            }
+        }
+    }
+    int j=0, k=0, l = 0;
+    while (a[j][4])
+    {
+        if (k > a[j][4])
+        {
+            j++;
+        }
+        else
+        {
+            k = a[j][4];
+            l = j;
+            j++;
+        }
+    }
+    printf("%d %d %d", k, a[l][0], a[l][1]);
+    return 0; 
+}

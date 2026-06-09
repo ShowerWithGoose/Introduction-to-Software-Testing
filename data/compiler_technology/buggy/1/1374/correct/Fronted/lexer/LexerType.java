@@ -1,0 +1,15 @@
+package Fronted.lexer;
+
+public enum LexerType {
+    //变量
+    IDENFR, INTCON, STRCON, CHRCON,
+    //关键字
+    MAINTK, CONSTTK, INTTK, CHARTK, BREAKTK, CONTINUETK, IFTK, ELSETK, FORTK,
+    //逻辑运算
+    NOT, AND, OR,
+    //函数
+    GETINTTK, GETCHARTK, PRINTFTK, RETURNTK, VOIDTK,
+    //符号
+    PLUS, MINU, MULT, DIV, MOD, LSS, LEQ, GRE, GEQ, EQL, NEQ, ASSIGN,
+    SEMICN, COMMA, LPARENT, RPARENT, LBRACK, RBRACK, LBRACE, RBRACE
+}

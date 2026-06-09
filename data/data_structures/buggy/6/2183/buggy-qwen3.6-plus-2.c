@@ -1,0 +1,34 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+int ins(int top){
+    return top == 99 ? 0 : 1;
+}
+int ous(int top){
+    return top == 0 ? 0 : 1; // @@ The condition for checking if the stack is empty should be top == -1, not top == 0. Since top is initialized to -1, this incorrectly returns 1 (indicating not empty), which leads to accessing stack[-1] during a pop operation.
+}
+int main(){
+    int stack[111];
+    int top = -1;
+    int a, b;
+    while(scanf("%d",&a)){
+        if(a == -1)
+            break;       
+        else if(a == 1 && ins(top)){
+            scanf("%d", &b);
+            stack[++top] = b;
+        }
+        else if(a == 1 && !ins(top)){
+            scanf("%d", &b);
+            printf("error ");
+        }
+        else if(a == 0 && !ous(top)){
+            printf("error ");
+        }
+        else if(a == 0 && ous(top)){
+            printf("%d ", stack[top--]);
+        }
+    }
+
+    return 0;
+}
