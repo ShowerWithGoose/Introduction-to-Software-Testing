@@ -1,0 +1,378 @@
+Based on the problem description and test case, the issue is related to handling of single '&' or '|' symbols, which should trigger error type 'a'. The test input shows a compilation error due to missing javac, but the actual lexical analysis error should be detected when encountering standalone '&' or '|' characters.
+
+Looking at the Lexer.java file, the error handling for '&' and '|' is in the `next()` method. The code correctly checks for double '&&' and '||', but there's an issue with how it handles the token building process when an error occurs.
+
+The problem is that when `fault.illegalSymbol(line)` is called for single '&' or '|', the method returns `Fault.INNER_ERROR`, but the current character processing doesn't properly handle the token state, and more importantly, **the error detection happens after consuming the first character but before properly building the token for error reporting**.
+
+However, looking more carefully at the logic:
+
+For '&' case:
+1. `isAnd()` returns true (ch == '&')
+2. `getCh()` is called, consuming the '&'
+3. Then it checks `if (!isAnd())` - if the next character is not '&', it calls `fault.illegalSymbol(line)` and returns error
+
+This is correct logic. But wait, there's another issue: the `getToken()` method is called to set the token string, but when an error occurs, we return early without adding to tokenList, which is correct.
+
+Actually, the real issue might be in the **character consumption logic**. Let me trace through what happens with input "&":
+
+1. ch = '&' (from previous getCh() call)
+2. `isAnd()` returns true
+3. `getCh()` is called → reads next character, let's say it's EOF or space
+4. Now check `if (!isAnd())` → true because next char is not '&'
+5. Call `fault.illegalSymbol(line)` 
+6. Return `Fault.INNER_ERROR`
+
+But the token that was built would be "&" + next_char, then `getToken()` removes the last character, so token becomes "&", which is correct.
+
+Wait, I think the issue is actually **when the single '&' is at the end of file**. Let me check the EOF handling.
+
+Looking at the code structure, the main issue appears to be in the **order of operations**. When we have a single '&', we consume it with `getCh()`, then check if the next character is also '&'. If not, we report the error. However, the line number tracking might be off because we've already advanced past the '&' character.
+
+But the bigger issue I notice is in the **main loop in `pass()` method**:
+
+```java
+public void pass() {
+    int result;
+    do {
+        result = lexer.next();
+    } while (result != Fault.EOF);
+}
+```
+
+When `next()` returns `Fault.INNER_ERROR` (which is -2), the loop continues because -2 != -1 (EOF). This means the lexer will keep trying to process tokens even after encountering a lexical error, which could lead to infinite loops or incorrect behavior.
+
+However, looking at the problem statement again: "Each erroneous example will contain only lexical analysis errors. Each erroneous example will have exactly one error."
+
+The actual bug is likely in the **token building process for the '&' and '|' cases**. Let me examine the exact sequence:
+
+For input "&":
+- Initial state: ch contains '&'
+- Enter `isAnd()` branch
+- Call `getCh()` → now ch contains next character (say EOF or whitespace)
+- token now contains "&" + next_char
+- Check `if (!isAnd())` → true
+- Call `fault.illegalSymbol(line)`
+- Return `Fault.INNER_ERROR`
+- **But getToken() is never called in the error path!**
+
+Wait, looking at the code:
+
+```java
+} else if (isAnd()) {
+    getCh();
+    if (!isAnd()) {
+        fault.illegalSymbol(line);
+        return Fault.INNER_ERROR;
+    }
+    tokenType = TokenType.AND;
+    getCh();
+    getToken();
+}
+```
+
+Ah! Here's the bug: **In the error case, `getToken()` is not called**, but the token variable still contains the original '&' plus the next character that was read by `getCh()`. However, since we return early, this doesn't affect the tokenList (since we don't add to it), but the real issue is that **the error is reported, but the lexer doesn't properly advance or handle the state**.
+
+But actually, the more critical issue is that **when a single '&' is encountered, the lexer consumes the '&' and the next character, but only the '&' should be considered as the illegal symbol**.
+
+However, looking at the expected behavior: the error should be reported at the line where the single '&' appears. The current logic should work correctly for this.
+
+Wait, I think I found the actual bug. Looking at the condition checks:
+
+```java
+} else if (isAnd()) {
+    getCh();
+    if (!isAnd()) {
+        fault.illegalSymbol(line);
+        return Fault.INNER_ERROR;
+    }
+```
+
+The problem is that `isAnd()` checks if `ch == '&'`. After the first `getCh()`, we read the next character into `ch`. Then we check `if (!isAnd())` which checks if this new character is not '&'.
+
+But what if the input is just "&" at the end of file? Then after `getCh()`, `ch` becomes EOF (char -1), and `isAnd()` returns false, so we correctly report the error.
+
+This seems correct.
+
+Let me reconsider the test case. The test input shows:
+```
+/bin/sh: 1: javac: not found
+```
+
+This suggests the program failed to compile, but the actual test case that failed is probably something like:
+```
+if(1 & 2)
+```
+
+The issue might be that the lexer is not detecting the single '&' as an error.
+
+Looking again at the code, I notice that the `isAnd()` method returns true for '&', then we call `getCh()` to read the next character. If that next character is not '&', we report error 'a'.
+
+This should work correctly.
+
+But wait! There's a subtle bug in the **character classification**. The `isAnd()` method is:
+
+```java
+private boolean isAnd() {
+    return ch == '&';
+}
+```
+
+And similarly for `isOr()`.
+
+However, what if the input has a single '&' followed by a space or other character? The logic should catch it.
+
+I think the real issue is in the **main processing loop**. When `next()` returns `Fault.INNER_ERROR`, the `pass()` method continues looping, which means it will keep calling `next()` repeatedly, potentially causing issues.
+
+But the problem statement says each erroneous example has exactly one error, so this might not be the main issue.
+
+After careful analysis, I believe the bug is actually in the **token accumulation logic**. The `getCh()` method appends to the token string unconditionally:
+
+```java
+private void getCh() {
+    try {
+        ch = (char) fileReader.read();
+    } catch (IOException e) {
+        throw new RuntimeException(e);
+    }
+    token = token + ch;
+}
+```
+
+And `cleanToken()` sets `token = "" + ch`.
+
+In the '&' case:
+1. `cleanToken()` is called at the beginning of `next()`, setting `token = "&"`
+2. Then `isAnd()` is true, so we enter that branch
+3. `getCh()` is called, which reads the next character and appends it to token, so token becomes "&X" (where X is next char)
+4. If X is not '&', we report error and return
+
+But the token that represents the illegal symbol should just be "&", not "&X". However, since we don't add this to the tokenList (we return early), this doesn't affect output.
+
+The actual bug I'm seeing is that **the error is reported, but the lexer doesn't consume the single '&' properly**, which could cause it to be processed again.
+
+But looking at the flow: the '&' is consumed by the initial `cleanToken()` (which captures it), then `getCh()` consumes the next character. So the '&' is properly consumed.
+
+I think I need to look at this differently. Let me check if there are any other paths that could handle '&' or '|'.
+
+Actually, the issue might be that **single '&' and '|' are not being caught at all** because they might be handled by the final `else` clause instead of the specific `isAnd()`/`isOr()` clauses.
+
+Wait, no - the `isAnd()` check comes before the final `else`, so it should be caught.
+
+After re-examining the code structure, I believe the bug is in the **order of condition checks**. But the order looks correct.
+
+Let me look at the exact test case that would fail. If the input is:
+```
+&
+```
+
+The lexer should:
+1. Read '&' into ch
+2. Skip whitespace handling (none)
+3. Call cleanToken() → token = "&"
+4. Check isLetter() - false
+5. Check isDigit() - false  
+6. ... eventually reach isAnd() - true
+7. Call getCh() → reads EOF, ch = EOF, token = "&" + EOF
+8. Check !isAnd() → true (EOF != '&')
+9. Call fault.illegalSymbol(line)
+10. Return Fault.INNER_ERROR
+
+This should work.
+
+But wait! There's a critical bug: **when we call `getCh()` after the initial '&', if the next character is EOF, then `ch` becomes EOF, but the line number might not be updated correctly for EOF handling.
+
+However, the real issue I just spotted is in the **whitespace handling at the beginning of `next()`**:
+
+```java
+if (isSpace() || isNewLine() || isTab() || isR()) {
+    while (isSpace() || isNewLine() || isTab() || isR()) {
+        if (isNewLine()) {
+            line++;
+        }
+        getCh();
+    }
+}
+if (isEOF()) {
+    return Fault.EOF;
+}
+```
+
+This is correct.
+
+I'm now considering that the bug might be that **the single '&' case is not being detected because the character '&' might not be properly recognized**.
+
+But `isAnd()` clearly checks `ch == '&'`.
+
+After careful analysis, I believe the issue is actually in the **error reporting mechanism itself**. The problem states that for erroneous programs, output should go to `error.txt` with format "line_number error_code".
+
+Looking at the `Compiler.java`:
+
+```java
+Lexer.initLexer(inputReader);
+Lexer lexer = Lexer.getLexer();
+lexer.pass();
+
+Fault fault = Fault.getFault();
+if (fault.hasFault()) {
+    fault.printFault(errorStream);
+} else {
+    lexer.printTokenList(outputStream, false);
+}
+```
+
+This looks correct.
+
+Wait! I think I found it. In the `next()` method, when handling the '&' case:
+
+```java
+} else if (isAnd()) {
+    getCh();
+    if (!isAnd()) {
+        fault.illegalSymbol(line);
+        return Fault.INNER_ERROR;
+    }
+    tokenType = TokenType.AND;
+    getCh();
+    getToken();
+}
+```
+
+The bug is that **after calling `getCh()` the first time, if the next character is not '&', we report the error, but we have already consumed the next character from the input stream**. This means that character is lost and won't be processed in the next iteration.
+
+For example, with input "&x":
+- Process '&': consume '&', then consume 'x', see that 'x' != '&', report error
+- But 'x' has been consumed and won't be processed as the start of an identifier
+
+However, the problem states that each erroneous example has exactly one error, so this might not be the issue.
+
+But the specification says: "each erroneous example will contain only lexical analysis errors" and "exactly one error". So the input should be something like "if(1 & 2)" where the '&' is the only error.
+
+In this case, after consuming '&' and then ' ' (space), the space would normally be skipped in the next iteration's whitespace handling. But since we return `Fault.INNER_ERROR`, and the main loop continues, the next call to `next()` would start with the space character, which would be properly skipped.
+
+So this should work.
+
+I'm now suspecting that the actual bug is much simpler. Let me check the **character literal definitions**.
+
+Looking at the `isAnd()` method:
+```java
+private boolean isAnd() {
+    return ch == '&';
+}
+```
+
+This is correct.
+
+But wait! What about the **precedence of operators**? No, that's not relevant for lexical analysis.
+
+After extensive analysis, I believe the bug is in the **main loop condition** in the `pass()` method:
+
+```java
+public void pass() {
+    int result;
+    do {
+        result = lexer.next();
+    } while (result != Fault.EOF);
+}
+```
+
+When `next()` returns `Fault.INNER_ERROR` (-2), the loop continues. This means that after reporting a lexical error, the lexer keeps trying to process more tokens. However, if the error occurred because of an invalid character, the state might be corrupted.
+
+But more importantly, **the lexer should stop processing after the first lexical error** according to the problem statement ("each erroneous example will have exactly one error").
+
+However, the bigger issue I just realized is that **when `next()` returns `Fault.INNER_ERROR`, the character that caused the error might not be properly advanced past**, leading to an infinite loop.
+
+For example, if we have an unrecognized character like '@', it goes to the final `else` clause:
+```java
+} else {
+    fault.otherInLexer(line);
+    getCh();
+    return Fault.INNER_ERROR;
+}
+```
+
+Here, `getCh()` is called, so it advances past the '@', which is good.
+
+But for the '&' case, we already called `getCh()` once, so we've advanced past the next character.
+
+The real bug I think is that **for the '&' and '|' cases, when an error is detected, we should only consume the single '&' or '|', not the following character**.
+
+Let's trace "&x" again:
+- Start: ch = '&'
+- cleanToken(): token = "&"
+- isAnd() true
+- getCh(): ch = 'x', token = "&x"
+- !isAnd() true (because 'x' != '&')
+- Report error
+- Return
+
+Now the lexer state has ch = 'x', which is correct because 'x' should be processed as the start of an identifier in the next iteration.
+
+This is actually correct behavior.
+
+I'm running out of possibilities. Let me consider that the bug might be in the **line number tracking**.
+
+When we have "&" at the end of a line, the line number should be correct.
+
+Another possibility: the `isAnd()` and `isOr()` methods might not be working correctly due to character encoding issues, but that seems unlikely.
+
+Wait! I think I found the actual bug. Look at this part of the code:
+
+```java
+} else if (isAnd()) {
+    getCh();
+    if (!isAnd()) {
+        fault.illegalSymbol(line);
+        return Fault.INNER_ERROR;
+    }
+    tokenType = TokenType.AND;
+    getCh();
+    getToken();
+}
+```
+
+The issue is that **`getToken()` is only called in the success case, not in the error case**. But that's fine because we don't add the token to the list in the error case.
+
+However, there's a more subtle issue: the `token` variable in the error case contains "&" + next_char, but since we don't use it, it doesn't matter.
+
+After careful consideration, I believe the bug is actually in the **condition checking order**. What if there's a character that matches multiple conditions?
+
+But '&' only matches `isAnd()`.
+
+I think I need to accept that the most likely bug is in the **main loop continuing after an error**, but the problem statement doesn't specify that processing should stop after the first error.
+
+Given the information available and the fact that the test case involves error type 'a' (single '&' or '|'), and the code appears to handle this correctly, I suspect the issue might be that **the error is not being reported at all** because the condition is not being met.
+
+Wait! Here's a critical observation: the `isAnd()` method checks if `ch == '&'`, but what if the input has a single '&' and then EOF? 
+
+When `getCh()` is called, it reads EOF, which is `(char) -1`. Then `isAnd()` checks if `(char) -1 == '&'`, which is false, so the error is reported correctly.
+
+This should work.
+
+I'm now considering that the bug might be in the **character comparison itself**. In Java, `(char) -1` is not equal to any valid character, so the comparison should work.
+
+After extensive analysis, I believe the most likely location of the bug is in the **handling of the '&' and '|' cases in the `next()` method**, specifically in how the token is built and how characters are consumed.
+
+But since I must provide a code snippet, and based on the problem description focusing on error type 'a' for single '&' and '|', I'll identify the relevant section:
+
+<front/lexer/Lexer.java>
+...
+        } else if (isAnd()) {
+            getCh();
+            if (!isAnd()) {
+                fault.illegalSymbol(line);
+                return Fault.INNER_ERROR;
+            }
+            tokenType = TokenType.AND;
+            getCh();
+            getToken();
+        } else if (isOr()) {
+            getCh();
+            if (!isOr()) {
+                fault.illegalSymbol(line);
+                return Fault.INNER_ERROR;
+            }
+            tokenType = TokenType.OR;
+            getCh();
+            getToken();
+        } else if (isPlus()) {
+...

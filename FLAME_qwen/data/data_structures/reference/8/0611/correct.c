@@ -1,0 +1,62 @@
+
+#include<stdio.h>
+#include<string.h>
+int weights[200][200],visited[200]={0},que[200];
+
+int n,m;
+void travelDFS(int v)
+{
+	int i;
+	printf("%d ",v);
+	visited[v]=1;
+	for(i = 0; i < n; i++)
+		if (weights[v][i] && !visited[i])	//如果矩阵元素为 1 且未访问过
+		{
+			travelDFS(i);		//DFS访问
+		}
+}
+void travelBFS(int v)
+{
+	int i,head=0,tail=1,tmp;	//队头，队尾，出列的元素
+	que[head]=v;	//入队
+	while(head<=tail)	//队列访问完毕
+	{
+		tmp=que[head];	//出队
+		head++;			//出队
+		if(visited[tmp])	continue;	//如果访问过
+		else
+		{
+			printf("%d ",tmp);		//打印出队元素
+			visited[tmp]=1;			//已访问
+			for(i=0;i<n;i++)
+				if (weights[tmp][i] && !visited[i])	//如果矩阵元素为 1 且未访问过
+					que[tail++]=i;		//入队
+		}
+	}
+}
+int main()
+{
+	int u,v,i,del;
+	scanf("%d %d",&n,&m);
+	for(i=0;i<m;i++)
+	{
+		scanf("%d %d",&u,&v); //录入矩阵
+		weights[u][v]=1;
+		weights[v][u]=1;
+	}
+	travelDFS(0);puts("");	//DFS
+
+	memset(visited,0,sizeof(visited));	//初始化不要忘了
+	travelBFS(0);puts("");	//BFS
+
+	scanf("%d",&del);
+	memset(visited,0,sizeof(visited));	//初始化不要忘了
+	visited[del]=1;		//	要删除的元素设置为已访问
+	travelDFS(0);puts("");	//DFS
+
+	memset(visited,0,sizeof(visited));memset(que,0,sizeof(que));//********注意：队列初始化不要忘了
+	visited[del]=1;		//	要删除的元素设置为已访问
+	travelBFS(0);puts("");	//BFS
+	return 0;
+}
+

@@ -1,0 +1,50 @@
+package lexical;
+
+public enum TokenType {
+    // identifier
+    IDENFR,
+    // const
+    INTCON,
+    STRCON,
+    CHRCON,
+    // keyword
+    CONSTTK,
+    INTTK,
+    CHARTK,
+    BREAKTK,
+    CONTINUETK,
+    IFTK,
+    ELSETK,
+    FORTK,
+    RETURNTK,
+    VOIDTK,
+    MAINTK,
+    // function
+    GETINTTK,
+    GETCHARTK,
+    PRINTFTK,
+    // separator
+    NOT,
+    AND,
+    OR,
+    PLUS,
+    MINU,
+    MULT,
+    DIV,
+    MOD,
+    LSS,
+    LEQ,
+    GRE,
+    GEQ,
+    EQL,
+    NEQ,
+    ASSIGN,
+    SEMICN,
+    COMMA,
+    LPARENT,
+    RPARENT,
+    LBRACK,
+    RBRACK,
+    LBRACE,
+    RBRACE,
+}

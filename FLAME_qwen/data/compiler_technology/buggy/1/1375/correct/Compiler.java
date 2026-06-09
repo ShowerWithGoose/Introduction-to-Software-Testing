@@ -1,0 +1,58 @@
+import frontend.lexer.Token;
+import frontend.lexer.TokenLexer;
+import frontend.lexer.TokenType;
+import frontend.parser.CompUnit;
+import frontend.parser.CompUnitParser;
+import frontend.readfile;
+
+
+import java.io.*;
+
+public class Compiler {
+    public static void main(String[] args) {
+        InputStream in = null;
+        try {
+            in = new FileInputStream("testfile.txt");
+        } catch (FileNotFoundException e) {
+            System.err.println("File not found");
+        }
+        readfile rf = new readfile(in);
+        TokenLexer lexer = new TokenLexer(rf);
+        CompUnitParser compUnitParser = new CompUnitParser(lexer.tokens,lexer.error_tokens);
+
+        CompUnit compUnit = compUnitParser.parseCompUnit();
+        try {
+            OutputStream out = new FileOutputStream("parser.txt");
+            OutputStream out2 = new FileOutputStream("token.txt");
+            try {
+                for(Token t:lexer.tokens){
+                    out2.write((t.type+" "+t.content+"\n").getBytes());
+                }
+
+                out.write(compUnit.syntaxOutput().getBytes());
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        try {
+            OutputStream out2 = new FileOutputStream("error.txt");
+            for (Token t : lexer.error_tokens) {
+                if(t.type.equals(TokenType.ERROR_A)){
+                    t.content="a";
+                }
+            }
+            lexer.sort_error_tokens();
+            try {
+                for (Token t : lexer.error_tokens) {
+                    out2.write(((t.linenum + 1) + " " + t.content + "\n").getBytes());
+                }
+            } catch (IOException e) {
+                throw new RuntimeException(e);
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+}

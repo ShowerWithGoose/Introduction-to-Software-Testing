@@ -1,0 +1,102 @@
+<frontend/Lexer.cpp>
+...
+    } else if (this->Char == '&') {
+        getChar();
+        if (this->Char == '&') {
+            catToken();
+            symbol = AND;
+        } else {
+            retract();
+            return -1; // @@ [When a single '&' is encountered, the function returns -1 to indicate an error, but it does not record the current character as part of the token. However, more critically, the current implementation fails to include the initial '&' in the Token before returning error, which may affect error reporting consistency. But the main issue is that the error handling correctly returns -1 for single '&', so this seems okay. However, looking closer: the initial '&' was never added to Token because catToken() is only called after getChar() in the multi-char cases. For single-character symbols like '&', the first '&' is read into Char and then getChar() is called, but catToken() hasn't been called yet to include the first '&'. Thus, when returning -1, the lexer has consumed the '&' but not recorded it, and the error is flagged—but the problem is that the first '&' was never appended to Token, so the error detection logic is correct per spec (error 'a' for lone &), BUT the real bug is that the initial character '&' is not added to Token before checking the next char. However, note that in the case of single '&', we do: Char='&', then getChar() reads next, then if not '&', we retract(), but we never did catToken() for the initial '&'. So Token remains empty. But the error is still correctly detected. However, the specification says: output line number and error code 'a'. The current code does push lineNum and output 'a', so why the failure?
+
+Wait—the actual issue is more subtle. In the case of a single '&', the code does:
+- Char = '&' (from initial getChar() in getsym())
+- Then enters the '&' branch
+- Calls getChar() → now Char is next char, say ' '
+- Since next char != '&', calls retract() → curPos goes back, Char restored to '&'
+- Then returns -1
+
+But note: at no point was the '&' added to Token via catToken(). However, for error reporting, the content of Token doesn't matter—only the line number. So that's fine.
+
+But wait: what about the initial call to catToken()? In the structure of getsym(), after skipping whitespace, we do:
+    catToken();   // <-- This adds the first non-whitespace char to Token
+
+Ah! Yes! Right after skipping whitespace and before checking the type, there is a call to catToken(). So when Char is '&', catToken() is called, so Token becomes "&". Then we enter the '&' branch.
+
+So in the '&' branch:
+- Token is already "&"
+- getChar() reads next char
+- if next is '&', then catToken() appends second '&', Token="&&", good.
+- else: retract(), so Char is restored to '&', and Token remains "&", then return -1.
+
+So error is correctly detected, Token is "&", but we don't use Token in error output—only line number. So why would this fail?
+
+But the test case input shows: "/bin/sh: 1: g++: not found", which suggests the program didn't even compile. However, the user says "Buggy Output:" is empty and "Expected Output:" is also empty, which is confusing.
+
+However, focusing on the lexical logic: the code for handling '|' has the same structure.
+
+But here's the real bug: in the case of a single '&', after retract(), the current Char is '&', and Token is "&", and we return -1. That is correct.
+
+However, consider what happens after returning -1: in lexicalAnalysis(), it records the current lineNum and sets right=false. Then the loop continues? No—it returns -1, so the current token is considered erroneous, but the lexer does not consume the '&' character. Because after retract(), curPos points to the '&', and then the function returns. On the next iteration of the while loop in lexicalAnalysis(), it will read the same '&' again, leading to an infinite loop.
+
+Ah! That's the critical bug.
+
+Because when getsym() returns -1, it does not advance the input pointer past the erroneous character. So the next call to getsym() will see the same '&' again, and again return -1, causing an infinite loop.
+
+Therefore, the error is that upon encountering a single '&' or '|', the lexer reports an error but does not consume the character, leading to an infinite loop.
+
+To fix this, even in the error case, the character should be consumed (i.e., not retract, or advance past it). But according to the problem, each erroneous example has exactly one error, so we can consume the bad character and then stop or continue? But the spec says output the line number and error code, and since there's only one error, we can break or ensure progress.
+
+But the current code retracts, leaving the input pointer at the '&', so next getsym() will process the same '&'.
+
+Thus, the bug is in the retract() call before returning -1. We should not retract; instead, we should leave the pointer advanced, or better: since the first '&' was already added to Token via the initial catToken(), and then we read the next char, if it's not '&', we should NOT retract, because we want to consume the single '&' as an erroneous token and move on. But the problem says each test has exactly one error, so we can just consume the '&' and report error.
+
+But the current logic: 
+- Initial catToken() → Token="&"
+- getChar() → reads next char
+- if not '&', then retract() → now curPos is back to after '&', Char='&'
+- return -1
+
+But then the next getsym() will start by reading the same '&' again.
+
+So to avoid infinite loop, we must not retract. Instead, we should treat the single '&' as a consumed token (even though invalid), so we don't retract.
+
+Therefore, the error is the retract() before returning -1.
+
+So the lines with retract() followed by return -1 are problematic.
+
+Specifically:
+
+In the '&' branch:
+        } else {
+            retract();
+            return -1;
+        }
+
+And similarly in the '|' branch.
+
+These retract() calls cause the lexer to not make progress on invalid single '&' or '|', leading to infinite loop.
+
+Hence, the error location is these two retract() calls before return -1.
+
+So annotate those lines.
+...
+    } else if (this->Char == '&') {
+        getChar();
+        if (this->Char == '&') {
+            catToken();
+            symbol = AND;
+        } else {
+            retract(); // @@ [This retract causes the lexer to not consume the single '&' character, leading to an infinite loop on subsequent calls to getsym() because the same '&' will be processed again. The single '&' should be treated as consumed (no retract) when reporting the error.]
+            return -1;
+        }
+    } else if (this->Char == '|') {
+        getChar();
+        if (this->Char == '|') {
+            catToken();
+            symbol = OR;
+        } else {
+            retract(); // @@ [Same issue as above: retracting causes the lexer to reprocess the same single '|' character indefinitely, resulting in an infinite loop.]
+            return -1;
+        }
+...

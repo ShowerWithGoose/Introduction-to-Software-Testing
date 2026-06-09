@@ -1,0 +1,92 @@
+#include<stdio.h>
+#include<string.h>
+int main()
+{
+	char a[1000],b[1000],c[1000];
+	int i,n,j,d[1000],k=0,p,q;
+	gets(a);
+	n=strlen(a);
+	for(i=0,j=0;i<n;i=i+1)
+	{
+		if(a[i]!=' ')
+		{
+			b[j]=a[i];
+			j=j+1;
+		}
+	}
+	n=strlen(b);
+	j=0;
+	for(i=0;i<n;i=i+1)
+	{
+		if(b[i]<'0'||b[i]>'9')
+		{
+			c[j]=b[i];
+			j=j+1;
+			k=k+1;
+		}
+		else
+		{
+			if(b[i-1]>='0'&&b[i-1]<='9')
+			{
+				d[k]=d[k]*10+b[i]-'0';
+			}
+			else
+			d[k]=b[i]-'0';
+		}
+	}
+	p=j;
+	q=k;
+	for(j=0;j<p;j=j+1)
+	{
+		if(c[j]=='*')
+		{
+			d[j+1]=d[j]*d[j+1];
+			for(i=j;i<p-1;i=i+1)
+			{
+				d[i]=d[i+1];
+				c[i]=c[i+1];
+			}
+			p=p-1;
+			j=j-1;
+		}
+		if(c[j]=='/')
+		{
+			d[j+1]=d[j]/d[j+1];
+			for(i=j;i<p-1;i=i+1)
+			{
+				d[i]=d[i+1];
+				c[i]=c[i+1];
+			}
+			p=p-1;
+			j=j-1;
+		}
+	}
+	for(j=0;j<p;j=j+1)
+	{
+		if(c[j]=='+')
+		{
+			d[j+1]=d[j]+d[j+1];
+			for(i=j;i<p-1;i=i+1)
+			{
+				d[i]=d[i+1];
+				c[i]=c[i+1];
+			}
+			p=p-1;
+			j=j-1;
+		}
+		if(c[j]=='-')
+		{
+			d[j+1]=d[j]-d[j+1];
+			for(i=j;i<p-1;i=i+1)
+			{
+				d[i]=d[i+1];
+				c[i]=c[i+1];
+			}
+			p=p-1;
+			j=j-1;
+		}
+	}
+	printf("%d",d[0]);
+	return 0;
+}
+

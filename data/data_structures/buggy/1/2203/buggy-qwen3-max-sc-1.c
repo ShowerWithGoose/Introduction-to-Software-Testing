@@ -1,8 +1,0 @@
-#include<stdio.h>
-#include<string.h>
-int main(){
-    char s[100];
-    gets(s); // @@ [The function 'gets' is unsafe and has been removed from the C standard library since C11; using it may cause compilation errors with modern compilers. It should be replaced with 'fgets'.]
-    printf("%s",s);
-    return 0;
-}

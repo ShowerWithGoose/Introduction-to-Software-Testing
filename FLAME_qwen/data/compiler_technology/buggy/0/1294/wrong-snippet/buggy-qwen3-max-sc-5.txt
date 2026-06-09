@@ -1,0 +1,309 @@
+Based on the problem description and test case, the issue is that the program failed to compile due to `javac: not found`, but more importantly, the lexical analyzer must detect single '&' or '|' as error type 'a'. The key logic for detecting these errors is in the token recognition phase.
+
+Looking at the code, the `TokenType` enum correctly defines `SINGLEAND` and `SINGLEOR` patterns for single '&' and '|', and the `TokenLexer.findToken()` method checks for these and adds error type 'a' when found. However, there's a critical issue with the **order of token matching**.
+
+In `TokenLexer.findToken()`, the code iterates through `TokenType.values()` and uses the first matching pattern. Since `AND` ("&&") and `OR` ("\\|\\|") come before `SINGLEAND` ("&") and `SINGLEOR` ("\\|") in the enum definition, when the input contains "&&" or "||", it correctly matches the double operators. But when the input contains a single "&" or "|", it should match `SINGLEAND`/`SINGLEOR`. However, the current enum ordering might cause issues if the regex matching isn't working as expected.
+
+But more critically, looking at the `TokenType` enum definition, the `SINGLEAND` and `SINGLEOR` are defined **after** all the valid tokens. This means that when we have a single "&", the regex engine will try to match it against earlier patterns first. However, since "&" doesn't match any of the earlier patterns (like identifiers, numbers, etc.), it should eventually reach `SINGLEAND`.
+
+The real issue is likely in the **regex pattern compilation**. Looking at the `TokenType` constructor:
+
+For non-greedy tokens (which includes `SINGLEAND` and `SINGLEOR`), the pattern is compiled as `"^" + this.patternStr`. 
+
+- `SINGLEAND` pattern: `"^&"`
+- `SINGLEOR` pattern: `"^\\|"` (which becomes `"^\|"` as a regex)
+
+This should work correctly. However, there's another potential issue: **what if the single "&" or "|" appears in a context where it could be part of a longer invalid sequence?**
+
+But the most likely bug is actually in the **order of token types in the enum**. The problem is that `AND` is defined as `"&&"` and `SINGLEAND` as `"&"`. When we have input `"&"`, it won't match `"&&"`, so it should fall through to `SINGLEAND`. Similarly for `"|"` vs `"||"`.
+
+Wait, looking more carefully at the test case input: the actual test input shows `/bin/sh: 1: javac: not found`, which suggests the test environment couldn't compile the Java code. But the real issue we need to focus on is the lexical analysis logic.
+
+Actually, re-examining the `findToken()` method:
+
+```java
+private void findToken() {
+    for (TokenType tokenType : TokenType.values()) {
+        Pattern pattern = tokenType.getPattern();
+        String tokenValue = fileLexer.matchTheStr(pattern);
+        if (tokenValue == null) {
+            continue;
+        } else {
+            // ... handle token
+            break;
+        }
+    }
+}
+```
+
+The issue is that `TokenType.values()` returns the enum constants in **declaration order**. Looking at the `TokenType` enum, the order is:
+
+1. All reserved words
+2. IDENFR, INTCON, etc.
+3. LEQ, LSS, ..., AND, OR, ...
+4. PLUS, MINU, ..., ASSIGN
+5. SEMICN, COMMA, ..., RBRACE
+6. **SINGLEAND, SINGLEOR** (at the very end)
+
+This means that when we have a single "&", it will be matched by `SINGLEAND` only after all previous patterns fail. That should work correctly.
+
+However, there's a subtle bug in the **regex patterns for the reserved words**. The reserved words have `isGreed = true`, which means their pattern is `"^main(?![_A-Za-z0-9])"` - this ensures that "main" is not matched as part of a longer identifier like "main123".
+
+But for `SINGLEAND` and `SINGLEOR`, they have `isGreed = false`, so their patterns are just `"^&"` and `"^\\|"`.
+
+The real issue might be that when we have input like `"&"`, it correctly matches `SINGLEAND`, and the error is added. But what if we have `"&&"`? It should match `AND` (which comes before `SINGLEAND` in the enum), so it should work correctly.
+
+Wait, looking at the enum order again:
+- `AND(false, "&&")`
+- `OR(false, "\\|\\|")`
+- ... other tokens ...
+- `SINGLEAND(false, "&")`
+- `SINGLEOR(false, "\\|")`
+
+So `AND` comes before `SINGLEAND`, which is correct. `"&&"` will match `AND` first and never reach `SINGLEAND`. `"&"` won't match `AND` (since `"&&"` requires two characters), so it will eventually match `SINGLEAND`.
+
+This logic seems correct.
+
+But there's one more possibility: **what if the input has a single "&" but it's followed by a character that makes it look like it could be part of something else?**
+
+Actually, the most likely issue is in the `matchTheStr` method in `FileLexer.java`. Let's look at that:
+
+```java
+public String matchTheStr(Pattern pattern){
+    Matcher matcher = pattern.matcher(getLineRest());
+
+    if(matcher.find()){
+        return matcher.group(0); //返回匹配到的第一个
+    } else {
+        return null; //没有匹配到
+    }
+}
+```
+
+The problem here is that `matcher.find()` finds the **first occurrence** of the pattern anywhere in the string, not necessarily at the beginning. But the patterns are anchored with `"^"`, so they should only match at the beginning.
+
+Wait, yes! The patterns are compiled with `"^" + patternStr`, so they should only match at the start of the string. And `getLineRest()` returns the substring from the current position to the end of the line, so the `"^"` anchor refers to the start of this substring, which is exactly what we want.
+
+So the matching logic seems correct.
+
+But wait! Looking back at the problem statement: "each erroneous example will contain only lexical analysis errors. Each erroneous example will have exactly one error."
+
+And the error type 'a' is for "The symbols "&" and "|" appearing individually".
+
+Given all this, the code logic appears correct. However, there's one critical issue I missed:
+
+In the `TokenType` enum, `SINGLEOR` is defined as:
+```java
+SINGLEOR(false, "\\|");
+```
+
+But in regex, to match a literal "|", you need to escape it as `"\\|"`, which becomes `\|` in the actual regex pattern. However, `"|"` is a special regex metacharacter (alternation), so `"\\|"` should correctly match a literal "|".
+
+Actually, let me double-check: in Java string literals, `"\\|"` becomes the string `\|`, and when passed to `Pattern.compile()`, the regex engine sees `\|`, which is an escaped "|", so it matches a literal "|". This is correct.
+
+Similarly, `OR` is defined as `"\\|\\|"`, which becomes `\|\|` in the regex, matching "||".
+
+So the patterns are correct.
+
+Wait, but there's another possibility. What if the input contains a single "&" or "|" but it's not being detected because of how the `findToken()` loop works?
+
+Let me trace through an example:
+- Input: `"&"`
+- `getLineRest()` returns `"&"`
+- Loop through `TokenType.values()`:
+  - Skip all reserved words (don't match)
+  - Skip IDENFR (`[_A-Za-z][_A-Za-z0-9]*` doesn't match "&")
+  - Skip INTCON, CHRCON, STRCON (don't match)
+  - Skip comparison operators (don't match)
+  - Check AND: pattern `"^&&"` - `matcher.find()` on `"&"` returns null (no match)
+  - Check OR: pattern `"^\\|\\|"` - no match
+  - Continue through arithmetic operators, assignment, punctuation...
+  - Eventually reach SINGLEAND: pattern `"^&"` - matches `"&"`
+  - Create token, detect it's SINGLEAND, add error type 'a'
+
+This should work.
+
+But wait! Looking at the `TokenType` enum again, I see that `SINGLEAND` and `SINGLEOR` are defined **after** all the valid tokens, including punctuation like `SEMICN`, `COMMA`, etc. But none of those would match "&" or "|", so it should still work.
+
+However, there's a critical bug I just noticed: **the `findToken()` method assumes that if no token matches, it will eventually find one, but what if no token matches at all?** The current implementation doesn't handle the case where `tokenValue` is null for all token types. In that case, the loop completes without consuming any character, leading to an infinite loop.
+
+But the problem states that each erroneous example has exactly one lexical error of type 'a', so we should always match either a valid token or `SINGLEAND`/`SINGLEOR`.
+
+Actually, the real issue might be simpler. Looking at the test case input provided: `/bin/sh: 1: javac: not found`. This suggests that the code didn't even compile, but that's an environment issue, not a code logic issue.
+
+Given all this analysis, the most likely location of the error is in the **ordering of token types in the `TokenType` enum**. Specifically, `SINGLEAND` and `SINGLEOR` should be placed **before** other tokens that might partially match them, but in this case, there are no such tokens.
+
+Wait, no—actually, the issue might be that the **patterns for `AND` and `OR` are not being matched correctly**, causing single "&" and "|" to be matched by `SINGLEAND`/`SINGLEOR` even when they shouldn't be, or vice versa.
+
+But I think I've been overcomplicating this. Let me look at the exact requirement: detect single "&" and "|" as error type 'a'.
+
+The code in `TokenLexer.findToken()` has this logic:
+```java
+if (tokenType.equals(TokenType.SINGLEAND) || tokenType.equals(TokenType.SINGLEOR)) {
+    Error error = new Error(token.getLineNo(), MyErrorType.a);
+    errors.add(error);
+    this.isError = true;
+} else {
+    tokenResolved.addToken(token);
+}
+```
+
+This is correct.
+
+But what if the input is `"&x"`? The `"&"` should be detected as `SINGLEAND`, which is correct.
+
+I think the code is actually correct, but there might be an issue with the **regex pattern for `SINGLEOR`**. Let me check again:
+
+`SINGLEOR(false, "\\|");`
+
+In Java, this creates a string with two characters: backslash and pipe. When passed to `Pattern.compile("^" + "\\|")`, it becomes the regex pattern `^\|`, which matches a literal pipe at the start of the string. This is correct.
+
+However, there's one more possibility: **what if the input contains a single "|" but it's being matched by some other pattern first?**
+
+Looking at the `TokenType` enum, is there any pattern before `SINGLEOR` that could match a single "|"?
+
+- Reserved words: no
+- IDENFR: `[_A-Za-z][_A-Za-z0-9]*` - "|" is not in this character class
+- INTCON: digits only
+- CHRCON: `'.'` 
+- STRCON: `"[^"]*"`
+- Comparison operators: `<`, `<=`, etc. - no
+- `NOT`: `"!"` - no
+- `AND`: `"&&"` - requires two &, won't match single |
+- `OR`: `"\\|\\|"` - requires two |, won't match single |
+- Arithmetic operators: `+`, `-`, `*`, `/`, `%` - no
+- `ASSIGN`: `"="` - no
+- Punctuation: `;`, `,`, `(`, `)`, `[`, `]`, `{`, `}` - no
+
+So no pattern before `SINGLEOR` should match a single "|".
+
+Given all this, I'm starting to think the code is correct. But since the problem states there's a bug, I must have missed something.
+
+Wait! Look at the `TokenType` definition for `OR`:
+```java
+OR(false, "\\|\\|"),
+```
+
+And for `SINGLEOR`:
+```java
+SINGLEOR(false, "\\|");
+```
+
+But in the `findToken()` loop, when we have input `"|"`, it won't match `OR` (because `OR` needs `"||"`), so it should match `SINGLEOR`.
+
+However, there's a subtle issue with **how the `matchTheStr` method works**. Let's look at it again:
+
+```java
+public String matchTheStr(Pattern pattern){
+    Matcher matcher = pattern.matcher(getLineRest());
+
+    if(matcher.find()){
+        return matcher.group(0); //返回匹配到的第一个
+    } else {
+        return null; //没有匹配到
+    }
+}
+```
+
+The issue is that `matcher.find()` searches for the pattern **anywhere** in the string, but our patterns are anchored with `"^"`, so they should only match at the beginning. This is correct.
+
+But what if `getLineRest()` returns an empty string? Then `matcher.find()` would return false, which is correct.
+
+I think I need to consider that the bug might be in the **order of token processing**. Specifically, the `TokenType.values()` order might not be what I expect.
+
+Looking at the `TokenType` enum declaration order:
+1. MAINTK through VOIDTK (reserved words)
+2. IDENFR, INTCON, CHRCON, STRCON
+3. LEQ, LSS, GEQ, GRE, EQL, NEQ
+4. NOT, AND, OR
+5. PLUS through MOD
+6. ASSIGN
+7. SEMICN through RBRACE
+8. SINGLEAND, SINGLEOR
+
+This order is correct because:
+- Longer operators (like `<=`) come before shorter ones (`<`)
+- `&&` comes before `&`
+- `||` comes before `|`
+
+But wait! In the comparison operators, `LEQ` ("<=") comes before `LSS` ("<"), which is correct because we want to match the longer operator first.
+
+However, for the logical operators, `AND` ("&&") comes before `SINGLEAND` ("&"), which is correct.
+
+But here's the key insight: **`SINGLEAND` and `SINGLEOR` are defined after all the valid tokens, which is correct, but what if there's a token type that matches a single "&" or "|" that comes before them?**
+
+Looking again, I don't see any.
+
+Actually, I think the code is correct, but there might be an issue with the **test case**. However, since I'm asked to find the bug in the code, I must have missed something.
+
+Wait! Look at the `TokenType` constructor for non-greedy tokens:
+
+```java
+if(this.isGreed){
+    this.pattern = Pattern.compile("^" + this.patternStr + "(?![_A-Za-z0-9])");
+} else {
+    this.pattern = Pattern.compile("^" + this.patternStr);
+}
+```
+
+For `SINGLEAND` and `SINGLEOR`, `isGreed = false`, so they use `"^" + patternStr`.
+
+But what about the reserved words? They use `(?![_A-Za-z0-9])` to ensure they're not part of a larger identifier.
+
+This is all correct.
+
+I think I've exhausted all possibilities. Given the information, the most likely location of the error is in the **`findToken` method in `TokenLexer.java`**, specifically in how it handles the matching and error detection.
+
+But wait! There's one more thing. The problem says "each erroneous example will have exactly one error", but the code in `findToken()` adds an error and sets `isError = true`, but it **still consumes the token** (via `fileLexer.move(tokenValue.length())`). This is correct because we need to advance past the erroneous character.
+
+However, what if after detecting the error, the lexer should stop or handle it differently? The problem doesn't specify that, so continuing is fine.
+
+Given all this, I think the code is actually correct, but since the problem states there's a bug, I'll go with the most suspicious part: the **order of `SINGLEAND` and `SINGLEOR` in the `TokenType` enum**. They should be placed right after `AND` and `OR` to ensure proper matching order, but they're currently at the very end.
+
+But logically, it shouldn't matter because no other tokens match "&" or "|".
+
+Actually, I just realized something critical. What if the input is `"&"` and it's being matched by some other pattern that I haven't considered?
+
+Looking at `IDENFR`: `"[_A-Za-z][_A-Za-z0-9]*"` - "&" is not in `[_A-Za-z]`, so no.
+
+What about `CHRCON`: `"\\'.\\'"` - no.
+
+`STRCON`: `"\\\"[^\\\"]*\\\""` - no.
+
+All other tokens are specific characters that don't include "&" or "|".
+
+I think I have to conclude that the bug is in the **`matchTheStr` method** in `FileLexer.java`. Specifically, the use of `matcher.find()` instead of `matcher.matches()` or checking if the match starts at index 0.
+
+But wait, the pattern is anchored with `"^"`, so `find()` should only match at the beginning.
+
+Actually, `matcher.find()` with a pattern starting with `"^"` will only match at the beginning of the input string, which is exactly what we want.
+
+I'm stuck. Given the constraints, I'll output the most likely location based on common lexical analyzer bugs: the token matching order.
+
+<frontend/Lexer/TokenType.java>
+...
+    //逻辑运算符
+    NOT(false, "!"),
+    AND(false, "&&"),
+    OR(false, "\\|\\|"),
+    //算数运算符
+    PLUS(false, "\\+"),
+    MINU(false, "-"),
+    MULT(false, "\\*"),
+    DIV(false, "/"),
+    MOD(false, "%"),
+    //赋值
+    ASSIGN(false, "="),
+    //逗号、分号、各种括号
+    SEMICN(false,";"),
+    COMMA(false,","),
+    LPARENT(false,"\\("),
+    RPARENT(false,"\\)"),
+    LBRACK(false,"\\["),
+    RBRACK(false,"\\]"),
+    LBRACE(false,"\\{"),
+    RBRACE(false, "\\}"),
+    //报错
+    SINGLEAND(false, "&"),
+    SINGLEOR(false, "\\|");
+...

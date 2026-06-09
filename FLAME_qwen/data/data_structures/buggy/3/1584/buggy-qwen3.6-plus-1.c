@@ -1,0 +1,36 @@
+#include<stdio.h>
+int main()
+{
+    char a;
+    int b=0,c=-1,d=1,biao1=0,biao2=0;
+    while(scanf("%c",&a)!=EOF)
+    {
+        if(a=='.')
+        {
+            biao2=1;
+        }
+        else if(a>='0'&&a<='9')
+        {
+            if(a!='0')
+            {
+                biao1=1;
+            }
+            if(biao1==1)
+            {
+                printf("%c",a);
+                if(d==1)
+                {
+                    printf("."); // @@ [Unconditionally prints a decimal point after the first significant digit, violating the output format requirement that a base with only one significant digit should be an integer without a decimal point.]
+                    d=0;
+                }
+                c++;
+            }
+            if(biao2==1)
+            {
+                b++;
+            }
+        }
+    }
+    printf("e%d",c-b);
+    return 0;
+}

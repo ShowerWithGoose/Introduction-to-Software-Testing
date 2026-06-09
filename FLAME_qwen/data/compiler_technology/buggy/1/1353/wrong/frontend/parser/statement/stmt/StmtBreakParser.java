@@ -1,0 +1,43 @@
+package frontend.parser.statement.stmt;
+
+import frontend.error.Error;
+import frontend.error.ErrorSet;
+import frontend.error.ErrorType;
+import frontend.lexer.Token;
+import frontend.lexer.TokenListIterator;
+import frontend.lexer.TokenType;
+
+public class StmtBreakParser {
+    private TokenListIterator iterator;
+    /* StmtBreak Attributes */
+    private Token breakTk; // 'break'
+    private Token semicn; // ';'
+
+    public StmtBreakParser(TokenListIterator iterator) {
+        this.iterator = iterator;
+    }
+
+    public StmtBreak parseStmtBreak() {
+        this.breakTk = this.iterator.next();
+        if (!this.breakTk.getTokenType().equals(TokenType.BREAKTK)) {
+            System.out.println("EXPECT BREAKTK IN STMTBREAKPARSER");
+        }
+        this.semicn = this.iterator.next();
+        if (!this.semicn.getTokenType().equals(TokenType.SEMICN)) {
+            System.out.println("EXPECT SEMICN IN STMTBREAKPARSER");
+            handleIError();
+        }
+        StmtBreak stmtBreak = new StmtBreak(this.breakTk, this.semicn);
+        return stmtBreak;
+    }
+
+    /**
+     * i error
+     * missing ';'
+     */
+    private void handleIError() {
+        iterator.unRead(2);
+        ErrorSet.getInstance().addError(new Error(ErrorType.MISSING_SEMICN, iterator.next().getLine()));
+        this.semicn = null;
+    }
+}

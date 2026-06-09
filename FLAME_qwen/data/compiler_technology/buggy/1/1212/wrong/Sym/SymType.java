@@ -1,0 +1,26 @@
+package Sym;
+
+public enum SymType {
+    ConstChar,
+
+    ConstInt,
+
+    ConstCharArray,
+
+    ConstIntArray,
+
+    Char,
+
+    Int,
+
+    CharArray,
+
+    IntArray,
+
+    VoidFunc,
+
+    CharFunc,
+
+    IntFunc
+
+}

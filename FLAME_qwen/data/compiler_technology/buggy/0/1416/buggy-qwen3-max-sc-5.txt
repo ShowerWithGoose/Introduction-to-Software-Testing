@@ -1,0 +1,110 @@
+<frontend/Lexer.java>
+...
+    public int next(int pos, String line) {
+        StringBuilder token = new StringBuilder();
+        if (line.charAt(pos) == ' ' || line.charAt(pos) == '\n' || line.charAt(pos) == '\t') {
+            return 1;
+        }
+        else if (Character.isDigit(line.charAt(pos))) {
+            token.append(line.charAt(pos++));
+            while (pos < line.length() && Character.isDigit(line.charAt(pos))) {
+                token.append(line.charAt(pos++));
+            }
+            this.dictionary.add(new Pair(LexType.INTCON, token.toString()));
+        } else if (isNotDigit(line.charAt(pos))) {
+            if (isKeySymbol(line.charAt(pos))) {
+                parseKeySymbol(pos, line, token);
+            } else if (line.charAt(pos) == '\"') {
+                parseStringConst(pos, line, token);
+            } else if (line.charAt(pos) == '\'') {
+                parseCharConst(pos, line, token);
+            } else {
+                token.append(line.charAt(pos++));
+                while (pos < line.length() && !isKeySymbol(line.charAt(pos)) &&
+                        (isNotDigit(line.charAt(pos)) || Character.isDigit(line.charAt(pos)))) {
+                    token.append(line.charAt(pos++));
+                }
+                parseKeyWord(token.toString());
+            }
+        }
+        return token.length(); // @@ [When an error (e.g., single '&' or '|') is detected in parseKeySymbol, the method still returns token.length() (which may be 1), allowing analysis to continue. However, the lexer should stop or skip further tokenization after detecting a lexical error, but more critically, the error state is set without preventing subsequent tokens from being added to dictionary, and the return value does not reflect that an error occurred and consumed only one character. This causes incorrect token length return when an error is found, leading to wrong position advancement.]
+    }
+...
+    public void parseKeySymbol(int pos, String line, StringBuilder token) {
+        char ch = line.charAt(pos++);
+        token.append(ch);
+        if (ch == '!') {
+            if (line.charAt(pos) == '=') {
+                token.append(line.charAt(pos));
+                this.dictionary.add(new Pair(LexType.NEQ, token.toString()));
+            } else {
+                this.dictionary.add(new Pair(LexType.NOT, token.toString()));
+            }
+        } else if (ch == '&') {
+            if (line.charAt(pos) == '&') {
+                token.append(line.charAt(pos));
+                this.dictionary.add(new Pair(LexType.AND, token.toString()));
+            } else {
+                this.row_num = this.lineNum;
+                this.column_num = pos - 1;
+                this.errorType = ErrorType.a;
+            } // @@ [After setting errorType, the method does not append anything to token beyond the single '&', so token.length() is 1. However, the calling function 'next' returns this length and advances by 1, which is correct for consuming the single '&'. The real issue is that even after setting an error, the lexer continues processing the rest of the file and may output tokens to dictionary, but the specification says that for erroneous input, only the error should be output. However, the critical bug is that the error is recorded but tokenization continues, and the final output decision is based solely on whether errorType != null. But since multiple lines are processed before checking errorType, and errorType can be overwritten, and tokens are still collected, this leads to incorrect behavior. However, the immediate cause of failure in test cases with error 'a' is that the lexer does not stop tokenizing after the first error, but the problem states each erroneous example has exactly one error, so the main flaw is that the error is detected but the token ('&') is NOT added to dictionary, which is correct, but the bigger issue is in the control flow: the method parseKeySymbol does not return how many characters were consumed in the error case, and the caller assumes token.length() reflects consumed characters. In the error case, token contains "&", so length=1, which is correct. So why is there a problem? Actually, the deeper issue is that the error is recorded, but the lexer continues analyzing the rest of the line and file, possibly adding more tokens to dictionary. Then, in LexerOutPut(), if errorType != null, it writes the error, but the dictionary may already contain tokens from before or after the error. However, the problem states: "each erroneous example will have exactly one error", and the expected behavior is to output ONLY the error. But the current code collects tokens even after an error occurs. However, looking at the test input: the compilation error shown ("javac: not found") suggests the program didn't run, but the actual issue is likely that when an error is detected, the lexer should not add any tokens to the dictionary for that file, or should discard them. But the specification says: for erroneous source program, output only the error. So the presence of any tokens in dictionary when errorType is set leads to incorrect behavior because the program might output tokens if no error was set later, but in this case, errorType is set. However, the real bug is that the error is detected, but the program does not immediately stop processing; however, the output logic checks errorType at the end and outputs only the error. So why would it fail? Another possibility: the column_num and row_num are set, but what if multiple errors occur? The problem says only one error. But the critical flaw is in the handling of the single '&' or '|' — the code sets errorType = ErrorType.a, but does not consume the character correctly? Let's reexamine: in parseKeySymbol, for single '&', it sets error info but does not add a token. The token variable has "&", length 1, so next() returns 1, which is correct. So the position advances. But the issue is: after setting errorType, the lexer continues to process the rest of the file, adding more tokens to dictionary. Then, at the end, it outputs the error (because errorType != null), which is correct per spec (only error is output). So why would this fail? Unless... the error is not being detected at all in some cases. Wait: in the next() function, when isKeySymbol returns true for '&', it calls parseKeySymbol. In parseKeySymbol, if it's a single '&', it sets errorType but does NOT add a token to dictionary. That's correct. And returns token.length() = 1. So far so good. But what if the error occurs, but then later another token is processed that overwrites errorType? The code uses a single errorType field, so only the last error is recorded. But the problem states there's exactly one error. So that should be fine. However, looking at the test case input provided: "/bin/sh: 1: javac: not found" — this indicates the Java code wasn't compiled, so the actual test case content is unknown. But based on the error type 'a', the issue must be that the lexer fails to detect a single '&' or '|' as an error. Wait: in parseKeySymbol, when ch is '&', it checks if the next character is '&'. But what if pos is at the end of the line? Then line.charAt(pos) would throw StringIndexOutOfBoundsException. For example, if the line ends with a single '&', then pos equals line.length(), and accessing line.charAt(pos) is invalid. This would crash the program instead of reporting error 'a'. That is the real bug! The code does not check bounds before accessing line.charAt(pos) in parseKeySymbol. So in cases where '&' or '|' is the last character in the line, the program throws an exception instead of setting errorType.a. Similarly for other two-character operators like '!', '<', etc., but for error type 'a', specifically '&' and '|' at end of line cause crash. Therefore, the error is missing bounds checks before accessing line.charAt(pos) in parseKeySymbol.
+        } else if (ch == '|') {
+            if (line.charAt(pos) == '|') { // @@ [If pos >= line.length(), this line throws StringIndexOutOfBoundsException instead of treating single '|' as error 'a'. Similarly for the '&' case above and other two-character operator checks.]
+                token.append(line.charAt(pos));
+                this.dictionary.add(new Pair(LexType.OR, token.toString()));
+            } else {
+                this.row_num = this.lineNum;
+                this.column_num = pos - 1;
+                this.errorType = ErrorType.a;
+            }
+        } else if (ch == '<') {
+            if (line.charAt(pos) == '=') { // @@ [Same issue: no bounds check before accessing line.charAt(pos). If '<' is at end of line, this throws exception.]
+                token.append(line.charAt(pos));
+                this.dictionary.add(new Pair(LexType.LEQ, token.toString()));
+            } else {
+                this.dictionary.add(new Pair(LexType.LSS, token.toString()));
+            }
+        } else if (ch == '>') {
+            if (line.charAt(pos) == '=') { // @@ [Same issue: no bounds check.]
+                token.append(line.charAt(pos));
+                this.dictionary.add(new Pair(LexType.GEQ, token.toString()));
+            } else {
+                this.dictionary.add(new Pair(LexType.GRE, token.toString()));
+            }
+        } else if (ch == '=') {
+            if (line.charAt(pos) == '=') { // @@ [Same issue: no bounds check.]
+                token.append(line.charAt(pos));
+                this.dictionary.add(new Pair(LexType.EQL, token.toString()));
+            } else {
+                this.dictionary.add(new Pair(LexType.ASSIGN, token.toString()));
+            }
+        } else if (ch == '+') {
+            this.dictionary.add(new Pair(LexType.PLUS, token.toString()));
+        } else if (ch == '-') {
+            this.dictionary.add(new Pair(LexType.MINU, token.toString()));
+        } else if (ch == '*') {
+            this.dictionary.add(new Pair(LexType.MULT, token.toString()));
+        } else if (ch == '/') {
+            this.dictionary.add(new Pair(LexType.DIV, token.toString()));
+        } else if (ch == '%') {
+            this.dictionary.add(new Pair(LexType.MOD, token.toString()));
+        } else if (ch == ';') {
+            this.dictionary.add(new Pair(LexType.SEMICN, token.toString()));
+        } else if (ch == ',') {
+            this.dictionary.add(new Pair(LexType.COMMA, token.toString()));
+        } else if (ch == '(') {
+            this.dictionary.add(new Pair(LexType.LPARENT, token.toString()));
+        }else if (ch == ')') {
+            this.dictionary.add(new Pair(LexType.RPARENT, token.toString()));
+        }else if (ch == '[') {
+            this.dictionary.add(new Pair(LexType.LBRACK, token.toString()));
+        }else if (ch == ']') {
+            this.dictionary.add(new Pair(LexType.RBRACK, token.toString()));
+        }else if (ch == '{') {
+            this.dictionary.add(new Pair(LexType.LBRACE, token.toString()));
+        } else if (ch == '}') {
+            this.dictionary.add(new Pair(LexType.RBRACE, token.toString()));
+        }
+    }
+...

@@ -1,0 +1,166 @@
+Based on the problem description and test case input, the error occurs when the system tries to run a Java program but `javac` is not found. However, this appears to be a red herring—the actual issue lies in the lexical analyzer's handling of erroneous inputs.
+
+The key clue is:
+- **Error type "a"** corresponds to standalone `&` or `|` symbols.
+- The program should detect such errors and output to `error.txt`.
+- But the test shows **no output**, suggesting the error isn't being handled properly.
+
+Looking at the code, in `<frontend/Lexer.java>`, the `signal()` method correctly adds an error for single `&` or `|`. However, after adding the error, it **does not set a valid `lexType`**, which causes issues later.
+
+Specifically, when an error like `&` is encountered:
+- An `Err` object is added to `errorList`
+- But `lexType` remains uninitialized (still null)
+- Then a `Token` is created with this null `lexType`
+- Later, in `Compiler.java`, tokens are written only if `token.getLexType() != LexType.NOTE`
+- But since `lexType` is null, calling `getLexType()` may cause unexpected behavior or silent failure
+
+However, more critically: **even if there's an error, the tokenizer continues producing tokens**, and the main program only writes to `error.txt` if `errorList` is non-empty—but it still also writes tokens unless `flag` is set correctly.
+
+Wait—but looking closer at `Compiler.java`:
+
+```java
+boolean flag = true;
+try (BufferedWriter writer = new BufferedWriter(new FileWriter("error.txt"))) {
+    for (Err error : errorList) {
+        flag = false;
+        writer.write(error.getLineNum() + " " + error.getCode());
+        writer.newLine();
+    }
+    ...
+}
+```
+
+This writes **all errors** to `error.txt`, even if there are tokens. But according to the spec:  
+> For an erroneous source program, output ... into `error.txt`  
+> For a correct source program, output ... into `lexer.txt`
+
+And:  
+> Each erroneous example will have exactly one error.
+
+So if **any** lexical error exists, **only** `error.txt` should be produced.
+
+But here’s the real bug:
+
+In `<frontend/Lexer.java>`, in the `signal()` method, when encountering a single `&` or `|`, it adds an error **but does not set `lexType`**. So `lexType` remains whatever it was before (possibly null). Then, in `next()`, a `Token` is created with that invalid `lexType`.
+
+Later, in `Compiler.java`, when writing tokens:
+
+```java
+if (token.getLexType() != LexType.NOTE) {
+    writer.write(token.getLexType() + " " + token.getName());
+    ...
+}
+```
+
+If `lexType` is **null**, then `token.getLexType()` returns `null`, and comparing `null != LexType.NOTE` is true, but then `token.getLexType().toString()` (implicitly in string concatenation) would throw a `NullPointerException`.
+
+But the test output shows **no output at all**, and the error is "javac not found"—which suggests the program crashed before producing any output.
+
+However, the user says:  
+> Buggy Output: (empty)  
+> Expected Output: (empty)
+
+Wait—that doesn’t help. But the **real logical error** is:
+
+> When a lexical error (like single `&`) is found, the lexer should **not** produce a token for it. But currently, it **does** produce a token with an undefined `lexType`.
+
+Moreover, in the `signal()` method, after adding the error, **no `lexType` is assigned**, so the `Token` constructor receives a `null` lexType, which violates assumptions elsewhere.
+
+But even worse: the program **should stop or skip** the invalid symbol, but it doesn't advance `curPos` properly in the error case?
+
+Wait—look at the `signal()` method:
+
+```java
+case '&':
+    if (curPos < source.length() && source.charAt(curPos) == '&') {
+        name.append(source.charAt(curPos++));
+        lexType = LexType.AND;
+    }
+    else {
+        errorList.add(new Err(lineNum,"a"));
+        // <-- NO lexType assigned!
+        // Also, curPos was already incremented in the switch statement!
+    }
+    break;
+```
+
+Note: `curPos` is incremented in the `switch (source.charAt(curPos++))` — so even in the error case, `curPos` moves past the `&`.
+
+But the **critical issue** is: **no `lexType` is set in the error branch**, so `lexType` is undefined (whatever it was from previous token).
+
+This leads to a `Token` with garbage `lexType`, which may cause crash or incorrect output.
+
+However, the spec says: **each erroneous example has exactly one lexical error**, and **only error info should be output**.
+
+But the current design collects errors **and still generates tokens**, including possibly invalid ones.
+
+Yet the bigger problem revealed by the test environment error (`javac not found`) is likely a distraction. The **actual bug** that would cause failure on a test case like:
+
+```
+if(1 & 2)
+```
+
+is that the lexer adds error "a", but then creates a `Token` with `lexType == null`, and when `Compiler.java` tries to write tokens (because `flag` is only set to false **after** writing errors), it may crash or behave incorrectly.
+
+But wait—in `Compiler.java`, it writes errors **first**, sets `flag = false`, and then **skips** writing tokens.
+
+So if `errorList` is non-empty, tokens are **not** written. So the null `lexType` might not matter.
+
+Then why no output?
+
+Ah! Look at the `signal()` method again: in the `else` branch for `&`, it adds an error, but **does not set `lexType`**. So when the `Token` is constructed:
+
+```java
+token = new Token(name.toString(),0, lineNum, lexType);
+```
+
+`lexType` is **null**.
+
+Then, in `Compiler.java`, when iterating over `tokens`, even if we don't write them, the `Token` object exists. But that shouldn't crash.
+
+Unless... the program crashes during tokenization.
+
+But the real smoking gun is this:
+
+> In the `charConst()` method, it assumes every char const has exactly 3 characters: `'x'`
+
+But what if the input is `'\n'`? That’s 4 characters. Or what if it's unterminated? But the problem states only error type "a" is tested.
+
+Back to error "a".
+
+The **most likely location of the bug** is in the `signal()` method in `<frontend/Lexer.java>`, where after detecting a single `&` or `|`, it fails to set `lexType`, leading to undefined behavior.
+
+But actually—looking at the `Token` usage: in `Compiler.java`, when writing tokens, it checks:
+
+```java
+if (token.getLexType() != LexType.NOTE)
+```
+
+If `lexType` is `null`, this condition is `true` (since `null != LexType.NOTE`), and then it tries to write `token.getLexType() + " " + ...`, which calls `toString()` on `null`, causing **NullPointerException**.
+
+That would crash the program, resulting in **no output files**, which matches the observed behavior (empty buggy output, and system error about javac—which might be misleading; perhaps the real crash is NPE).
+
+Therefore, the error is in `<frontend/Lexer.java>` in the `signal()` method: missing `lexType` assignment in error cases.
+
+<frontend/Lexer.java>
+...
+            case '&':
+                if (curPos < source.length() && source.charAt(curPos) == '&') {
+                    name.append(source.charAt(curPos++));
+                    lexType = LexType.AND;
+                }
+                else {
+                    errorList.add(new Err(lineNum,"a"));
+                }
+                break;
+
+            case '|':
+                if (curPos < source.length() && source.charAt(curPos) == '|') {
+                    name.append(source.charAt(curPos++));
+                    lexType = LexType.OR;
+                }
+                else {
+                    errorList.add(new Err(lineNum,"a"));
+                }
+                break;
+...

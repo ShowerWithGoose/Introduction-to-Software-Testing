@@ -1,0 +1,69 @@
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+int main(){
+    char s[10000]={0};
+    gets(s);
+    int n=strlen(s),ans,d[10000]={0},j=0,e[10000]={0},t; // @@ ans and t are uninitialized, leading to undefined behavior. ans should be initialized to 0, t to 0.
+    for(int i=0;i<n;i++){
+        if(s[i]=='='){
+            t++; // @@ t is used uninitialized; incrementing garbage value.
+            break;
+        }
+        if(s[i]>='0'&&s[i]<='9'){
+            d[j]=d[j]*10+s[i]-'0';
+        }
+        else if(s[i]=='+'){
+            t+=2;
+            j++;
+            d[j]=-1;
+            j++;
+        }
+        else if(s[i]=='-'){
+            t+=2;
+            j++;
+            d[j]=-2;
+            j++;
+        }
+        else if(s[i]=='*'){
+            t+=2;
+            j++;
+            d[j]=-3;
+            j++;
+        }
+        else if(s[i]=='/'){
+            t+=2;
+            j++;
+            d[j]=-4;
+            j++;
+        }
+        
+    }
+    ans+=d[0]; // @@ ans is uninitialized. Moreover, adding d[0] before multiplication/division processing is logically incorrect; the algorithm should first combine * and /, then add/subtract.
+    j=0;
+    for(int i=0;i<t;i++){
+        if(d[i]==-3){
+           d[j-1]=d[j-1]*d[i+1];
+           i++;
+        }
+        else if(d[i]==-4){
+           d[j-1]=d[j-1]/d[i+1];
+           i++;
+        }
+        else d[j++]=d[i];
+    }
+    n=j;
+    j=0;
+    for(int i=1;i<n;i++){
+        if(d[i]==-1){
+           ans+=d[i+1];
+           i++;
+        }
+        else if(d[i]==-2){
+           ans-=d[i+1];
+           i++;
+        }
+    }
+    printf("%d",ans);
+    return 0;
+}

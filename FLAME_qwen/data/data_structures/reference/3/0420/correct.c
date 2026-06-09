@@ -1,0 +1,63 @@
+#include<stdio.h>
+#include<string.h>
+int main()
+{
+    int i,j,k,p,lenth;
+    char str[200],m='e',n='-',tmp;
+    scanf("%s",str);
+    lenth=strlen(str);
+    for(i=0;i<120;i++)
+    {
+        if(str[i]=='.')
+        {
+            if(i==1)
+            {
+                if(str[i-1]!='0')
+                {
+                    str[lenth]='e',str[lenth+1]='0';
+                    puts(str);
+                    break;
+                }
+                else
+                {
+                    for(j=i+1;j<100;j++)
+                    {
+                        if(str[j]!='0')
+                        {
+                            if(j==lenth-1)
+                            {
+                                printf("%c%c%c%d",str[j],m,n,lenth-2);
+                                break;
+                            }
+                            else
+                            {
+                                printf("%c%c",str[j],str[i]);
+                                for(k=j+1;k<lenth;k++)
+                                {
+                                    printf("%c",str[k]);
+                                }
+                                printf("%c%c%d",m,n,j-1);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                printf("%c%c",str[0],str[i]);
+                for(p=1;p<lenth;p++)
+                {
+                    if(str[p]!='.')
+                    {
+                        printf("%c",str[p]);
+                    }
+                }
+                printf("%c%d",m,i-1);
+                break;
+            }
+        }
+    }
+    return 0;
+}
+

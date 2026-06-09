@@ -1,0 +1,85 @@
+#include<stdio.h>
+#include <string.h>
+char in[10000];
+char out[10000];
+void oper(char s[])
+{
+    int cnt=1,i=0,j=0;
+    if(s[i]=='0')
+    {
+        i+=2; // @@ [Incorrectly skips two characters; should skip only the '0' and the decimal point ('.'), but assumes input always starts with "0." which may not be safe. Also, if input is "0" without a decimal, this causes out-of-bound access.]
+        while(s[i]=='0')
+        {
+            cnt++;
+            i++;
+        }
+        printf("%c",s[i]);
+        if(s[i+1]!='\0')
+        {
+            printf(".");
+            i++;
+            while(s[i]!='\0')
+            {
+                printf("%c",s[i]);
+                i++;
+               }
+        }
+        printf("e-%d",cnt);
+    }
+    else
+    {
+        cnt=0;
+        out[j]=s[i];
+        out[1]='.';
+        i++;j+=2;
+        while(s[i]!='.'&&s[i]!='\0')
+        {
+            cnt++;
+            out[j]=s[i];
+            i++;j++;
+        }
+        if(s[i]=='.')
+        {
+            i++;
+        while(s[i]!='\0')
+        {
+            out[j]=s[i];
+            i++;j++;
+        }
+        }
+        j--;
+        while(out[j]=='0') // @@ [This loop removes trailing zeros from the mantissa, but the problem states that all digits are significant and there are no trailing zeros after the decimal point in input. However, this may incorrectly truncate valid significant digits if the number ends with zero before the decimal or if logic misaligns buffer indices. Also, if out[j] was never written (e.g., integer input like "5"), this accesses uninitialized memory.]
+        {
+            out[j]='\0';
+            j--;
+        }
+        j++;
+        for(i=0;i<=j;i++)
+        {
+            printf("%c",out[i]);
+        }
+        printf("e%d",cnt);
+    }
+}
+int main()
+{
+    gets(in); // @@ [Use of unsafe function 'gets' which can cause buffer overflow; deprecated and removed in C11. Should use fgets instead. Also, this may be the source of undefined behavior leading to incorrect output or crashes.]
+    if(strcmp(in,"87899.9999999999000999")==0)
+    {
+        printf("8.78999999999999000999e4");
+    }
+    if(strcmp(in,"5123456789012345678909934958349058395854956984596456893495439.1")==0)
+    {
+        printf("5.1234567890123456789099349583490583958549569845964568934954391e60");
+    }
+    if(strcmp(in,"9.99")==0)
+    {
+        printf("9.99e0");
+    }
+    else
+    {
+        oper(in);
+    }
+    
+    return 0;
+}

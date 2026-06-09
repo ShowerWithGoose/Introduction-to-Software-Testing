@@ -1,0 +1,15 @@
+#pragma once
+
+#include <string>
+#include <vector>
+
+class Lexer {
+    int _lineno = 1;
+    std::istream& _input;
+    static const std::unordered_map<std::string, Token::TokenType> _keywords_table;
+
+    public:
+        void getToken(Token& token);
+
+        Lexer(std::istream& input) : _input(input) {}
+};

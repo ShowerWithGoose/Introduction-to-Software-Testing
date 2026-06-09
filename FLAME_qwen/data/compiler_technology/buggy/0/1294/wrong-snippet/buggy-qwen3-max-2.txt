@@ -1,0 +1,338 @@
+Based on the problem description and test case, the issue is related to handling of the error type 'a', which occurs when single '&' or '|' symbols appear (not as '&&' or '||'). The test case input shows a compilation error where `javac` is not found, but the actual lexical analysis error should be detected and reported.
+
+Looking at the code, the error detection logic in `TokenLexer.findToken()` correctly identifies `SINGLEAND` and `SINGLEOR` tokens and creates error type 'a'. However, the order of token matching in the `TokenType` enum is critical for proper lexical analysis.
+
+The problem is in the **order of token types** in the `TokenType` enum. The single character tokens `SINGLEAND` ("&") and `SINGLEOR` ("|") are defined **after** the multi-character tokens like `AND` ("&&") and `OR` ("||"). However, since the lexer iterates through `TokenType.values()` in enum declaration order, it will match the single character patterns first if they appear earlier, but in this case they appear later.
+
+Actually, looking more carefully: the `AND` pattern is "&&" and `SINGLEAND` is "&". If the input contains "&", it should NOT match "&&" (which requires two characters), so it should fall through to match "&". But if the input contains "&&", it should match `AND` first.
+
+However, the real issue is that the **greedy matching** logic is only applied to reserved words (with `isGreed = true`), but not to operators. For reserved words, the pattern includes a negative lookahead `(?![_A-Za-z0-9])` to ensure they are complete words. But for operators like "&", there's no such protection.
+
+But wait - the actual bug is more subtle. The `findToken()` method iterates through `TokenType.values()` in the order they are declared in the enum. Since `AND` ("&&") comes before `SINGLEAND` ("&"), when the input has "&&", it will correctly match `AND`. When the input has "&", it won't match `AND` (since "&&" doesn't match a single "&"), so it will continue and eventually match `SINGLEAND`.
+
+However, looking at the `TokenType` enum definition, I notice that `SINGLEAND` and `SINGLEOR` are defined at the very end. This should work correctly.
+
+But there's another issue: the `matchTheStr` method in `FileLexer` uses `matcher.find()` which finds the pattern anywhere in the string, but the pattern already has `^` anchor, so it should only match at the beginning.
+
+Wait, let me reconsider the test case. The test case input shows:
+```
+/bin/sh: 1: javac: not found
+```
+
+This suggests that the actual test input file might contain something like `if(1 & 2)`, which should trigger error type 'a'.
+
+Looking at the `findToken()` method again:
+
+```java
+private void findToken() {
+    for (TokenType tokenType : TokenType.values()) {
+        Pattern pattern = tokenType.getPattern();
+        String tokenValue = fileLexer.matchTheStr(pattern);
+        if (tokenValue == null) {
+            continue;
+        } else {
+            // ... handle token
+            break;
+        }
+    }
+}
+```
+
+The issue is that when it encounters a single "&", it should match `SINGLEAND` and report an error. But what if there are other patterns that could match?
+
+Actually, the real problem is in the **order of token types**. The `IDENFR` pattern `[_A-Za-z][_A-Za-z0-9]*` comes before the operator patterns. But "&" doesn't match `IDENFR`, so that's fine.
+
+Let me check the patterns again:
+- `AND`: `"&&"` 
+- `SINGLEAND`: `"&"`
+
+If the input is "&", then:
+- `AND` pattern `"^&&"` won't match
+- Eventually `SINGLEAND` pattern `"^&"` will match
+
+This should work.
+
+But wait! Looking at the `TokenType` enum, I see that `DIV` is `"/"`, and there's also line comment `"//"`. The comment handling is done before token recognition, so that should be fine.
+
+Actually, the most likely issue is in the **comment handling logic**. Let's look at `jumpOverComment()`:
+
+```java
+private int jumpOverComment() { //如果跳过了注释需要返回大于0的整数
+    if (fileLexer.getSubstring(2).equals(lineCommentSign)) {
+        fileLexer.jumpCurrentLine();
+        return 1;
+    } else if (fileLexer.getSubstring(2).equals(blockCommentSign1)) {
+        fileLexer.move(2);
+        while (!fileLexer.endOfFile() &&
+                !fileLexer.getSubstring(2).equals(blockCommentSign2)) {
+            fileLexer.move(1);
+        }
+        //出循环现在位于*/
+        if (fileLexer.getSubstring(2).equals(blockCommentSign2)) {
+            fileLexer.move(2);
+            return 2;
+        }
+    }
+    return 0;
+}
+```
+
+This looks correct.
+
+Wait, going back to the original problem: the test case shows a compilation error about `javac` not being found, but that's just the environment issue. The actual lexical analysis should handle the error case.
+
+Looking more carefully at the `findToken()` method, I notice that after matching a token, it calls `fileLexer.move(tokenValue.length())`. For error tokens like `SINGLEAND`, it still moves the position forward, which is correct.
+
+But here's the key insight: the `TokenType` enum has `SINGLEAND` and `SINGLEOR` at the end, but what if there are other patterns that could match a single "&" or "|" character?
+
+Looking at all the patterns, none of the earlier patterns should match "&" or "|", so it should reach `SINGLEAND`/`SINGLEOR`.
+
+However, there's a critical issue: the **order of iteration** in `TokenType.values()` means that longer matches should be tried before shorter ones. But in this case, `AND` ("&&") is before `SINGLEAND` ("&"), which is correct.
+
+But what if the input is something like "&=" or "|="? These aren't handled by any token, so they would match `SINGLEAND` or `SINGLEOR` for the first character, which is correct behavior for error detection.
+
+Actually, I think the code is logically correct. But let me check the regex patterns again.
+
+For `SINGLEOR`: the pattern is `"\\|"`, which becomes `\|` in regex, which matches a literal "|". Correct.
+
+For `OR`: the pattern is `"\\|\\|"`, which becomes `\|\|` in regex, which matches "||". Correct.
+
+The issue might be elsewhere. Let me look at the `matchTheStr` method:
+
+```java
+public String matchTheStr(Pattern pattern){
+    Matcher matcher = pattern.matcher(getLineRest());
+
+    if(matcher.find()){
+        return matcher.group(0); //返回匹配到的第一个
+    } else {
+        return null; //没有匹配到
+    }
+}
+```
+
+Since the pattern starts with `^`, `matcher.find()` should only match at the beginning of the string, which is what we want.
+
+Wait, but `getLineRest()` returns the rest of the current line from `position` onwards, so the `^` anchor refers to the start of this substring, which is correct.
+
+I think the logic is sound. But let's consider: what if the file ends with a single "&"? 
+
+Actually, looking back at the problem statement: "Each erroneous example will have exactly one error."
+
+Given all this, I suspect the issue might be in the **order of token types** after all. Let me check if there's any token that could accidentally match "&" or "|".
+
+Looking at the `TokenType` enum:
+
+- Reserved words: none contain "&" or "|"
+- `IDENFR`: `[_A-Za-z][_A-Za-z0-9]*` - doesn't match "&" or "|"
+- `INTCON`: `[0-9]+` - doesn't match
+- `CHRCON`: `\\'.\\'` - doesn't match
+- `STRCON`: `\\\"[^\\\"]*\\\"` - doesn't match
+- Comparison operators: `<`, `<=`, etc. - don't match
+- `NOT`: `!` - doesn't match
+- `AND`: `&&` - requires 2 chars
+- `OR`: `\|\|` - requires 2 chars
+- Arithmetic operators: `+`, `-`, `*`, `/`, `%` - don't match "&" or "|"
+- Assignment: `=` - doesn't match
+- Punctuation: `;`, `,`, `(`, etc. - don't match
+
+So `SINGLEAND` and `SINGLEOR` should be reached.
+
+But wait! What about the `MULT` token? It's `"\\*"`, which is "*", not "&".
+
+I think the code should work. However, there's one more possibility: the `jumpOverComment()` function might not be working correctly for certain cases, but that seems unrelated.
+
+Actually, looking at the `doLexer()` method:
+
+```java
+private void doLexer() { //开始词法分析
+    while (!fileLexer.endOfFile()) {
+        jumpOverBlankSpace();
+        if (jumpOverComment() > 0) {
+            continue;
+        }
+        findToken();
+    }
+}
+```
+
+What if `findToken()` doesn't find any token? The current implementation assumes that one of the token types will always match, but if there's an unrecognized character, it would loop infinitely because `findToken()` wouldn't advance the position.
+
+Ah! That's the bug. In `findToken()`, if no token pattern matches, the method does nothing and doesn't advance the file position. This would cause an infinite loop.
+
+But in our case, `SINGLEAND` and `SINGLEOR` are supposed to catch "&" and "|", so they should match.
+
+Unless... what if there's another unrecognized character? But the problem states the error is specifically type 'a' for single "&" or "|".
+
+Wait, let's look at the `findToken()` method again. It iterates through all `TokenType` values, and if none match (`tokenValue == null` for all), then it exits the loop without doing anything. This means the file position never advances, causing an infinite loop.
+
+But in the case of "&", `SINGLEAND` should match. Unless...
+
+Looking at the `TokenType` enum definition again, I notice that `SINGLEAND` and `SINGLEOR` are defined, but what if the regex pattern is incorrect?
+
+For `SINGLEAND`: `"&"` - this should work.
+For `SINGLEOR`: `"\\|"` - this becomes `\|` in regex, which is correct for matching "|".
+
+But here's a subtle issue: in Java regex, `|` is a metacharacter (alternation), so it must be escaped. The pattern `"\\|"` becomes `\|` in the regex, which is correct.
+
+I think the code should work. But given that the test is failing, and considering common pitfalls, the most likely issue is the **order of token types**.
+
+Actually, no—the order is correct because `AND` comes before `SINGLEAND`.
+
+Wait a minute! Looking at the `TokenType` enum, I see:
+
+```java
+//逻辑运算符
+NOT(false, "!"),
+AND(false, "&&"),
+OR(false, "\\|\\|"),
+//算数运算符
+PLUS(false, "\\+"),
+MINU(false, "-"),
+MULT(false, "\\*"),
+DIV(false, "/"),
+MOD(false, "%"),
+...
+//报错
+SINGLEAND(false, "&"),
+SINGLEOR(false, "\\|");
+```
+
+This order is correct.
+
+But what if the input is something like `&` followed by a letter, like `&x`? The `SINGLEAND` pattern `"^&"` would match just the "&", which is correct, and then on the next iteration, `x` would be processed as an identifier.
+
+I'm running out of ideas. Let me consider the possibility that the error is in the **FileLexer.getChar()** method.
+
+Looking at `getChar()`:
+
+```java
+public char getChar(){
+    if(endOfLine()){
+        return '\n';
+    } else if(endOfFile()){
+        return 0;
+    } else{
+        return getLine().charAt(position);
+    }
+}
+```
+
+And `endOfLine()`:
+
+```java
+public boolean endOfLine(){
+    if(endOfFile()){
+        return true;
+    } else if(lineNo >= lines.size()){
+        return true;
+    }
+    return position >= lines.get(lineNo).length();
+}
+```
+
+This looks correct.
+
+Actually, I think I found the issue. In the `jumpOverComment()` method, for block comments:
+
+```java
+while (!fileLexer.endOfFile() &&
+        !fileLexer.getSubstring(2).equals(blockCommentSign2)) {
+    fileLexer.move(1);
+}
+```
+
+If the file ends inside a block comment (i.e., `/*` without `*/`), then `fileLexer.getSubstring(2)` when near the end of file might not work correctly.
+
+But that's not related to error type 'a'.
+
+Given all this analysis, I believe the most likely location of the error is in the **TokenLexer.findToken()** method, specifically in how it handles the case when no token matches. But since `SINGLEAND` and `SINGLEOR` should match "&" and "|", this shouldn't be the issue.
+
+Wait! Looking back at the problem statement: "The symbols "&" and "|" appearing individually".
+
+What if the input contains `\&` or `\|`? No, that's not mentioned.
+
+Another possibility: the `matchTheStr` method might not be working correctly with the `^` anchor when the string has leading whitespace, but `jumpOverBlankSpace()` is called before `findToken()`, so there should be no leading whitespace.
+
+I think I need to focus on the most probable issue. Given that the error type 'a' is specifically for single "&" and "|", and the code has `SINGLEAND` and `SINGLEOR` tokens to catch these, the issue must be that these tokens are not being matched when they should be.
+
+Looking at the `TokenType` constructor:
+
+```java
+TokenType(boolean isGreed, String patternStr){
+    this.isGreed = isGreed;
+    this.patternStr = patternStr;
+    if(this.isGreed){
+        this.pattern = Pattern.compile("^" + this.patternStr + "(?![_A-Za-z0-9])");
+    } else {
+        this.pattern = Pattern.compile("^" + this.patternStr);
+    }
+}
+```
+
+For `SINGLEAND` and `SINGLEOR`, `isGreed` is `false`, so the pattern is `"^&"` and `"^\\|"`, which is correct.
+
+But what if there's a token that comes before `SINGLEAND` in the enum that matches "&"? Let's check all tokens before `SINGLEAND`:
+
+- All reserved words: no
+- `IDENFR`: pattern `^[_A-Za-z][_A-Za-z0-9]*` - doesn't match "&"
+- `INTCON`: `^[0-9]+` - doesn't match
+- `CHRCON`: `^\\'.\\'` - doesn't match
+- `STRCON`: `^\\\"[^\\\"]*\\\"` - doesn't match
+- Comparison operators: no
+- `NOT`: `"^!"` - doesn't match
+- `AND`: `"^&&"` - doesn't match single "&"
+- `OR`: `"^\\|\\|"` - doesn't match single "|"
+- Arithmetic operators: no
+- Assignment and punctuation: no
+
+So nothing before `SINGLEAND` should match "&".
+
+This is puzzling. Given the time, I'll go with the most likely candidate based on common lexical analyzer bugs: the **order of token types** might still be an issue, or there's a problem with the regex patterns.
+
+But looking at the `SINGLEOR` pattern: `"\\|"` - in Java string, this becomes `\|`, which in regex is a literal "|". Correct.
+
+Wait! I think I see it. In the `TokenType` enum, `SINGLEOR` is defined as `"\\|"`, but in regex, to match a literal "|", you need to escape it because "|" is a metacharacter. So `"\\|"` in Java string becomes `\|` in regex, which is correct.
+
+But what if the regex engine is interpreting it differently?
+
+Actually, no—this should be correct.
+
+Given all this, I think the issue might be that the `findToken()` method doesn't handle the case where no token matches, but since `SINGLEAND` and `SINGLEOR` are defined, they should match.
+
+However, looking at the code again, I notice that in `TokenLexer.findToken()`, after matching a token, it breaks out of the loop. This is correct.
+
+But what if the file contains a character that doesn't match any token, including `SINGLEAND` and `SINGLEOR`? Then it would infinite loop. But "&" and "|" should match.
+
+I'm going to conclude that the error is likely in the **TokenType enum definition**, specifically with the regex patterns for `SINGLEAND` and `SINGLEOR`, but they look correct.
+
+Wait! One last possibility: in Java regex, the `|` character is special, but when escaped as `\|`, it should be literal. However, maybe the pattern should be `"\\\\|"`? No, because in a Java string, to get a single backslash in the regex, you need two backslashes. So `"\\|"` in Java string gives `\|` in regex, which is correct for matching literal "|".
+
+I think I have to go with the code as is. Given the problem description and the fact that error type 'a' is not being reported, the most likely location is in the `findToken()` method where it processes `SINGLEAND` and `SINGLEOR`.
+
+<frontend/Lexer/TokenLexer.java>
+...
+    private void findToken() {
+        for (TokenType tokenType : TokenType.values()) {
+            Pattern pattern = tokenType.getPattern();
+            String tokenValue = fileLexer.matchTheStr(pattern);
+            if (tokenValue == null) {
+                continue;
+            } else {
+                //if(tokenValue.equals("main")){
+                //    System.out.println("main");
+                //}
+                Token token = new Token(tokenType, fileLexer.getLineNo(), tokenValue);
+                fileLexer.move(tokenValue.length());
+                if (tokenType.equals(TokenType.SINGLEAND) || tokenType.equals(TokenType.SINGLEOR)) {
+                    Error error = new Error(token.getLineNo(), MyErrorType.a);
+                    errors.add(error);
+                    this.isError = true;
+                } else {
+                    tokenResolved.addToken(token);
+                }
+                break;
+            }
+        }
+    }
+...

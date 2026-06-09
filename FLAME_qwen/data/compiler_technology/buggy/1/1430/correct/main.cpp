@@ -1,0 +1,81 @@
+// main.cpp
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
+#include "CommentRemover.h"
+#include "Error.h"
+#include "Lexer.h"
+#include "Parser.h"
+#include "Token.h"
+
+std::vector<Token> tokens;
+std::vector<Error> errors;
+bool hasError = false;
+
+int main() {
+    // 删除注释并生成无注释的代码文件
+    removeComments("testfile.txt", "testfile-1.txt");
+
+    // 打开处理后的文件
+    std::ifstream inputFile("testfile-1.txt");
+    if (!inputFile) {
+        return 1;
+    }
+
+    // 读取文件内容到字符串
+    std::string code((std::istreambuf_iterator<char>(inputFile)),
+                     std::istreambuf_iterator<char>());
+    inputFile.close();
+
+    // 执行词法分析
+    tokens = lexer(code);
+
+    // 打开输出文件，保存词法分析结果
+    std::ofstream outputFile("lexer.txt");
+    if (!outputFile) {
+        return 1;
+    }
+
+    // 输出每个词法单元
+    for (const auto &token : tokens) {
+        outputFile << token.type << " " << token.value << std::endl;
+    }
+    outputFile.close();
+
+    //词法分析和错误处理
+    std::shared_ptr<TreeNode> tree = parsing();
+    std::ofstream outputFile1("parser.txt");
+    if (!outputFile) {
+        return 1;
+    }
+/*
+    if(!hasError)
+    {
+        traverseLeaves(tree, outputFile1);
+    }
+    else
+    {
+        std::ofstream errorFile("error.txt");
+        if (!errorFile) {
+            return 1;
+        }
+        for (const auto &error : errors) {
+            errorFile << error.line << " " << error.type << std::endl;
+        }
+        errorFile.close();
+    }
+*/
+    traverseLeaves(tree, outputFile1);
+    std::ofstream errorFile("error.txt");
+    if (!errorFile) {
+        return 1;
+    }
+    for (const auto &error : errors) {
+        errorFile << error.line << " " << error.type << std::endl;
+    }
+    errorFile.close();
+    outputFile1.close();
+
+    return 0;
+}

@@ -1,0 +1,22 @@
+public enum TokenType {
+    // 标识符和常量
+    IDENFR, INTCON, STRCON, CHRCON,
+
+    // 保留字
+    MAINTK, CONSTTK, INTTK, CHARTK, VOIDTK,
+    IFTK, ELSETK, WHILETK, FORTK,
+    BREAKTK, CONTINUETK, RETURNTK, PRINTFTK, SCANFTK,
+    GETINTTK, GETCHARTK,
+
+    // 操作符
+    PLUS, MINU, MULT, DIV, MOD, ASSIGN,
+    LSS, LEQ, GRE, GEQ, EQL, NEQ,
+    AND, OR, NOT,
+
+    // 符号
+    COMMA, SEMICN, COLON, DOT,
+    LPARENT, RPARENT, LBRACK, RBRACK, LBRACE, RBRACE,
+
+    // 错误
+    ERROR // 用于非法符号
+}

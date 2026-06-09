@@ -1,0 +1,46 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#define MAXSIZE 200 @@ The problem specifies a maximum stack capacity of 100, but this macro incorrectly defines it as 200.
+int stack[MAXSIZE];
+int top = -1;
+
+int isEmpty() {
+    return top == -1;
+}
+
+int isFull() {
+    return top == MAXSIZE - 1;
+}
+
+void push(int a) {
+    if (isFull()) {
+        printf("error ");
+    } else {
+        stack[++top] = a;
+    }
+
+}
+
+void pop() {
+    if (isEmpty()) {
+        puts("error "); @@ `puts` automatically appends a newline character, which violates the output format requirement of printing "error" followed by a space on the same line. It should use `printf("error ");`.
+    } else {
+        printf("%d ", stack[top--]);
+    }
+}
+
+int main() {
+    int a;
+    scanf("%d", &a);
+    while (a != -1) {
+        if (a == 1) {
+            scanf("%d", &a);
+            push(a);
+        } else {
+            pop();
+        }
+        scanf("%d", &a);
+    }
+
+}

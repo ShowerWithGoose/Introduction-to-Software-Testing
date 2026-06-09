@@ -1,0 +1,64 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <math.h>
+#include <string.h>
+#include <ctype.h>
+
+#define eps 1e-10
+#define LL long long
+
+typedef struct _DT
+{
+    int data;
+    struct _DT *left, *right;
+} DT, *PDT;
+
+PDT insert(PDT root, int data)
+{
+    if (root == NULL)
+    {
+        PDT temp = (PDT)malloc(sizeof(DT));
+        temp->data = data;
+        temp->left = temp->right = NULL;
+        return temp;
+    }
+    if (data < root->data)
+    {
+        root->left = insert(root->left, data);
+    }
+    else
+    {
+        root->right = insert(root->right, data);
+    }
+    return root;
+}
+
+void printLeaf(PDT t) // @@ Missing height parameter to track node depth for output.
+{
+    if (t != NULL)
+    {
+        if (t->left == NULL && t->right == NULL)
+        {
+            printf("%d ", t->data); // @@ Does not print the height and newline as required by the output format.
+        }
+        printLeaf(t->left); // @@ Missing height argument in recursive call.
+        printLeaf(t->right); // @@ Missing height argument in recursive call.
+    }
+    return;
+}
+
+int main()
+{
+
+    int n, num;
+    scanf("%d", &n);
+    PDT T = NULL;
+    for (int i = 0; i < n; i++)
+    {
+        scanf("%d", &num);
+        T = insert(T, num);
+    }
+    printLeaf(T); // @@ Missing initial height argument (should be 1) in function call.
+    return 0;
+}
