@@ -1,0 +1,223 @@
+Based on the problem description and the test case, the program fails to detect missing semicolons (error code 'i') in specific contexts.
+
+1.  **Test Case Analysis**:
+    *   `printf("Hello SysY!\n") // error 1`: The `printf` statement is missing a semicolon. The expected output is `2 i`.
+    *   `int a // error 2`: The variable declaration is missing a semicolon. The expected output is `9 i`.
+    *   `return 0 // error 3`: The return statement is missing a semicolon. The expected output is `13 i`.
+
+2.  **Code Analysis**:
+    *   **`VarDecl.java`**: Handles variable declarations like `int a`. It checks for `SEMICN` at the end. If missing, it adds an error: `error.put(line.get(line.size() - 1), 'i');`. This logic seems correct for detecting the error, but we need to ensure the line number is correct. `line` contains line numbers of parsed components. The last component before the semicolon check is `VarDef`. For `int a`, the `VarDef` consumes `a`. The line number of `a` is 9. So `line.get(line.size() - 1)` should be 9. This looks correct.
+    *   **`Stmt.java`**: Handles statements.
+        *   For `printf`: The code block for `PRINTFTK` checks for `SEMICN` at the end. If missing, it executes `error.put(line.get(line.size() - 1), 'i');`. The last item added to `list` before this check is the `STRCON` (via `addList(new Others(lex))`). The line number of `STRCON` is 2. This should produce `2 i`. This also looks correct.
+        *   For `return`: The code block for `RETURNTK` checks for `SEMICN`. If missing, it does `lex.returnTo(pre); err = true; return;`. **It does NOT record an error.** It just backtracks and reports failure. This means the missing semicolon after `return 0` is not caught here as an error 'i'. Instead, the `Stmt` fails, and the parser might try other rules or fail upwards. Since `return` is a valid start of a statement, failing to parse it completely due to missing semicolon should ideally report the error. However, the current implementation treats it as a parse failure for that specific statement structure, potentially causing higher-level errors or missed detection. But wait, if `Stmt` returns `err=true`, the `BlockItem` or `Block` will see it as an error. If `Block` sees an error in `BlockItem`, it might stop.
+        *   Let's look closer at `Stmt` for `return`.
+            ```java
+            } else if (lex.getFirst() == TOKEN.RETURNTK) {
+                addList(new Others(lex)); // Consumes 'return'
+                tmp = new Exp(lex);
+                if (!tmp.isErr()) {
+                    addList(tmp); // Consumes '0'
+                }
+                if (lex.getFirst() != TOKEN.SEMICN) {
+                    lex.returnTo(pre); // Backtracks to before 'return'
+                    err = true;
+                    return;
+                }
+                addList(new Others(lex)); // Consumes ';'
+            }
+            ```
+            If `;` is missing, it backtracks. This means the `return 0` is effectively "un-parsed". The caller (`BlockItem`) tries `Decl` first (fails), then `Stmt`. `Stmt` fails. `BlockItem` returns `err=true`. `Block` sees `tmp.isErr()` and stops the loop. It then checks for `RBRACE`. If `RBRACE` is present (it is, eventually), `Block` succeeds? No, `Block` expects `{ BlockItem* }`. If `BlockItem` fails, the loop terminates. Then it checks for `}`.
+            In the test case:
+            ```c
+            int main() {
+                printf("Hello SysY!\n") // error 1
+                if (1)
+                /*********/
+                ;
+                int a // error 2
+                for (;;) {}
+                return 0 // error 3
+            }
+            ```
+            After `printf` (which might fail or succeed depending on implementation), there is `if (1)`.
+            Let's trace `printf` in `Stmt`.
+            ```java
+            } else if (lex.getFirst() == TOKEN.PRINTFTK) {
+                // ... parses printf ...
+                if (lex.getFirst() != TOKEN.SEMICN) {
+                    error.put(line.get(line.size() - 1), 'i'); // Records error 2 i
+                } else {
+                    addList(new Others(lex));
+                }
+            }
+            ```
+            It records the error but *does not backtrack*. It continues. So `Stmt` succeeds (with an error recorded). This is good for error recovery.
+            
+            Now `if (1)`.
+            ```java
+            } else if (lex.getFirst() == TOKEN.IFTK) {
+                // ... parses if ...
+                tmp = new Stmt(lex); // Recursive call for body
+                // ...
+            }
+            ```
+            The body of `if (1)` is empty? No, the next token is `;` (from the comment line `/******/` which is skipped by lexer, so next is `;`).
+            Wait, the input is:
+            ```
+            if (1)
+
+
+            /*********/
+            ;
+            ```
+            The lexer skips comments. So after `)`, the next token is `;`.
+            Inside `if` parsing:
+            `tmp = new Stmt(lex)`. The current token is `;`.
+            `Stmt` tries `LVal` (fails), `IFTK` (no), `FORTK` (no)... `Block` (no)... `Exp` (no)...
+            Finally:
+            ```java
+            if (lex.getFirst() != TOKEN.SEMICN) {
+                lex.returnTo(pre);
+                err = true;
+                return;
+            }
+            addList(new Others(lex)); // Consumes ;
+            ```
+            So `Stmt` parses `;` as an empty statement. This is correct.
+            
+            Next is `int a`.
+            `BlockItem` tries `Decl`. `Decl` tries `ConstDecl` (no), `VarDecl`.
+            `VarDecl` parses `int`, `a`. Then checks for `;`.
+            Token is `for`. Not `;`.
+            `error.put(line.get(line.size() - 1), 'i');` -> Error `9 i` recorded.
+            `VarDecl` does *not* backtrack. It finishes. `Decl` finishes. `BlockItem` finishes.
+            So `int a` is parsed with an error.
+            
+            Next is `for (;;) {}`.
+            `BlockItem` tries `Decl` (fails on `for`). Tries `Stmt`.
+            `Stmt` matches `FORTK`. Parses `for` loop. Succeeds.
+            
+            Next is `return 0`.
+            `BlockItem` tries `Decl` (fails). Tries `Stmt`.
+            `Stmt` matches `RETURNTK`.
+            Parses `return`. Parses `0` (Exp).
+            Checks for `;`. Token is `}`.
+            Condition `lex.getFirst() != TOKEN.SEMICN` is true.
+            Executes:
+            ```java
+            lex.returnTo(pre);
+            err = true;
+            return;
+            ```
+            It backtracks! So `Stmt` returns `err=true`.
+            `BlockItem` sees `Stmt` error. Returns `err=true`.
+            `Block` loop `while (!tmp.isErr())` terminates.
+            `Block` checks for `RBRACE`. Current token is `return` (because of backtrack).
+            `lex.getFirst() != TOKEN.RBRACE`.
+            `Block` constructor:
+            ```java
+            if (lex.getFirst() != TOKEN.RBRACE) {
+                lex.returnTo(pre); // pre was start of Block '{'
+                err = true;
+                return;
+            }
+            ```
+            So `Block` fails and backtracks to `{`.
+            `MainFuncDef` sees `Block` error.
+            ```java
+            tmp = new Block(lex);
+            if(tmp.isErr()){
+                lex.returnTo(pre); // pre was start of MainFuncDef 'int'
+                err = true;
+                return;
+            }
+            ```
+            `MainFuncDef` fails.
+            `CompUnit` sees `MainFuncDef` error.
+            ```java
+            tmp = new MainFuncDef(lex);
+            if (tmp.isErr()) {
+                lex.returnTo(pre); // pre was start of CompUnit
+                err = true;
+                return;
+            }
+            ```
+            `CompUnit` fails.
+            
+            So, for `return 0` missing semicolon, the parser backtracks all the way up and fails to parse the program. It does *not* output `13 i`.
+            
+            Similarly, let's re-evaluate `printf`.
+            `Stmt` for `printf` records error but does *not* backtrack.
+            So `Stmt` succeeds. `BlockItem` succeeds. `Block` continues.
+            This explains why `printf` error is detected (output `2 i`) but `return` error is not (backtracks).
+            
+            And `int a`?
+            `VarDecl` records error but does *not* backtrack.
+            So `VarDecl` succeeds. `Decl` succeeds. `BlockItem` succeeds. `Block` continues.
+            This explains why `int a` error is detected (output `9 i`).
+            
+            So the issue is inconsistent error handling. `VarDecl` and `Printf` part of `Stmt` record error and continue (error recovery). `Return` part of `Stmt` backtracks (no error recovery/reporting).
+            
+            To fix `return 0` missing semicolon, the `Stmt` parser for `RETURNTK` should record the error and consume/skip or just record error and not backtrack, similar to `printf`.
+            
+            Also, look at `Break/Continue`:
+            ```java
+            } else if (lex.getFirst() == TOKEN.BREAKTK || lex.getFirst() == TOKEN.CONTINUETK) {
+                addList(new Others(lex));
+                if (lex.getFirst() != TOKEN.SEMICN) {
+                    error.put(line.get(line.size() - 1), 'i');
+                } else {
+                    addList(new Others(lex));
+                }
+            }
+            ```
+            This records error and continues. Correct.
+            
+            Look at `LVal = Exp ;`:
+            ```java
+            if (lex.getFirst() != TOKEN.SEMICN) {
+                error.put(tmp.getLine(), 'i');
+            } else {
+                tmp = new Others(lex);
+                addList(tmp);
+            }
+            ```
+            Records error and continues. Correct.
+            
+            Look at `Exp ;` (expression statement):
+            ```java
+            tmp = new Exp(lex);
+            if (!tmp.isErr()) {
+                addList(tmp);
+                if (lex.getFirst() != TOKEN.SEMICN) {
+                    error.put(line.get(line.size() - 1), 'i');
+                } else {
+                    addList(new Others(lex));
+                }
+                return;
+            }
+            ```
+            Records error and continues. Correct.
+            
+            So the only problematic one in `Stmt` is `RETURNTK`.
+            
+            There is another potential issue. `VarDecl` and `ConstDecl` record errors but don't backtrack. This is good for this test case.
+            
+            So the primary bug is in `pac/tool/Stmt.java` within the `RETURNTK` branch. It should record the error instead of backtracking.
+
+<pac/tool/Stmt.java>
+...
+        } else if (lex.getFirst() == TOKEN.RETURNTK) {
+            addList(new Others(lex));
+            tmp = new Exp(lex);
+            if (!tmp.isErr()) {
+                addList(tmp);
+            }
+            if (lex.getFirst() != TOKEN.SEMICN) {
+                lex.returnTo(pre);
+                err = true;
+                return;
+            }
+            addList(new Others(lex));
+        } else if (lex.getFirst() == TOKEN.PRINTFTK) {
+...

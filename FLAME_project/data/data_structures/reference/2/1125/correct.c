@@ -1,0 +1,80 @@
+#include<stdio.h>
+#include<ctype.h>
+#include<string.h>
+char s[1000];
+char a[1000];
+int b[1000];
+int main()
+{
+    gets(s);
+    int i,n=0,num1=0,tmp,p=1,j=0,t,num2=1,ans=0,flot=0,k;
+    for(i=0;s[i]!='\0';i++)
+    {
+        if(s[i]!=' ')
+        {
+            a[++n]=s[i];
+        }
+    }
+    a[0]='+';
+    for(i=0;i<n;i++)
+    {
+        if(a[i]=='+'||a[i]=='-')
+        {
+            k=i;
+            continue;
+        }
+        if(a[i]=='*'||a[i]=='/')
+        {
+            continue;
+        }
+        while(isdigit(a[i]))
+        {
+            b[++j]=a[i]-'0';
+            i++;
+        }
+        for(t=j;t>=1;t--)
+        {
+            num1+=b[t]*p;
+            p*=10;
+        }
+        if(flot==1)
+        {
+            num1*=num2;
+        }
+        if(flot==2)
+        {
+            num1=num2/num1;
+        }
+        flot=0;
+        j=0;p=1;
+        if(a[i]=='+'||a[i]=='-'||a[i]=='=')
+        {
+            if(a[k]=='-')
+            {
+                ans-=num1;
+                num1=0;
+            }
+            if(a[k]=='+')
+            {
+                ans+=num1;
+                num1=0;
+            }
+            i--;
+        }
+        else
+        {
+            num2=num1;
+            num1=0;
+            if(a[i]=='*')
+            {
+                flot=1;
+            }
+            if(a[i]=='/')
+            {
+                flot=2;
+            }
+            i--;
+        }
+    }
+    printf("%d",ans);
+}

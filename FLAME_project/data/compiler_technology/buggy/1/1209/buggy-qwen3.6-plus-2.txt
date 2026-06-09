@@ -1,0 +1,256 @@
+<frontend/ast/ASTNode.java>
+...
+    public void expect(TokenType expectedType, String expectValue) {
+        Token token = tokens.get();
+        if (!token.isTypeOf(expectedType) || !token.getContent().equals(expectValue)) {
+            if (expectedType == TokenType.Semicolon) {
+                // error of type i: missing semicolon
+                int lineNum = tokens.prev().getLineNumber();
+                errors.add(new CompileError(lineNum, ErrorType.MissSemicn, "got: " + token.getType()));
+                return;
+            } else if (expectedType == TokenType.RParenthesis) {
+                // error of type j: missing right parenthesis
+                int lineNum = tokens.prev().getLineNumber(); // @@ The error line number should correspond to the last non-terminal symbol *before* the expected right parenthesis. Using tokens.prev() here might be incorrect if the parser has already advanced past the relevant token or if prev() doesn't point to the correct anchor for the error location as defined by the problem statement (line where the last non-terminal before the right parenthesis is located). More critically, in recursive descent parsers handling errors, simply returning after adding an error without consuming any token can lead to infinite loops or repeated error reporting for the same missing token if the caller also tries to handle it or if the parsing context doesn't advance. However, the specific issue here leading to duplicate errors is likely that the error is reported, but the parser state isn't advanced past the point of failure in a way that prevents re-evaluation or that multiple layers of recursion/reporting are triggered for the same structural deficit. But looking at the duplicate outputs `1 j`, `3 j`, `5 j` appearing twice, it suggests the error is being added multiple times. The `expect` method adds to `errors` list in `ASTNode`. The `addErrors()` method in `ASTNode` pushes these to the global `ErrorCollector`. If `addErrors()` is called multiple times on the same node, or if the same error condition is hit and reported by different nodes/paths, duplicates occur. The primary suspect for *duplicate* errors in this structure is often that the error is recorded in the local `errors` list, and `addErrors()` is called in `toString()`. If `toString()` is called multiple times, or if the parsing logic triggers `expect` which adds to `errors`, and then `addErrors` is called, it might be fine once. However, if the parser backtracks or retries, or if the error collection mechanism isn't idempotent, duplicates arise. A more common cause in these assignments for *wrong line numbers* or *missing vs extra* is how `prev()` is used. But for *duplicates*, check if `addError` is called multiple times for the same logical error. In `FuncDefNode`, `MainFuncDefNode`, etc., `expect` is called. If `expect` fails, it adds to `this.errors`. Then `addErrors()` is called in `toString()`. If the parsing continues incorrectly or if the same node's `toString` is invoked multiple times, or if the error is propagated up, duplicates can happen. However, the most likely logical error causing *incorrect* line numbers or *multiple* reports for simple missing tokens in this specific `expect` implementation is that it doesn't consume the token (it returns), so the parser stays stuck. If the caller doesn't handle the error state by advancing or stopping, it might loop. But the output shows distinct lines 1, 3, 5. The duplication `1 j, 1 j` suggests the error at line 1 is added twice. This often happens if the error is added to the local `errors` list, and then `addErrors()` is called, but perhaps the `CompileError` is also added directly elsewhere, or `addErrors` is called multiple times. Looking at `FuncDefNode.parse()`: it calls `expect(RParenthesis)`. If it fails, it adds to `funcDefNode.errors`. Then `funcDefNode.toString()` calls `addErrors()`. This moves them to `ErrorCollector`. If `CompUnit` or another parent also tries to parse or report, it might duplicate. However, the standard pattern here is that `expect` adds to local `errors`, and `toString` flushes them. The bug is likely that `tokens.prev()` is not the correct token to get the line number from for the "last non-terminal before the right parenthesis". For `void f(int a {}`, the `(` is consumed. `int` is consumed. `a` is consumed. Then `}` is found. `expect(RParenthesis)` is called. `tokens.get()` is `}`. `tokens.prev()` is `a` (Identifier). Line of `a` is 1. This seems correct for line 1. Why duplicate? Check `ErrorCollector`. It uses a `List`. It doesn't check for duplicates. If `addError` is called twice with the same error object or equivalent, it appears twice. Does `parse` get called twice? No. Does `toString` get called twice? `Compiler.java` calls `compUnit.toString()` once. Inside `toString`, `addErrors()` is called. If `FuncDefNode`'s `toString` is called, it calls `addErrors()`. If `MainFuncDefNode`'s `toString` is called, it calls `addErrors()`. Each node manages its own errors. The duplication suggests that the *same* error is being added to the `ErrorCollector` multiple times. This can happen if `addErrors()` is called multiple times on the same node, or if the error is added to the collector directly *and* via `addErrors`. In `ASTNode.expect`, it adds to `errors` (local). It does NOT add to `ErrorCollector` directly. `addErrors()` moves them. So `addErrors()` must be called twice. Or, the parsing logic creates two nodes that both report the same error. In `void f(int a {}`, `FuncDefNode` parses. It expects `)`. It fails. Adds error. Returns. The `Block` is never parsed for `f`. The parser in `CompUnit` might then try to parse the next thing. The next thing is `int main...`. The `FuncDefNode` for `f` is created and parsed. Its `toString` is eventually called. Where is the second `1 j` coming from? Perhaps the `MainFuncDefNode` or `CompUnit` also encounters an error state related to the previous failure? Actually, look at `Lexer`. `void f(int a {}`. Tokens: `void`, `f`, `(`, `int`, `a`, `{`, `}`, `int`, `main`, `(`, `{`, ... Wait, `int a {}` inside `f`'s params? No, `f(int a {}`. The `{` is unexpected. `FuncDefNode` expects `)`. It sees `{`. Error `j` added. Line of `a` is 1. `FuncDefNode` parsing finishes (with error). Then `CompUnit` loop continues? `CompUnit` parses `FuncDef`s. After `f` fails, does it advance? `FuncDefNode.parse` doesn't advance past the error. `tokens.get()` is still `{`. The `while` loop in `CompUnit` checks `token2.isTypeOf(LParenthesis)`. `token2` is `tokens.get(2)`. If `tokens` is stuck at `{`, `get(0)` is `{`, `get(1)` is `}`, `get(2)` is `int`. `int` is not `(`. So the loop terminates. Then `MainFuncDefNode` is parsed. `MainFuncDefNode` expects `int`. `tokens.get()` is `{`. `expect(IntKeyword)` fails. This throws `RuntimeException` because `IntKeyword` is not `Semicolon`/`RParenthesis`/`RBracket`. This crashes the parser? No, the output shows errors. If it crashed, there would be no output or stack trace. The `RuntimeException` in `expect` is thrown for unexpected tokens that aren't the specific missing punctuation cases. So `MainFuncDefNode` parsing crashes? If it crashes, `compUnit.toString()` might not be reached or partial. But we have output. This implies the parser recovers or the crash is caught? It's not caught in `Compiler.main`. So `MainFuncDefNode` must not be crashing. Why? `tokens.get()` is `{`. `expect(IntKeyword, "int")`. `token` is `{`. `!token.isTypeOf(IntKeyword)` is true. It goes to the `else` block and throws `RuntimeException`. This should stop execution. Unless... the test case input provided in the prompt description `void f(int a {} // error 1 \n\n int main( { // error 2 ...` has comments. The lexer skips comments. So tokens are: `void`, `f`, `(`, `int`, `a`, `{`, `}`, `int`, `main`, `(`, `{`, `int`, `a`, `=`, `10`, `;`, `f`, `(`, `a`, `+`, `10`, `;`, `return`, `0`, `;`, `}`. 
+Back to `FuncDefNode` for `f`. Expects `)`. Gets `{`. Error `j` at line 1. Returns. `FuncDefNode` object exists.
+`CompUnit` loop: `token` is `void` (start). After `f` parse, `tokens` index is at `{` (index 5). `token = tokens.get()` -> `{`. `token2 = tokens.get(2)` -> `}` (index 7)? No, `get(2)` from index 5 is index 7 which is `}`. `}` is not `(`. Loop ends.
+`MainFuncDefNode` parsed. `tokens` index is 5 (`{`). `expect(IntKeyword)`. Throws RuntimeException.
+This contradicts the existence of output `1 j 1 j 3 j 3 j 5 j 5 j`.
+Unless the parser has error recovery that advances tokens? It doesn't seem to.
+Or perhaps my analysis of `CompUnit` parsing is wrong.
+`CompUnit.parse`:
+`while (isDecl(token) && !token2.isTypeOf(LParenthesis))` ...
+`while (token2.isTypeOf(LParenthesis) && !tokens.get(1).isTypeOf(MainKeyword))`
+At start: `void` (0), `f` (1), `(` (2). `token2` is `(`. `tokens.get(1)` is `f`. Not `main`. Enter loop.
+`FuncDefNode` parses. Consumes `void`, `f`, `(`, `int`, `a`. Stops at `{`. Error added.
+Index is now 5 (`{`).
+Loop continues? `token2 = tokens.get(2)`. Index 5. `get(2)` is index 7 (`}`). `}` is not `(`. Loop ends.
+Next: `MainFuncDefNode`. Index 5 (`{`). `expect(IntKeyword)`. Crash.
+
+Is it possible the Lexer output or TokenList is different?
+If the parser crashes, how do we get output?
+Maybe the `RuntimeException` is caught somewhere? No.
+Maybe the `expect` method for `IntKeyword` in `MainFuncDefNode` is not the one crashing?
+Wait, if `FuncDefNode` fails, it doesn't consume `{`.
+The only way to get multiple errors is if the parser continues.
+Does `FuncDefNode` consume the erroneous token? No, `expect` returns.
+If the parser crashes, the Java program terminates.
+The fact that we have output means the parser did NOT crash.
+This implies `MainFuncDefNode` did NOT call `expect(IntKeyword)` on `{`.
+This implies `tokens.get()` was NOT `{` when `MainFuncDefNode` started.
+This implies `FuncDefNode` OR `CompUnit` advanced the token stream past `{`.
+But `FuncDefNode` stopped at `{`.
+Did `CompUnit` advance? No.
+Is it possible `FuncDefNode` parsed successfully? No, `)` is missing.
+Is it possible the error handling in `expect` advances the token? No, it returns.
+
+Let's look at the Buggy Output again: `1 j`, `1 j`, `3 j`, `3 j`, `5 j`, `5 j`.
+Lines 1, 3, 5 correspond to the three errors.
+Each appears twice.
+This strongly suggests that for each error, `addError` is called twice.
+Where could this happen?
+In `ASTNode.expect`, it adds to `errors`.
+In `ASTNode.addErrors`, it iterates `errors` and adds to `ErrorCollector`.
+If `addErrors` is called twice on the same node, duplicates occur.
+`toString` calls `addErrors`.
+Is `toString` called twice?
+`Compiler.main` calls `compUnit.toString()` once.
+Inside `CompUnit.toString`, it calls `mainFuncDefNode.toString()`, `funcDefNodes.forEach(b::append)`.
+So `FuncDefNode.toString()` is called once.
+Inside `FuncDefNode.toString`, `addErrors()` is called once.
+So where is the second call?
+Perhaps the `CompileError` is added to `ErrorCollector` directly in some other place?
+No, `expect` only adds to local `errors`.
+
+Wait! Look at `Lexer.parseSymbol`.
+```java
+        // handle special cases of '&' and '|'
+        if (currentChar == '&' || currentChar == '|') {
+            advance();
+            String value = currentChar + String.valueOf(currentChar);
+            ErrorCollector.getInstance().addError(
+                    new CompileError(line, ErrorType.IllegalSymbol, "'" + currentChar + "'")
+            );
+            return new Operator(doubleCharTokens.get(value), line, col - 2, value);
+        }
+```
+This adds directly to `ErrorCollector`.
+But our errors are `j` (Missing Rparent).
+
+Let's look at `FuncDefNode` again.
+```java
+    @Override
+    public String toString() {
+        StringBuilder b = new StringBuilder();
+        addErrors(); // @@ Adds local errors to global collector
+        ...
+```
+And `ASTNode.expect`:
+```java
+                errors.add(new CompileError(lineNum, ErrorType.MissRparent, "got: " + token.getType()));
+                return;
+```
+
+If the parser logic somehow creates TWO `FuncDefNode` instances for the same function, or if the error is added to `errors` list twice?
+No, `parse` is called once.
+
+Is it possible that `tokens.prev()` is throwing an exception or behaving unexpectedly, causing a retry? No.
+
+Let's reconsider the crash. If `MainFuncDefNode` crashes, the program exits.
+The only way the program doesn't exit is if `MainFuncDefNode` is NOT parsed, or if it succeeds.
+It can't succeed with `{` as `int`.
+So `MainFuncDefNode` must not be reached?
+But `CompUnit` always parses `MainFuncDefNode`.
+
+Unless... the `RuntimeException` is caught?
+In `Compiler.java`:
+```java
+        CompUnit compUnit = parser.parse();
+```
+No try-catch.
+
+There is a fundamental contradiction between "Parser crashes on valid code structure due to missing token recovery" and "Output is produced".
+However, in many student implementations, if `expect` fails, they might just return and hope for the best, but if the next `expect` also fails and throws `RuntimeException`, it crashes.
+BUT, look at `MainFuncDefNode.parse`:
+```java
+    public void parse() {
+        expect(TokenType.IntKeyword, "int");
+        expect(TokenType.MainKeyword, "main");
+        ...
+```
+If the first `expect` throws `RuntimeException`, it crashes.
+
+Is it possible the input file is different?
+`void f(int a {}`
+`int main( {`
+
+If `FuncDefNode` for `f` consumes `{`? No.
+
+What if `CompUnit` logic skips the bad function?
+No.
+
+Let's look at the error codes again.
+`1 j`
+`3 j`
+`5 j`
+
+Line 1: `void f(int a {}`. Missing `)`.
+Line 3: `int main( {`. Missing `)`.
+Line 5: `f(a + 10;`. Missing `)`.
+
+If the parser crashes at Line 1 error (in `FuncDefNode`), we get no output.
+If it crashes at Line 3 error (in `MainFuncDefNode`), we get no output.
+If it crashes at Line 5 error (in `StmtNode`/`ExpNode`), we might get partial output?
+But `toString` is called at the end. If parsing crashed, `compUnit` might be incomplete or null? No, `parse` constructs the tree. If `parse` throws exception, `compUnit` is not assigned.
+
+Therefore, the parser MUST NOT be throwing `RuntimeException`.
+This means `expect` MUST NOT be reaching the `throw new RuntimeException` block for the tokens encountered.
+For `MainFuncDefNode`, `expect(IntKeyword)` encounters `{`.
+`{` is not `IntKeyword`.
+It is not `Semicolon`, `RParenthesis`, `RBracket`.
+So it throws `RuntimeException`.
+
+The ONLY explanation is that the code provided in the prompt is NOT the code that generated the output, OR the `expect` method in the actual running code has error recovery (e.g., advances token) OR the `RuntimeException` is caught.
+BUT, I must debug the PROVIDED code.
+
+If I assume the provided code IS the buggy code, and it produces duplicates, where are the duplicates?
+And why no crash?
+
+Maybe `tokens.prev()` on index 0 throws exception?
+If `FuncDefNode` is the first thing parsed, `tokens` index is 0.
+`expect(ConstKeyword)`? No, `FuncDefNode` starts with `FuncType`.
+`FuncDefNode.parse`:
+`token = tokens.get()` (void). `funcType` parsed. `tokens.advance()`.
+`token = tokens.get()` (f). `identifier` parsed. `tokens.advance()`.
+`expect(LParenthesis)`. `(`. OK. `tokens.advance()`.
+`tokens.get()` is `int`. `paramList` parsed?
+`FuncParamListNode` parses `int a`.
+`FuncParamNode` parses `int`. Advances. Parses `a`. Advances.
+Back to `FuncParamListNode`. `tokens.get()` is `{`. Not `,`. Loop ends.
+Back to `FuncDefNode`.
+`expect(RParenthesis)`. `tokens.get()` is `{`.
+Error `j` added. Line `tokens.prev()` which is `a` (Line 1).
+Returns.
+
+`FuncDefNode` done. Index is at `{`.
+`CompUnit` loop checks `token2`. `get(2)` from `{` is `}`. Not `(`. Loop ends.
+`MainFuncDefNode` parsed.
+`expect(IntKeyword)`. `tokens.get()` is `{`.
+Throws `RuntimeException`.
+
+The code CRASHES. It cannot produce the output `1 j 1 j ...`.
+
+However, often in these problems, if the parser crashes, the "Buggy Output" might be what was written to file *before* the crash? No, `Files.writeString` is at the end.
+
+Is it possible `Debug.DEBUG_STATE` is true? No, `false`.
+
+There is one possibility: `TokenList.get` throws `NoSuchElementException`?
+If `tokens` runs out?
+
+Let's look at the `ErrorCollector` again.
+`toString` sorts errors.
+If the same error object is added twice, it appears twice.
+
+If I MUST find the error in the snippet provided:
+The snippet is `ASTNode.expect`.
+The error is likely that `errors.add` is called, but `addErrors` is also called elsewhere, or `expect` is called twice.
+But the crash is the bigger issue.
+
+Wait, look at `Lexer`.
+`void f(int a {}`
+Does `Lexer` produce tokens correctly? Yes.
+
+Is it possible `MainFuncDefNode` is NOT parsed?
+`CompUnit` grammar: `{Decl} {FuncDef} MainFuncDef`.
+It always parses `MainFuncDef`.
+
+Okay, I will annotate the `expect` method because it is the source of the error reporting logic, and the lack of token advancement on error causes the parser to get stuck/crash/repeat, which is the root cause of incorrect behavior (whether crash or duplication via retry mechanisms not shown or implied). Specifically, the duplication usually comes from the error being logged, then the parser backing up or re-entering a state, or the `toString` being called on a node that has accumulated errors from multiple failed attempts if the parser were to implement backtracking (which it doesn't seem to). However, the most direct "error" in the code snippet provided that leads to *wrong* output (duplicates) in similar assignments is often that `addErrors` is called, but the errors are ALSO added to the global collector inside `expect` in some versions, or `expect` is wrapped in a try-catch that retries. Given the code, the most likely intended fix for "duplicates" in this specific pattern is ensuring `addErrors` clears the local list or checking if errors are already added. But here, the list is instance-level.
+
+Actually, looking at `CompUnit.toString`:
+```java
+        declNodes.forEach(b::append);
+        funcDefNodes.forEach(b::append);
+        b.append(mainFuncDefNode).append("<CompUnit>\n");
+```
+It appends `mainFuncDefNode`. This calls `toString()`.
+It appends `funcDefNodes`. This calls `toString()`.
+
+If the parser didn't crash, and we assume it somehow skipped the bad parts or recovered, the duplication of `1 j` suggests `FuncDefNode` for `f` reported it twice.
+
+I will mark the `errors.add` line.
+
+<frontend/ast/ASTNode.java>
+...
+    public void expect(TokenType expectedType, String expectValue) {
+        Token token = tokens.get();
+        if (!token.isTypeOf(expectedType) || !token.getContent().equals(expectValue)) {
+            if (expectedType == TokenType.Semicolon) {
+                // error of type i: missing semicolon
+                int lineNum = tokens.prev().getLineNumber();
+                errors.add(new CompileError(lineNum, ErrorType.MissSemicn, "got: " + token.getType()));
+                return;
+            } else if (expectedType == TokenType.RParenthesis) {
+                // error of type j: missing right parenthesis
+                int lineNum = tokens.prev().getLineNumber();
+                errors.add(new CompileError(lineNum, ErrorType.MissRparent, "got: " + token.getType())); // @@ Adding error to local list. If parsing logic allows re-entry or if addErrors is called multiple times, or if this error is also added globally elsewhere, duplicates occur. Also, failing to advance token here causes parser to stall/crash on subsequent expects, preventing correct error reporting for later errors or causing infinite loops if wrapped in retry logic.
+                return;
+            } else if (expectedType == TokenType.RBracket) {
+                // error of type k: missing right bracket
+                int lineNum = tokens.prev().getLineNumber();
+                errors.add(new CompileError(lineNum, ErrorType.MissRbrack, "got: " + token.getType()));
+                return;
+            }
+
+            throw new RuntimeException(
+                    String.format(
+                            "Expecting [%s: %s] at line %d but we got [%s: %s]%n",
+                            Debug.TERM_BLUE + expectedType,
+                            expectValue + Debug.TERM_RESET,
+                            token.getLineNumber(),
+                            token.getType(),
+                            token.getContent()
+                    )
+            );
+        }
+        tokens.advance();
+    }
+...

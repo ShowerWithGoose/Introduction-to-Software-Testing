@@ -1,0 +1,432 @@
+Looking at the difference between the buggy output and expected output, I can see the issue is in the order of output for the variable declaration section.
+
+In the buggy output:
+- The semicolon (`SEMICN ;`) is output before `<InitVal>`, `<VarDef>`, and `<VarDecl>`
+- This is incorrect because according to the grammar and expected output, the structure should be:
+  - Parse the init value and output `<InitVal>`
+  - Then output `<VarDef>` 
+  - Then consume and output the semicolon
+  - Finally output `<VarDecl>`
+
+The problem is in the `parseDef` method in the `Parser.java` file. The current code outputs `<VarDef>` immediately after parsing the optional initializer, but before handling the semicolon. However, looking more carefully at the expected output, I see that `<InitVal>` should be output before the semicolon is consumed.
+
+Actually, looking at the expected output more carefully:
+1. The array initialization block ends with `RBRACE }`
+2. Then `<InitVal>` is output
+3. Then `<VarDef>` is output  
+4. Then `SEMICN ;` is output
+5. Then `<VarDecl>` is output
+
+But in the buggy output:
+1. The array initialization block ends with `RBRACE }`
+2. Then `SEMICN ;` is output immediately
+3. Then `<InitVal>`, `<VarDef>` are output
+
+This suggests that the semicolon is being consumed and output too early, before the `<InitVal>` and `<VarDef>` are properly output.
+
+Looking at the `parseDef` method:
+
+```java
+private Ast.Def parseDef(DataType dataType, boolean isConst) throws IOException {
+    Token ident = tokenList.getAndAdd();
+    Ast.Exp length = null;
+    if (tokenList.look(0).getType() == TokenType.LBRACK) {
+        tokenList.skip();
+        length = parseExp(true);
+        err(TokenType.RBRACK);
+    }
+    Ast.InitValue initValue = null;
+    if (isConst) {
+        tokenList.skip(); // '='
+        initValue = parseInitVal(isConst);
+        MyStream.printParser("<ConstDef>\n");
+    } else {
+        if (tokenList.look(0).getType() == TokenType.ASSIGN) {
+            tokenList.skip(); // '='
+            initValue = parseInitVal(isConst);
+        }
+        MyStream.printParser("<VarDef>\n");  // This is output here
+    }
+    return new Ast.Def(dataType, ident, length, initValue);
+}
+```
+
+And then in `parseDecl`:
+```java
+err(TokenType.SEMICN);  // This consumes and outputs the semicolon
+if (isConst) {
+    MyStream.printParser("<ConstDecl>\n");
+} else {
+    MyStream.printParser("<VarDecl>\n");
+}
+```
+
+The issue is that `parseInitVal` outputs `<InitVal>` when it's called, but in the buggy output, the semicolon appears before `<InitVal>`. This means that somehow the semicolon is being output before `parseInitVal` completes.
+
+Wait, looking at the `parseInitVal` method:
+
+```java
+private Ast.InitValue parseInitVal(boolean isConst) throws IOException {
+    boolean isString = false;
+    boolean isSimpleArray = false;
+    ArrayList<Ast.Exp> valueList = new ArrayList<>();
+    Ast.StringConst stringConst = null;
+    if (tokenList.look(0).getType() == TokenType.LBRACE) {
+        tokenList.skip();
+        //array init
+        isSimpleArray = true;
+        while (tokenList.look(0).getType() != TokenType.RBRACE) {
+            valueList.add(parseExp(isConst));
+            tokenList.skip();  // This skips commas, but what about the final RBRACE?
+        }
+    } else if (tokenList.look(0).getType() == TokenType.STRCON) {
+        //StringConst
+        isString = true;
+        stringConst = new Ast.StringConst(tokenList.getAndAdd().getContent());
+    } else {
+        valueList.add(parseExp(isConst));
+    }
+    if (isConst) {
+        MyStream.printParser("<ConstInitVal>\n");
+    } else {
+        MyStream.printParser("<InitVal>\n");
+    }
+    return new Ast.InitValue(isString, valueList, stringConst, isSimpleArray);
+}
+```
+
+In the array initialization case, the loop `while (tokenList.look(0).getType() != TokenType.RBRACE)` will exit when it sees `RBRACE`, but it never consumes the `RBRACE`. However, looking at the output, I can see that `RBRACE }` is properly output, which means it must be consumed somewhere else.
+
+Actually, looking at the working part of the output, after the last `INTCON 5` and its associated expressions, we see `RBRACE }` in both outputs, so the `RBRACE` is being properly consumed.
+
+The real issue is in the `parseDecl` method. The `err(TokenType.SEMICN)` call consumes and outputs the semicolon BEFORE the `<VarDecl>` is printed, but according to the expected output, the sequence should be:
+
+1. `<InitVal>` (from parseInitVal)
+2. `<VarDef>` (from parseDef) 
+3. `SEMICN ;` (the semicolon token)
+4. `<VarDecl>` (from parseDecl)
+
+But in the buggy output, it's:
+1. `SEMICN ;` 
+2. `<InitVal>`
+3. `<VarDef>`
+4. `<VarDecl>`
+
+This suggests that the semicolon is being consumed too early. Looking at the control flow:
+
+1. `parseDecl` calls `parseDef`
+2. `parseDef` calls `parseInitVal` 
+3. `parseInitVal` should output `<InitVal>` before returning
+4. `parseDef` outputs `<VarDef>` before returning  
+5. Back in `parseDecl`, `err(TokenType.SEMICN)` consumes and outputs the semicolon
+6. `parseDecl` outputs `<VarDecl>`
+
+This should produce the correct order. But the buggy output shows the semicolon coming first.
+
+Wait, I think I found the issue. In the `parseInitVal` method, for the array case:
+
+```java
+while (tokenList.look(0).getType() != TokenType.RBRACE) {
+    valueList.add(parseExp(isConst));
+    tokenList.skip();  // This skips the comma, but after the last element, there's no comma
+}
+```
+
+After processing the last element (`INTCON 5`), the next token is `RBRACE`, so the loop exits. But then the `RBRACE` is never consumed in `parseInitVal`. However, in the output we see `RBRACE }` appears, which means it must be consumed elsewhere.
+
+Looking back at the `parseDef` method, after calling `parseInitVal`, there's no code to consume the `RBRACE`. But wait, the `RBRACE` was already consumed as part of the array literal parsing.
+
+Actually, looking at the grammar:
+```
+InitVal → Exp | '{' [ Exp { ',' Exp } ] '}' | StringConst
+```
+
+So the `RBRACE` is part of the `InitVal` production and should be consumed within `parseInitVal`.
+
+The bug is in `parseInitVal` - it doesn't consume the `RBRACE` after the while loop. It should consume it before outputting `<InitVal>`.
+
+But wait, in the output I can see `RBRACE }` appears in the correct position in both buggy and expected output, right after the last array element's `<Exp>`. So the `RBRACE` is being consumed correctly.
+
+Let me trace through the actual token consumption:
+
+From the input: `int a[5] = {1,2,3,4,5};`
+
+Tokens: `INTTK`, `IDENFR`, `LBRACK`, `INTCON`, `RBRACK`, `ASSIGN`, `LBRACE`, `INTCON`, `COMMA`, `INTCON`, `COMMA`, `INTCON`, `COMMA`, `INTCON`, `COMMA`, `INTCON`, `RBRACE`, `SEMICN`
+
+In `parseDef`:
+- `ident` = `a` (consumed)
+- sees `LBRACK`, consumes it
+- parses `5` as ConstExp, outputs all the expression stuff
+- calls `err(RBRACK)` which consumes and outputs `RBRACK`
+- sees `ASSIGN`, consumes it  
+- calls `parseInitVal(false)`
+
+In `parseInitVal`:
+- sees `LBRACE`, consumes and outputs it
+- enters loop:
+  - parses `1`, outputs expression stuff
+  - `skip()` consumes and outputs `COMMA`
+  - parses `2`, outputs expression stuff  
+  - `skip()` consumes and outputs `COMMA`
+  - ... continues until last element `5`
+  - parses `5`, outputs expression stuff
+  - now `look(0)` is `RBRACE`, so loop exits
+- **BUG**: `RBRACE` is never consumed in `parseInitVal`!
+- outputs `<InitVal>`
+- returns
+
+Back in `parseDef`:
+- outputs `<VarDef>`
+- returns
+
+Back in `parseDecl`:
+- now `look(0)` is still `RBRACE` (not consumed yet!)
+- `err(SEMICN)` checks if current token is `SEMICN`, but it's `RBRACE`, so it throws error "i" (missing semicolon) using line number of previous token
+- BUT WAIT, in the buggy output I don't see any error, and I see `SEMICN ;` being output
+
+This doesn't match. Let me look again at the buggy output...
+
+Actually, in the buggy output, after the array elements, I see:
+```
+INTCON 5
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACE }
+SEMICN ;
+<PrimaryExp>
+...
+```
+
+So `RBRACE }` IS being output, which means it was consumed. And then `SEMICN ;` is output immediately after.
+
+But then later I see:
+```
+<InitVal>
+<VarDef>
+<VarDecl>
+```
+
+This suggests that the `<InitVal>` and `<VarDef>` are being output AFTER the semicolon, which means they are being output during some other parsing phase, not during the initial declaration parsing.
+
+Looking more carefully at the buggy output, after `SEMICN ;`, there's:
+```
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RETURNTK return
+```
+
+Ah! I see what's happening. The `<PrimaryExp>`, `<UnaryExp>`, etc. after `SEMICN ;` are actually part of the `return` statement parsing, not part of the variable declaration.
+
+So the real issue is that `<InitVal>` and `<VarDef>` are missing from their correct positions and appearing later.
+
+Looking at the expected output, after `RBRACE }` we should have:
+```
+<InitVal>
+<VarDef>
+SEMICN ;
+<VarDecl>
+```
+
+But in buggy output, after `RBRACE }` we have:
+```
+SEMICN ;
+```
+
+And then much later, before the return statement, we have:
+```
+<InitVal>
+<VarDef>
+<VarDecl>
+```
+
+This suggests that the `<InitVal>`, `<VarDef>`, and `<VarDecl>` are being output at the wrong time.
+
+The problem is in the `parseInitVal` method. When parsing an array initializer, after the while loop, it needs to consume the `RBRACE`, but it's not doing so. However, from the output we can see `RBRACE }` is being output, so it must be consumed somewhere.
+
+Wait, I think I found the real issue. In the `parseInitVal` method:
+
+```java
+if (tokenList.look(0).getType() == TokenType.LBRACE) {
+    tokenList.skip();
+    //array init
+    isSimpleArray = true;
+    while (tokenList.look(0).getType() != TokenType.RBRACE) {
+        valueList.add(parseExp(isConst));
+        tokenList.skip();
+    }
+}
+```
+
+The `tokenList.skip()` inside the loop consumes tokens after each expression. For the array `{1,2,3,4,5}`, this works as:
+- Parse `1`, then skip `,` 
+- Parse `2`, then skip `,`
+- Parse `3`, then skip `,` 
+- Parse `4`, then skip `,`
+- Parse `5`, then check `look(0)` which is `RBRACE`, so loop exits
+
+But the `RBRACE` is never consumed! However, in the output we see `RBRACE }`, which means it must be consumed by something else.
+
+Actually, looking at the grammar again, the `RBRACE` is part of the `InitVal` production, so it should be consumed in `parseInitVal`. The missing `tokenList.skip()` after the while loop to consume the `RBRACE` is the bug.
+
+But wait, if `RBRACE` wasn't consumed, then when `parseDecl` calls `err(TokenType.SEMICN)`, it would see `RBRACE` instead of `SEMICN` and throw an error. But no error is thrown, and `SEMICN` is output, which means `RBRACE` was consumed.
+
+I think the issue is elsewhere. Let me look at the `TokenList.skip()` method:
+
+```java
+public void skip() throws IOException {
+    MyStream.printParser(tokenList.get(curIndex).toString());
+    curIndex++;
+}
+```
+
+And `getAndAdd()`:
+
+```java
+public Token getAndAdd() throws IOException {
+    MyStream.printParser(tokenList.get(curIndex).toString());
+    return tokenList.get(curIndex++);
+}
+```
+
+Both methods output the token when they consume it.
+
+Now, looking at the expected vs buggy output more carefully:
+
+**Expected:**
+```
+RBRACE }
+<InitVal>
+<VarDef>
+SEMICN ;
+<VarDecl>
+```
+
+**Buggy:**
+```
+RBRACE }
+SEMICN ;
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RETURNTK return
+...
+<InitVal>
+<VarDef>
+<VarDecl>
+```
+
+The key insight is that in the buggy output, after `SEMICN ;`, there's a sequence of `<PrimaryExp>`, `<UnaryExp>`, etc. that shouldn't be there. These appear to be from parsing the `return` statement, but they're showing up in the wrong place.
+
+Actually, looking even more carefully, I see that in the buggy output, right after `SEMICN ;`, there's:
+
+```
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RETURNTK return
+```
+
+But `RETURNTK return` is a token that should be output as `RETURNTK return`, not as part of expression parsing. This suggests that the parser is incorrectly parsing the `return` keyword as part of an expression.
+
+Wait, no - looking at the full context, the `RETURNTK return` is correctly positioned as the start of the return statement. The issue is that the `<InitVal>`, `<VarDef>`, and `<VarDecl>` are completely missing from their correct positions and appearing at the end of the function.
+
+I think the real problem is in the `parseDef` method for non-const variables. Let's look at this part:
+
+```java
+} else {
+    if (tokenList.look(0).getType() == TokenType.ASSIGN) {
+        tokenList.skip(); // '='
+        initValue = parseInitVal(isConst);
+    }
+    MyStream.printParser("<VarDef>\n");
+}
+```
+
+The issue is that `MyStream.printParser("<VarDef>\n")` is called regardless of whether there's an initializer or not, but it's called BEFORE the `parseInitVal` has a chance to output `<InitVal>`.
+
+Wait, no - if there is an initializer, `parseInitVal` is called first, which should output `<InitVal>`, then `<VarDef>` is output.
+
+But in the buggy output, `<InitVal>` appears much later. This suggests that `parseInitVal` is not being called when it should be, or it's being called but not outputting at the right time.
+
+Looking at the array initialization in `parseInitVal` again:
+
+```java
+while (tokenList.look(0).getType() != TokenType.RBRACE) {
+    valueList.add(parseExp(isConst));
+    tokenList.skip();
+}
+```
+
+For the last element (`5`), `parseExp(isConst)` is called, which outputs `<Exp>` (since `isConst` is false for VarDecl). Then `tokenList.skip()` is called, but after the last element, there's no comma - the next token is `RBRACE`, so `tokenList.skip()` would consume and output `RBRACE }`!
+
+That's the bug! 
+
+In the array `{1,2,3,4,5}`, after parsing `5`, the next token is `RBRACE`, not a comma. But the code does `tokenList.skip()` unconditionally after each `parseExp`, which means it consumes the `RBRACE` as if it were a comma separator.
+
+So the sequence is:
+- Parse `1` -> outputs expression stuff
+- `skip()` -> consumes and outputs `COMMA ,`
+- Parse `2` -> outputs expression stuff  
+- `skip()` -> consumes and outputs `COMMA ,`
+- Parse `3` -> outputs expression stuff
+- `skip()` -> consumes and outputs `COMMA ,`
+- Parse `4` -> outputs expression stuff
+- `skip()` -> consumes and outputs `COMMA ,`
+- Parse `5` -> outputs expression stuff
+- `skip()` -> consumes and outputs `RBRACE }`  **THIS IS WRONG!**
+
+The `RBRACE` should not be consumed by the `skip()` call. The `skip()` should only consume commas, not the closing brace.
+
+The correct logic should be:
+- Parse first expression
+- While next token is comma:
+  - Consume comma
+  - Parse next expression
+
+So the fix is to restructure the loop in `parseInitVal`.
+
+<frontend/parser/Parser.java>
+...
+    private Ast.InitValue parseInitVal(boolean isConst) throws IOException {
+        boolean isString = false;
+        boolean isSimpleArray = false;
+        ArrayList<Ast.Exp> valueList = new ArrayList<>();
+        Ast.StringConst stringConst = null;
+        if (tokenList.look(0).getType() == TokenType.LBRACE) {
+            tokenList.skip();
+            //array init
+            isSimpleArray = true;
+            if (tokenList.look(0).getType() != TokenType.RBRACE) {
+                valueList.add(parseExp(isConst));
+                while (tokenList.look(0).getType() == TokenType.COMMA) {
+                    tokenList.skip();
+                    valueList.add(parseExp(isConst));
+                }
+            }
+            tokenList.skip(); // consume RBRACE
+        } else if (tokenList.look(0).getType() == TokenType.STRCON) {
+            //StringConst
+            isString = true;
+            stringConst = new Ast.StringConst(tokenList.getAndAdd().getContent());
+        } else {
+            valueList.add(parseExp(isConst));
+        }
+        if (isConst) {
+            MyStream.printParser("<ConstInitVal>\n");
+        } else {
+            MyStream.printParser("<InitVal>\n");
+        }
+        return new Ast.InitValue(isString, valueList, stringConst, isSimpleArray);
+    }
+...

@@ -1,0 +1,1023 @@
+Based on the problem description, test case input, expected output, and actual buggy behavior (no output file generated), the issue appears to be in the **`BlockItem.java`** file. 
+
+In the test case, there is a block containing a variable declaration:
+```c
+{
+    int a = 1;
+    printf("%d",a);
+}
+```
+According to the grammar, `BlockItem → Decl | Stmt`, and for a `Decl`, **no `<Stmt>` should be printed**. However, in the current implementation of `BlockItem.parse()`, when it parses a `Decl`, it does **not** output `<Stmt>`, which is correct — but when it parses a `Stmt`, it **does** output `<Stmt>` **after** parsing it.
+
+However, looking at the expected output, we see that **every statement (including declarations inside blocks) eventually leads to a `<Stmt>` being printed only for actual statements**, and **declarations produce `<VarDecl>` etc., but not `<Stmt>`**.
+
+But more critically: **the program produced no output at all**, which suggests that the parser may have encountered an unhandled condition or thrown an exception silently, or failed to write anything due to incorrect control flow.
+
+Looking closely at `BlockItem.parse()`:
+
+```java
+if (parser.getCurrentToken().type == LexType.CONSTTK || parser.getCurrentToken().type == LexType.INTTK || parser.getCurrentToken().type == LexType.CHARTK) {
+    new Decl().parse(parser,writer);
+} else {
+    new Stmt().parse(parser,writer);
+    writer.write("<Stmt>\n");
+}
+```
+
+This logic is **backwards** in terms of output ordering and correctness.
+
+- For a **statement**, it parses the `Stmt` (which internally outputs many things including terminals and non-terminals like `<Exp>`, etc.), and **then** writes `<Stmt>` **after** the entire statement has been parsed.
+- But according to the **expected output**, the `<Stmt>` line appears **before** the contents of the statement are detailed.
+
+Wait — actually, looking at the expected output:
+
+```
+PRINTFTK printf
+...
+SEMICN ;
+<Stmt>
+```
+
+So `<Stmt>` is printed **after** the entire statement's tokens and subcomponents. That part is correct.
+
+But now consider the **variable declaration inside the inner block**:
+
+Expected:
+```
+INTTK int
+IDENFR a
+ASSIGN =
+INTCON 1
+<Number>
+...
+<VarDef>
+SEMICN ;
+<VarDecl>
+```
+
+Note: **No `<Stmt>`** is printed for the declaration — correct.
+
+However, in the **outer scope**, we have:
+```c
+int a = 0;
+```
+Which produces:
+```
+...
+<VarDecl>
+```
+and then later a `printf` produces:
+```
+...
+<Stmt>
+```
+
+So far so good.
+
+But here's the critical bug:
+
+In `BlockItem.java`, when parsing a **Decl**, it calls `new Decl().parse(...)`, which **does output `<VarDecl>` or `<ConstDecl>`**, as seen in `Decl.java`:
+
+```java
+if (const) { ... writer.write("<ConstDecl>\n"); }
+else { ... writer.write("<VarDecl>\n"); }
+```
+
+✅ That’s correct.
+
+However, the real issue causing **no output at all** is likely elsewhere.
+
+Wait — the **buggy output says "No output file"**, meaning `parser.txt` was never created or written to.
+
+Looking at `Compiler.java`:
+
+```java
+new Parser(tokenList, lexerWriter);
+// Output errors
+lexer.writeErrorsToFile(errorOutputPath);
+```
+
+The `Parser` constructor calls `parseCompUnit(writer)`, which should write to `lexerWriter` (which is actually misnamed — it's the **parser output**, but it's writing to `lexer.txt`!).
+
+Wait! **Big mistake**: In `Compiler.java`, the `BufferedWriter lexerWriter` is opened on **`lexer.txt`**, and passed to the `Parser`. So the parser writes its output (syntax components and tokens) to **`lexer.txt`**, not `parser.txt`.
+
+But the problem says:
+> For correct source programs, output ... to `parser.txt`
+
+So the program is writing to the wrong file!
+
+However, the **expected output provided is what should go into `parser.txt`**, but the code writes it to `lexer.txt`. And since the test system looks for `parser.txt`, it finds nothing → "No output file".
+
+But wait — the problem says:
+> Output the information ... to `parser.txt`
+
+But in the given `Compiler.java`:
+
+```java
+String lexerOutputPath = "lexer.txt";   // 词法分析输出文件
+...
+try (BufferedWriter lexerWriter = new BufferedWriter(new FileWriter(lexerOutputPath))) {
+    ...
+    new Parser(tokenList, lexerWriter);
+}
+```
+
+So the **parser is writing to `lexer.txt`**, but it should write to `parser.txt`.
+
+However, the problem also says that lexical analysis output goes to `lexer.txt`, but in this code, **lexical analysis doesn't write anything to `lexer.txt`**! It only collects tokens into `tokenList`. The actual token output is done by the **parser**.
+
+According to the problem:  
+> Output the word category code and the word's character/string form ... in the order they are read.
+
+This is typically the job of **lexical analysis**, but the problem says this output is part of syntax analysis output — i.e., the parser must output each token as it consumes it, plus the non-terminals.
+
+So the parser **should** output tokens + non-terminals to `parser.txt`.
+
+But in `Compiler.java`, it's writing to `lexer.txt`.
+
+Thus, the output ends up in `lexer.txt`, while the judge expects `parser.txt` → so "No output file" for `parser.txt`.
+
+But wait — the problem says:
+> In the first round ... output the code snippet where the error is likely to be located.
+
+However, looking again: the **test case is correct**, so **no errors**, so `error.txt` is empty, and `parser.txt` should be produced.
+
+But the code never creates `parser.txt`.
+
+So the bug is in `Compiler.java`: it passes `lexerWriter` (pointing to `lexer.txt`) to the `Parser`, but it should open a **separate writer for `parser.txt`**.
+
+But hold on — the problem says:
+> For correct source programs, output ... to `parser.txt`
+
+But the current code writes parser output to `lexer.txt`.
+
+However, looking at the **expected output format**, it includes both tokens and non-terminals, which is parser output.
+
+So yes, the parser should write to `parser.txt`.
+
+But in the given code, there is **no `parser.txt` being written**.
+
+Therefore, the root cause is in `Compiler.java`.
+
+But wait — the assignment might intend that the **parser writes to stdout or to a file named `parser.txt`**, but the code uses `lexer.txt`.
+
+However, the problem states the output must go to `parser.txt`.
+
+So the error is in `Compiler.java`.
+
+But let’s double-check: is it possible that the **real bug** is that the parser **fails early** and throws an exception, so nothing is written?
+
+Looking at the test input:
+```c
+int main() {
+    printf("21373119");
+    int a = 0;
+    {
+        int a = 1;
+        printf("%d",a); // 输出 1
+    }
+    return 0;
+}
+```
+
+Now, look at `CompUnit.java`:
+
+```java
+while(parser.tokens.size() > parser.currentTokenIndex + 2 && parser.tokens.get(parser.currentTokenIndex + 2).type != LexType.LPARENT){
+    new Decl().parse(parser,writer);
+}
+while(parser.tokens.get(parser.currentTokenIndex + 1).type != LexType.MAINTK){
+    new FuncDef().parse(parser,writer);
+    writer.write("<FuncDef>\n");
+}
+```
+
+This logic is **very fragile**.
+
+At the start, tokens are:
+`[INTTK(int), MAINTK(main), LPARENT((), RPARENT()), LBRACE({), ...]`
+
+Check condition: `parser.tokens.size() > current+2` → true.
+`parser.tokens.get(current+2).type` = `LPARENT` → so **skip the Decl loop**.
+
+Then: `while (tokens[current+1].type != MAINTK)` → `tokens[1]` is `MAINTK`, so condition false → skip FuncDef loop.
+
+Then parse `MainFuncDef`.
+
+So far okay.
+
+But what about the **inner block**? That should be handled by `BlockItem`.
+
+Now, the **real smoking gun** is in `BlockItem.java`:
+
+When parsing the **inner block**, the first token inside `{` is `INTTK`, so it goes into the `Decl` branch.
+
+But after parsing `Decl`, it **does not output `<Stmt>`**, which is correct.
+
+However, look at the expected output: after the inner `printf`, we have:
+
+```
+...
+SEMICN ;
+<Stmt>
+RBRACE }
+<Block>
+<Stmt>
+```
+
+Note: the **entire inner block** is treated as a `<Stmt>`, because `Stmt → Block`.
+
+And in `Stmt.java`, when it sees `LBRACE`, it does:
+
+```java
+} else if (parser.getCurrentToken().type == LexType.LBRACE) {
+    new Block().parse(parser,writer);
+    writer.write("<Block>\n");
+}
+```
+
+But wait — according to the expected output, after the block, it prints `<Block>` and then `<Stmt>`.
+
+But in this code, it only prints `<Block>`, **not `<Stmt>`**.
+
+Ah! Here's the bug.
+
+In `Stmt.java`, when parsing a block-statement, it should **output `<Stmt>`** at the end, just like other statements.
+
+But it doesn't.
+
+Compare with other branches in `Stmt.java`:
+
+- For `if`: ends with `writer.write("<Stmt>\n");`
+- For `for`: ends with `writer.write("<Stmt>\n");`
+- For `return`: no explicit `<Stmt>` — but wait, look:
+
+Actually, **none** of the branches in `Stmt.java` write `<Stmt>` **at the end of the method**.
+
+Instead, in `BlockItem.java`, when it parses a `Stmt`, it does:
+
+```java
+new Stmt().parse(parser,writer);
+writer.write("<Stmt>\n");
+```
+
+So the responsibility of writing `<Stmt>` is in `BlockItem`, **not in `Stmt` itself**.
+
+That means: **every time a `Stmt` is parsed via `BlockItem`, `<Stmt>` is printed afterward**.
+
+Now, in the inner block:
+- The `printf` is a `Stmt` → `BlockItem` calls `Stmt.parse()`, then writes `<Stmt>` → correct.
+- The **block itself** (`{ ... }`) is also a `Stmt` (because `Stmt → Block`), and it appears as a `BlockItem` in the outer block.
+
+So when the parser encounters `{ ... }` in the outer block, it goes to the `else` branch in `BlockItem` (since first token is `LBRACE`, not a decl), so it calls `Stmt.parse()`, which handles the block, and then `BlockItem` writes `<Stmt>`.
+
+And in the expected output, we see:
+```
+RBRACE }
+<Block>
+<Stmt>
+```
+
+So `<Block>` is written inside `Stmt.parse()` (when it sees LBRACE), and then `<Stmt>` is written by `BlockItem`.
+
+So that seems correct.
+
+But why no output?
+
+Another possibility: the parser **crashes** on the `printf` call.
+
+Look at `Stmt.java` in the `PRINTFTK` branch:
+
+```java
+} else if (parser.match(LexType.PRINTFTK)){
+    writer.write("PRINTFTK printf\n");
+    parser.match(LexType.LPARENT);
+    writer.write("LPARENT (\n");
+    writer.write("STRCON "+parser.getCurrentToken().word+"\n");
+    parser.match(LexType.STRCON);
+    ...
+}
+```
+
+What if `getCurrentToken()` is null? But in the test case, after `(` comes `"21373119"`, which is `STRCON`, so okay.
+
+But what about the second `printf`: `printf("%d",a);`
+
+After matching `STRCON "%d"`, it enters the `while (match(COMMA))` loop.
+
+It matches `,`, then calls `new Exp().parse(...)`.
+
+`Exp → AddExp`, which eventually parses `a` as `LVal → Ident`.
+
+In `PrimaryExp.java`:
+
+```java
+} else if (parser.getCurrentToken().type == LexType.IDENFR) {
+    new LVal().parse(parser,writer);
+    writer.write("<LVal>\n");
+}
+```
+
+In `LVal.java`:
+
+```java
+writer.write("IDENFR "+parser.getCurrentToken().word+"\n");
+parser.match(LexType.IDENFR);
+```
+
+This should work.
+
+But now, the **critical bug** is in `AddExp.java` and similar recursive descent parsers.
+
+Look at `AddExp.java`:
+
+```java
+public class AddExp {
+    public AddExp parse(Parser parser,BufferedWriter writer) throws IOException{
+        new MulExp().parse(parser,writer);
+        writer.write("<MulExp>\n");
+        while (parser.match(LexType.PLUS) || parser.match(LexType.MINU)) {
+            writer.write("<AddExp>\n");
+            writer.write(parser.tokens.get(parser.currentTokenIndex-1).type+" "+parser.tokens.get(parser.currentTokenIndex-1).word+"\n");
+            new AddExp().parse(parser,writer);
+            
+        }
+        writer.flush();
+        return this;
+    }
+}
+```
+
+This is **left-recursive**, and the way it's implemented will cause **infinite recursion** or **incorrect output order**.
+
+But more importantly, it **writes `<MulExp>` after parsing it**, but the expected output shows:
+
+```
+IDENFR a
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+```
+
+So the non-terminals are written **after** their children.
+
+But in `AddExp.parse()`:
+- It parses `MulExp` (which will output its own internals and then `<UnaryExp>`, etc.)
+- Then it writes `<MulExp>`
+- Then if there's an operator, it writes `<AddExp>`, then the operator token, then recursively parses another `AddExp`
+
+This will produce:
+
+```
+... (output from MulExp)
+<MulExp>
+<AddExp>
+PLUS +
+... (output from next AddExp)
+```
+
+But the expected output for a simple `a` is:
+
+```
+IDENFR a
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+```
+
+So the order is: deepest first, then parents.
+
+That matches.
+
+But why no output?
+
+Wait — the **real issue** is that in `Compiler.java`, after parsing, it calls:
+
+```java
+lexer.writeErrorsToFile(errorOutputPath);
+```
+
+But if there are **no errors**, `error.txt` is created (empty or not), but `lexer.txt` (which contains parser output) is closed at the end of the try block.
+
+But the problem expects output in `parser.txt`, not `lexer.txt`.
+
+However, the problem statement in the user message says:
+
+> Output the information of each word line by line in the order recognized by lexical analysis. [...] to `parser.txt`
+
+But the code writes to `lexer.txt`.
+
+So the judge looks for `parser.txt`, finds nothing → "No output file".
+
+But is that the only issue?
+
+Possibly, but the instructions say: "identify the location of the errors in the program below" based on the test case.
+
+Given that the **expected output is non-empty** and the **buggy output is "No output file"**, the most direct cause is that the parser output is written to the wrong file.
+
+However, looking back at the problem statement provided to the student, it says:
+
+> Output [...] to `parser.txt`
+
+But in the given `Compiler.java`, the parser writes to `lexer.txt`.
+
+So the fix would be to change the filename.
+
+But wait — the problem also says that lexical analysis output goes to `lexer.txt`, but in this code, **lexical analysis doesn't output anything to `lexer.txt`**; it only collects tokens.
+
+So perhaps the design is that the **parser outputs both tokens and non-terminals to `parser.txt`**, and `lexer.txt` is unused.
+
+Therefore, the error is in `Compiler.java`: it should open `parser.txt`, not `lexer.txt`, for the parser output.
+
+But the user instruction says: "output the code snippet where the error is likely to be located".
+
+However, there's another possibility: the parser **throws an exception** and exits early, so nothing is written.
+
+For example, in `MainFuncDef.java`:
+
+```java
+if (parser.match(LexType.INTTK) && parser.match(LexType.MAINTK) && parser.match(LexType.LPARENT) && parser.match(LexType.RPARENT)) {
+    writer.write("INTTK int\nMAINTK main\nLPARENT (\nRPARENT )\n");
+} else {
+    parser.reportError(...);
+    writer.write("INTTK int\nMAINTK main\nLPARENT (\n");
+}
+```
+
+The `match` calls consume tokens. If any fails, it goes to else.
+
+But in the test case, it should succeed.
+
+But what if `parser.match(LexType.INTTK)` succeeds, but then `parser.match(LexType.MAINTK)` fails? Then it would have consumed `INTTK`, and the else branch writes fixed strings, but the token stream is corrupted.
+
+However, in the test case, the tokens are correct.
+
+Given the complexity, the most consistent explanation for "No output file" is that the output is written to `lexer.txt` instead of `parser.txt`.
+
+But the problem says the output should be in `parser.txt`.
+
+However, looking at the **expected output provided**, it matches exactly what the parser should emit, so if it were written to `parser.txt`, it would pass.
+
+Therefore, the bug is in `Compiler.java`.
+
+But wait — the problem might be that the **Parser constructor throws an exception**, so the `lexerWriter` is never flushed, and the file remains empty or not created.
+
+Why would it throw? Because of a null token.
+
+In many places, the code does `parser.getCurrentToken().type` without checking if it's null.
+
+For example, in `BlockItem.java`:
+
+```java
+if (parser.getCurrentToken().type == LexType.CONSTTK || ...)
+```
+
+If `getCurrentToken()` returns null (end of file), this throws NPE.
+
+In the test case, after `return 0; }`, the parser should finish.
+
+But in `CompUnit.java`, after parsing `MainFuncDef`, it writes `<MainFuncDef>` and `<CompUnit>`, and returns.
+
+But what if there are extra tokens? Unlikely.
+
+However, the **inner block** ends with `RBRACE`, then `return`.
+
+Let’s simulate the token stream.
+
+But a more likely culprit is in `Stmt.java`, in the branch:
+
+```java
+} else if (parser.currentLineHasToken(LexType.ASSIGN)){
+```
+
+This method `currentLineHasToken` temporarily advances `currentTokenIndex` and then resets it.
+
+But what if `currentTokenIndex` is at the last token? It might go out of bounds.
+
+In `currentLineHasToken`:
+
+```java
+while (currentTokenIndex < tokens.size() && tokens.get(currentTokenIndex).lineNumber == line) {
+    if (tokens.get(currentTokenIndex).type == symbol) {
+        currentTokenIndex = originalIndex;
+        return true;
+    }
+    currentTokenIndex++;
+}
+```
+
+This is safe.
+
+But the real issue might be in the **order of output** and **missing flush**, but the code calls `writer.flush()` in every parse method.
+
+Given the time, the most probable location of the error that causes **no output** is that the parser **encounters an unhandled case and throws an exception**, and the exception is caught in `main`, but the `lexerWriter` is closed without content.
+
+Looking at the `printf` parsing in `Stmt.java`:
+
+```java
+writer.write("STRCON "+parser.getCurrentToken().word+"\n");
+parser.match(LexType.STRCON);
+```
+
+What if after the last `printf`, there is a comment? The lexer removes comments, so tokens are fine.
+
+But in the second `printf`: `printf("%d",a);`
+
+After parsing `a`, it tries to match `RPARENT`.
+
+In `Stmt.java`:
+
+```java
+if(!parser.match(LexType.RPARENT)){
+    parser.reportError(...);
+}else{
+    writer.write("RPARENT )\n");
+}
+```
+
+Then it matches `SEMICN`.
+
+This should work.
+
+But now, consider the **first statement**: `printf("21373119");`
+
+This has no comma, so after matching `STRCON`, the while loop condition `parser.match(LexType.COMMA)` is false, so it proceeds to match `RPARENT`.
+
+Okay.
+
+I think the **actual bug** is in `BlockItem.java`: when it parses a `Decl`, it does **not** ensure that the decl is followed by something, but more importantly, the **output of `<Stmt>` is only for statements**, which is correct.
+
+But why no output?
+
+Wait — the **expected output starts with**:
+
+```
+INTTK int
+MAINTK main
+...
+```
+
+But in `MainFuncDef.java`, if the match succeeds, it writes:
+
+```java
+writer.write("INTTK int\nMAINTK main\nLPARENT (\nRPARENT )\n");
+```
+
+So that's correct.
+
+Then it parses the block.
+
+In `Block.java`:
+
+```java
+parser.match(LexType.LBRACE);
+writer.write("LBRACE {\n");
+```
+
+But `match` returns true and consumes the token, but what if `match` fails? It doesn't handle error.
+
+In `Block.java`, it assumes `LBRACE` is there, but doesn't check.
+
+If `getCurrentToken()` is null, `match` will throw NPE.
+
+Because in `match`:
+
+```java
+if (expectedToken == this.getCurrentToken().type) {
+```
+
+If `getCurrentToken()` is null, `.type` throws NPE.
+
+So if the token list is empty at any point, NPE occurs.
+
+In the test case, after `MainFuncDef` is parsed, the parser should be at the end.
+
+But in `CompUnit.java`, after parsing `MainFuncDef`, it writes two lines and returns.
+
+So no NPE.
+
+Given all this, the most consistent explanation is the **file name mistake**.
+
+But the problem says the output should be in `parser.txt`, and the code writes to `lexer.txt`.
+
+However, the user instruction says to output the code snippet where the error is likely located.
+
+But there's another possibility: the **Parser constructor catches IOException and swallows it**, but no, it throws IOException.
+
+In `Compiler.java`, the try block will close `lexerWriter`, flushing content to `lexer.txt`.
+
+So `lexer.txt` will have the expected content, but the judge looks for `parser.txt`.
+
+So the error is in `Compiler.java`.
+
+But the problem might be designed such that the output file name is correct, and the real bug is elsewhere.
+
+Let me read the problem again:
+
+> Output the information [...] to `parser.txt`
+
+But in the code, it's `lexer.txt`.
+
+So yes.
+
+However, looking at the provided source code, the student might have been given this `Compiler.java` and asked to implement the parser, so the file name might be intentional, and the real bug is in the parser logic.
+
+But the expected output is non-empty, and the buggy output is "No output file", which suggests that **no file named `parser.txt` was created**, which is true because the code writes to `lexer.txt`.
+
+So the error is in `Compiler.java`.
+
+But the instructions say: "based on the problem description, the test case inputs that the program failed, the program's output, and the expected output"
+
+Program's output: "No output file" — meaning `parser.txt` not found.
+
+Expected output: the long list.
+
+So the code wrote to the wrong file.
+
+Therefore, the error is in `Compiler.java`.
+
+But wait — the problem might be that for correct programs, it should write to `parser.txt`, and for errors, to `error.txt`.
+
+In `Compiler.java`, it always writes parser output to `lexer.txt`, which is wrong.
+
+So the fix is to change `lexerOutputPath` to `"parser.txt"`.
+
+So the error is in `Compiler.java`.
+
+But the user asks for the code snippet where the error is likely located.
+
+So:
+
+<Compiler.java>
+...
+            String inputFilePath = "testfile.txt";  // 输入文件
+            String lexerOutputPath = "lexer.txt";   // 词法分析输出文件
+            String errorOutputPath = "error.txt";    // 错误输出文件
+
+            Lexer lexer = Lexer.getInstance();
+            lexer.initialize(inputFilePath);  // 初始化词法分析器
+
+            ArrayList<Token> tokenList = new ArrayList<Token>();
+
+            try (BufferedWriter lexerWriter = new BufferedWriter(new FileWriter(lexerOutputPath))) {
+
+                while (lexer.next()) {
+                    if (lexer.getLexType() != null) {
+                        // 正确的 token 输出到 lexer.txt
+                        tokenList.add(new Token(lexer.getLexType(),lexer.getLineNumber(), lexer.getToken()));
+                    } 
+                }
+                
+                new Parser(tokenList, lexerWriter);
+                // 输出错误信息
+                lexer.writeErrorsToFile(errorOutputPath);
+            }
+...
+
+But wait, the problem says that the parser output should go to `parser.txt`, so `lexerOutputPath` should be `"parser.txt"`.
+
+However, there's another possibility: the **problem expects that the parser output includes only non-terminals and the tokens are not output by the parser**, but that contradicts the expected output which includes tokens.
+
+Given the expected output includes tokens like `INTTK int`, the parser must output them.
+
+So yes.
+
+But now, looking back, the **most likely actual bug** that causes no output is not the file name, because the problem might be testing with `lexer.txt` as the output file.
+
+But the user says: "Buggy Output: No output file", and "Expected Output: ...", implying that the judge expects `parser.txt`.
+
+However, in many compiler assignments, the parser output is written to stdout or to a specific file.
+
+Given the provided information, I think the intended bug is in the **parser logic**, not the file name.
+
+Let me look at the expected output again.
+
+In the expected output, for the line `int a = 0;`, we have:
+
+```
+INTTK int
+IDENFR a
+ASSIGN =
+INTCON 0
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+<InitVal>
+<VarDef>
+SEMICN ;
+<VarDecl>
+```
+
+Now, in `VarDecl.java`:
+
+```java
+new BType().parse(parser,writer); // outputs "INTTK int"
+new VarDef().parse(parser,writer); // outputs "IDENFR a", "ASSIGN =", then parses InitVal
+writer.write("<VarDef>\n");
+...
+writer.write("SEMICN ;\n");
+```
+
+In `VarDef.java`, when it sees `ASSIGN`, it calls `new InitVal().parse(...)`, which for `0` (INTCON) goes to the else branch:
+
+```java
+} else {
+    new Exp().parse(parser,writer);
+    writer.write("<Exp>\n");
+}
+```
+
+In `Exp.java`:
+
+```java
+new AddExp().parse(parser,writer);
+writer.write("<AddExp>\n");
+```
+
+In `AddExp.java`:
+
+```java
+new MulExp().parse(parser,writer);
+writer.write("<MulExp>\n");
+```
+
+In `MulExp.java`:
+
+```java
+new UnaryExp().parse(parser,writer);
+writer.write("<UnaryExp>\n");
+```
+
+In `UnaryExp.java`:
+
+```java
+} else {
+    new PrimaryExp().parse(parser,writer);
+    writer.write("<PrimaryExp>\n");
+}
+```
+
+In `PrimaryExp.java`:
+
+```java
+} else if (parser.getCurrentToken().type == LexType.INTCON) {
+    writer.write("INTCON "+parser.getCurrentToken().word+"\n");
+    new Number().parse(parser);
+    writer.write("<Number>\n");
+}
+```
+
+So the output order is:
+
+```
+INTCON 0
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+```
+
+But the expected output has:
+
+```
+INTCON 0
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+```
+
+Perfect.
+
+So why no output?
+
+Unless... in `Number.java`:
+
+```java
+public class Number {
+    public Number parse(Parser parser){
+        parser.nextToken();
+        return this;
+    }
+}
+```
+
+This advances the token index.
+
+Similarly, `Character.java` does the same.
+
+This is correct.
+
+I think the only remaining possibility is that the **program throws an exception in `CompUnit.java`** due to index out of bounds.
+
+In `CompUnit.java`:
+
+```java
+while(parser.tokens.size() > parser.currentTokenIndex + 2 && parser.tokens.get(parser.currentTokenIndex + 2).type != LexType.LPARENT){
+    new Decl().parse(parser,writer);
+}
+```
+
+If `tokens.size() == 0`, but in our case, tokens exist.
+
+At the beginning, `currentTokenIndex=0`, `tokens.size() > 2` is true, `tokens[2]` is `LPARENT`, so skip.
+
+Then:
+
+```java
+while(parser.tokens.get(parser.currentTokenIndex + 1).type != LexType.MAINTK){
+```
+
+`tokens[1]` is `MAINTK`, so condition false.
+
+Then parse `MainFuncDef`.
+
+In `MainFuncDef.java`:
+
+```java
+if (parser.match(LexType.INTTK) && parser.match(LexType.MAINTK) && parser.match(LexType.LPARENT) && parser.match(LexType.RPARENT)) {
+```
+
+Each `match` advances the index.
+
+After this, `currentTokenIndex=4`.
+
+Then parse `Block`.
+
+In `Block.java`, match `LBRACE` (index 4), advance to 5.
+
+Then while token != `RBRACE`, parse `BlockItem`.
+
+First token is `PRINTFTK`, so `BlockItem` goes to else branch, calls `Stmt.parse()`.
+
+In `Stmt.java`, matches `PRINTFTK`, then manually matches `LPARENT` (without using `match` in a safe way).
+
+In `Stmt.java` for `PRINTFTK`:
+
+```java
+parser.match(LexType.LPARENT);
+writer.write("LPARENT (\n");
+```
+
+`match` will return true and advance.
+
+Then:
+
+```java
+writer.write("STRCON "+parser.getCurrentToken().word+"\n");
+parser.match(LexType.STRCON);
+```
+
+This is unsafe! Because if `getCurrentToken()` is null, it crashes.
+
+But in our case, it's not.
+
+However, the **real bug** is that in `Stmt.java`, for the `PRINTFTK` branch, it does:
+
+```java
+parser.match(LexType.LPARENT);
+writer.write("LPARENT (\n");
+```
+
+But `match` may fail, and if it fails, it doesn't advance, but the code assumes it succeeded and writes `LPARENT (`.
+
+In the test case, it should succeed.
+
+I think I have to conclude that the error is in the **file output name**.
+
+But the instructions say to output the code snippet.
+
+However, there's a more subtle bug.
+
+Look at `BlockItem.java`:
+
+```java
+} else {
+    new Stmt().parse(parser,writer);
+    writer.write("<Stmt>\n");
+}
+```
+
+This is correct for statements.
+
+But what about the **last `}` in the main function**?
+
+After parsing the `return 0;`, the next token is `RBRACE`.
+
+In `Block.java`:
+
+```java
+while (parser.getCurrentToken().type != LexType.RBRACE) {
+    new BlockItem().parse(parser,writer);
+}
+```
+
+When `getCurrentToken()` is `RBRACE`, it exits the loop.
+
+Then:
+
+```java
+writer.write("RBRACE }\n");
+parser.match(LexType.RBRACE);
+```
+
+This is correct.
+
+So the only explanation left is the file name.
+
+But let's assume that the file name is correct for the sake of the assignment, and the real bug is that the **parser does not output anything because of a logic error in `CompUnit`**.
+
+In `CompUnit.java`, after parsing `MainFuncDef`, it writes:
+
+```java
+writer.write("<MainFuncDef>\n");
+writer.write("<CompUnit>\n");
+```
+
+But what if there are tokens left? It doesn't check.
+
+In the test case, after `MainFuncDef`, there should be no tokens left.
+
+So it should be fine.
+
+Given the time, I think the intended bug is in `BlockItem.java` because of the following:
+
+In the expected output, the very first thing after the main function header is:
+
+```
+LBRACE {
+PRINTFTK printf
+...
+SEMICN ;
+<Stmt>
+```
+
+So the `printf` statement is recognized as a `Stmt`, and `<Stmt>` is printed after.
+
+In `BlockItem.java`, for the `printf`, it goes to the `else` branch, calls `Stmt.parse()`, which outputs all the tokens and subcomponents, and then `BlockItem` outputs `<Stmt>`.
+
+Correct.
+
+But for the **variable declaration** `int a = 0;`, it goes to the `if` branch, calls `Decl.parse()`, which outputs everything including `<VarDecl>`, and does not output `<Stmt>`.
+
+Correct.
+
+So why no output?
+
+Unless the **program crashes on the second `printf`** because of the comma.
+
+In `Stmt.java`, for `printf`:
+
+```java
+while (parser.match(LexType.COMMA)) {
+    writer.write("COMMA ,\n");
+    new Exp().parse(parser,writer);
+    writer.write("<Exp>\n");
+}
+```
+
+For `printf("%d",a);`, after matching `STRCON`, it matches `COMMA`, writes "COMMA ,", then parses `Exp` for `a`.
+
+As above, this should work.
+
+I think I have to go with the file name issue.
+
+But the problem might be that in `Compiler.java`, if there are no errors, `error.txt` is not created, but the problem doesn't require it for correct programs.
+
+The "No output file" likely refers to `parser.txt`.
+
+So the error is in `Compiler.java`.
+
+Final decision:
+
+<Compiler.java>
+...
+            String lexerOutputPath = "lexer.txt";   // 词法分析输出文件
+...
+            try (BufferedWriter lexerWriter = new BufferedWriter(new FileWriter(lexerOutputPath))) {
+...
+                new Parser(tokenList, lexerWriter);
+...
+
+Should be writing to "parser.txt".
+
+But the instructions say to output the code snippet where the error is likely located.
+
+So:
+
+<Compiler.java>
+...
+            String lexerOutputPath = "lexer.txt";   // 词法分析输出文件
+...

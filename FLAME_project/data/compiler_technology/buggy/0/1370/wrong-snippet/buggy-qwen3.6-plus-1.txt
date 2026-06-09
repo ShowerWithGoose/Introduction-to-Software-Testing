@@ -1,0 +1,856 @@
+**Summary of Analysis:**
+
+1.  **Problem**: The lexical analyzer needs to detect error type `a` (individual `&` or `|`) and report the correct line number.
+2.  **Test Case**: The input code contains `if ('a' <= str[i] & str[i] <= 'z')` on **line 25**. The `&` here is a single ampersand, which is invalid in this grammar (should be `&&` for logical AND, or it's just a syntax error treated as lexical error `a` per the problem description "symbols '&' and '|' appearing individually").
+3.  **Expected Output**: `25 a`
+4.  **Actual Output**: `22 a`
+5.  **Discrepancy**: The program reports the error on line 22 instead of line 25. Line 22 is `void _to_upper(char str[]) {`.
+6.  **Root Cause**: In `Lexer.java`, when handling multi-line comments (`/* ... */`), the code increments `lineno` when it encounters a newline character `\n` inside the comment. However, look at the `GetChar.java` implementation:
+    ```java
+    line = line+'\n';
+    ll++;
+    ```
+    The `GetChar` appends a `\n` to the end of every line read.
+    
+    Now look at `Lexer.java`'s comment handling:
+    ```java
+    if(ch == '\n'){
+        lineno++;
+    }
+    ```
+    This logic seems correct for counting lines inside comments. Let's trace carefully.
+    
+    The issue likely lies in how `lineno` is managed relative to `getAChar`.
+    In `getATokenDear`:
+    ```java
+    if(ch == '\n'){//下一行了
+        this.lineno++;
+        ch = getChar.getAChar();
+        ...
+    }
+    ```
+    When a normal token processing finishes, if the next char is `\n`, `lineno` is incremented.
+    
+    Let's look at the specific error detection for `&`:
+    ```java
+    else if(ch == '&'){
+        String c = ""+ch;
+        ch = getChar.getAChar();
+        if(ch == null){
+            workOff();
+            return specialC(c);
+        }
+        if(ch == '&'){
+            c = c+'&';
+            return specialC(c);
+        }else{
+            sendError(ErrorType.a,lineno); // <--- Error reported here
+            getChar.unGetAChar();
+            return null;
+        }
+    }
+    ```
+    
+    Why is `lineno` 22 when it should be 25?
+    
+    Let's check the line counting logic again.
+    In `GetChar`, `ll` is length of line + 1 (for the added `\n`). `cc` goes from 0 to `ll-1`.
+    When `cc == ll`, it reads the next line.
+    
+    In `Lexer`, `lineno` starts at 1.
+    When `ch == '\n'`, `lineno` is incremented *before* reading the next character.
+    
+    Wait, look at `GetChar.getAChar()`:
+    ```java
+    public Character getAChar(){
+        Character ans;
+        if(cc == ll){
+            try {
+                line = br.readLine();
+                if(line == null){ ... }
+                ll = line.length();
+                cc = 0;
+                line = line+'\n';
+                ll++;
+            } ...
+        }
+        ans = line.charAt(cc);
+        cc++;
+        ...
+    }
+    ```
+    
+    If the file has empty lines or specific structures, does `lineno` drift?
+    
+    Let's look at the comment skipping logic in `Lexer.java` again:
+    ```java
+    else if(ch == '*'){
+        boolean flag1 = false;
+        while(true){
+            ch = getChar.getAChar();
+            if(ch == null){ ... }
+            if(ch == '\n'){
+                lineno++;
+            }
+            ...
+        }
+        return null;
+    }
+    ```
+    This looks okay.
+    
+    However, there is a subtle bug in how `lineno` is updated in the main loop vs inside comments.
+    
+    Actually, let's look at the test case input again.
+    Line 22: `void _to_upper(char str[]) {`
+    Line 23: `    int i,len = _strlen(str);`
+    Line 24: `    for (i = 0;i < len;i = i + 1) {`
+    Line 25: `        if ('a' <= str[i] & str[i] <= 'z')`
+    
+    The error is at line 25. The output is 22. This suggests `lineno` is stuck or not incrementing for lines 23, 24, 25? Or maybe it incremented too early?
+    
+    If `lineno` was 22 when processing line 22, it should become 23 when hitting the newline at the end of line 22.
+    
+    Let's trace `getATokenDear` for a standard line.
+    1. Read chars for `void`.
+    2. Read space.
+    3. Read `_to_upper`.
+    4. ...
+    5. Read `{`.
+    6. Next char is `\n` (appended by GetChar).
+    7. Loop continues. `getATokenDear` is called again? No, `lexer()` calls `getATokenDear` in a loop.
+    
+    Inside `getATokenDear`:
+    ```java
+    ch = getChar.getAChar(); // Gets first char of next token
+    ...
+    if(ch == '\n'){
+        this.lineno++;
+        ch = getChar.getAChar();
+        ...
+    }
+    ```
+    
+    If the previous token ended exactly before `\n`, the next call to `getATokenDear` will read `\n`.
+    Then `lineno` becomes `lineno + 1`.
+    Then it reads the first char of the next line.
+    
+    So, when we are processing tokens on Line 25, `lineno` should have been incremented to 25 when the `\n` at the end of Line 24 was processed.
+    
+    Why would it be 22?
+    
+    Is it possible that `lineno` is not being incremented correctly because of the way `GetChar` handles the end of file or empty lines?
+    
+    Let's look closely at `GetChar`.
+    `line = line + '\n';`
+    
+    If a line is empty, `br.readLine()` returns `""`.
+    `ll = 0`.
+    `line = "\n"`.
+    `ll = 1`.
+    `cc = 0`.
+    `ans = '\n'`.
+    `cc = 1`.
+    Next call: `cc == ll` (1 == 1). Reads next line.
+    
+    This seems fine.
+    
+    Let's look at the `&` handling again.
+    ```java
+    else if(ch == '&'){
+        ...
+        sendError(ErrorType.a,lineno);
+        ...
+    }
+    ```
+    
+    If the output is 22, it means `lineno` is 22 when this block is executed.
+    This implies that the lexer thinks it is still on line 22.
+    
+    This usually happens if newlines were consumed but `lineno` wasn't incremented, OR if `lineno` was reset, OR if the newlines were part of a comment/string where logic differs.
+    
+    Lines 22-25 do not contain comments or strings spanning multiple lines.
+    
+    Wait! Look at `GetChar` again.
+    
+    ```java
+    public Character getAChar(){
+        Character ans;
+        if(cc == ll){
+            try {
+                line = br.readLine();
+                if(line == null){
+                    br.close();
+                    return null;
+                }
+                ll = line.length();
+                cc = 0;
+                line = line+'\n';
+                ll++;
+                //System.out.println("GetChar Error:the last char of line is not '\n' \n");
+
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+        ans = line.charAt(cc);
+        cc++;
+        if(ans!=null){
+            return ans;
+        }
+        return null;
+    }
+    ```
+    
+    And `Lexer`:
+    ```java
+    if(ch == '\n'){//下一行了
+        this.lineno++;
+        ch = getChar.getAChar();
+        if(ch == null){
+            workOff();
+            return null;
+        }
+    }
+    ```
+    
+    There is a potential issue here. If `getATokenDear` is called, and the *first* character it reads is `\n`, it increments `lineno` and reads the *next* character.
+    
+    However, what if the previous token consumption left `ch` as something else, and the loop in `lexer()` calls `getATokenDear` again?
+    
+    Let's trace the end of Line 22: `void _to_upper(char str[]) {`
+    The last token is `{`.
+    `specialC("{")` is returned.
+    The `ch` variable in `Lexer` currently holds the character *after* `{`.
+    In `specialC`, `ch` is NOT updated. It remains whatever it was after reading `{`.
+    
+    Wait, `specialC` doesn't read ahead.
+    Let's look at `getATokenDear` flow for `{`:
+    1. `ch` is `{` (read at start of method or previous iteration).
+    2. Goes to `else` branch (since `{` is not letter, digit, etc., handled by specific checks? No, `{` is not explicitly checked in `if/else if` chain except the final `else`).
+    
+    Let's check the `if/else` chain in `getATokenDear`:
+    - `isLetter`? No.
+    - `isDigit`? No.
+    - `/`? No.
+    - `'`? No.
+    - `"`? No.
+    - `< > = !`? No.
+    - `&`? No.
+    - `|`? No.
+    - `else`: `return specialC(""+ch);`
+    
+    So for `{`, it calls `specialC`.
+    Crucially, `getATokenDear` returns. The `ch` member variable still holds `{`?
+    No, `ch` was set at the beginning of `getATokenDear`: `ch = getChar.getAChar();`.
+    So `ch` is `{`.
+    
+    The next time `getATokenDear` is called:
+    1. `ch = getChar.getAChar();` -> This reads the character AFTER `{`.
+    2. If the source is `{\n`, the next char is `\n`.
+    3. Code checks `while(ch == ' '|| ch == '\0')`. `\n` is not space or null.
+    4. Code checks `if(ch == '\n')`. Yes.
+    5. `lineno++`. (Now `lineno` is 23).
+    6. `ch = getChar.getAChar();` (Reads first char of line 23).
+    
+    This logic seems correct for advancing lines.
+    
+    So why is it 22?
+    
+    Is it possible that `lineno` is initialized to 1, and the first line is processed as line 1? Yes.
+    
+    Let's look at the `sendError` call again.
+    `sendError(ErrorType.a, lineno);`
+    
+    If the output is 22, `lineno` is 22.
+    
+    Could the error be in `GetChar`?
+    
+    What if `br.readLine()` strips the newline? Yes, it does.
+    Then `line = line + '\n'`.
+    
+    Is it possible that the file `testfile.txt` has Windows line endings `\r\n`?
+    If `br.readLine()` reads a line ending in `\r\n`, it returns the string without `\r\n`.
+    Then `line = line + '\n'`.
+    The `\r` is gone.
+    
+    If the file has `\r\n`, `readLine` removes both.
+    
+    What if the issue is simpler?
+    
+    Look at `Lexer.java` line 22 in the provided snippet? No, line numbers in snippet don't match runtime.
+    
+    Let's look at the `&` handling block again.
+    
+    ```java
+    else if(ch == '&'){
+        String c = ""+ch;
+        ch = getChar.getAChar();
+        if(ch == null){
+            workOff();
+            return specialC(c);
+        }
+        if(ch == '&'){
+            c = c+'&';
+            return specialC(c);
+        }else{
+            sendError(ErrorType.a,lineno);
+            getChar.unGetAChar();
+            return null;
+        }
+    }
+    ```
+    
+    When `&` is read, `ch` is `&`. `lineno` is current line.
+    Then `ch = getChar.getAChar()`.
+    If the next char is NOT `&`, it sends error with current `lineno`.
+    
+    In the test case: `if ('a' <= str[i] & str[i] <= 'z')`
+    The `&` is followed by a space ` `.
+    So `ch` becomes ` `.
+    It sends error.
+    
+    At this point, `lineno` MUST be 25.
+    
+    If `lineno` is 22, it means `lineno` failed to increment for lines 23, 24, and 25's start.
+    
+    Why would `lineno` fail to increment?
+    
+    Check the `if(ch == '\n')` block again.
+    
+    ```java
+    if(ch == '\n'){//下一行了
+        this.lineno++;
+        ch = getChar.getAChar();
+        if(ch == null){
+            workOff();
+            return null;
+        }
+    }
+    ```
+    
+    This block is ONLY entered if `ch` is `\n` at the start of `getATokenDear` (after skipping spaces/nulls? No, BEFORE skipping spaces/nulls?
+    
+    ```java
+    public Token getATokenDear(){
+        ch = getChar.getAChar();
+        if(ch == null){//文件结束了吗
+           workOff();
+           return null;
+        }
+        while(ch == ' '|| ch == '\0'){//跳过不想要的字符
+            ch = getChar.getAChar();
+            if(ch == null){
+                workOff();
+                return null;
+            }
+        }
+        if(ch == '\n'){//下一行了
+            this.lineno++;
+            ch = getChar.getAChar();
+            if(ch == null){
+                workOff();
+                return null;
+            }
+        }
+        // ... rest of logic
+    }
+    ```
+    
+    Ah! The `while` loop skips spaces `' '` and nulls `'\0'`. It does **NOT** skip newlines `'\n'`.
+    So if `ch` is `\n`, it falls through to `if(ch == '\n')`.
+    
+    This logic seems robust for standard cases.
+    
+    Is it possible that `lineno` is not being initialized or updated correctly in `GetChar`? No, `lineno` is in `Lexer`.
+    
+    Let's look at `GetChar.unGetAChar()`.
+    ```java
+    public void unGetAChar(){
+        if(cc>0){
+            cc--;
+            return;
+        }
+        System.out.println("GetChar Error:You Want to be back to the last line!\n");
+    }
+    ```
+    
+    If `unGetAChar` is called, `cc` decreases. The next `getAChar` will return the same character again.
+    
+    Does `unGetAChar` affect `lineno`? No.
+    
+    However, consider the scenario where `unGetAChar` is called on a newline?
+    
+    In the `&` error case:
+    1. `ch` is `&`.
+    2. `ch = getChar.getAChar()` -> ` ` (space).
+    3. Error detected.
+    4. `getChar.unGetAChar()` -> `cc` moves back. Next read will be ` ` again.
+    5. Returns `null`.
+    
+    The `lexer()` loop continues.
+    Next `getATokenDear`:
+    1. `ch = getChar.getAChar()` -> ` ` (space).
+    2. `while(ch == ' ')` -> skips space.
+    3. `ch = getChar.getAChar()` -> `s` (from `str`).
+    4. Processes `str`.
+    
+    This doesn't explain the line number drift.
+    
+    Let's look at the `lineno` initialization.
+    `private int lineno = 1;`
+    
+    If the file starts with line 1.
+    
+    Is it possible that the `testfile.txt` has fewer lines than expected?
+    The input shows lines 1-30+.
+    
+    Let's look at the `WriteIntoF` usage.
+    `writeToFile(false, errorm)` appends to `error.txt`.
+    
+    Wait, look at `Compiler.java`.
+    `Lexer lexer = new Lexer("testfile.txt");`
+    `lexer.lexer();`
+    
+    If `WriteIntoF` is a singleton, and files are opened in append mode (`true` in `FileWriter`), previous runs might contaminate? But usually tests run in clean environments.
+    
+    Let's reconsider the `lineno` update logic.
+    
+    What if the error is in `GetChar` regarding `ll` and `cc`?
+    
+    If `line` is empty?
+    
+    Actually, there is a known issue with `BufferedReader.readLine()` and line separators.
+    
+    But the most suspicious part is the discrepancy of exactly 3 lines (25 - 22 = 3).
+    
+    Lines 22, 23, 24, 25.
+    
+    If `lineno` is 22 when processing line 25, it missed increments for 23, 24, 25?
+    
+    Or did it miss increments for 22, 23, 24?
+    
+    If `lineno` is 22 at the start of line 22, it becomes 23 at start of line 23.
+    
+    If the output is 22, it means `lineno` is 22.
+    
+    Could it be that `lineno` is initialized to 0? No, it's 1.
+    
+    Let's look at the `if(ch == '\n')` block again.
+    
+    ```java
+    if(ch == '\n'){//下一行了
+        this.lineno++;
+        ch = getChar.getAChar();
+        ...
+    }
+    ```
+    
+    If this block is skipped, `lineno` won't increment.
+    
+    When would it be skipped?
+    If `ch` is not `\n`.
+    
+    But `GetChar` appends `\n` to every line.
+    
+    Unless... `ch` is consumed elsewhere?
+    
+    Look at the `while(ch == ' '|| ch == '\0')` loop.
+    It skips spaces.
+    
+    What if there are trailing spaces before the newline?
+    `line = "int i;   \n"`
+    `getAChar` returns `i`, `n`, `t`, ` `, `i`, `;`, ` `, ` `, ` `, `\n`.
+    
+    1. `ch` is ` `. Skipped.
+    2. `ch` is `\n`.
+    3. `if(ch == '\n')` -> True. `lineno++`.
+    
+    This works.
+    
+    Is it possible that `lineno` is being printed incorrectly?
+    `sendError` uses `lineno`.
+    
+    Let's look at the `Token` creation.
+    `new Token(..., lineno)`
+    
+    The error is definitely in `Lexer.java`.
+    
+    There is one subtle bug in many lexers:
+    If `unGetAChar` is called, and then `getAChar` is called, the state is restored.
+    
+    However, `lineno` is NOT restored by `unGetAChar`.
+    
+    If `unGetAChar` "ungets" a newline, `lineno` has already been incremented.
+    
+    Example:
+    1. `ch` is `\n`.
+    2. `lineno++` (now 23).
+    3. `ch = getChar.getAChar()` (reads first char of line 23).
+    4. Suppose this char leads to an error or backtracking?
+    
+    In the `&` case, we don't backtrack over newlines.
+    
+    Let's look at the `|` case. Same logic.
+    
+    Let's look at the `< > = !` case.
+    
+    ```java
+    else if(ch == '<' || ch == '>' ||ch == '=' || ch == '!'){
+        String c = ""+ch;
+        ch = getChar.getAChar();
+        if(ch == null){ ... }
+        if(ch == '='){
+            c = c+'=';
+            return specialC(c);
+        }else{
+            getChar.unGetAChar();
+            return specialC(c);
+        }
+    }
+    ```
+    
+    If `ch` was `<` and next is ` ` (space).
+    `unGetAChar` puts ` ` back.
+    
+    This doesn't affect `lineno`.
+    
+    **Hypothesis:**
+    
+    The issue might be related to how `lineno` is initialized or how the first line is counted.
+    
+    If `lineno` starts at 1.
+    Line 1 is read. `lineno` is 1.
+    End of Line 1: `\n` encountered. `lineno` becomes 2.
+    Line 2 is read. `lineno` is 2.
+    
+    This is standard.
+    
+    Why 22 vs 25?
+    
+    Let's count the lines in the input provided in the prompt.
+    
+    1: `int _strlen(char str[]) {`
+    2: `    int i;`
+    3: `    for (i = 0;str[i] != 0;i = i + 1) ;`
+    4: `    return i;`
+    5: `}`
+    6: ``
+    7: `void _strcat(char str1[],char str2[]) {`
+    8: `    int i,len1 = _strlen(str1),len2 = _strlen(str2);`
+    9: `    for (i = 0;i < len2 + 1;i = i + 1) {`
+    10: `        str1[i + len1] = str2[i];`
+    11: `    }`
+    12: `}`
+    13: ``
+    14: `void _print_str(char str[]) {`
+    15: `    int i,len = _strlen(str);`
+    16: `    for (i = 0;i < len;i = i + 1) {`
+    17: `        printf("%c",str[i]);`
+    18: `    }`
+    19: `    printf("\n");`
+    20: `}`
+    21: ``
+    22: `void _to_upper(char str[]) {`
+    23: `    int i,len = _strlen(str);`
+    24: `    for (i = 0;i < len;i = i + 1) {`
+    25: `        if ('a' <= str[i] & str[i] <= 'z')`
+    26: `            str[i] = str[i] - 'a' + 'A';`
+    27: `    }`
+    28: `}`
+    
+    The error is on line 25.
+    The output is 22.
+    
+    Line 22 is `void _to_upper(char str[]) {`.
+    
+    It seems `lineno` stopped updating after line 22?
+    Or `lineno` was 22 when it should have been 25.
+    
+    If `lineno` is 22 at line 22, it should be 23 at line 23, 24 at line 24, 25 at line 25.
+    
+    If it reports 22, it means `lineno` is 22.
+    
+    This implies `lineno` did NOT increment for lines 23, 24, 25.
+    
+    Why?
+    
+    Look at `GetChar` again.
+    
+    ```java
+    line = line+'\n';
+    ll++;
+    ```
+    
+    If `line` contains `\r`?
+    
+    If the input file has `\r\n` (Windows), `readLine` strips `\r\n`.
+    `line` is content.
+    `line + '\n'` adds `\n`.
+    
+    This is fine.
+    
+    **Wait!**
+    
+    Look at `Lexer.java` line 105-115 (Comment handling).
+    
+    ```java
+    else if(ch == '*'){
+        boolean flag1 = false;
+        while(true){
+            ch = getChar.getAChar();
+            if(ch == null){
+                workOff();
+                return null;
+            }
+            if(ch == '\n'){
+                lineno++;
+            }
+            if(flag1){
+                if(ch == '/'){
+                    break;
+                }else{
+                    flag1 = false;
+                }
+            }
+            if(ch == '*'){
+                flag1 = true;
+            }
+        }
+        return null;
+    }
+    ```
+    
+    This handles `/* ... */`.
+    
+    The test case does NOT have multi-line comments.
+    
+    However, look at `getATokenDear` structure.
+    
+    If `ch` is `/`, it checks for `//` or `/*`.
+    
+    If it's `//`, it consumes until `\n`.
+    ```java
+    if(ch == '/'){
+        while(ch!='\n'){
+            ch = getChar.getAChar();
+            if(ch == null){
+                workOff();
+                return null;
+            }
+        }
+        getChar.unGetAChar();
+        return null;
+    }
+    ```
+    
+    Note: It consumes `\n`?
+    `while(ch!='\n')` stops when `ch` IS `\n`.
+    So `ch` is `\n`.
+    Then `unGetAChar()`.
+    Then `return null`.
+    
+    Next `getATokenDear`:
+    1. `ch = getChar.getAChar()` -> `\n`.
+    2. `if(ch == '\n')` -> `lineno++`.
+    
+    This is correct.
+    
+    **Is it possible that `lineno` is not thread-safe or static?**
+    `private int lineno = 1;` Instance variable.
+    
+    **Let's check the `sendError` method.**
+    
+    ```java
+    public void sendError(ErrorType errorType,int errorline){
+        String errorm = "" + errorline + ' ' +errorType.toString() +  '\n';
+        WriteIntoF.getInstance().writeToFile(false,errorm);
+    }
+    ```
+    
+    It writes `errorline`.
+    
+    **Conclusion:**
+    
+    The logic for `lineno` increment seems correct for standard cases.
+    
+    However, there is a very common bug in these assignments:
+    
+    **The `lineno` is incremented when `\n` is READ, but the token is associated with the line it STARTS on.**
+    
+    In `getATokenDear`:
+    1. `ch = getChar.getAChar()`
+    2. If `ch == '\n'`, `lineno++`, read next.
+    
+    So when we start processing a token on Line N, `lineno` is N.
+    
+    When we encounter `&` on Line 25, `lineno` should be 25.
+    
+    If it is 22, then `lineno` is wrong.
+    
+    I suspect the issue is in `GetChar` or how `lineno` interacts with `unGetAChar` in a way I missed, OR `lineno` is simply not incrementing because the condition `ch == '\n'` is failing.
+    
+    Why would `ch == '\n'` fail?
+    
+    If `GetChar` returns `\r` instead of `\n`?
+    
+    If the file is Unix, it's `\n`.
+    If the file is Windows, `readLine` strips `\r\n`. We add `\n`.
+    
+    What if the file is Mac (old)? `\r`.
+    `readLine` might behave differently?
+    
+    Assuming standard environment.
+    
+    Let's look at the `Lexer.java` code provided in the prompt again.
+    
+    Is it possible that `lineno` is defined as `static`?
+    `private int lineno = 1;` No.
+    
+    **Wait, I see a potential issue in `GetChar`**:
+    
+    ```java
+    public Character getAChar(){
+        Character ans;
+        if(cc == ll){
+            try {
+                line = br.readLine();
+                if(line == null){
+                    br.close();
+                    return null;
+                }
+                ll = line.length();
+                cc = 0;
+                line = line+'\n';
+                ll++;
+                //System.out.println("GetChar Error:the last char of line is not '\n' \n");
+
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+        ans = line.charAt(cc);
+        cc++;
+        if(ans!=null){
+            return ans;
+        }
+        return null;
+    }
+    ```
+    
+    If `line` is empty (blank line in source), `br.readLine()` returns `""`.
+    `ll = 0`.
+    `line = "\n"`.
+    `ll = 1`.
+    `cc = 0`.
+    `ans = '\n'`.
+    `cc = 1`.
+    
+    Next call: `cc == ll` (1 == 1). Reads next line.
+    
+    This handles blank lines correctly.
+    
+    **Final Check:**
+    
+    Is it possible that the `lineno` variable in `Lexer` is shadowed or not the one being used?
+    No.
+    
+    Is it possible that `sendError` is called with a stale `lineno`?
+    
+    In the `&` block:
+    `sendError(ErrorType.a,lineno);`
+    
+    `lineno` is the instance variable.
+    
+    If the output is 22, `lineno` is 22.
+    
+    The only explanation is that `lineno` failed to increment 3 times.
+    
+    This happens if the newlines at the end of lines 22, 23, 24 were NOT processed by the `if(ch == '\n')` block.
+    
+    Why?
+    
+    Maybe they were consumed by the `while(ch == ' '|| ch == '\0')` loop?
+    No, `\n` is not `' '` or `'\0'`.
+    
+    Maybe they were consumed by `getATokenDear` returning `null` or something?
+    
+    If `getATokenDear` returns `null` (e.g. comment), the loop continues.
+    
+    But lines 22-24 are code.
+    
+    **I will bet on the `lineno` initialization or the `GetChar` newline handling being slightly off in a way that causes `lineno` to lag.**
+    
+    Actually, looking at similar bugs online:
+    
+    If `lineno` is incremented ONLY when `\n` is the FIRST character read in `getATokenDear`, but what if a token spans across lines? (Impossible in this grammar).
+    
+    What if the error is that `lineno` is incremented AFTER reading the newline, but the token on the NEXT line uses the OLD `lineno`?
+    
+    No:
+    ```java
+    if(ch == '\n'){
+        this.lineno++; // Incremented
+        ch = getChar.getAChar(); // Read first char of new line
+    }
+    // Process token with new lineno
+    ```
+    
+    This is correct.
+    
+    **However**, if `lineno` is 22, and it should be 25.
+    
+    I will highlight the `lineno` usage in `Lexer.java`.
+
+<Lexer.java>
+...
+    private int lineno = 1;
+
+    private boolean workDone = false;
+...
+        if(ch == '\n'){//下一行了
+            this.lineno++;
+            ch = getChar.getAChar();
+            if(ch == null){
+                workOff();
+                return null;
+            }
+        }
+...
+        else if(ch == '&'){
+            String c = ""+ch;
+            ch = getChar.getAChar();
+            if(ch == null){
+                workOff();
+                return specialC(c);
+            }
+            if(ch == '&'){
+                c = c+'&';
+                return specialC(c);
+            }else{
+                sendError(ErrorType.a,lineno);
+                getChar.unGetAChar();
+                return null;
+            }
+        }else if(ch == '|'){
+            String c = ""+ch;
+            ch = getChar.getAChar();
+            if(ch == null){
+                workOff();
+                return specialC(c);
+            }
+            if(ch == '|'){
+                c = c+'|';
+                return specialC(c);
+            }else{
+                sendError(ErrorType.a,lineno);
+                getChar.unGetAChar();
+                return null;
+            }
+        }else{
+            return specialC(""+ch);
+        }
+
+
+    }
+...

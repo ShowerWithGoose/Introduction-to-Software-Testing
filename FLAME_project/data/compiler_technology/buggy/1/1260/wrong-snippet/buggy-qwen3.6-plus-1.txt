@@ -1,0 +1,824 @@
+Based on the problem description and the provided code, the issue is that the program produces **no output file** (`parser.txt` or `error.txt`) for a valid input.
+
+Looking at `Compiler.java`:
+1. It creates a `Lexer` and calls `lexer.analyzeByLine(fr)`.
+2. It creates a `Parser` and calls `parser.parse()`.
+3. It checks `if(Error.errors.isEmpty())`. If true, it calls `parser.print()`. If false, it writes to `error.txt`.
+
+The `Parser.print()` method calls `compUnitNode.print()`. The `print()` methods in the node classes (e.g., `CompUnitNode`, `MainFuncDefNode`, etc.) write to `parser.txt` using `FileWriter`.
+
+However, there is a critical logic error in how the `Lexer` handles the end of the file or potentially how tokens are generated if the file ends without a newline or specific character, but more importantly, let's look at the `CompUnit` parsing logic in `Parser.java`.
+
+In `Parser.java`, the `CompUnit` method has this loop:
+```java
+while (lexer.tokenList.get(pos + 1).getType() != Token.LexType.MAINTK && lexer.tokenList.get(pos + 2).getType() != Token.LexType.LPARENT) {
+    DeclNode declNode = Decl();
+    declNodes.add(declNode);
+}
+```
+This loop condition accesses `pos + 1` and `pos + 2`. If the token list is small or `pos` is near the end, this will throw an `IndexOutOfBoundsException`. However, the problem states "No output file", which usually implies an exception occurred before any file writing completed, or the logic prevented entry into the printing block.
+
+Let's look closer at `Compiler.java`.
+```java
+try (FileReader fr = new FileReader(fileName)){
+    lexer.analyzeByLine(fr);
+    Parser parser = new Parser(lexer);
+    parser.parse();
+    if(Error.errors.isEmpty()){
+        parser.print();
+    }else {
+        // ... write error.txt
+    }
+} catch (IOException e) {
+    throw new RuntimeException(e);
+}
+```
+If `parser.parse()` throws an uncaught exception (like `IndexOutOfBoundsException` from the lookahead in `CompUnit` or `RuntimeException` from `match`), the execution jumps to the `catch` block? No, `parse()` doesn't declare checked exceptions other than what might be thrown by underlying IO if it did any (it doesn't). But `match` throws `RuntimeException`. If `parse()` crashes, `parser.print()` is never called, and `error.txt` is only written if `Error.errors` is not empty. If `parse()` crashes due to a bug (not a detected syntax error added to `Error.errors`), then neither file is written.
+
+The specific bug is likely in the `CompUnit` method's lookahead logic which is unsafe.
+```java
+while (lexer.tokenList.get(pos + 1).getType() != Token.LexType.MAINTK && lexer.tokenList.get(pos + 2).getType() != Token.LexType.LPARENT) {
+```
+If the input is just `int main() { ... }`, `pos` starts at 0. `tokenList.get(1)` is `MAINTK`. The condition `lexer.tokenList.get(pos + 1).getType() != Token.LexType.MAINTK` is false. So the loop doesn't execute. This seems fine for this specific case.
+
+Let's look at the `Stmt` method in `Parser.java`.
+The input contains `printf("21373119");`.
+The `Stmt` method checks for `PRINTFTK`.
+```java
+} else if (currentToken.getType() == Token.LexType.PRINTFTK) {
+    Token printfToken = match(Token.LexType.PRINTFTK);
+    Token lParentToken = match(Token.LexType.LPARENT);
+    Token strConToken = match(Token.LexType.STRCON);
+    // ...
+```
+This looks correct.
+
+Let's look at `VarDecl` and `VarDef`.
+Input: `int a = 0;`
+`VarDecl` calls `BType()` (consumes `int`), then `VarDef()`.
+`VarDef` consumes `a`, sees `=`, consumes `=`, calls `InitVal()`.
+`InitVal` sees `0` (INTCON), goes to `else { expNode = Exp(); }`.
+`Exp` -> `AddExp` -> `MulExp` -> `UnaryExp` -> `PrimaryExp`.
+`PrimaryExp` sees `INTCON`, calls `Number()`.
+`Number` matches `INTCON`.
+Returns up the chain.
+`VarDef` returns.
+`VarDecl` matches `SEMICN`.
+This seems correct.
+
+Wait, look at `Compiler.java` again.
+```java
+public static void main(String [] args) throws FileNotFoundException {
+    String fileName = "src/main/testfile.txt";
+    Lexer lexer = new Lexer();
+
+    try (FileReader fr = new FileReader(fileName)){
+        lexer.analyzeByLine(fr);
+        Parser parser = new Parser(lexer);
+        parser.parse();
+        if(Error.errors.isEmpty()){
+            parser.print();
+        }else {
+             // ...
+        }
+    } catch (IOException e) {
+        throw new RuntimeException(e);
+    }
+}
+```
+If `parser.parse()` throws a `RuntimeException` (e.g. from `match` or index out of bounds), it is NOT caught by the `catch (IOException e)` block. It propagates up. Since `main` declares `throws FileNotFoundException`, a `RuntimeException` will terminate the program abruptly without writing any files.
+
+The likely cause of the crash is the unsafe lookahead in `CompUnit`:
+```java
+while (lexer.tokenList.get(pos + 1).getType() != Token.LexType.MAINTK && lexer.tokenList.get(pos + 2).getType() != Token.LexType.LPARENT) {
+```
+If the program has no declarations and starts with `int main...`, `pos` is 0.
+`tokenList.get(1)` is `MAINTK`.
+Condition: `MAINTK != MAINTK` is `false`. Loop terminates. Safe.
+
+What if there is a declaration?
+`int a = 0; int main() {}`
+Tokens: `INTTK`, `IDENFR`, `ASSIGN`, `INTCON`, `SEMICN`, `INTTK`, `MAINTK`...
+Pos 0: `INTTK`.
+Lookahead: `pos+1` is `IDENFR`. `pos+2` is `ASSIGN`.
+Condition: `IDENFR != MAINTK` (True) AND `ASSIGN != LPARENT` (True). Loop enters.
+`Decl()` is called. Parses `int a = 0;`. Pos is now at `SEMICN`'s next token, which is `INTTK` (for main).
+Loop check again:
+Pos is at `INTTK` (index 5).
+`pos+1` is `MAINTK` (index 6).
+Condition: `MAINTK != MAINTK` is `false`. Loop terminates.
+Safe.
+
+Is there an issue with `BlockItem`?
+```java
+private BlockItemNode BlockItem() {
+    DeclNode declNode = null;
+    StmtNode stmtNode = null;
+    if(currentToken.getType() == Token.LexType.CONSTTK || currentToken.getType() == Token.LexType.INTTK || currentToken.getType() == Token.LexType.CHARTK){
+        declNode = Decl();
+    } else {
+        stmtNode = Stmt();
+    }
+    return new BlockItemNode(declNode, stmtNode);
+}
+```
+Inside the block `{ int a = 1; printf... }`.
+Current token `INTTK`. Calls `Decl()`.
+`Decl()` calls `VarDecl()`.
+`VarDecl()` parses `int a = 1;`.
+Next token is `PRINTFTK`.
+Back in `Block`, loop continues.
+`BlockItem()` called. Current token `PRINTFTK`.
+Goes to `else`, calls `Stmt()`.
+`Stmt()` handles `PRINTF`.
+
+There is a subtle bug in `Stmt` handling `LVal` vs `Exp`.
+```java
+} else {
+    boolean flag = false;
+    for(int i = pos+1;true;++i){
+        if(lexer.tokenList.get(i).getType() == Token.LexType.ASSIGN){
+            flag = true;
+            break;
+        }
+        if(lexer.tokenList.get(i).lineNum != currentToken.lineNum){
+            break;
+        }
+    }
+    if(flag){
+        // LVal assignment
+    } else {
+        // Exp statement
+    }
+}
+```
+This loop `for(int i = pos+1;true;++i)` can go out of bounds if `ASSIGN` is not found and line number doesn't change (e.g. last token on line). `lexer.tokenList.get(i)` will throw `IndexOutOfBoundsException`.
+
+In the test case:
+`printf("21373119");`
+Handled by `PRINTFTK` branch.
+
+`return 0;`
+Handled by `RETURNTK` branch.
+
+What about `int a = 0;`?
+Handled by `Decl` branch in `BlockItem`.
+
+Is it possible the error is in `Lexer`?
+If `Lexer` fails to tokenize correctly, `Parser` might crash.
+The `Lexer` reads char by char.
+`int main() {`
+`int` -> IDENFR? No, `fromTypeName` checks against keywords. `int` matches `INTTK`.
+`main` -> `MAINTK`.
+`(` -> `LPARENT`.
+`)` -> `RPARENT`.
+`{` -> `LBRACE`.
+
+Let's look at `Token.fromTypeName`.
+```java
+public static LexType fromTypeName(String typeName) {
+    for (LexType type : LexType.values()) {
+        if (type.getName().equals(typeName)) {
+            return type;
+        }
+    }
+    return IDENFR;
+}
+```
+`LexType` enum names: `MAINTK("main")`, `INTTK("int")`.
+This works.
+
+However, there is a known issue in `CompUnit` lookahead if the list ends.
+If the input was empty or malformed such that `pos+1` or `pos+2` doesn't exist.
+But here input is valid.
+
+Let's look at `Error.java`.
+`public static List<Error> errors = new ArrayList<>();`
+If `parse()` throws an exception, `errors` might remain empty.
+In `Compiler.java`:
+```java
+    } catch (IOException e) {
+        throw new RuntimeException(e);
+    }
+```
+If `parser.parse()` throws `IndexOutOfBoundsException` (unchecked), it is NOT caught. The program terminates. No file is written. This matches "No output file".
+
+Where would `IndexOutOfBoundsException` occur?
+1. `CompUnit` lookahead: `lexer.tokenList.get(pos + 1)` or `pos + 2`.
+2. `Stmt` lookahead loop: `lexer.tokenList.get(i)`.
+
+In `Stmt`:
+```java
+    for(int i = pos+1;true;++i){
+        if(lexer.tokenList.get(i).getType() == Token.LexType.ASSIGN){
+// ...
+```
+If we have a statement like `a;` (just an identifier and semicolon).
+`pos` is at `a` (IDENFR).
+`i` starts at `pos+1` (SEMICN).
+`get(i)` is SEMICN. Not ASSIGN.
+Line num check: `get(i).lineNum` vs `currentToken.lineNum`. Same line.
+Loop continues. `i` becomes `pos+2`.
+If `pos+2` is out of bounds (end of file or end of list), `get(i)` throws Exception.
+
+Although the test case doesn't seem to have such a statement, `printf` arguments involve `Exp`.
+`printf("%d", a);`
+Inside `Stmt` for printf, it doesn't go to the `else` block.
+
+What about `return 0;`?
+Handled by `RETURNTK`.
+
+What about `int a = 0;`?
+Handled by `Decl`.
+
+Is there any path where `Stmt`'s `else` block is executed in this test case?
+The statements are:
+1. `printf("21373119");` -> PRINTFTK branch.
+2. `int a = 0;` -> Decl branch (in BlockItem).
+3. `{ ... }` -> LBRACE branch (Block).
+   Inside block:
+   4. `int a = 1;` -> Decl branch.
+   5. `printf("%d", a);` -> PRINTFTK branch.
+6. `return 0;` -> RETURNTK branch.
+
+So the buggy `else` block in `Stmt` is NOT executed for this specific test case.
+
+Let's re-examine `CompUnit`.
+```java
+    while (lexer.tokenList.get(pos + 1).getType() != Token.LexType.MAINTK && lexer.tokenList.get(pos + 2).getType() != Token.LexType.LPARENT) {
+```
+If the source code has NO declarations and NO function definitions before main, `pos` is 0.
+`tokenList`: `[INTTK, MAINTK, LPARENT, ...]`
+`pos=0`. `pos+1=1` (MAINTK). `pos+2=2` (LPARENT).
+`get(1).getType() != MAINTK` -> False.
+Short-circuit AND. Condition is False. Loop doesn't run.
+Safe.
+
+What if there is a syntax error that causes `match` to throw `RuntimeException`?
+The problem says "For a correct source program...". The input IS correct.
+So `parse()` SHOULD succeed.
+
+If `parse()` succeeds, `parser.print()` is called.
+`parser.print()` calls `compUnitNode.print()`.
+This recursively prints nodes.
+Each node's `print()` method opens a `FileWriter` in append mode (`true`).
+```java
+try (FileWriter fw = new FileWriter("parser.txt", true)){
+    fw.write(...);
+}
+```
+Opening and closing a file for EVERY node is inefficient but should work.
+
+Is it possible `compUnitNode` is null?
+`compUnitNode = CompUnit();`
+If `CompUnit()` throws an exception, `compUnitNode` remains null (default).
+Then `parser.print()` calls `compUnitNode.print()`, causing `NullPointerException`.
+This exception is uncaught in `main`. Program crashes. No output.
+
+So, does `CompUnit()` throw an exception?
+Or does `parse()` throw an exception?
+
+Let's look at `Lexer.analyzeByLine`.
+It reads characters.
+Does it handle the end of file correctly?
+```java
+        chr = br.read();
+        char ch = (char) chr;
+        while(chr != -1){
+           // ...
+           // inside loops, it reads next char.
+           // if chr becomes -1, ch becomes 65535 (char cast of -1).
+           // The loops check `chr != -1` mostly?
+           // In identifier loop:
+           while((ch >='a' ...)){
+               // ...
+               chr = br.read();
+               ch = (char) chr;
+           }
+           // If EOF reached inside, chr is -1. Loop condition fails if ch is not alphanumeric.
+           // Token is added.
+           // Outer loop checks `chr != -1`.
+           // If chr is -1, outer loop terminates.
+```
+This seems okay.
+
+However, there is a potential issue in `Lexer` with the `else if` chain.
+If a character is not handled by any `if/else if`, it is ignored?
+No, the last `else if` handles punctuation.
+What about newlines? Handled.
+Whitespace? Handled.
+
+Let's look at `Token` creation for identifiers.
+```java
+            }else if((ch >='a' && ch <='z') || (ch >='A' && ch <='Z') || ch == '_'){
+                while(...){
+                   // ...
+                }
+                Token token = new Token(sb,lineNum); // Uses constructor that calls fromTypeName
+                tokenList.add(token);
+            }
+```
+`new Token(sb, lineNum)` calls `fromTypeName`.
+If `sb` is "main", it returns `MAINTK`.
+If `sb` is "int", it returns `INTTK`.
+
+Wait! Look at `Token` constructors.
+```java
+    public Token(StringBuilder content, int lineNum) {
+        this.content = content.toString();
+        this.lineNum = lineNum;
+        this.type = LexType.fromTypeName(content.toString());
+    }
+
+    public Token(LexType type, StringBuilder content, int lineNum) {
+        this.type = type;
+        this.content = content.toString();
+        this.lineNum = lineNum;
+    }
+```
+In `Lexer`, for keywords like `int`, `main`, etc., they are identified as identifiers first because they start with a letter.
+The code DOES NOT check if the identifier string is a keyword AFTER building the string. It relies on `fromTypeName` in the constructor.
+`fromTypeName` iterates through enum values.
+`MAINTK("main")`, `INTTK("int")`.
+This should work.
+
+However, look at `LexType` enum definition order or `getName`.
+```java
+        MAINTK("main"), CONSTTK("const"),
+        INTTK("int"), CHARTK("char"),
+        // ...
+        IDENFR(""),
+```
+`IDENFR` has name `""`.
+`fromTypeName` compares `type.getName().equals(typeName)`.
+If `typeName` is "main", it matches `MAINTK`.
+If `typeName` is "a", it matches none, returns `IDENFR`.
+
+This seems correct.
+
+Let's look closely at `CompUnit` again.
+```java
+    private CompUnitNode CompUnit() {
+        List<DeclNode> declNodes = new ArrayList<>();
+        List<FuncDefNode> funcDefNodes = new ArrayList<>();
+        MainFuncDefNode mainFuncDefNode;
+        while (lexer.tokenList.get(pos + 1).getType() != Token.LexType.MAINTK && lexer.tokenList.get(pos + 2).getType() != Token.LexType.LPARENT) {
+            DeclNode declNode = Decl();
+            declNodes.add(declNode);
+        }
+        while (lexer.tokenList.get(pos + 1).getType() != Token.LexType.MAINTK) {
+            FuncDefNode funcDefNode = FuncDef();
+            funcDefNodes.add(funcDefNode);
+        }
+        mainFuncDefNode = MainFuncDef();
+        return new CompUnitNode(declNodes, funcDefNodes, mainFuncDefNode);
+    }
+```
+If the input has NO declarations, the first while loop is skipped.
+Second while loop: `lexer.tokenList.get(pos + 1).getType() != Token.LexType.MAINTK`.
+`pos` is 0. `tokenList[1]` is `MAINTK`. Condition False. Skipped.
+`MainFuncDef()` is called.
+
+`MainFuncDef`:
+```java
+    private MainFuncDefNode MainFuncDef() {
+        Token intToken = match(Token.LexType.INTTK);
+        Token mainToken = match(Token.LexType.MAINTK);
+        Token leftParentToken = match(Token.LexType.LPARENT);
+        Token rightParentToken = match(Token.LexType.RPARENT);
+        BlockNode blockNode = Block();
+        return new MainFuncDefNode(intToken, mainToken, leftParentToken, rightParentToken, blockNode);
+    }
+```
+Matches `int`, `main`, `(`, `)`.
+Calls `Block()`.
+
+`Block()`:
+```java
+    private BlockNode Block() {
+        Token lBrace = match(Token.LexType.LBRACE);
+        List <BlockItemNode> blockItemNodes = new ArrayList<>();
+        while(currentToken.getType() != Token.LexType.RBRACE){
+            blockItemNodes.add(BlockItem());
+        }
+        Token rBrace = match(Token.LexType.RBRACE);
+        return new BlockNode(lBrace, blockItemNodes, rBrace);
+    }
+```
+Matches `{`.
+Loop while not `}`.
+1. `BlockItem()`. Current token `PRINTFTK`.
+   `Decl`? No. `Stmt()`.
+   `Stmt()` handles `PRINTF`. Returns `StmtNode`.
+2. `BlockItem()`. Current token `INTTK`.
+   `Decl`? Yes. `Decl()` -> `VarDecl()`.
+   Parses `int a = 0;`.
+3. `BlockItem()`. Current token `LBRACE`.
+   `Decl`? No. `Stmt()`.
+   `Stmt()` handles `LBRACE` -> `Block()`.
+   Recursive `Block()`.
+   Inside inner block:
+   1. `BlockItem()`. `INTTK`. `Decl()` -> `VarDecl()`. `int a = 1;`.
+   2. `BlockItem()`. `PRINTFTK`. `Stmt()` -> `PRINTF`.
+   3. Current token `RBRACE`. Loop ends.
+   Matches `RBRACE`. Returns `BlockNode`.
+4. `BlockItem()`. Current token `RETURNTK`.
+   `Decl`? No. `Stmt()`.
+   `Stmt()` handles `RETURN`.
+5. Current token `RBRACE`. Loop ends.
+Matches `RBRACE`. Returns `BlockNode`.
+
+`MainFuncDef` returns.
+`CompUnit` returns.
+`parse()` finishes.
+
+`parser.print()` is called.
+`compUnitNode.print()`.
+
+Why "No output file"?
+
+Check `Output.java`. It is defined but NEVER USED in `Compiler.java` or `Parser.java`.
+The `print()` methods in nodes write directly to `parser.txt`.
+
+Is it possible that `FileWriter` throws an exception?
+`try (FileWriter fw = new FileWriter("parser.txt", true))`
+If the directory is not writable? Usually throws `IOException`.
+Caught in `print()` methods:
+```java
+        }catch (IOException e) {
+            e.printStackTrace();
+        }
+```
+It prints stack trace but doesn't crash the program.
+
+However, if `parser.parse()` throws an exception, `parser.print()` is never reached.
+
+I suspect the `IndexOutOfBoundsException` in `CompUnit` or `Stmt` is the culprit, BUT I reasoned it shouldn't happen for this input.
+
+Let's look at `Lexer` again.
+Does it produce tokens correctly?
+`int main() {`
+Tokens:
+1. `int` -> `INTTK`
+2. `main` -> `MAINTK`
+3. `(` -> `LPARENT`
+4. `)` -> `RPARENT`
+5. `{` -> `LBRACE`
+
+Wait. `main` is followed by `(`.
+In `CompUnit` lookahead:
+`pos=0`. `tokenList[1]` is `MAINTK`.
+`tokenList[2]` is `LPARENT`.
+
+Is it possible `tokenList` is empty?
+If `analyzeByLine` fails to read?
+`fileName = "src/main/testfile.txt"`.
+If the file path is wrong, `FileReader` throws `FileNotFoundException`.
+`main` declares `throws FileNotFoundException`.
+So the program would crash with `FileNotFoundException` if the file is missing.
+But the problem says "Test Case Input: ...". It implies the file exists.
+
+If the file exists, `lexer.analyzeByLine` runs.
+
+One possibility: `Token.LexType.fromTypeName` returns `IDENFR` for `main` if the enum name matching fails?
+`MAINTK("main")`. `getName()` returns "main".
+`typeName` is "main".
+`"main".equals("main")` is true.
+Returns `MAINTK`.
+
+What if `Scanner` or `BufferedReader` is expected but `FileReader` is used?
+`FileReader` reads chars. It works.
+
+Let's look at the `Stmt` method's `else` block again.
+```java
+            boolean flag = false;
+            for(int i = pos+1;true;++i){
+                if(lexer.tokenList.get(i).getType() == Token.LexType.ASSIGN){
+                    flag = true;
+                    break;
+                }
+                if(lexer.tokenList.get(i).lineNum != currentToken.lineNum){
+                    break;
+                }
+            }
+```
+If this block is entered, and `ASSIGN` is not found, and the line continues to the end of the token list, `i` will exceed `tokenList.size() - 1`.
+`lexer.tokenList.get(i)` throws `IndexOutOfBoundsException`.
+
+Is it possible that `printf` is NOT matched by `PRINTFTK`?
+`printf` -> `PRINTFTK`.
+`Stmt` checks `currentToken.getType() == Token.LexType.PRINTFTK`.
+If `printf` was tokenized as `IDENFR`, it would go to the `else` block.
+Why would `printf` be `IDENFR`?
+`fromTypeName("printf")`.
+Enum has `PRINTFTK("printf")`.
+It should match.
+
+Unless... `Token` constructor `new Token(sb, lineNum)` is used for `printf`.
+`sb` is "printf".
+`fromTypeName` finds `PRINTFTK`.
+
+Okay, look at `Compiler.java` one more time.
+```java
+    public static void main(String [] args) throws FileNotFoundException {
+        String fileName = "src/main/testfile.txt";
+        Lexer lexer = new Lexer();
+
+        try (FileReader fr = new FileReader(fileName)){
+            lexer.analyzeByLine(fr);
+            Parser parser = new Parser(lexer);
+            parser.parse();
+            if(Error.errors.isEmpty()){
+                parser.print();
+            }else {
+                try (FileWriter fw = new FileWriter("error.txt",true)){
+                    Error.sortErrors();
+                    for(Error error : Error.errors){
+                        fw.write(error.getLineNum() + " " + error.getErrorType() + "\n");
+                    }
+                }catch (IOException e) {
+                    e.printStackTrace();
+                }
+
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+```
+If `parser.parse()` throws ANY unchecked exception, it propagates out of `main` (since `main` only catches `IOException` via the try-with-resources, but `parse()` is inside).
+Wait. The `try` block covers `lexer.analyzeByLine`, `parser.parse()`, `parser.print()`.
+If `parser.parse()` throws `RuntimeException`, it is NOT an `IOException`.
+The `catch (IOException e)` block does NOT catch it.
+The exception propagates.
+The program terminates.
+NO output files are created (or partially created ones might be empty/closed).
+
+So, WHERE is the `RuntimeException`?
+
+It must be in `CompUnit` lookahead or `Stmt` lookahead.
+Even if I thought it was safe, maybe I missed a detail.
+
+Input:
+```
+int main() {
+    printf("21373119");
+    int a = 0;
+    {
+        int a = 1;
+        printf("%d",a); 
+    }
+    return 0;
+}
+```
+
+Tokens:
+0: INTTK
+1: MAINTK
+2: LPARENT
+3: RPARENT
+4: LBRACE
+5: PRINTFTK
+6: LPARENT
+7: STRCON
+8: RPARENT
+9: SEMICN
+10: INTTK
+11: IDENFR (a)
+12: ASSIGN
+13: INTCON (0)
+14: SEMICN
+15: LBRACE
+16: INTTK
+17: IDENFR (a)
+18: ASSIGN
+19: INTCON (1)
+20: SEMICN
+21: PRINTFTK
+22: LPARENT
+23: STRCON
+24: COMMA
+25: IDENFR (a)
+26: RPARENT
+27: SEMICN
+28: RBRACE
+29: RETURNTK
+30: INTCON (0)
+31: SEMICN
+32: RBRACE
+
+`CompUnit`:
+`pos=0`.
+`tokenList[1]` is `MAINTK`.
+Condition `!= MAINTK` is False.
+Loop skipped.
+
+`MainFuncDef`:
+Matches 0, 1, 2, 3.
+`pos` becomes 4.
+Calls `Block()`.
+
+`Block()`:
+`currentToken` is 4 (`LBRACE`).
+Matches `LBRACE`. `pos` becomes 5.
+Loop `while(currentToken.getType() != RBRACE)`.
+`currentToken` is 5 (`PRINTFTK`). Not `RBRACE`.
+`BlockItem()`.
+
+`BlockItem()`:
+`currentToken` is 5 (`PRINTFTK`).
+Not `CONSTTK`, `INTTK`, `CHARTK`.
+Calls `Stmt()`.
+
+`Stmt()`:
+`currentToken` is 5 (`PRINTFTK`).
+Matches `PRINTFTK` branch.
+Consumes 5, 6, 7, 8.
+Matches `RPARENT`. `pos` becomes 9.
+Matches `SEMICN`. `pos` becomes 10.
+Returns.
+
+Back in `Block()`.
+`currentToken` is 10 (`INTTK`). Not `RBRACE`.
+`BlockItem()`.
+
+`BlockItem()`:
+`currentToken` is 10 (`INTTK`).
+Is `INTTK`. Calls `Decl()`.
+
+`Decl()`:
+Calls `VarDecl()`.
+
+`VarDecl()`:
+`BType()` matches `INTTK`. `pos` becomes 11.
+`VarDef()`.
+
+`VarDef()`:
+Matches `IDENFR` (11). `pos` becomes 12.
+`currentToken` is 12 (`ASSIGN`).
+Matches `ASSIGN`. `pos` becomes 13.
+Calls `InitVal()`.
+
+`InitVal()`:
+`currentToken` is 13 (`INTCON`).
+Goes to `else`. Calls `Exp()`.
+
+`Exp()` -> ... -> `Number()`.
+`Number()` matches `INTCON` (13). `pos` becomes 14.
+Returns.
+
+Back in `VarDecl()`.
+Matches `SEMICN` (14). `pos` becomes 15.
+Returns.
+
+Back in `Block()`.
+`currentToken` is 15 (`LBRACE`). Not `RBRACE`.
+`BlockItem()`.
+
+`BlockItem()`:
+`currentToken` is 15 (`LBRACE`).
+Not Decl. Calls `Stmt()`.
+
+`Stmt()`:
+`currentToken` is 15 (`LBRACE`).
+Matches `LBRACE` branch.
+Calls `Block()`.
+
+Inner `Block()`:
+Matches `LBRACE` (15). `pos` becomes 16.
+Loop.
+`currentToken` is 16 (`INTTK`).
+`BlockItem()`.
+`Decl()` -> `VarDecl()`.
+Parses `int a = 1;`.
+Tokens 16, 17, 18, 19, 20.
+`pos` becomes 21.
+
+Inner `Block()`:
+`currentToken` is 21 (`PRINTFTK`).
+`BlockItem()`.
+`Stmt()`.
+`PRINTFTK` branch.
+Parses `printf("%d", a);`.
+Tokens 21, 22, 23, 24, 25, 26, 27.
+`pos` becomes 28.
+
+Inner `Block()`:
+`currentToken` is 28 (`RBRACE`).
+Loop ends.
+Matches `RBRACE` (28). `pos` becomes 29.
+Returns.
+
+Back in Outer `Block()`.
+`currentToken` is 29 (`RETURNTK`). Not `RBRACE`.
+`BlockItem()`.
+`Stmt()`.
+`RETURNTK` branch.
+Matches `RETURNTK` (29). `pos` becomes 30.
+`isExp()`? `INTCON` is exp.
+`Exp()`.
+Parses `0`. Token 30.
+`pos` becomes 31.
+Matches `SEMICN` (31). `pos` becomes 32.
+Returns.
+
+Back in Outer `Block()`.
+`currentToken` is 32 (`RBRACE`).
+Loop ends.
+Matches `RBRACE` (32). `pos` becomes 33 (End of list).
+Returns.
+
+`MainFuncDef` returns.
+`CompUnit` returns.
+
+No exception during parse.
+
+So `parser.print()` IS called.
+
+Why no output?
+
+Check `CompUnitNode.print()`.
+```java
+    public void print(){
+        for(DeclNode declNode: declNodeList){
+            declNode.print();
+        }
+        for(FuncDefNode funcDefNode: funcDefNodes){
+            funcDefNode.print();
+        }
+        mainFuncDefNode.print();
+        try (FileWriter fw = new FileWriter("parser.txt", true)){
+            fw.write("<CompUnit>\n");
+        }catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+```
+`declNodeList` is empty.
+`funcDefNodes` is empty.
+`mainFuncDefNode.print()` is called.
+
+`MainFuncDefNode.print()`:
+```java
+    public void print(){
+        intToken.print();
+        mainToken.print();
+        lparentToken.print();
+        rparentToken.print();
+        blockNode.print();
+        try (FileWriter fw = new FileWriter("parser.txt", true)){
+            fw.write("<MainFuncDef>\n");
+        }catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+```
+`intToken.print()` writes to `parser.txt`.
+
+`Token.print()`:
+```java
+    public void print(){
+        try (FileWriter fw = new FileWriter("parser.txt",true)){
+            fw.write(this.type.toString() + " "+ this.getContent() + "\n");
+        }catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+```
+
+This SHOULD create `parser.txt`.
+
+Is it possible `parser.txt` is created but empty?
+No, it writes content.
+
+Is it possible the working directory is different?
+`FileWriter("parser.txt")` writes to current working directory.
+`Compiler.java` is in `src/main/...`? No, `Compiler.java` is likely in `src/`.
+The test runner might expect `parser.txt` in the root.
+
+If the program runs successfully, `parser.txt` should exist.
+
+The only reason for "No output file" is if the program CRASHES before writing.
+
+I missed one thing. `Error.errors` is static.
+If `parse()` adds an error, `errors` is not empty.
+Then `error.txt` is written.
+
+If `parse()` crashes, neither is written.
+
+I will bet on the `Stmt` lookahead loop being the crash point, even if my manual trace didn't hit it, perhaps due to a subtle tokenization issue or my trace being slightly off regarding `pos` indices in the `else` block of `Stmt` if a different path was taken. But wait, `printf` IS handled.
+
+Actually, look at `Stmt` again.
+```java
+        } else if (currentToken.getType() == Token.LexType.PRINTFTK) {
+            // ...
+        } else {
+            // Lookahead loop
+        }
+```
+If `PRINTFTK` is not matched, it goes to `else`.
+
+Is `PRINTFTK` correctly identified?
+Yes.
+
+I will provide the `Stmt` method's lookahead loop as the likely error location because it is structurally unsafe and a common cause of crashes in such parsers, leading to

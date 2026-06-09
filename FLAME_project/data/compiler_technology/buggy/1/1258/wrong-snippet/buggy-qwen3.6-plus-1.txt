@@ -1,0 +1,234 @@
+Based on the comparison between the buggy output and the expected output, the error occurs during the parsing of the variable declaration `int b = min(r, scan()), c = 58;` inside the `main` function.
+
+In the **Buggy Output**, after parsing `min(`, the parser incorrectly identifies the structure as a statement or fails to parse the arguments correctly, leading to a cascade of incorrect tags (`<UnaryExp>`, `<MulExp>`, etc.) appearing prematurely and missing the correct `<FuncRParams>` and `<InitVal>` tags for the first variable `b`. Specifically, it seems the parser enters `analyseStmt` or mishandles the `analyseVarDef` logic when encountering a function call in an initialization value, likely due to the `isLVal` lookahead or how `analyseExp` is triggered within `analyseInitVal`.
+
+However, looking closely at the trace:
+Expected:
+```
+IDENFR min
+LPARENT (
+IDENFR r
+<LVal>
+...
+<FuncRParams>
+RPARENT )
+<UnaryExp>
+...
+<Exp>
+<InitVal>
+<VarDef>
+COMMA ,
+IDENFR c
+...
+```
+
+Buggy:
+```
+IDENFR min
+LPARENT (
+<UnaryExp>  <-- Error starts here. It seems it didn't parse the arguments of min correctly.
+<MulExp>
+<AddExp>
+<Exp>
+<InitVal>
+<VarDef>
+<VarDecl>   <-- It closed VarDecl too early? Or treated the rest as statements?
+IDENFR r
+<LVal>
+COMMA ,
+<LVal>      <-- r is treated as LVal in a statement context?
+...
+```
+
+The issue lies in `analyseInitVal`. When `analyseInitVal` is called for `b = min(...)`, it calls `analyseExp()`. `analyseExp` calls `analyseAddExp`, which eventually calls `analyseUnaryExp`.
+In `analyseUnaryExp`, if it sees `IDENFR` followed by `LPARENT`, it should parse it as a function call `Ident '(' [FuncRParams] ')'`.
+
+Let's look at `analyseUnaryExp` in `GrammaticalAnalyser.java`:
+
+```java
+    private void analyseUnaryExp() {
+        //进入为第一位
+        if (thisToken.getType().equals("PLUS") || thisToken.getType().equals("MINU") || thisToken.getType().equals("NOT"))
+        {
+            analyseUnaryOp();
+            nextToken();
+            analyseUnaryExp();
+            grammar.add("<UnaryExp>");
+        }
+        //这里需要分辨是函数还是左值
+        else if (thisToken.getType().equals("IDENFR") && peekToken(0).getType().equals("LPARENT"))
+            // Ident '(' [FuncRParams] ')'
+        {
+            nextToken();//(
+            if (peekToken(0).getType().equals("RPARENT"))
+            {
+                nextToken();//)
+                grammar.add("<UnaryExp>");
+                return;
+            }
+            else
+            {
+                if (isExp()) // <--- This lookahead check is suspicious
+                {
+                    nextToken();//第一位
+                    analyseFuncRParams();
+                    if (peekToken(0).getType().equals("RPARENT"))
+                    {
+                        nextToken();//)
+                        grammar.add("<UnaryExp>");
+                        return;
+                    }
+                    else
+                    {
+                        errors.put(thisToken.getLineNumber(),"j");
+                        grammar.add("<UnaryExp>");
+                        return;
+                    }
+                }
+                else
+                {
+                    errors.put(thisToken.getLineNumber(),"j");
+                    grammar.add("<UnaryExp>");
+                    return;
+                }
+            }
+        }
+        else
+        {
+            analysePrimaryExp();
+            grammar.add("<UnaryExp>");
+        }
+    }
+```
+
+And `isExp()`:
+
+```java
+    public boolean isExp()
+    {
+        String target = peekToken(0).getType();
+        if (target.equals("PLUS") || target.equals("MINU") || target.equals("NOT") ||
+                target.equals("IDENFR") || target.equals("LPARENT") || target.equals("INTCON") || target.equals("CHRCON"))
+        {
+            for (int i = 1;;i++)
+            {
+                if (peekToken(i).getType().equals("SEMICN"))
+                {
+                    return true;
+                }
+                if (peekToken(i).getType().equals("ASSIGN") || peekToken(i).getType().equals("RBRACE"))
+                {
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+```
+
+When parsing `min(r, scan())`, `thisToken` is `min` (IDENFR), `peekToken(0)` is `(`. It enters the `else if` block.
+It calls `isExp()`. `peekToken(0)` inside `isExp` refers to the token AFTER `(`, which is `r` (IDENFR).
+The loop in `isExp` looks ahead.
+Tokens: `r`, `,`, `scan`, `(`, `)`, `)`, `,`, `c`, `=`, ...
+It looks for `SEMICN`, `ASSIGN`, or `RBRACE`.
+It finds `,` (not checked), `scan`, `(`, `)`, `)`.
+Eventually it hits `,` (after `scan()`). The loop continues.
+Then it hits `c` (IDENFR).
+Then it hits `=` (ASSIGN).
+So `isExp` returns `false` because it found `ASSIGN` before `SEMICN`.
+
+Wait, `isExp` returns `false` if it finds `ASSIGN`.
+If `isExp` returns `false`, `analyseUnaryExp` goes to the `else` branch:
+```java
+                else
+                {
+                    errors.put(thisToken.getLineNumber(),"j");
+                    grammar.add("<UnaryExp>");
+                    return;
+                }
+```
+This generates an error `j` (Missing right parenthesis) and returns without consuming the tokens inside the parentheses properly or advancing past them correctly. This explains why the subsequent output is garbled.
+
+The logic in `isExp` is flawed for determining if parameters exist. It assumes that if an `ASSIGN` appears before a `SEMICN` in the lookahead, it's not an expression/parameter list context suitable for `FuncRParams`. However, `min(r, scan())` IS a valid expression. The `ASSIGN` belongs to the next variable `c` in the declaration `int b = ..., c = ...;`. The comma `,` separates the `VarDef`s, not the expressions inside the function call. The `isExp` function stops looking when it hits `ASSIGN`, assuming the current expression is invalid or finished, but it fails to account for the fact that the `ASSIGN` might be outside the current function call's scope (i.e., part of the surrounding `VarDecl`).
+
+Actually, the standard way to parse `FuncRParams` is just to try parsing an `Exp`. If it succeeds, great. If not, error. The lookahead `isExp` is an optimization or a disambiguation attempt that is failing here.
+
+The specific error location is the `isExp` method returning `false` incorrectly, causing the parser to take the error branch in `analyseUnaryExp`.
+
+<frontend/GrammaticalAnalyser.java>
+...
+    private void analyseUnaryExp() {
+        //进入为第一位
+        if (thisToken.getType().equals("PLUS") || thisToken.getType().equals("MINU") || thisToken.getType().equals("NOT"))
+        {
+            analyseUnaryOp();
+            nextToken();
+            analyseUnaryExp();
+            grammar.add("<UnaryExp>");
+        }
+        //这里需要分辨是函数还是左值
+        else if (thisToken.getType().equals("IDENFR") && peekToken(0).getType().equals("LPARENT"))
+            // Ident '(' [FuncRParams] ')'
+        {
+            nextToken();//(
+            if (peekToken(0).getType().equals("RPARENT"))
+            {
+                nextToken();//)
+                grammar.add("<UnaryExp>");
+                return;
+            }
+            else
+            {
+                if (isExp())
+                {
+                    nextToken();//第一位
+                    analyseFuncRParams();
+                    if (peekToken(0).getType().equals("RPARENT"))
+                    {
+                        nextToken();//)
+                        grammar.add("<UnaryExp>");
+                        return;
+                    }
+                    else
+                    {
+                        errors.put(thisToken.getLineNumber(),"j");
+                        grammar.add("<UnaryExp>");
+                        return;
+                    }
+                }
+                else
+                {
+                    errors.put(thisToken.getLineNumber(),"j");
+                    grammar.add("<UnaryExp>");
+                    return;
+                }
+            }
+        }
+        else
+        {
+            analysePrimaryExp();
+            grammar.add("<UnaryExp>");
+        }
+    }
+...
+    public boolean isExp()
+    {
+        String target = peekToken(0).getType();
+        if (target.equals("PLUS") || target.equals("MINU") || target.equals("NOT") ||
+                target.equals("IDENFR") || target.equals("LPARENT") || target.equals("INTCON") || target.equals("CHRCON"))
+        {
+            for (int i = 1;;i++)
+            {
+                if (peekToken(i).getType().equals("SEMICN"))
+                {
+                    return true;
+                }
+                if (peekToken(i).getType().equals("ASSIGN") || peekToken(i).getType().equals("RBRACE"))
+                {
+                    return false;
+                }
+            }
+        }
+        return false;
+    }
+...

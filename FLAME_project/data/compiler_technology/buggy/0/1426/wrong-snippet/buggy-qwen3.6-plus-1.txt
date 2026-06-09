@@ -1,0 +1,111 @@
+Based on the problem description and the provided code, the issue is a **Time Limit Exceeded (TLE)** error. This typically indicates an infinite loop or extremely inefficient processing in the lexical analysis phase.
+
+Looking at `frontend/Lexer.java`, specifically the `addToken` method:
+
+1.  The method first checks for identifiers (`IDENFR`) using a regex. If it matches, it consumes the characters and returns.
+2.  If it's not an identifier, it iterates through `TokenType.values()` to find a match.
+3.  Crucially, if **no** token type matches (the `for` loop finishes without finding a `lookingAt` match), the code executes:
+    ```java
+    System.err.println("No valid token found at line " + currentLine + " at index " + currentIndex);
+    ```
+    And then the method returns **without advancing `currentIndex`**.
+
+4.  Back in `handletoken()`:
+    ```java
+    while (!FileEnd()) {
+        skipWhiteSpace();
+        if (skipComment()) {
+            continue;
+        }
+        addToken();
+    }
+    ```
+    If `addToken()` fails to match any token and does not advance `currentIndex`, the `while` loop will call `skipWhiteSpace()` (which won't skip anything if the current char isn't whitespace) and then `addToken()` again on the same character. This creates an **infinite loop**, causing the TLE.
+
+The input file contains characters that might not be covered by the defined tokens if they appear in unexpected contexts, or more likely, the logic for handling unmatched characters is missing. However, looking closely at `TokenType`, there is an `ERROR` token defined as `" [&|] "`. But `addToken` tries to match specific tokens. If a character like `&` appears alone, `AND` (`&&`) won't match `lookingAt` fully if the next char isn't `&`, but `ERROR` (`[&|]`) *should* match.
+
+Wait, let's look at the order of `TokenType.values()`. The enum order matters in the loop.
+`ERROR` is defined near the end.
+If the input has a single `&`, `AND` (`\\&\\&`) will fail `lookingAt` (because it needs two chars).
+Eventually, the loop reaches `ERROR` (`[&|]`). `matcher.lookingAt()` should match `&`.
+So why TLE?
+
+Let's look at `CHRCON` and `STRCON`.
+`STRCON("\"[^\"]*\"")`
+`CHRCON("'[^']*'")`
+
+If there is a malformed string or char constant, e.g., `"abc` (missing closing quote), the regex `"[^"]*"` will match `"abc` if it's at the end of the file? No, `*` is greedy but requires the closing `"`. If the closing `"` is missing, `lookingAt` might fail depending on implementation details or if it doesn't find the end. Actually, `Pattern.matcher` with `lookingAt` tries to match from the beginning. If the pattern is `"[^"]*"`, it expects a closing quote. If the source is `"abc\n...`, it won't match.
+
+If `STRCON` fails, and no other token matches, we hit the "No valid token" case.
+
+However, there is a more subtle issue in `addToken`.
+The code checks for `IDENFR` first.
+Then it loops through ALL `TokenType`s.
+Inside the loop, if it finds a match, it adds the token and returns.
+
+If the input contains a character that is **not** matched by any regex (e.g., an unexpected symbol not in the grammar, or perhaps a newline that wasn't skipped properly, though `skipWhiteSpace` handles newlines), `currentIndex` is not incremented.
+
+Let's look at `skipWhiteSpace`. It skips `\n`, `\r`, `\t`, spaces.
+What if the file ends with a non-whitespace character that is not a valid token? Infinite loop.
+
+But the most likely cause for TLE in student lexers is usually related to how comments or strings are handled if regexes are inefficient or if fallback logic is missing.
+
+Actually, look at `frontend/TokenType.java`.
+`ERROR("[&|]")` is defined.
+In `addToken`, if we have a single `&`, `AND` fails. `ERROR` matches. So `&` is consumed.
+
+Is there a case where `lookingAt` matches an empty string?
+Regexes like `[0-9]+` require at least one digit.
+`[_A-Za-z][_A-Za-z0-9]*` requires at least one letter/underscore.
+
+What if `skipComment` returns false, but `skipWhiteSpace` didn't advance because the current char is not whitespace?
+Then `addToken` is called.
+If `addToken` doesn't match anything, it prints error and returns.
+`handletoken` loops. `skipWhiteSpace` does nothing. `skipComment` does nothing. `addToken` does nothing. **Infinite Loop.**
+
+The fix is to ensure that if `addToken` cannot identify a token, it must either consume the character (as an error token) or throw an exception/terminate. Given the requirement to output errors, it should probably consume the character as an `ERROR` token or similar.
+
+However, the prompt asks to identify the location. The location is the `addToken` method in `Lexer.java` where it fails to advance `currentIndex` when no token is matched.
+
+<frontend/Lexer.java>
+...
+    private void addToken() {
+        String remainingString = FileValue.substring(currentIndex);
+
+        // 首先检测是否为 IDENFR
+        Pattern idenfrPattern = Pattern.compile("[_A-Za-z][_A-Za-z0-9]*");
+        Matcher idenfrMatcher = idenfrPattern.matcher(remainingString);
+        if (idenfrMatcher.lookingAt()) {
+            String tokenStr = idenfrMatcher.group();
+            Token token = new Token(tokenStr, TokenType.IDENFR, currentLine);
+            //System.out.println(tokenStr);
+            currentIndex += tokenStr.length();
+
+            for (TokenType tokenType : TokenType.values()) {
+                Pattern pattern = tokenType.getPattern();
+                Matcher matcher = pattern.matcher(tokenStr);
+                if (matcher.matches()) {
+                    token.setType(tokenType);
+                    break;
+                }
+            }
+            this.tokens.add(token);
+            return;
+        }
+
+        // 接下来检测其他符号和常量
+        for (TokenType tokenType : TokenType.values()) {
+            Matcher matcher = tokenType.getPattern().matcher(remainingString);
+            if (matcher.lookingAt()) {
+                String tokenStr = matcher.group();
+
+                // 创建 Token 对象
+                Token token = new Token(tokenStr, tokenType, currentLine);
+                currentIndex += tokenStr.length();
+                this.tokens.add(token);
+                return; // 找到匹配后返回
+            }
+        }
+        System.err.println("No valid token found at line " + currentLine + " at index " + currentIndex);
+    }
+...

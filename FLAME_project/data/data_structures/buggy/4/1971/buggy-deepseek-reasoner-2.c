@@ -1,0 +1,79 @@
+#include<stdio.h>
+#include<math.h>
+#include <ctype.h>
+#define sf scanf
+#define pf printf
+#define ll long long
+#define eps 1e-8
+#include<string.h>
+#include<stdlib.h>
+#define ui unsigned int
+#define max(a,b) ((a)>(b))?(a):(b)
+#include<stdio.h>
+#include<stdlib.h>
+#include<string.h>
+#include<math.h>
+typedef struct node
+{
+   char s[200];
+   int time;
+   struct node*next;
+}*ptr,word;
+char sh[200];
+int main()
+{
+  FILE*in;
+  in=fopen("article.txt","r");
+  ptr p=NULL,q=NULL,first=NULL;
+  int i=0;
+  first=p=q; // @@ Here first becomes NULL, but later code treats first as a dummy head node (accessing first->next), leading to a null pointer dereference.
+  char c;
+  while((c=fgetc(in))!=EOF)
+  {
+  if(isalpha(c))
+  {
+      sh[i]=tolower(c);
+      i++;
+  }
+  else
+  {
+      if(strlen(sh)!=0)
+      {
+            q=(ptr)malloc(sizeof(word));
+            strcpy(q->s,sh);
+            q->time=1;
+            q->next=NULL;
+            if(first->next==NULL) // @@ Dereferencing first when it is NULL, causing a runtime error.
+                 first->next=q; 
+            else
+            {
+                   for(p=first;p->next!=NULL&&strcmp(p->next->s,q->s)<0;p=p->next); // @@ p is first (NULL), accessing p->next is invalid.
+                   if(p->next==NULL) // @@ p is NULL, cannot access p->next.
+                        p->next=q;
+                   else
+                   {
+                       if(strcmp(p->next->s,q->s)==0)
+                       {
+                         p->next->time++;
+                         free(q);
+                        }
+                       else
+                       {
+                       q->next=p->next;
+                       p->next=q;
+                       }
+                   }
+            }
+      for(int j=0;j<200;j++)
+          sh[j]='\0';
+      i=0;
+      }
+  }
+  }
+ for(p=first->next;p!=NULL;p=p->next) // @@ first may still be NULL if no words are read, leading to another dereference of NULL.
+{
+     printf("%s %d\n",p->s,p->time);
+}
+ fclose(in);
+ return 0;
+}

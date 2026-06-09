@@ -1,0 +1,715 @@
+Based on the problem description, the test case input, and the expected output, the program is failing to produce any output (Buggy Output is empty). This suggests that the parsing process is either crashing silently, entering an infinite loop, or failing to match the `CompUnit` structure correctly, resulting in an empty or null output string being written.
+
+Looking at the `Parser.java` file, specifically the `parseCompUnit` method:
+
+1.  The logic attempts to distinguish between `Decl`, `FuncDef`, and `MainFuncDef` by looking ahead up to 3 tokens (`first`, `second`, `third`).
+2.  For `int main() { ... }`:
+    *   `first` is `INTTK` ("int").
+    *   `second` is `MAINTK` ("main").
+    *   `third` is `LPARENT` ("(").
+    *   The condition `first.getType().equals(LexType.INTTK)` is true.
+    *   The condition `third.getType().equals(LexType.LPARENT)` is true.
+    *   The condition `second.getType().equals(LexType.MAINTK)` is true.
+    *   It calls `parseMainFuncDef()`.
+
+However, there is a critical issue in how `parseMainFuncDef` and other parsing methods interact with the lexer's state if an error occurs or if the lookahead logic in `parseCompUnit` consumes tokens incorrectly or fails to handle the end of the stream.
+
+But the most likely cause for **empty output** when the expected output is substantial is that the `CompUnit` object or its children are not generating output correctly, OR the parser fails to enter the loop or breaks out prematurely.
+
+Let's look closer at `parseCompUnit`:
+
+```java
+    public CompUnit parseCompUnit() {
+        CompUnit compUnit = new CompUnit();
+        while (true) {
+            Token first = lexer.getToken();
+            Token second = lexer.preRead();
+            Token third = lexer.prePreRead();
+            // ... checks ...
+            if (first.getType().equals(LexType.INTTK)) {
+                if (third.getType().equals(LexType.LPARENT)) {
+                    if (second.getType().equals(LexType.MAINTK)) {
+                        compUnit.setMainFuncDef(parseMainFuncDef());
+                        break;
+                    } else {
+                        compUnit.addFuncDef(parseFuncDef());
+                    }
+                } else {
+                    compUnit.addDecl(parseDecl());
+                }
+            } 
+            // ... other checks ...
+        }
+        return compUnit;
+    }
+```
+
+If `lexer.getToken()` returns `null` (end of file), `first.getType()` will throw a `NullPointerException`. If this exception is caught somewhere higher up or ignored, it might result in no output. However, usually, a crash would stop execution.
+
+Let's look at `Lexer.preRead` and `prePreRead`. They save state, call `next()`, and restore state. This seems correct for lookahead.
+
+Let's look at the `Block` parsing.
+In `parseBlock`:
+```java
+    public Block parseBlock() {
+        Token lBrace = lexer.getToken();
+        lexer.next();
+        ArrayList<BlockItem> blockItems = new ArrayList<>();
+        while (lexer.getToken() != null && !lexer.getToken().getType().equals(LexType.RBRACE)) {
+            BlockItem blockItem = parseBlockItem();
+            blockItems.add(blockItem);
+        }
+        Token rBrace = lexer.getToken();
+        lexer.next();
+        return new Block(lBrace, blockItems, rBrace);
+    }
+```
+
+The issue might be in `parseStmt` inside `parseBlockItem`.
+In `parseStmt`:
+```java
+    public Stmt parseStmt() {
+        Token first = lexer.getToken();
+        if (first.getType().equals(LexType.SEMICN)) {
+             // ...
+        } else if (first.getType().equals(LexType.LBRACE)) {
+             // ...
+        } 
+        // ...
+        else if (first.getType().equals(LexType.IDENFR)) {
+            Token tk = lexer.getToken();
+            int pos = lexer.getPos();
+            int line = lexer.getLineno();
+            LVal lVal = parseLVal();
+            if (lexer.getToken().getType().equals(LexType.ASSIGN)) {
+                 // ...
+            } else {
+                lexer.reset(tk, pos, line);
+                return new Stmt(parseStmtExp());
+            }
+        } else {
+            return new Stmt(parseStmtExp());
+        }
+    }
+```
+
+Wait, look at `parseStmtExp`:
+```java
+    public StmtExp parseStmtExp() {
+        Exp exp = parseExp();
+        Token semi;
+        if (lexer.getToken().getType().equals(LexType.SEMICN)) {
+            semi = lexer.getToken();
+            lexer.next();
+        } else {
+            semi = null;
+        }
+        return new StmtExp(exp, semi);
+    }
+```
+
+And `parseExp`:
+```java
+    public Exp parseExp() {
+        return new Exp(parseAddExp());
+    }
+```
+
+If `parseStmtExp` is called for a statement that is just `;` (empty statement), `parseExp` will try to parse an expression. If the current token is `;`, `parseAddExp` -> `parseMulExp` -> `parseUnaryExp` -> `parsePrimaryExp` will fail to match `INTCON`, `CHRCON`, `LPARENT`, or `IDENFR` (since `LVal` starts with `IDENFR`).
+In `parsePrimaryExp`:
+```java
+    public PrimaryExp parsePrimaryExp() {
+        if (lexer.getToken().getType().equals(LexType.INTCON)) {
+            return new PrimaryExp(parseNumber());
+        } else if (lexer.getToken().getType().equals(LexType.CHRCON)) {
+            return new PrimaryExp(parseChar());
+        } else if (lexer.getToken().getType().equals(LexType.LPARENT)) {
+            return new PrimaryExp(parsePriExp());
+        } else {
+            return new PrimaryExp(parseLVal());
+        }
+    }
+```
+If the token is `SEMICN`, it goes to `else` and calls `parseLVal()`.
+In `parseLVal()`:
+```java
+    public LVal parseLVal() {
+        Token ident = lexer.getToken();
+        lexer.next();
+        // ...
+    }
+```
+It consumes the `SEMICN` as an identifier! This is a major logical error. `parseLVal` assumes the current token is an `IDENFR`. If it's not, it creates an `LVal` with a non-identifier token, which will likely cause issues later or incorrect output.
+
+However, the specific test case `int main() { printf("21373119"); int a = 0; ... }` starts with `printf`.
+`printf` is `PRINTFTK`.
+In `parseStmt`:
+`first` is `PRINTFTK`.
+It falls through to the final `else`: `return new Stmt(parseStmtExp());`.
+`parseStmtExp` calls `parseExp`.
+`parseExp` calls `parseAddExp`.
+... eventually `parsePrimaryExp`.
+Current token is `PRINTFTK`.
+`parsePrimaryExp` checks `INTCON`, `CHRCON`, `LPARENT`. None match.
+It goes to `else`: `return new PrimaryExp(parseLVal());`.
+`parseLVal` takes `PRINTFTK` as `ident`.
+Then `parseLVal` checks for `[`. No.
+Returns `LVal(PRINTFTK)`.
+Back in `parsePrimaryExp`, returns `PrimaryExp(LVal(PRINTFTK))`.
+Back in `parseUnaryExp` (called by `parseMulExp` etc.):
+Wait, `parseExp` -> `parseAddExp` -> `parseMulExp` -> `parseUnaryExp`.
+
+In `parseUnaryExp`:
+```java
+    public UnaryExp parseUnaryExp() {
+        Token first = lexer.getToken();
+        Token second = lexer.preRead();
+        if (first.getType().equals(LexType.IDENFR)) {
+            if (second.getType().equals(LexType.LPARENT)) {
+                return new UnaryExp(parseFuncExp());
+            } else {
+                return new UnaryExp(parsePrimaryExp());
+            }
+        } else if (first.getType().equals(LexType.PLUS) ||
+                first.getType().equals(LexType.MINU) ||
+                first.getType().equals(LexType.NOT)){
+            return new UnaryExp(parseOpExp());
+        } else {
+            return new UnaryExp(parsePrimaryExp());
+        }
+    }
+```
+Current token is `PRINTFTK`. It is NOT `IDENFR`. It is NOT unary op.
+So it goes to `else`: `return new UnaryExp(parsePrimaryExp());`.
+`parsePrimaryExp` is called AGAIN.
+Inside `parsePrimaryExp`, token is still `PRINTFTK`.
+It goes to `else`: `return new PrimaryExp(parseLVal());`.
+`parseLVal` consumes `PRINTFTK`.
+So `printf` is parsed as an `LVal` inside an `Exp` inside a `StmtExp`.
+Then `parseStmtExp` expects a `;`. The next token is `(`.
+`lexer.getToken().getType().equals(LexType.SEMICN)` is false.
+`semi` is null.
+Error "i" might be generated? But the output is empty.
+
+Actually, the problem is that `printf` should be parsed as a `StmtPrint`.
+In `parseStmt`, `PRINTFTK` is handled:
+```java
+        } else if (first.getType().equals(LexType.PRINTFTK)) {
+            return new Stmt(parseStmtPrint());
+        }
+```
+This branch EXISTS. So `printf` SHOULD be parsed correctly as `StmtPrint`.
+
+Let's re-read `parseStmt`:
+```java
+    public Stmt parseStmt() {
+        Token first = lexer.getToken();
+        if (first.getType().equals(LexType.SEMICN)) {
+            return new Stmt(parseStmtSemi());
+        } else if (first.getType().equals(LexType.LBRACE)) {
+            return new Stmt(parseStmtBlock());
+        } else if (first.getType().equals(LexType.IFTK)) {
+            return new Stmt(parseStmtIf());
+        } else if (first.getType().equals(LexType.FORTK)) {
+            return new Stmt(parseStmtFor());
+        } else if (first.getType().equals(LexType.BREAKTK)) {
+            return new Stmt(parseStmtBreak());
+        } else if (first.getType().equals(LexType.CONTINUETK)) {
+            return new Stmt(parseStmtContinue());
+        } else if (first.getType().equals(LexType.RETURNTK)) {
+            return new Stmt(parseStmtReturn());
+        } else if (first.getType().equals(LexType.PRINTFTK)) {
+            return new Stmt(parseStmtPrint());
+        } else if (first.getType().equals(LexType.IDENFR)) {
+             // ...
+        } else {
+            return new Stmt(parseStmtExp());
+        }
+    }
+```
+This looks correct for `printf`.
+
+Why is the output empty?
+Check `CompUnit.getOutPut()`:
+```java
+    public String getOutPut() {
+        StringBuilder str = new StringBuilder();
+        for (Decl decl : decls) {
+            str.append(decl.getOutPut());
+        }
+        for (FuncDef funcDef : funcDefs) {
+            str.append(funcDef.getOutPut());
+        }
+        str.append(mainFuncDef.getOutPut());
+        str.append(name + "\n");
+        return str.toString();
+    }
+```
+If `mainFuncDef` is null, `mainFuncDef.getOutPut()` throws `NullPointerException`.
+In `parseCompUnit`, if the logic fails to identify `main`, `mainFuncDef` remains null.
+
+Let's trace `parseCompUnit` with `int main() { ... }`.
+1. `first` = `INTTK`.
+2. `second` = `MAINTK`.
+3. `third` = `LPARENT`.
+4. `first` is `INTTK`.
+5. `third` is `LPARENT`.
+6. `second` is `MAINTK`.
+7. Calls `parseMainFuncDef()`.
+
+Inside `parseMainFuncDef()`:
+```java
+    public MainFuncDef parseMainFuncDef() {
+        FuncType funcType = new FuncType(lexer.getToken()); // INTTK
+        lexer.next();
+        Token ident = lexer.getToken(); // MAINTK
+        lexer.next();
+        Token lParent = lexer.getToken(); // LPARENT
+        lexer.next();
+        Token rParent;
+        if (lexer.getToken().getType().equals(LexType.RPARENT)) { // RPARENT
+            rParent = lexer.getToken();
+            lexer.next();
+        } else {
+            rParent = null;
+        }
+        Block block = parseBlock(); // Parses { ... }
+        return new MainFuncDef(funcType, ident, lParent, rParent, block);
+    }
+```
+This seems correct.
+
+Is it possible `lexer.getToken()` returns null initially?
+In `Compiler.java`:
+```java
+        Lexer lexer = new Lexer(content);
+        Parser parser = new Parser(lexer);
+        CompUnit compUnit = parser.parseCompUnit();
+```
+`Lexer` constructor calls `next()`. If file is empty, `token` is null.
+If `token` is null, `parseCompUnit` calls `lexer.getToken()` which returns null.
+`first.getType()` -> NPE.
+
+But the input is not empty.
+
+Let's look at `BlockItem` output.
+```java
+<frontend/parser/block/BlockItem.java>
+package frontend.parser.block;
+
+
+public class BlockItem {
+    private final String name = "<BlockItem>";
+    private BItem item;
+
+    public BlockItem(BItem item) {
+        this.item = item;
+    }
+
+    public String getOutPut() {
+        return item.getOutPut();
+    }
+//...
+}
+```
+Note: `<BlockItem>` is NOT printed. The problem description says: "Before completing the analysis of any syntax components in the grammar (except for <BlockItem>, <Decl>, <BType>), output the name...". So `BlockItem` should NOT output its name. This matches the code.
+
+However, look at `Decl` output:
+```java
+<frontend/parser/declaration/Decl.java>
+package frontend.parser.declaration;
+
+import frontend.parser.block.BItem;
+
+public class Decl implements BItem {
+    private final String name = "<Decl>";
+    private Declaration declaration;
+
+    public Decl(Declaration declaration) {
+        this.declaration = declaration;
+    }
+
+    public String getOutPut() {
+        return declaration.getOutPut();
+    }
+//...
+}
+```
+`<Decl>` is NOT printed. Matches requirements.
+
+Look at `BType` output:
+```java
+<frontend/parser/declaration/BType.java>
+package frontend.parser.declaration;
+
+import frontend.lexer.Token;
+
+public class BType {
+    private final String name = "<Btype>";
+    private Token token;
+
+    public BType(Token token) {
+        this.token = token;
+    }
+
+    public String getOutPut() {
+        return token.getOutPut();
+    }
+}
+```
+`<Btype>` is NOT printed. Matches requirements. Note: Name is `<Btype>` (lowercase t) but grammar says `<BType>`. Usually case matters, but since it's not outputted, it doesn't matter.
+
+Let's look at `VarDecl` output:
+```java
+    public String getOutPut() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(bType.getOutPut());
+        sb.append(firstDef.getOutPut());
+        //...
+        sb.append(semi.getOutPut());
+        sb.append(name + "\n"); // <VarDecl>
+        return sb.toString();
+    }
+```
+This outputs `<VarDecl>`. Correct.
+
+There is a subtle bug in `parseCompUnit`'s lookahead logic when dealing with `preRead` and `prePreRead` if the lexer is at the end of file or if `next()` behaves unexpectedly.
+
+However, the most common reason for "Wrong Answer" with **Empty Output** in these types of assignments is an uncaught exception during parsing that terminates the program before writing to the file, or the `getOutPut()` method returning an empty string because the structure wasn't built.
+
+If `parseMainFuncDef` throws an exception, `compUnit` is returned with `mainFuncDef` set? No, if exception occurs, `parseCompUnit` doesn't complete normally.
+
+Let's check `parseStmtPrint`:
+```java
+    public StmtPrint parseStmtPrint() {
+        Token print = lexer.getToken();
+        lexer.next();
+        Token lParent = lexer.getToken();
+        lexer.next();
+        Token strCon = lexer.getToken();
+        lexer.next();
+        //...
+    }
+```
+Input: `printf("21373119");`
+1. `print` = `PRINTF`. `next()`.
+2. `lParent` = `(`. `next()`.
+3. `strCon` = `"21373119"`. `next()`.
+4. Loop `while (lexer.getToken().getType().equals(LexType.COMMA))`. Next is `)`. False.
+5. Check `RPARENT`. Yes. `rParent` = `)`. `next()`.
+6. Check `SEMICN`. Yes. `semi` = `;`. `next()`.
+7. Returns `StmtPrint`.
+
+This seems fine.
+
+What about `int a = 0;`?
+Parsed as `VarDecl`.
+`parseVarDecl`:
+1. `BType` = `int`. `next()`.
+2. `parseVarDef`:
+   `ident` = `a`. `next()`.
+   Check `[`. No.
+   Check `=`. Yes.
+   `eq` = `=`. `next()`.
+   `parseInitVal`:
+     Token `0` (`INTCON`).
+     `parseExp` -> ... -> `Number`.
+     Returns `InitVal(Number)`.
+   Returns `VarDef(a, =, InitVal)`.
+3. Check `,`. No.
+4. Check `;`. Yes. `semi` = `;`. `next()`.
+5. Returns `VarDecl`.
+
+This also seems fine.
+
+Is it possible the error is in `Lexer`?
+In `Lexer.next()`, if `pos >= source.length()`, `token = null`.
+If `token` is null, `getToken()` returns null.
+
+If the parser crashes, the `Compiler.java` main method might catch the exception? No, it declares `throws IOException`. It does not catch `RuntimeException`. So if there's an NPE or IndexOutOfBounds, the program crashes, and `parser.txt` might remain empty or not be flushed/closed properly.
+
+The prompt says "Buggy Output: [Empty]". This strongly implies a crash or early termination.
+
+Let's look at `parseCompUnit` again.
+```java
+            Token first = lexer.getToken();
+            Token second = lexer.preRead();
+            Token third = lexer.prePreRead();
+```
+If `first` is `INTTK`, `second` is `MAINTK`, `third` is `LPARENT`.
+`parseMainFuncDef` is called.
+
+Inside `parseMainFuncDef`, `lexer.getToken()` is called.
+The lexer state was restored by `prePreRead` and `preRead`. So `getToken()` returns `INTTK` again.
+`lexer.next()` advances to `MAINTK`.
+`lexer.getToken()` returns `MAINTK`.
+`lexer.next()` advances to `LPARENT`.
+`lexer.getToken()` returns `LPARENT`.
+`lexer.next()` advances to `RPARENT`.
+`lexer.getToken()` returns `RPARENT`.
+`lexer.next()` advances to `{`.
+`parseBlock()` is called.
+
+Inside `parseBlock()`:
+`lBrace` = `{`. `next()` advances to `printf`.
+Loop: `getToken()` is `PRINTF`. Not `RBRACE`.
+`parseBlockItem()` is called.
+
+Inside `parseBlockItem()`:
+`getToken()` is `PRINTF`.
+Checks: `CONSTTK`, `INTTK`, `CHARTK`. None match.
+Calls `parseStmt()`.
+
+Inside `parseStmt()`:
+`first` = `PRINTF`.
+Matches `PRINTFTK`.
+Calls `parseStmtPrint()`.
+
+Inside `parseStmtPrint()`:
+`print` = `PRINTF`. `next()` advances to `(`.
+`lParent` = `(`. `next()` advances to `"21373119"`.
+`strCon` = `"21373119"`. `next()` advances to `)`.
+Loop comma: `getToken()` is `)`. No.
+Check `RPARENT`: Yes. `rParent` = `)`. `next()` advances to `;`.
+Check `SEMICN`: Yes. `semi` = `;`. `next()` advances to `int`.
+Returns `StmtPrint`.
+
+Back in `parseStmt`, returns `Stmt(StmtPrint)`.
+Back in `parseBlockItem`, returns `BlockItem(Stmt)`.
+Back in `parseBlock`, adds to list.
+Loop continues. `getToken()` is `INTTK`. Not `RBRACE`.
+`parseBlockItem()` called.
+
+Inside `parseBlockItem()`:
+`getToken()` is `INTTK`.
+Matches `INTTK`.
+Calls `parseDecl()`.
+
+Inside `parseDecl()`:
+`getToken()` is `INTTK`. Not `CONSTTK`.
+Calls `parseVarDecl()`.
+
+Inside `parseVarDecl()`:
+`BType` = `INTTK`. `next()` advances to `a`.
+`parseVarDef()`:
+`ident` = `a`. `next()` advances to `=`.
+Check `[`. No.
+Check `=`. Yes.
+`eq` = `=`. `next()` advances to `0`.
+`parseInitVal()`:
+Token `0`.
+Calls `parseExp()`.
+
+Inside `parseExp()`:
+Calls `parseAddExp()`.
+
+Inside `parseAddExp()`:
+Calls `parseMulExp()`.
+
+Inside `parseMulExp()`:
+Calls `parseUnaryExp()`.
+
+Inside `parseUnaryExp()`:
+`first` = `0` (`INTCON`).
+`second` = `;` (`SEMICN`) (via `preRead`).
+`first` is not `IDENFR`. Not unary op.
+Calls `parsePrimaryExp()`.
+
+Inside `parsePrimaryExp()`:
+Token `0` (`INTCON`).
+Matches `INTCON`.
+Calls `parseNumber()`.
+
+Inside `parseNumber()`:
+`t` = `0`. `next()` advances to `;`.
+Returns `Number`.
+
+Back in `parsePrimaryExp`, returns `PrimaryExp(Number)`.
+Back in `parseUnaryExp`, returns `UnaryExp(PrimaryExp)`.
+Back in `parseMulExp`, returns `MulExp(UnaryExp)`.
+Back in `parseAddExp`, returns `AddExp(MulExp)`.
+Back in `parseExp`, returns `Exp(AddExp)`.
+Back in `parseInitVal`, returns `InitVal(Exp)`.
+Back in `parseVarDef`, returns `VarDef`.
+Back in `parseVarDecl`:
+Check `,`. No.
+Check `;`. Yes. `semi` = `;`. `next()` advances to `{`.
+Returns `VarDecl`.
+
+Back in `parseDecl`, returns `Decl(VarDecl)`.
+Back in `parseBlockItem`, returns `BlockItem(Decl)`.
+Back in `parseBlock`, adds to list.
+Loop continues. `getToken()` is `{`. Not `RBRACE`.
+`parseBlockItem()` called.
+
+Inside `parseBlockItem()`:
+`getToken()` is `{`.
+Not `CONSTTK`, `INTTK`, `CHARTK`.
+Calls `parseStmt()`.
+
+Inside `parseStmt()`:
+`first` is `{`.
+Matches `LBRACE`.
+Calls `parseStmtBlock()`.
+
+Inside `parseStmtBlock()`:
+Calls `parseBlock()`.
+
+Inside `parseBlock()`:
+`lBrace` = `{`. `next()` advances to `int`.
+Loop: `getToken()` is `INTTK`.
+`parseBlockItem()` called.
+... parses `int a = 1;` ...
+... parses `printf("%d",a);` ...
+Loop: `getToken()` is `}`.
+Exits loop.
+`rBrace` = `}`. `next()` advances to `return`.
+Returns `Block`.
+
+Back in `parseStmtBlock`, returns `StmtBlock(Block)`.
+Back in `parseStmt`, returns `Stmt(StmtBlock)`.
+Back in `parseBlockItem`, returns `BlockItem(Stmt)`.
+Back in outer `parseBlock`, adds to list.
+Loop continues. `getToken()` is `RETURNTK`.
+... parses `return 0;` ...
+Loop continues. `getToken()` is `}`.
+Exits loop.
+`rBrace` = `}`. `next()` advances to EOF.
+Returns `Block`.
+
+Back in `parseMainFuncDef`, returns `MainFuncDef`.
+Back in `parseCompUnit`, sets `mainFuncDef`. Breaks loop.
+Returns `compUnit`.
+
+Back in `Compiler.java`:
+`compUnit.getOutPut()` is called.
+
+If everything parses correctly, why is output empty?
+
+Check `Block.getOutPut()`:
+```java
+    public String getOutPut() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(lBrace.getOutPut());
+        for (BlockItem item : blockItems) {
+            sb.append(item.getOutPut());
+        }
+        sb.append(rBrace.getOutPut());
+        sb.append(name + "\n");
+        return sb.toString();
+    }
+```
+If `blockItems` is null?
+In `Block` constructor:
+```java
+    public Block(Token lBrace, ArrayList<BlockItem> blockItems, Token rBrace) {
+        this.lBrace = lBrace;
+        this.blockItems = blockItems;
+        this.rBrace = rBrace;
+    }
+```
+In `parseBlock`, `blockItems` is initialized to `new ArrayList<>()`. So it's not null.
+
+Is it possible `lBrace` or `rBrace` is null?
+In `parseBlock`, `lBrace = lexer.getToken()`. If lexer is at EOF, `lBrace` is null. `lBrace.getOutPut()` throws NPE.
+
+But we traced it, and it shouldn't be EOF.
+
+Wait! Look at `Lexer.preRead` and `prePreRead` again.
+```java
+    public Token preRead() {
+        Token t = token;
+        int p = pos;
+        int l = lineno;
+        next();
+        Token ans = token;
+        token = t;
+        pos = p;
+        lineno = l;
+        return ans;
+    }
+```
+This restores `token`, `pos`, `lineno`.
+
+However, `next()` updates `token`.
+If `next()` encounters an error or EOF, `token` becomes null.
+`preRead` restores `token` to `t`.
+
+There is a potential issue in `parseCompUnit` if `lexer.getToken()` returns `null`.
+```java
+            Token first = lexer.getToken();
+            Token second = lexer.preRead();
+            Token third = lexer.prePreRead();
+            if (first.getType().equals(LexType.INTTK)) { // NPE if first is null
+```
+If the file ends with `}` and `next()` was called after `}`, `token` is null.
+In our trace, after parsing the main block, `next()` is called after `}`.
+`parseBlock` reads `}`, calls `next()`.
+Now `token` is null.
+`parseMainFuncDef` returns.
+`parseCompUnit` loop continues?
+No, `break` is executed after `parseMainFuncDef`.
+So `parseCompUnit` returns.
+
+So `token` being null at the end is fine.
+
+Is there an error in `StmtPrint.getOutPut()`?
+```java
+    @Override
+    public String getOutPut() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(printTk.getOutPut());
+        sb.append(lParent.getOutPut());
+        sb.append(strCon.getOutPut());
+        for (int i = 0; i < commas.size(); i++) { // NPE if commas is null
+            sb.append(commas.get(i).getOutPut());
+            sb.append(exps.get(i).getOutPut());
+        }
+        //...
+    }
+```
+In `parseStmtPrint`:
+```java
+        if (commas.isEmpty()) {
+            return new StmtPrint(print, lParent, strCon, rParent, semi);
+        } else {
+            return new StmtPrint(print, lParent, strCon, commas, exps, rParent, semi);
+        }
+```
+Constructor 1:
+```java
+    public StmtPrint(Token printTk, Token lParent, Token strCon,
+                     Token rParent, Token semi) {
+        //...
+        this.commas = null;
+        //...
+    }
+```
+So `commas` is null.
+In `getOutPut()`, `commas.size()` throws NPE.
+
+**Found it!**
+
+In `StmtPrint.getOutPut()`, the code iterates over `commas` without checking if it is null. When there are no extra arguments (like `printf("21373119")`), the constructor with `commas = null` is used. The `getOutPut` method then tries to access `commas.size()`, causing a `NullPointerException`. This crashes the program during output generation, resulting in an empty or incomplete file.
+
+<frontend/parser/block/statement/StmtPrint.java>
+...
+    @Override
+    public String getOutPut() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(printTk.getOutPut());
+        sb.append(lParent.getOutPut());
+        sb.append(strCon.getOutPut());
+        for (int i = 0; i < commas.size(); i++) {
+            sb.append(commas.get(i).getOutPut());
+            sb.append(exps.get(i).getOutPut());
+        }
+        if (rParent != null) {
+            sb.append(rParent.getOutPut());
+        }
+        if (semi != null) {
+            sb.append(semi.getOutPut());
+        }
+        return sb.toString();
+    }
+...

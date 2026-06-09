@@ -1,0 +1,700 @@
+Based on the problem description, expected output, and actual buggy behavior (Time Limit Exceeded), the issue likely stems from **infinite recursion or incorrect lookahead logic** in the parser.
+
+Looking at the test input and expected output, we can see that function calls like `fun();` should be parsed as statements. In the expected output, these appear as:
+
+```
+IDENFR fun
+LPARENT (
+RPARENT )
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+SEMICN ;
+<Stmt>
+```
+
+However, examining the `parseStmt()` method in `Parser.java`, there's a critical flaw in how it handles function calls.
+
+The issue is in the **`isLvalExp()`**, **`isGetInt()`**, and **`isGetChar()`** helper methods. These methods scan forward through tokens without proper bounds checking relative to statement boundaries, potentially causing infinite loops or incorrect parsing decisions.
+
+Most critically, **function calls like `fun()` are not being correctly recognized** because the parser falls into the wrong branch in `parseStmt()`. According to the grammar:
+``` 
+Stmt → ... | [Exp] ';'
+Exp → AddExp
+AddExp → MulExp
+MulExp → UnaryExp
+UnaryExp → Ident '(' [FuncRParams] ')'
+```
+
+So `fun()` should be parsed as an expression statement. But the current logic in `parseStmt()` has this structure:
+
+```java
+if (currentToken().getType().equals("LBRACE")) {
+    ...
+} else if (match("IFTK", stmtNode)) {
+    ...
+} else if (match("FORTK", stmtNode)) {
+    ...
+} else if (match("BREAKTK", stmtNode)) {
+    ...
+} else if (match("CONTINUETK", stmtNode)) {
+    ...
+} else if (match("RETURNTK", stmtNode)) {
+    ...
+} else if (match("PRINTFTK", stmtNode)) {
+    ...
+} else {
+    if (isGetInt() || isGetChar()) {
+        ...
+    } else if (isLvalExp()) {
+        ...
+    } else {
+        ...
+    }
+}
+```
+
+The problem is that **`isLvalExp()` returns false for `fun()`** because it looks for an `ASSIGN` token, but `fun()` is just an identifier followed by parentheses — not an assignment. However, it should still be parsed as an expression statement via the final `else` branch.
+
+But there's another issue: **the `isLvalExp()` method itself has flawed logic**. It scans forward until it finds either `SEMICN` or `ASSIGN`, but doesn't account for newlines properly, which could cause it to scan too far or infinitely in some cases.
+
+However, the most immediate bug causing the **Time Limit Exceeded** is likely in the **`isDecl()` method**, which is used both in `parseCompUnit()` and `parseBlockItem()`. Let's examine it:
+
+```java
+private boolean isDecl() {
+    if (currentToken().getType().equals("CONSTTK")) {
+        if (preRead(1).getType().equals("INTTK") || preRead(1).getType().equals("CHARTK")) {
+            if (preRead(2).getType().equals("SEMICN")) {
+                return true;
+            }
+            if (preRead(2).getType().equals("IDENFR") &&
+                    (preRead(3).getType().equals("ASSIGN") || preRead(3).getType().equals("LBRACK") || preRead(3).getType().equals("COMMA"))) {
+                return true;
+            } else {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    } else if (currentToken().getType().equals("INTTK") || currentToken().getType().equals("CHARTK")) {
+        if (preRead(1).getType().equals("IDENFR") && !preRead(2).getType().equals("LPARENT")) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+    return false;
+}
+```
+
+This method assumes that `preRead(n)` will always return a non-null token, but if we're near the end of the token list, `preRead(n)` can return `null`, and calling `.getType()` on `null` would throw a `NullPointerException`.
+
+But wait — looking more carefully at `preRead()`:
+
+```java
+private Token preRead(int plusIndex) {
+    if (currentTokenIndex < tokens.size() && currentTokenIndex + plusIndex < tokens.size()) {
+        int preReadIndex = currentTokenIndex + plusIndex;
+        return tokens.get(preReadIndex);
+    }
+    return null;
+}
+```
+
+So if `preRead()` returns `null`, then calling `.getType()` on it in `isDecl()` will indeed cause a `NullPointerException`.
+
+However, the error reported is **Time Limit Exceeded**, not a crash, so it's more likely an **infinite loop**.
+
+Looking again at `parseCompUnit()`:
+
+```java
+private SyntaxNode parseCompUnit() {
+    SyntaxNode compUnitNode = new SyntaxNode("<CompUnit>");
+    while (currentToken() != null && (isDecl() || isFuncDef())) {
+        if (isDecl()) {
+            compUnitNode.addChild(parseDecl());
+        } else if (isFuncDef()) {
+            compUnitNode.addChild(parseFuncDef());
+        }
+    }
+    compUnitNode.addChild(parseMainFuncDef());
+    return compUnitNode;
+}
+```
+
+If `isDecl()` or `isFuncDef()` returns `true` but the corresponding `parseDecl()` or `parseFuncDef()` **doesn't consume any tokens** (due to an error or incorrect parsing), then the loop will run infinitely.
+
+Now look at `parseBType()`:
+
+```java
+private SyntaxNode parseBType() {
+    if (currentToken().getType().equals("INTTK")) {
+        SyntaxNode syntaxNode = new SyntaxNode("INTTK int");
+        currentTokenIndex++;
+        return syntaxNode;
+    } else {
+        SyntaxNode syntaxNode = new SyntaxNode("CHARTK char");
+        currentTokenIndex++;
+        return syntaxNode;
+    }
+}
+```
+
+This method **always increments `currentTokenIndex`**, even if the current token isn't `INTTK` or `CHARTK`! That's a bug. If the current token is something else (e.g., `VOIDTK`), it will incorrectly assume it's `CHARTK` and consume the token.
+
+But wait — `parseBType()` is only called in contexts where the next token **should** be `INTTK` or `CHARTK`, according to the grammar. So maybe that's not the issue.
+
+Let’s focus on the **function call parsing**. In the test input, we have:
+
+```c
+fun();
+```
+
+This should be parsed as:
+- `Stmt → [Exp] ';'`
+- `Exp → AddExp`
+- `AddExp → MulExp`
+- `MulExp → UnaryExp`
+- `UnaryExp → Ident '(' [FuncRParams] ')'`
+
+So in `parseStmt()`, it should go to the final `else` branch and do:
+
+```java
+if (!currentToken().getType().equals("SEMICN")) {
+    stmtNode.addChild(parseExp());
+}
+errorI(stmtNode);
+```
+
+But for this to work, `parseExp()` must successfully parse `fun()`.
+
+Now look at `parseUnaryExp()`:
+
+```java
+private SyntaxNode parseUnaryExp() {
+    SyntaxNode unaryExpNode = new SyntaxNode("<UnaryExp>");
+    if (currentToken().getType().equals("IDENFR") && preRead(1).getType().equals("LPARENT")) {
+        match("IDENFR", unaryExpNode);
+        match("LPARENT", unaryExpNode);
+        if (!currentToken().getType().equals("RPARENT"))unaryExpNode.addChild(parseFuncRParams());
+        errorJ(unaryExpNode);
+    } else if (...) {
+        ...
+    } else {
+        ...
+    }
+    return unaryExpNode;
+}
+```
+
+This looks correct. So why Time Limit Exceeded?
+
+Ah! Look at the **`isFuncDef()`** method:
+
+```java
+private boolean isFuncDef() {
+    if (currentToken().getType().equals("INTTK") || currentToken().getType().equals("CHARTK")) {
+        if (preRead(1).getType().equals("IDENFR") && preRead(2).getType().equals("LPARENT")) {
+            return true;
+        } else {
+            return false;
+        }
+    } else if (currentToken().getType().equals("VOIDTK")) {
+        return true;  // <-- BUG!
+    }
+    return false;
+}
+```
+
+The line `return true;` when current token is `VOIDTK` is **incorrect**! It should also check that the next tokens are `IDENFR` and `LPARENT`. Otherwise, **any `VOIDTK` token will be considered the start of a function definition**, even if it's inside a block or elsewhere.
+
+In the test input, we have:
+
+```c
+void fun()
+{
+    ...
+}
+```
+
+That's fine. But what about later in `main()`? There is no `void`, so maybe not the issue.
+
+Wait — the real issue is likely in **`parseStmt()`'s handling of expression statements**.
+
+Look at this part:
+
+```java
+else {
+    if (isGetInt() || isGetChar()) {
+        stmtNode.addChild(parseLVal());
+        match("ASSIGN", stmtNode);
+        if (isGetInt()) match("GETINTTK", stmtNode);
+        else match("GETCHARTK", stmtNode);
+        match("LPARENT", stmtNode);
+        errorJ(stmtNode);
+        errorI(stmtNode);
+    } else if (isLvalExp()) {
+        stmtNode.addChild(parseLVal());
+        match("ASSIGN", stmtNode);
+        stmtNode.addChild(parseExp());
+        errorI(stmtNode);
+    } else {
+        if (!currentToken().getType().equals("SEMICN")) {
+            stmtNode.addChild(parseExp());
+        }
+        errorI(stmtNode);
+    }
+}
+```
+
+For `fun();`, it should go to the final `else` branch. But what if `parseExp()` fails to consume tokens? Let's see.
+
+`parseExp()` calls `parseAddExp()`, which calls `parseMulExp()`, which calls `parseUnaryExp()`.
+
+In `parseUnaryExp()`, for `fun();`, we have:
+- current token: `IDENFR` ("fun")
+- next token: `LPARENT` ("(")
+
+So it should take the first branch:
+```java
+if (currentToken().getType().equals("IDENFR") && preRead(1).getType().equals("LPARENT")) {
+```
+
+But what if `preRead(1)` returns `null`? Then `.getType()` throws NPE. But again, that would crash, not TLE.
+
+Unless... the **`preRead()` method is being called with negative indices or in a loop**.
+
+Wait, look at **`isLvalExp()`**:
+
+```java
+private boolean isLvalExp() {
+    int lineNum = currentToken().getLineNum();
+    for (int i = 0; currentTokenIndex + i < tokens.size(); i++) {
+        if (preRead(i).getType().equals("SEMICN")) {
+            return false;
+        } else if (preRead(i).getType().equals("ASSIGN")) {
+            return true;
+        }
+        if (preRead(i).getLineNum() > lineNum) {
+            return false;
+        }
+    }
+    return false;
+}
+```
+
+This loop increments `i` starting from 0, and checks `preRead(i)`. But `preRead(i)` when `i=0` is the current token. The loop condition is `currentTokenIndex + i < tokens.size()`, which is correct.
+
+But what if there's **no semicolon and no newline**? Then it will loop until the end of file. In the test input, each statement ends with a semicolon, so it should be fine.
+
+However, consider a case like `fun()` — the tokens are: `IDENFR`, `LPARENT`, `RPARENT`, `SEMICN`.
+
+When `isLvalExp()` is called at `IDENFR`, it scans:
+- i=0: `IDENFR` → not SEMICN or ASSIGN
+- i=1: `LPARENT` → not SEMICN or ASSIGN
+- i=2: `RPARENT` → not SEMICN or ASSIGN
+- i=3: `SEMICN` → returns false
+
+So it correctly returns false, and the code goes to the final else branch.
+
+Then it calls `parseExp()`, which should parse the function call.
+
+So why TLE?
+
+Another possibility: **left recursion in expression parsing**.
+
+Look at `parseAddExp()`:
+
+```java
+private SyntaxNode parseAddExp() {
+    SyntaxNode addExpNode = new SyntaxNode("<AddExp>");
+    SyntaxNode leftNode = parseMulExp();
+    addExpNode.addChild(leftNode);
+    while (currentToken().getType().equals("PLUS") || currentToken().getType().equals("MINU")) {
+        SyntaxNode addExpNode1 = new SyntaxNode("<AddExp>");
+        addExpNode1.addChild(addExpNode);
+        match(currentToken().getType(), addExpNode1);
+        addExpNode1.addChild(parseMulExp());
+        addExpNode = addExpNode1;
+    }
+    return addExpNode;
+}
+```
+
+This is **right-recursive**, which is correct for recursive descent. So not the issue.
+
+After careful analysis, the most likely cause of **Time Limit Exceeded** is an **infinite loop in `parseCompUnit()`** due to **`isDecl()` or `isFuncDef()` returning true but the parser not consuming tokens**.
+
+Looking back at `parseMainFuncDef()`:
+
+```java
+private SyntaxNode parseMainFuncDef() {
+    SyntaxNode mainFuncDefNode = new SyntaxNode("<MainFuncDef>");
+    match("INTTK", mainFuncDefNode);
+    match("MAINTK", mainFuncDefNode);
+    match("LPARENT", mainFuncDefNode);
+    errorJ(mainFuncDefNode);
+    mainFuncDefNode.addChild(parseBlock());
+    return mainFuncDefNode;
+}
+```
+
+It **does not match `RPARENT`**! It calls `errorJ(mainFuncDefNode);` which is:
+
+```java
+private void errorJ(SyntaxNode node) {
+    if (!match("RPARENT", node)) {
+        int lineNum = tokens.get(currentTokenIndex - 1).getLineNum();
+        ErrorToken errorToken = new ErrorToken(lineNum, "j");
+        errorTokens.add(errorToken);
+    }
+}
+```
+
+So if there's no `RPARENT`, it adds an error but **does not consume any token**. However, in the test input, `main()` has `()`, so `RPARENT` is present, and `match("RPARENT", node)` should succeed.
+
+But wait — in `parseMainFuncDef()`, after matching `LPARENT`, it calls `errorJ(mainFuncDefNode)`, which calls `match("RPARENT", node)`. So it should consume the `RPARENT`.
+
+So that's fine.
+
+Now, the **real smoking gun** is in the **`parseStmt()` method for empty blocks**.
+
+In the test input, there's:
+
+```c
+{
+}
+```
+
+This should be parsed as a `Block` inside a `Stmt`.
+
+In `parseStmt()`:
+
+```java
+if (currentToken().getType().equals("LBRACE")) {
+    stmtNode.addChild(parseBlock());
+}
+```
+
+And `parseBlock()`:
+
+```java
+private SyntaxNode parseBlock() {
+    SyntaxNode blockNode = new SyntaxNode("<Block>");
+    match("LBRACE", blockNode);
+    while (!currentToken().getType().equals("RBRACE")) {
+        blockNode.addChild(parseBlockItem());
+    }
+    match("RBRACE", blockNode);
+    return blockNode;
+}
+```
+
+This looks correct.
+
+After extensive analysis, the most probable location of the error causing **Time Limit Exceeded** is in the **`isDecl()` method**, specifically in the handling of `preRead()` calls that may return `null`, but since that would cause a crash, not TLE, we must look elsewhere.
+
+Wait! Look at the **`parseConstInitVal()`** method:
+
+```java
+private SyntaxNode parseConstInitVal() {
+    SyntaxNode constIniValNode = new SyntaxNode("<ConstInitVal>");
+    if (match("STRCON", constIniValNode)) {
+    } else if (match("LBRACE", constIniValNode)) {
+        if (!match("RBRACE", constIniValNode)) {
+            constIniValNode.addChild(parseConstExp());
+            while (match("COMMA", constIniValNode)) {
+                constIniValNode.addChild(parseConstExp());
+            }
+            match("RBRACE", constIniValNode);
+        }
+    } else {
+        constIniValNode.addChild(parseConstExp());
+    }
+    return constIniValNode;
+}
+```
+
+And similarly in `parseInitVal()`.
+
+But the test input doesn't have array initializers, so probably not the issue.
+
+Given the time, the most likely culprit is the **`isLvalExp()`**, **`isGetInt()`**, and **`isGetChar()`** methods, which have **flawed lookahead logic** that could cause them to **scan beyond statement boundaries**, leading to incorrect parsing decisions and potential infinite loops.
+
+But the **immediate cause of Time Limit Exceeded** in the given test case is likely due to **function calls not being parsed correctly**, causing the parser to **repeatedly try to parse the same tokens**.
+
+Looking closely at the expected output, we see that `fun();` is parsed as an expression statement, producing `<Exp>` etc.
+
+But in the current `parseStmt()`, after parsing the expression, it calls `errorI(stmtNode);` to match the semicolon.
+
+However, if for some reason the expression parsing **doesn't consume the `SEMICN`**, then `errorI` will add an error but the token index won't advance, and if this happens in a loop...
+
+But where is the loop?
+
+Ah! In `parseBlock()`:
+
+```java
+while (!currentToken().getType().equals("RBRACE")) {
+    blockNode.addChild(parseBlockItem());
+}
+```
+
+If `parseBlockItem()` **doesn't consume any tokens**, this loop will run infinitely.
+
+And `parseBlockItem()` calls `parseStmt()`.
+
+So if `parseStmt()` for `fun();` **fails to consume the semicolon**, then the next call to `parseBlockItem()` will see the same `fun` token again, and loop infinitely.
+
+Why wouldn't it consume the semicolon?
+
+Because in the final else branch of `parseStmt()`:
+
+```java
+else {
+    if (!currentToken().getType().equals("SEMICN")) {
+        stmtNode.addChild(parseExp());
+    }
+    errorI(stmtNode);
+}
+```
+
+`errorI(stmtNode)` is defined as:
+
+```java
+private void errorI(SyntaxNode node) {
+    if (!match("SEMICN", node)) {
+        int lineNum = tokens.get(currentTokenIndex - 1).getLineNum();
+        ErrorToken errorToken = new ErrorToken(lineNum, "i");
+        errorTokens.add(errorToken);
+    }
+}
+```
+
+So if `match("SEMICN", node)` succeeds, it consumes the semicolon. If it fails, it adds an error but **does not consume any token**.
+
+In the test input, `fun();` has a semicolon, so `match` should succeed.
+
+Unless... the `parseExp()` call **did not consume all the tokens up to the semicolon**.
+
+For `fun();`, `parseExp()` should consume `fun`, `(`, `)`, leaving `SEMICN` as the current token.
+
+Then `errorI` calls `match("SEMICN", node)`, which should consume it.
+
+So it should work.
+
+Given the complexity, the most likely actual bug is in the **`parseUnaryExp()` method**, specifically in the function call branch.
+
+Look:
+
+```java
+if (currentToken().getType().equals("IDENFR") && preRead(1).getType().equals("LPARENT")) {
+    match("IDENFR", unaryExpNode);
+    match("LPARENT", unaryExpNode);
+    if (!currentToken().getType().equals("RPARENT"))unaryExpNode.addChild(parseFuncRParams());
+    errorJ(unaryExpNode);
+}
+```
+
+After matching `LPARENT`, if the next token is `RPARENT` (as in `fun()`), it skips `parseFuncRParams()`, then calls `errorJ(unaryExpNode)`, which does:
+
+```java
+if (!match("RPARENT", node)) { ... }
+```
+
+So it should match and consume `RPARENT`.
+
+Thus, `parseUnaryExp()` consumes `fun`, `(`, `)`.
+
+Then `parseExp()` returns, and `errorI` consumes `;`.
+
+So it should work.
+
+At this point, the only remaining possibility is that the **`isDecl()` method is incorrectly returning true for non-declaration tokens**, causing `parseDecl()` to be called inappropriately, and `parseDecl()` fails to consume tokens, leading to an infinite loop in `parseCompUnit()` or `parseBlockItem()`.
+
+Looking at `isDecl()` again:
+
+```java
+} else if (currentToken().getType().equals("INTTK") || currentToken().getType().equals("CHARTK")) {
+    if (preRead(1).getType().equals("IDENFR") && !preRead(2).getType().equals("LPARENT")) {
+        return true;
+    } else {
+        return false;
+    }
+}
+```
+
+This is supposed to distinguish between:
+- `int x;` (declaration)
+- `int func()` (function definition)
+
+But what if `preRead(2)` is `null`? Then `preRead(2).getType()` throws NPE.
+
+But again, that would crash.
+
+Unless the input is such that `preRead(2)` is not null, but the logic is flawed.
+
+In the test input, after the declarations and function definitions, in `main()`, we have:
+
+```c
+printf("21373457\n");
+```
+
+No `int` or `char` keywords, so `isDecl()` should return false.
+
+Later, we have:
+
+```c
+fun();
+```
+
+No issue.
+
+The only `int` in `main()` is in expressions like `ZERO + var2`, but those are `IDENFR` tokens, not `INTTK`.
+
+So `isDecl()` should not be triggered inside `main()`.
+
+Given all this, the most probable location of the error is in the **`parseStmt()` method's final else branch**, where it parses expression statements.
+
+But to match the expected output exactly, we need to ensure that **every terminal token is output**, and **non-terminals are output in post-order**.
+
+Looking at the expected output for `fun();`:
+
+```
+IDENFR fun
+LPARENT (
+RPARENT )
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+SEMICN ;
+<Stmt>
+```
+
+This implies that the **tokens are output first**, then the **non-terminals in post-order**.
+
+In the current `SyntaxNode.toString()` method:
+
+```java
+private String toString(int level) {
+    StringBuilder sb = new StringBuilder();
+    if (children.isEmpty()) {
+        sb.append(type).append("\n");
+    } else {
+        for (SyntaxNode child : children) {
+            sb.append(child.toString(level + 1));
+        }
+        sb.append(type).append("\n");
+    }
+    return sb.toString();
+}
+```
+
+This does **post-order traversal**: children first, then self.
+
+And for leaf nodes (tokens), it outputs the token string.
+
+So that's correct.
+
+Given the Time Limit Exceeded error, and after careful analysis, the most likely cause is an **infinite loop in the expression parsing due to left-recursion handling**, but the code uses right-recursion, which is correct.
+
+Wait! Look at `parseAddExp()`:
+
+```java
+SyntaxNode addExpNode = new SyntaxNode("<AddExp>");
+SyntaxNode leftNode = parseMulExp();
+addExpNode.addChild(leftNode);
+while (currentToken().getType().equals("PLUS") || currentToken().getType().equals("MINU")) {
+    SyntaxNode addExpNode1 = new SyntaxNode("<AddExp>");
+    addExpNode1.addChild(addExpNode);
+    match(currentToken().getType(), addExpNode1);
+    addExpNode1.addChild(parseMulExp());
+    addExpNode = addExpNode1;
+}
+return addExpNode;
+```
+
+This is correct.
+
+At this point, I suspect the issue is in the **`isLvalExp()` method**, which may be causing the parser to misclassify statements, but the TLE suggests an infinite loop.
+
+The only place with a `while` loop that could infinite loop is:
+- `parseCompUnit()`
+- `parseBlock()`
+- expression parsing loops (which are bounded by token consumption)
+
+So likely `parseCompUnit()` or `parseBlock()`.
+
+And that happens if `parseDecl()` or `parseStmt()` doesn't consume tokens.
+
+Now, look at `parseBType()` again:
+
+```java
+private SyntaxNode parseBType() {
+    if (currentToken().getType().equals("INTTK")) {
+        SyntaxNode syntaxNode = new SyntaxNode("INTTK int");
+        currentTokenIndex++;
+        return syntaxNode;
+    } else {
+        SyntaxNode syntaxNode = new SyntaxNode("CHARTK char");
+        currentTokenIndex++;
+        return syntaxNode;
+    }
+}
+```
+
+This is called from `parseConstDecl()` and `parseVarDecl()`.
+
+But what if the current token is not `INTTK` or `CHARTK`? For example, if we're inside a block and encounter `int x;`, it should be fine.
+
+But if for some reason `parseBType()` is called when the current token is not `INTTK` or `CHARTK`, it will **incorrectly consume the token** and assume it's `CHARTK`.
+
+For example, if current token is `IDENFR`, it will consume it and return a fake `CHARTK char` node.
+
+Then later parsing will fail, and tokens won't be consumed properly, leading to infinite loops.
+
+And `parseBType()` is called from `parseDecl()`, which is called from `parseBlockItem()`, which is called from `parseBlock()`.
+
+So if inside a block, we have a statement that starts with a keyword other than `int` or `char`, but `isDecl()` incorrectly returns true, then `parseDecl()` will call `parseBType()`, which will consume the wrong token.
+
+How could `isDecl()` return true incorrectly?
+
+In `isDecl()`:
+
+```java
+} else if (currentToken().getType().equals("INTTK") || currentToken().getType().equals("CHARTK")) {
+    if (preRead(1).getType().equals("IDENFR") && !preRead(2).getType().equals("LPARENT")) {
+        return true;
+    } else {
+        return false;
+    }
+}
+```
+
+This is correct for distinguishing declarations from function definitions.
+
+But what if `preRead(1)` is null? Then `.getType()` throws NPE.
+
+To prevent that, we need null checks.
+
+But the error is TLE, not crash.
+
+Unless in some Java environments, NPE is handled differently, but unlikely.
+
+Given the time, I'll conclude that the error is in the **`parseBType()` method**, because it **assumes the current token is either `INTTK` or `CHARTK`**, but if called in the wrong context, it will **consume any token and pretend it's `CHARTK`**, leading to parsing errors and potential infinite loops.
+
+<Parser.java>
+...
+    private SyntaxNode parseBType() {
+        if (currentToken().getType().equals("INTTK")) {
+            SyntaxNode syntaxNode = new SyntaxNode("INTTK int");
+            currentTokenIndex++;
+            return syntaxNode;
+        } else {
+            SyntaxNode syntaxNode = new SyntaxNode("CHARTK char");
+            currentTokenIndex++;
+            return syntaxNode;
+        }
+    }
+...

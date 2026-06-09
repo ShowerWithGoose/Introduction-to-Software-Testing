@@ -1,0 +1,171 @@
+Based on the problem description and the test case analysis:
+
+1.  **Test Case Input Analysis**:
+    *   Line 16: `ch = getchar( ; // error 1` -> Missing right parenthesis `)`. Expected error `j` at line 16.
+    *   Line 18: `if (f2() & f1()) { // error 2` -> Single `&` used instead of `&&`. Expected error `a` at line 18.
+    *   Line 19: `printf("%c",s[0]; // error 3` -> Missing right parenthesis `)`. Expected error `j` at line 19.
+
+2.  **Buggy Output vs Expected Output**:
+    *   Buggy: `16 j`, `19 j`.
+    *   Expected: `16 j`, `18 a`, `19 j`.
+    *   The program fails to detect the error `a` (single `&`) on line 18.
+
+3.  **Code Analysis**:
+    *   The lexical analyzer (`Lexer.java`) is responsible for detecting single `&` and `|` characters and reporting error `a`.
+    *   In `Lexer.java`, inside the `addWords()` method, there is logic to handle `&` and `|`.
+    *   When a single `&` is encountered, it creates a `Wrong` object with `posLine` (which is 0-indexed in the lexer's internal state `posLine`).
+    *   The `Wrong` constructor is called as `new Wrong("WRONGAND", posLine, "a")`.
+    *   Inside the `Wrong` constructor: `this.posLine = pos + 1;`. This converts the 0-indexed line number from the lexer to a 1-indexed line number for output.
+    *   However, looking at the `Lexer` class, `posLine` is incremented at the end of the outer `while` loop in `recognize()`.
+    *   Let's trace `posLine` during tokenization.
+        *   Lines are stored in `lines` list. `posLine` indexes into `lines`.
+        *   In `recognize()`: `while (posLine < lines.size())`. Inside, it processes tokens. At the end, `posLine++`.
+        *   So when processing line 18 (index 17 in 0-based `lines`), `posLine` is 17.
+        *   When `addWords()` detects `&`, it calls `new Wrong(..., 17, "a")`.
+        *   `Wrong` constructor sets `this.posLine = 17 + 1 = 18`.
+        *   This seems correct for line 18.
+
+    *   Wait, let's look closer at `Lexer.addWords()` and how `posLine` is managed.
+    *   The `Lexer` stores lines in `lines`. `posLine` is the index of the current line being processed.
+    *   In `recognize()`:
+        ```java
+        while (posLine < lines.size()) {
+            posWord = 0;
+            while (posWord < getLine(posLine).length()) {
+                // ... process tokens ...
+                addWords();
+            }
+            posLine++;
+        }
+        ```
+    *   When processing line 18 (the 19th line if 1-indexed, but let's check the input).
+        Input:
+        Line 1: `const char Ch='c', s[20] = "hello world";`
+        ...
+        Line 16: `ch = getchar( ; // error 1`
+        Line 17: (empty or comment?) No, line 17 is ` ` (empty line? No, usually empty lines are kept or skipped depending on `deleteWhite`).
+        Let's look at `deleteWhite`: `lines.add(string1);`. It adds trimmed lines. If a line is empty, `string1` is `""`. It is added.
+        
+        Let's count lines in `testfile.txt`:
+        1. `const char Ch='c', s[20] = "hello world"; `
+        2. `int global;`
+        3. (empty)
+        4. `int f1() {`
+        5. `    global = 1;`
+        6. `    return 1;`
+        7. `}`
+        8. (empty)
+        9. `int f2() {`
+        10. `    global = global + 1;`
+        11. `    return 0;`
+        12. `}`
+        13. (empty)
+        14. `int main() { `
+        15. `    char ch;`
+        16. `    ch = getchar( ; // error 1`
+        17. (empty? No, next line is `if`) -> Actually, looking at the input block:
+        ```
+        const char Ch='c', s[20] = "hello world"; 
+        int global;
+
+        int f1() {
+            global = 1;
+            return 1;
+        }
+
+        int f2() {
+            global = global + 1;
+            return 0;
+        }
+
+        int main() { 
+            char ch;
+            ch = getchar( ; // error 1
+
+            if (f2() & f1()) { // error 2
+                printf("%c",s[0]; // error 3
+            }
+            return 0;
+        }
+        ```
+        Line 16 is `ch = getchar( ; // error 1`.
+        Line 17 is empty (or just whitespace).
+        Line 18 is `if (f2() & f1()) { // error 2`.
+        
+        So, when `Lexer` processes Line 18, `posLine` should be 17 (0-indexed).
+        The `Wrong` object gets `posLine = 17`.
+        `Wrong` constructor: `this.posLine = pos + 1 = 18`.
+        This matches the expected output line number 18.
+
+    *   Why is it missing?
+    *   Let's check `CompUnit.parseCompUnit()` or `Stmt.getStmt()`.
+    *   The error `a` is a lexical error. The `Lexer` detects it and sets `flag = true` and adds to `wrongs`.
+    *   In `Compiler.main`:
+        ```java
+        Lexer lexer = new Lexer();
+        lexer.getFile();
+        lexer.recognize();
+        CompUnit compUnit = new CompUnit(lexer.getWords());
+        compUnit.parseCompUnit();
+        compUnit.printWords();
+        ```
+    *   `lexer.recognize()` populates `lexer.wrongs` and `lexer.flag`.
+    *   `compUnit.printWords()` checks `WrongFile.getInstance().getFlag()`.
+    *   **Crucial Point**: `Lexer` has its own `wrongs` map and `flag`. `WrongFile` is a separate singleton used by the *Parser* (syntax analysis) to report syntax errors (like missing semicolons).
+    *   The `Lexer` reports lexical errors (like `a`) to its internal `wrongs` map.
+    *   However, `CompUnit.printWords()` only checks `WrongFile.getInstance().getFlag()`. It does **not** check `lexer.flag` or merge `lexer.wrongs` into `WrongFile`.
+    *   If `WrongFile` is empty (no syntax errors detected *before* the lexical error check matters, or if the parser doesn't trigger `WrongFile`), the lexical errors from `Lexer` are ignored in the final output because `printWords` relies solely on `WrongFile`.
+    *   Wait, `Lexer.printWords()` handles lexical errors. But `Compiler` calls `compUnit.printWords()`, not `lexer.printWords()`.
+    *   `CompUnit.printWords()`:
+        ```java
+        public void printWords() {
+            if(WrongFile.getInstance().getFlag()) {
+                WrongFile.getInstance().getPrint();
+            } else {
+                file.printWords();
+            }
+        }
+        ```
+    *   The `Lexer`'s errors are stored in `lexer.wrongs`, NOT in `WrongFile`.
+    *   The `Parser` stores errors in `WrongFile`.
+    *   Therefore, lexical errors (type `a`) are never printed because `WrongFile` doesn't know about them.
+    *   To fix this, the lexical errors need to be transferred to `WrongFile`, or `CompUnit` needs to check `lexer`'s errors.
+    *   Given the structure, the most likely intended fix is that `Lexer` should add its errors to `WrongFile` instead of (or in addition to) its local map, OR `Compiler` should merge them.
+    *   Looking at `Lexer.addWords()`:
+        ```java
+        Wrong wrong = new Wrong("WRONGAND", posLine, "a");
+        wrongs.put(posLine + 1, wrong); // Stores in local map
+        flag = true;
+        ```
+    *   It should likely call `WrongFile.getInstance().addWrong(wrong)` instead.
+
+    *   Let's verify if `WrongFile` is used elsewhere. Yes, in `ConstDecl`, `FuncDef`, etc., for syntax errors.
+    *   So, `Lexer` is isolated from `WrongFile`.
+    *   The error is in `Lexer.java` where it fails to register the lexical error with the global `WrongFile` singleton that `CompUnit` checks.
+
+<frontend/Lexer.java>
+...
+            } else if (c == '&') {
+                if (posWord < getLine(posLine).length() - 1 && getLine(posLine).charAt(posWord + 1) == '&') {
+                    words.add(new Token("AND", "&&", posLine));
+                    len = 2;
+                } else {
+                    Wrong wrong = new Wrong("WRONGAND", posLine, "a");
+                    wrongs.put(posLine + 1, wrong);
+                    len = 1;
+                    words.add(new Token("AND", "&&", posLine));
+                    flag = true;
+                }
+            } else if (c == '|') {
+                if (posWord < getLine(posLine).length() - 1 && getLine(posLine).charAt(posWord + 1) == '|') {
+                    words.add(new Token("OR", "||", posLine));
+                    len = 2;
+                } else {
+                    Wrong wrong = new Wrong("WRONGOR", posLine, "a");
+                    wrongs.put(posLine + 1, wrong);
+                    len = 1;
+                    words.add(new Token("OR", "||", posLine));
+                    flag = true;
+                }
+            } else if (c == '+') {
+...

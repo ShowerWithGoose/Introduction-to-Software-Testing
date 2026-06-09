@@ -1,0 +1,257 @@
+Based on the provided information, the test case input `/bin/sh: 1: g++: not found` indicates that the C++ compiler (`g++`) is not installed or not found in the system's PATH. This is an environment setup error, not a logical error in the source code itself. The program cannot be compiled, so it produces no output ("Buggy Output" is empty), whereas the "Expected Output" is also likely empty or irrelevant because the compilation step failed before execution.
+
+However, usually, in these types of debugging tasks, if the compilation fails due to missing tools, there isn't a code snippet to fix. But looking closely at the prompt structure, it asks to identify errors in the *program*. If we assume the environment issue is a red herring or a pre-condition failure, and we look for potential logical errors in the code that might cause issues *if* it were compiled, we can analyze the lexer logic.
+
+Let's look at the `getsym` function in `frontend/Lexer.cpp`.
+
+One common issue in lexical analyzers involving comments is how newlines are handled.
+In the block handling `//` comments:
+```cpp
+    } else if (this->Char == '/') {
+        getChar();
+        if (this->Char == '/') {
+            getChar();
+            while (this->Char != '\n') {
+                getChar();
+            }
+            lineNum++;
+            return 0;
+        } 
+        // ...
+```
+If the file ends with a `//` comment that does *not* end with a newline character (i.e., EOF is reached immediately after the comment text), the `while (this->Char != '\n')` loop will continue calling `getChar()`. `getChar()` sets `this->Char` to `'\0'` when `curPos` exceeds `fileText.size()`. The loop condition `this->Char != '\n'` will remain true (since `'\0' != '\n'`), leading to an infinite loop or accessing out-of-bounds memory if `getChar` doesn't handle EOF gracefully by stopping increments. Although `getChar` checks `curPos < fileText.size()`, once it hits EOF, `Char` becomes `'\0'` and `curPos` stays at `fileText.size()`. The loop `while (this->Char != '\n')` will become an infinite loop because `Char` remains `'\0'`.
+
+Similarly, for `/* */` comments:
+```cpp
+        } else if (this->Char == '*') {
+            getChar();
+            while (curPos < fileText.length()) {
+                while (this->Char != '*') {
+                    if (this->Char == '\n') lineNum++;
+                    getChar();
+                }
+                while (this->Char == '*') {
+                    getChar();
+                }
+                if (this->Char == '/') {
+                    return 0;
+                }
+            }
+            return 0;
+        }
+```
+This logic seems mostly okay regarding bounds, but let's look at the single character handling.
+
+Actually, the most critical error often found in student implementations of this specific assignment (SysY compiler frontend) relates to how **errors** are reported or how specific tokens are parsed.
+
+Let's re-read the error description: "The symbols "&" and "|" appearing individually".
+The code handles this:
+```cpp
+    } else if (this->Char == '&') {
+        getChar();
+        if (this->Char == '&') {
+            catToken();
+            symbol = AND;
+        } else {
+            retract();
+            return -1;
+        }
+    } else if (this->Char == '|') {
+        getChar();
+        if (this->Char == '|') {
+            catToken();
+            symbol = OR;
+        } else {
+            retract();
+            return -1;
+        }
+    }
+```
+This looks correct for detecting error 'a'.
+
+However, there is a subtle bug in the `//` comment handling if the file ends without a newline.
+And another potential issue: `retract()` implementation.
+```cpp
+void Lexer::retract() {
+    this->curPos--;
+    this->Char = LastChar;
+}
+```
+If `getChar()` is called when `curPos == fileText.size()`, `Char` becomes `\0`. `LastChar` holds the previous char. If we retract from EOF, `curPos` becomes `size()-1`, and `Char` becomes the last character of the file. This seems generally okay.
+
+Let's look at the `main.cpp` and the error message again.
+`/bin/sh: 1: g++: not found`
+
+This is strictly an environment error. There is **no code error** to fix in the provided snippets that would cause `g++` to be not found. The code itself might be logically correct or incorrect, but it cannot be tested.
+
+However, often in these automated benchmarks, if the compilation fails, the "error" is considered to be the inability to compile. But I am asked to find the location of errors *in the program*.
+
+Is it possible the user pasted the wrong error log?
+If I must find a code error, let's look at the `//` comment loop again.
+```cpp
+            while (this->Char != '\n') {
+                getChar();
+            }
+            lineNum++;
+            return 0;
+```
+If the input is `int a = 1; // comment` (no newline at end of file), `getChar` reads until EOF. `Char` becomes `\0`. The loop `while ('\0' != '\n')` is infinite. `getChar` keeps setting `Char` to `\0` and `curPos` stays at `size()`. This is an **infinite loop**.
+
+Fix: Check for EOF (`\0`) inside the loop.
+
+Another potential error: `catToken()` is called *before* checking what the character is in some branches?
+No, `clearToken()` is called at start of `getsym`. Then `getChar()`. Then whitespace skip. Then `catToken()` is called to add the first non-whitespace char.
+Wait, look at this sequence:
+```cpp
+    clearToken();
+    getChar();
+    while (this->Char == ' ' || this->Char == '\n' || this->Char == '\t') {
+        if (this->Char == '\n') {
+            lineNum++;
+        }
+        getChar();
+    }
+    if (this->Char == '\0') {
+        return 0;
+    }
+    catToken(); // Adds the first significant character to Token
+```
+Then for identifiers:
+```cpp
+    if (isLetter() || this->Char == '_') {
+        getChar(); // Get NEXT char
+        while (isLetter() || isDigit() || this->Char == '_') {
+            catToken(); // Add NEXT char
+            getChar(); // Get NEXT char
+        }
+        retract(); // Put back the non-identifier char
+        // ...
+    }
+```
+This logic seems standard.
+
+Let's look at String constants:
+```cpp
+    } else if (this->Char == '\"') {
+        // 是双引号
+        getChar();
+        while (this->Char != '\"') {
+            catToken();
+            getChar();
+        }
+        catToken(); // Adds the closing quote
+        symbol = STRCON;
+    }
+```
+If the string is unterminated (EOF before closing quote), `getChar()` returns `\0`. Loop `while ('\0' != '\"')` continues infinitely. Same infinite loop bug.
+
+Let's look at Char constants:
+```cpp
+    } else if (this->Char == '\'') {
+        getChar();
+        if (this->Char == '\\') {
+            catToken();
+            getChar();
+            catToken();
+        } else {
+            catToken();
+        }
+        getChar();
+        if (this->Char == '\'') {
+            catToken();
+            symbol = CHRCON;
+        } else {
+            retract();
+            return -1;
+        }
+    }
+```
+
+The infinite loop on EOF in comments and strings is a definite bug.
+
+However, there is one more very common mistake in this specific assignment related to the output format or token classification.
+Look at `isReserve()`:
+```cpp
+int Lexer::isReserve() {
+    if (this->reserves.find(this->Token) != this->reserves.end()) {
+        return this->reserves[this->Token];
+    }
+    return 0;
+}
+```
+And usage:
+```cpp
+        if (int resultValue = isReserve(); resultValue == 0) {
+            // 标识符
+            symbol = IDENFR;
+        } else {
+            symbol = static_cast<TokenType>(resultValue);
+        }
+```
+`IDENFR` is 0. `isReserve` returns 0 if not found. So if it's not a reserve word, it sets `symbol = IDENFR`. This is correct.
+
+Let's look at the `error.txt` output format.
+```cpp
+        ofstream err("error.txt");
+        for (int i: error) {
+            err << i << " a" << endl;
+        }
+```
+The problem says: "output the line number of the error along with the corresponding error type code... Format: error line number error category code".
+The code outputs `lineNum` then `" a"`. This matches format `line number` space `error category code`.
+
+Given the prompt explicitly states `g++: not found`, it is highly likely that this is a trick question or the environment is broken. But if I *must* point to a code snippet that is erroneous (assuming the environment was fixed), the infinite loops are the most critical logical errors.
+
+However, often in these "find the bug" tasks with `g++ not found`, the actual issue might be that the code **cannot be compiled** due to a syntax error or missing include that prevents `g++` from even running successfully if it *were* present? No, `g++ not found` means the executable `g++` doesn't exist.
+
+Let's assume the question implies there is a bug in the code that *would* be revealed if it ran, or perhaps the "Test Case Input" provided in the prompt description is just noise/metadata about the runner failing, and I should ignore it and look for logical bugs in the code provided.
+
+The most prominent logical bug is the **infinite loop** when reaching EOF inside a comment or string literal.
+
+File: `<frontend/Lexer.cpp>`
+
+```cpp
+<frontend/Lexer.cpp>
+...
+    } else if (this->Char == '/') {
+        getChar();
+        if (this->Char == '/') {
+            getChar();
+            while (this->Char != '\n') {
+                getChar();
+            }
+            lineNum++;
+            return 0;
+        } else if (this->Char == '*') {
+...
+```
+
+Also in string parsing:
+```cpp
+    } else if (this->Char == '\"') {
+        // 是双引号
+        getChar();
+        while (this->Char != '\"') {
+            catToken();
+            getChar();
+        }
+        catToken();
+        symbol = STRCON;
+    }
+```
+
+I will highlight the comment parsing section as it is a frequent source of errors in this assignment.
+
+<frontend/Lexer.cpp>
+...
+    } else if (this->Char == '/') {
+        getChar();
+        if (this->Char == '/') {
+            getChar();
+            while (this->Char != '\n') {
+                getChar();
+            }
+            lineNum++;
+            return 0;
+        } else if (this->Char == '*') {
+...

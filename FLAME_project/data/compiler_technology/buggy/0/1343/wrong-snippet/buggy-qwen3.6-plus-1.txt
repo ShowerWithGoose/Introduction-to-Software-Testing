@@ -1,0 +1,204 @@
+The program fails to produce any output because the `TokenStream` is accessed before it is frozen, causing an `IllegalStateException` which terminates the program.
+
+In `Controller.java`, the line `TokenStream tokens = new Lexer(Configure.source).lex().emit();` calls `emit()`, which freezes the stream. However, looking at the `Lexer.java` implementation, specifically the `scanString` method, there is a logical error in handling escape sequences and format strings that might cause issues, but the primary reason for "No output file" with a valid input is likely an unhandled exception during lexing or token stream access.
+
+Let's look closer at `Lexer.java`.
+The `scanString` method has a flaw. It reads characters inside a string.
+```java
+            } else if (chr == '\\') {
+                chr = reader.read();
+                if (chr != 'n') {
+                    reader.unread(chr);
+                    errors.add(ErrorType.InvalidFormatString, location());
+                    continue;
+                }
+                str.append('\n');
+```
+The problem description states: `const char s1='a', s2[20]="hello\a world\t";`.
+The string contains `\a` and `\t`.
+When `scanString` encounters `\`, it reads the next char `a`. Since `a` != `n`, it unreads `a`, adds an error `InvalidFormatString`, and continues.
+Then it encounters `\` again (for `\t`? No, the loop continues).
+Wait, the input string is `"hello\a world\t"`.
+1. `h`, `e`, `l`, `l`, `o` are appended.
+2. `\` is encountered. `chr` becomes `a`. `a` != `n`. Unread `a`. Add Error. Continue.
+3. Next iteration: `chr` is `a` (from unread). It falls into the `else` block (assuming `a` is printable). Appends `a`.
+4. Next: ` ` (space). Appended.
+5. Next: `w`, `o`, `r`, `l`, `d`. Appended.
+6. Next: `\`. `chr` becomes `t`. `t` != `n`. Unread `t`. Add Error. Continue.
+7. Next iteration: `chr` is `t`. Appended.
+8. Next: `"`. Loop ends.
+
+So `scanString` generates errors for valid escape sequences like `\a` and `\t` which are not explicitly handled as valid in this specific lexer implementation (only `\n` seems to be treated as a valid escape sequence for strings, or rather, the code assumes only `\n` is valid and treats others as errors). However, the problem says "For a correct source program... output tokens". The test case input is considered a **correct** source program in the context of the expected output provided (which lists tokens and no errors). The expected output includes `STRCON "hello\a world\t"`. This implies the lexer should accept these escape sequences or at least not crash/error out in a way that prevents output.
+
+But wait, if `errors.add` is called, `errors.noError()` will return false.
+In `Controller.java`:
+```java
+            try (FileWriter writer = new FileWriter(errors.noError() ? Configure.target : Configure.error)) {
+                writer.write((errors.noError() ? tokens : errors).toString());
+            }
+```
+If errors are added, it writes to `error.txt`. The expected output is in `lexer.txt`. This means the lexer should **not** report errors for this input.
+
+The issue is in `scanString`. It incorrectly flags `\a` and `\t` as `InvalidFormatString`.
+However, there is a more critical issue. The `scanString` logic for `\` only handles `\n`. It unreads other characters.
+If the input is `"hello\a"`, it reads `\`, then `a`. Unreads `a`. Adds error.
+Next loop reads `a`. Appends `a`.
+Next reads `"`. Ends.
+Resulting string: `helloa`.
+Expected string value in token: `"hello\a world\t"`.
+The expected output shows `STRCON "hello\a world\t"`. This suggests the lexer should preserve the original escape sequences or handle them correctly.
+
+Actually, looking at the `Token.toString()`:
+```java
+    public String toString() {
+        return type + " " + value.replace("\n", "\\n");
+    }
+```
+And `scanString` builds `str`.
+If the lexer is supposed to support standard C-like escape sequences, `scanString` is incomplete.
+
+But why "No output file"?
+Usually, this means an exception was thrown.
+Let's check `scanSymbol`.
+```java
+            case '|' -> {
+                chr = reader.read();
+                if (chr != '|') {
+                    errors.add(ErrorType.InvalidToken, location());
+                    reader.unread(chr);
+                }
+                addToken(TokenType.Or, "||", start);
+            }
+```
+If it reads `|` and then `x` (not `|`), it adds an error, unreads `x`, but **still adds the token `||`**. This is logically wrong for error recovery (it creates a bogus token), but might not crash.
+
+Let's look at `scanIdentifier`.
+```java
+        while (Character.isLetterOrDigit(chr) || chr == '_') {
+            identifier.append((char) chr);
+            chr = reader.read();
+        }
+        reader.unread(chr);
+```
+This looks fine.
+
+Let's look at `scanNumber`.
+```java
+        do {
+            number.append((char) chr);
+        } while (Character.isDigit(chr = reader.read()));
+        reader.unread(chr);
+```
+This looks fine.
+
+Let's look at `scanSlash`.
+```java
+        } else if (chr == '*') {
+            // Multi-line comment
+            while ((chr = reader.read()) != -1) {
+                int nxt = reader.read();
+                if (chr == '*' && nxt == '/') {
+                    break;
+                }
+                reader.unread(nxt);  // unread a char to avoid missing '*/'
+            }
+        }
+```
+If `nxt` is `-1` (EOF), `reader.unread(-1)` might throw an exception or behave unexpectedly depending on `PushbackReader` implementation. `PushbackReader.unread(int c)` throws `IOException` if `c` is -1? No, it usually allows it or ignores it, but logically you shouldn't unread EOF. If `nxt` is -1, `chr` was the last char. If `chr` is not `*`, we unread -1.
+Actually, `PushbackReader.unread(int c)` javadoc: "Throws: IOException - If an I/O error occurs". It doesn't explicitly forbid -1, but reading -1 means EOF. Unreading EOF is semantically wrong.
+
+However, the most likely cause for "No output" in a student assignment context is an uncaught exception.
+
+Let's re-read `Controller.java`.
+```java
+        TokenStream tokens = new Lexer(Configure.source).lex().emit();
+```
+If `lex()` throws an IOException, it propagates. `main` throws IOException.
+
+Let's look at `scanString` again.
+```java
+        while ((chr = reader.read()) != '"') {
+            if (chr == '%') {
+               ...
+            } else if (chr == '\\') {
+                chr = reader.read();
+                if (chr != 'n') {
+                    reader.unread(chr);
+                    errors.add(ErrorType.InvalidFormatString, location());
+                    continue;
+                }
+                str.append('\n');
+            } else if (chr != (char) 32 && chr != (char) 33 && (chr < (char) 40 || chr > (char) 126)) {
+                errors.add(ErrorType.InvalidFormatString, location());
+            } else {
+                str.append((char) chr);
+            }
+        }
+```
+The input string is `"hello\a world\t"`.
+`\a` : `chr` is `\`. Reads `a`. `a` != `n`. Unreads `a`. Adds Error.
+Next iter: `chr` is `a`. `a` is 97. 97 is between 40 and 126. Appends `a`.
+`\t` : `chr` is `\`. Reads `t`. `t` != `n`. Unreads `t`. Adds Error.
+Next iter: `chr` is `t`. Appends `t`.
+
+So errors ARE added.
+`errors.noError()` is false.
+It writes to `Configure.error` ("error.txt").
+The expected output is in `lexer.txt`.
+The test case expects `lexer.txt` to be populated.
+This implies the input is considered **correct** and should have **no errors**.
+Therefore, the lexer is incorrectly identifying valid escape sequences as errors.
+
+But wait, the prompt says "Buggy Output: No output file".
+If it wrote to `error.txt`, there would be an output file (just the wrong one or content). "No output file" usually implies the program crashed or terminated before writing.
+
+Is there a crash?
+In `scanString`, if `reader.read()` returns -1 inside the loop (unterminated string), the loop condition `!= '"'` remains true.
+Inside the loop:
+`if (chr == '%')` ...
+`else if (chr == '\\')` ... `chr = reader.read()`. If this returns -1, `chr` is -1.
+`if (chr != 'n')` -> true.
+`reader.unread(-1)`.
+`PushbackReader.unread(-1)` typically throws an `IOException` or `IllegalArgumentException` because -1 is not a valid character to push back.
+**This is the crash.**
+
+Although the test case string `"hello\a world\t"` is properly terminated, does the lexer handle other strings correctly?
+The test case has:
+`printf("21373287\n");` -> `\n` is handled correctly.
+`printf("%d\n", t3);` -> `%` followed by `d` is handled. `\n` handled.
+`printf("error\n");` -> `\n` handled.
+`printf("%d\n", t3);` -> handled.
+
+So why would it crash on this specific input?
+Maybe it doesn't crash, but simply produces the wrong output file (`error.txt` instead of `lexer.txt`) and the grading system checks `lexer.txt` and finds it empty/missing?
+"Buggy Output: No output file" often refers to the *expected* output file being empty or missing. If the program writes to `error.txt` and the grader looks for `lexer.txt`, `lexer.txt` will be empty (or not created if the logic skips it).
+
+In `Controller.java`:
+```java
+            try (FileWriter writer = new FileWriter(errors.noError() ? Configure.target : Configure.error)) {
+                writer.write((errors.noError() ? tokens : errors).toString());
+            }
+```
+If `errors.noError()` is false, it writes to `Configure.error` ("error.txt").
+`Configure.target` is "lexer.txt".
+So `lexer.txt` is NOT written to.
+Thus, `lexer.txt` does not exist or is empty.
+The expected output is the content of `lexer.txt`.
+So the error is that the lexer is reporting errors for valid code.
+
+The errors are reported in `scanString` for `\a` and `\t`.
+The fix should be to allow common escape sequences or simply ignore them/preserve them without error if they are valid in the target language (C-like). The problem description doesn't explicitly list valid escape sequences for strings, but the expected output `STRCON "hello\a world\t"` implies they are valid.
+
+The code snippet where the error is located is in `Lexer.java`, specifically the `scanString` method's handling of backslashes.
+
+<top/swkfk/compiler/frontend/Lexer.java>
+...
+            } else if (chr == '\\') {
+                chr = reader.read();
+                if (chr != 'n') {
+                    reader.unread(chr);
+                    errors.add(ErrorType.InvalidFormatString, location());
+                    continue;
+                }
+                str.append('\n');
+...

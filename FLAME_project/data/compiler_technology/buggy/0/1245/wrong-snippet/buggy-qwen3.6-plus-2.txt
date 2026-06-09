@@ -1,0 +1,305 @@
+Based on the analysis of the problem description, test case, buggy output, and expected output:
+
+1.  **Problem Analysis**: The input source code is syntactically correct (no lexical errors like standalone `&` or `|`). Therefore, the program should output the tokens to `lexer.txt`.
+2.  **Discrepancy**: The "Buggy Output" contains an extra token `RBRACE }` at the very end, which corresponds to the closing brace of the `main` function. However, looking closely at the provided "Buggy Output" vs "Expected Output":
+    *   Expected Output ends with:
+        ```
+        RETURNTK return
+        INTCON 0
+        SEMICN ;
+        RBRACE }
+        ```
+    *   Buggy Output ends with:
+        ```
+        RETURNTK return
+        INTCON 0
+        SEMICN ;
+        RBRACE }
+        RBRACE }
+        ```
+    *   Wait, let's look closer at the input code structure.
+        ```java
+        int main()
+        {
+            // ... code ...
+            return 0;
+        }
+        // zhe shi yi ge hen niu bi de ce shi
+        ```
+    *   The input has one `main` function. The `tran` function also has braces.
+    *   Let's count braces in the Buggy Output.
+        *   `tran` function: `{` ... `}`. Correct.
+        *   `main` function: `{` ... `}`.
+    *   In the Buggy Output, after `return 0;` inside `main`, there is `RBRACE }`. Then there is *another* `RBRACE }`.
+    *   The Expected Output only has one `RBRACE }` after `return 0;`.
+    *   This implies the lexer is generating an extra `}` token.
+
+3.  **Code Analysis**:
+    *   Look at `Lexer.java`, specifically the `read()` method and how it handles end-of-file or empty lines.
+    *   In `read()`:
+        ```java
+        public static int read() throws IOException {
+            pos++;
+            if(storage==null || pos >= storage.length()){
+                readLine();
+            }
+            if(storage==null){
+                //读到文件结束
+                pos = 0;
+                lineno = 0;
+                return -1;
+            }
+            if(storage.isEmpty()){
+                return read(); // Recursively read next line if current is empty
+            }
+            p = storage.charAt(pos);
+            // ... checks for signs, ints, etc.
+            return read(); // If no token found, recurse
+        }
+        ```
+    *   Look at `checkSign`:
+        ```java
+        static boolean checkSign(char p) throws IOException {
+            String s = String.valueOf(p);
+            if(signMap.containsKey(s) || p=='&' || p=='|'){
+                // ... logic to handle signs ...
+                // It creates a token and returns true.
+            }
+            Arrays.fill(content,'\u0000');
+            return false;
+        }
+        ```
+    *   The issue likely lies in how the lexer handles the end of the file or specific characters that might be misinterpreted.
+    *   However, a more common issue in student lexers causing duplicate tokens or extra tokens at the end is related to how `pos` is managed when `readLine()` is called or how the loop in `main` terminates.
+    *   Let's look at `Compiler.java`:
+        ```java
+        while(Lexer.read()!=-1){
+            Lexer.putToken();
+        }
+        ```
+    *   `Lexer.read()` returns `1` if a token is found, `-1` if EOF.
+    *   If `read()` finds a token, it sets `currentToken` and returns `1`. `putToken()` adds it.
+    *   If `read()` doesn't find a token (e.g., whitespace), it calls `return read()` recursively.
+    *   
+    *   Let's look at `checkSign` again.
+        ```java
+        if(signMap.containsKey(s) || p=='&' || p=='|'){
+             // ...
+             if(checkSign(content)){ // Checks for 2-char operators like <=
+                 // ... creates token ...
+             }
+             else {
+                 // ...
+                 if(checkAnnotation(content)){
+                     read();
+                     return true; 
+                 }
+                 // ...
+                 currentToken = new Token(...);
+             }
+             // ...
+             return true;
+        }
+        ```
+    *   There is a subtle bug in `checkSign` regarding `pos`.
+        ```java
+        content[0]=p;
+        pos++; // Move to next char
+        if(pos>=storage.length()){
+             pos--; // Move back
+             currentToken = ... // Create single char token
+             // ...
+             return true;
+        }
+        content[1]=storage.charAt(pos); // Peek next char
+        if(checkSign(content)){ // Check if 2-char operator exists in map
+             // ... create 2-char token ...
+             // Note: pos is NOT incremented here in the successful 2-char branch? 
+             // Let's check turnString usage.
+             // If it is a 2-char operator, pos is currently pointing to the SECOND char.
+             // The next call to read() will do pos++, moving to the third char. This is correct.
+        }
+        else {
+             pos--; // Move back to first char
+             // ... handle error or single char token ...
+             // Creates single char token.
+             // Next read() will do pos++, moving to second char. Correct.
+        }
+        ```
+    *   Wait, look at `checkAnnotation`.
+        ```java
+        if(checkAnnotation(content)){
+             read();
+             return true;//注释会提前中止以保护递归调用的read()函数创造的token对象
+        }
+        ```
+        If it's a comment, it consumes the comment and calls `read()` to get the *next* token, then returns `true`. But `currentToken` was set by the recursive `read()` call inside `checkAnnotation`? No, `checkAnnotation` calls `readLine` or `annotationProcess`. It does *not* set `currentToken`.
+        The comment says "protects the token object created by the recursively called read() function".
+        So `read()` is called. That inner `read()` will eventually find a token and set `currentToken`. Then it returns `1`.
+        The outer `checkSign` returns `true`.
+        The outer `read()` returns `1`.
+        `putToken()` is called. This seems okay.
+
+    *   Let's look at the extra `RBRACE`.
+    *   The input file ends with:
+        ```
+        }
+        // zhe shi yi ge hen niu bi de ce shi
+        ```
+    *   The last line is a comment.
+    *   When the lexer processes the `}` on the second-to-last line:
+        1. `read()` is called.
+        2. `checkSign('}')` is called.
+        3. It finds `}` in `signMap`.
+        4. `pos++`.
+        5. `pos < storage.length()` (assuming no trailing newline issues or just the char).
+        6. `content[1] = next char`. If the line is just `}`, `pos` might be out of bounds?
+           - If `storage` is `"}"`, length is 1. `pos` starts at 0 (for the char `}`).
+           - `checkSign` is called with `p='}'`.
+           - `pos++` -> `pos=1`.
+           - `pos >= storage.length()` (1 >= 1) is True.
+           - `pos--` -> `pos=0`.
+           - Creates token `RBRACE`.
+           - Returns `true`.
+        7. `read()` returns `1`.
+        8. `putToken()` adds `RBRACE`.
+        
+    *   Then the loop continues. `read()` is called again.
+    *   `pos++` -> `pos=1`.
+    *   `pos >= storage.length()` -> True.
+    *   `readLine()` is called.
+    *   `storage` becomes `"// zhe shi yi ge hen niu bi de ce shi"`.
+    *   `lineno++`.
+    *   `storage` is not null, not empty.
+    *   `p = storage.charAt(1)`? No, `pos` is 1.
+    *   Wait, `readLine()` sets `pos=0`.
+    *   So `storage` is the comment line. `pos` is 0.
+    *   Back in `read()`:
+        - `pos++` -> `pos=1`.
+        - `p = storage.charAt(1)` -> `'/'`.
+        - `checkSign('/')` is called.
+        - `signMap` contains `/`.
+        - `pos++` -> `pos=2`.
+        - `pos < storage.length()`.
+        - `content[1] = storage.charAt(2)` -> `'/'`.
+        - `checkSign(content)` checks for `//`.
+        - `signMap` does NOT contain `//`.
+        - Goes to `else`.
+        - `pos--` -> `pos=1`.
+        - `checkAnnotation(content)` is called with `['/', '/']`.
+        - `checkAnnotation` sees `//`.
+        - Calls `readLine()`.
+        - `readLine()` sets `pos=0`, `lineno++`, reads next line.
+        - Next line is likely `null` (EOF) or empty.
+        - If EOF, `storage` becomes `null`.
+        - `checkAnnotation` returns `true`.
+        - Back in `checkSign`:
+          ```java
+          if(checkAnnotation(content)){
+               read(); // <--- HERE
+               return true;
+          }
+          ```
+        - It calls `read()` recursively.
+        - Inside this recursive `read()`:
+          - `pos++`.
+          - `storage` is `null` (if EOF) or empty.
+          - If `storage` is `null`:
+            - `readLine()` called again? No, `storage` is already null from previous `readLine`.
+            - Wait, `readLine()` was called inside `checkAnnotation`.
+            - If `source.readLine()` returns `null`, `storage` is `null`.
+            - Recursive `read()`:
+              - `pos++` (pos was 0 from `readLine` in `checkAnnotation`? No, `readLine` sets `pos=0`).
+              - `storage == null`.
+              - Enters `if(storage==null)`.
+              - Sets `pos=0`, `lineno=0`.
+              - Returns `-1`.
+          - So recursive `read()` returns `-1`.
+          - Back in `checkSign`: `read()` returned `-1`.
+          - `checkSign` returns `true`.
+          - Back in outer `read()`: `checkSign` returned `true`.
+          - Outer `read()` returns `1`.
+        - `putToken()` is called!
+        - But `currentToken` was NOT updated by the recursive `read()` because it hit EOF and returned `-1` without setting a token.
+        - So `currentToken` still holds the value from the PREVIOUS successful token?
+        - No, `currentToken` is a static variable.
+        - The previous token was `RBRACE`.
+        - So `putToken()` adds `RBRACE` again!
+
+    *   This explains the duplicate `RBRACE }` at the end.
+
+    *   **The Fix**: When `checkAnnotation` returns true, it calls `read()`. If that `read()` returns `-1` (EOF), `checkSign` should probably return `false` or handle it such that `read()` returns `-1`. Or, `checkSign` shouldn't return `true` if the recursive `read()` didn't find a token.
+    *   Actually, simpler fix: In `read()`, if `checkSign` returns `true`, we assume a token was found. But if the token was a comment, `checkSign` consumed it and tried to find the *next* token. If the next token is EOF, `read()` returns `-1`. But `checkSign` ignores the return value of `read()` and returns `true`.
+    *   The code in `checkSign`:
+        ```java
+        if(checkAnnotation(content)){
+             read();
+             return true;
+        }
+        ```
+    *   It should check the result of `read()`.
+        ```java
+        if(checkAnnotation(content)){
+             return read(); // Return whatever read() returns (-1 if EOF)
+        }
+        ```
+    *   However, `checkSign` returns `boolean`. `read()` returns `int`.
+    *   So `checkSign` signature might need to change, or logic adjusted.
+    *   Alternatively, in `read()`:
+        ```java
+        if(checkSign(p)){
+            return 1; // Assumes token found
+        }
+        ```
+    *   If `checkSign` handles a comment and hits EOF, it should signal that NO token was found for this `read()` call, effectively treating it as whitespace/consumed input.
+    *   If `checkSign` returns `false`, `read()` will continue to `return read()`, which will hit EOF and return `-1`.
+
+    *   So, changing `return true;` to `return read() != -1;` inside `checkSign` when handling annotations might work, but `checkSign` returns boolean.
+    *   Better:
+        ```java
+        if(checkAnnotation(content)){
+             int res = read();
+             if (res == -1) return false; // Propagate EOF
+             return true;
+        }
+        ```
+
+    *   Let's verify the location.
+
+<Lexer.java>
+...
+    static boolean checkSign(char p) throws IOException {
+        String s = String.valueOf(p);
+        if(signMap.containsKey(s) || p=='&' || p=='|'){
+            content[0]=p;
+            pos++;
+            if(pos>=storage.length()){
+                pos--;
+                currentToken = new Token(Token.TokenType.fromValue(signMap.get(String.valueOf(p))),String.valueOf(p),lineno);
+                Arrays.fill(content,'\u0000');
+                return true;
+            }
+            content[1]=storage.charAt(pos);
+            if(checkSign(content)){
+                currentToken = new Token(Token.TokenType.fromValue(signMap.get(turnString(content))),turnString(content),lineno);
+            }
+            else {
+                pos--;
+                if(checkAnnotation(content)){
+                    read();
+                    return true;//注释会提前中止以保护递归调用的read()函数创造的token对象
+                }
+                if(errorACheck(p)){
+                    Compiler.errorExists = true;
+                    currentErrorToken = new ErrorToken(ErrorToken.ErrorTokenType.IllegalSign,String.valueOf(p),lineno);
+                    errorTokens.add(currentErrorToken);
+                }
+                currentToken = new Token(Token.TokenType.fromValue(signMap.get(String.valueOf(p))),String.valueOf(p),lineno);
+            }
+            Arrays.fill(content,'\u0000');
+            return true;
+        }
+        Arrays.fill(content,'\u0000');
+        return false;
+    }
+...

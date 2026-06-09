@@ -1,0 +1,480 @@
+Based on the comparison between the buggy output and the expected output, the error lies in the `parseInitVal` method within `Parser.java`.
+
+**Analysis:**
+1.  **Expected Behavior**: When parsing an `InitVal` (or `ConstInitVal`) that is an array initializer (starts with `{`), the parser should consume the tokens inside the braces, then consume the closing brace `}`, and *then* print the non-terminal tag `<InitVal>` (or `<ConstInitVal>`).
+2.  **Buggy Behavior**: In the provided code, inside the `if (tokenList.look(0).getType() == TokenType.LBRACE)` block, the parser consumes `{`, parses the expressions, but **fails to consume the closing `}` (`RBRACE`)**. It immediately proceeds to print `<InitVal>`. Consequently, the `RBRACE` token is left in the stream and is consumed by the caller (`parseDef`), appearing *after* the `<InitVal>` tag in the output. The expected output shows `<InitVal>` printed *before* the `RBRACE` is effectively "closed" or rather, the `RBRACE` is part of the `InitVal` structure, so it should be consumed before printing the tag, or the tag should be printed after the whole structure is recognized. Looking closely at the expected output:
+    ```
+    RBRACE }
+    <InitVal>
+    ```
+    Wait, let's look at the expected output again:
+    ```
+    INTCON 5
+    ...
+    <Exp>
+    RBRACE }
+    <InitVal>
+    <VarDef>
+    SEMICN ;
+    <VarDecl>
+    ```
+    The expected output prints `RBRACE }` *before* `<InitVal>`. This implies that the `RBRACE` is printed as a token (via `getAndAdd` or `skip` inside the parsing of the init val content or just before returning), and then `<InitVal>` is printed.
+    
+    Let's look at the buggy output:
+    ```
+    INTCON 5
+    ...
+    <Exp>
+    RBRACE }
+    SEMICN ;
+    <InitVal>   <-- Printed AFTER RBRACE and SEMICN? No.
+    ```
+    Actually, looking at the buggy output:
+    ```
+    COMMA ,
+    INTCON 5
+    ...
+    <Exp>
+    RBRACE }
+    SEMICN ;     <-- Semicolon is printed here?
+    <InitVal>    <-- InitVal printed here?
+    <VarDef>
+    ```
+    No, the buggy output is:
+    ```
+    ...
+    <Exp>
+    RBRACE }
+    SEMICN ;
+    <InitVal>
+    <VarDef>
+    <VarDecl>
+    RETURNTK return
+    ...
+    ```
+    Wait, the buggy output has `SEMICN ;` *before* `<InitVal>`. This is very wrong.
+    
+    Let's re-examine `parseInitVal`:
+    ```java
+    if (tokenList.look(0).getType() == TokenType.LBRACE) {
+        tokenList.skip(); // Consumes '{'
+        // ... loops parsing exps ...
+        while (tokenList.look(0).getType() != TokenType.RBRACE) {
+             valueList.add(parseExp(isConst));
+             tokenList.skip(); // This skips commas or potentially the RBRACE if logic is flawed?
+        }
+        // MISSING: tokenList.skip() for RBRACE
+    }
+    // ...
+    if (isConst) {
+        MyStream.printParser("<ConstInitVal>\n");
+    } else {
+        MyStream.printParser("<InitVal>\n");
+    }
+    ```
+    
+    In `parseDef`:
+    ```java
+    if (tokenList.look(0).getType() == TokenType.ASSIGN) {
+        tokenList.skip(); // '='
+        initValue = parseInitVal(isConst);
+    }
+    MyStream.printParser("<VarDef>\n");
+    ```
+    
+    If `parseInitVal` does not consume the `RBRACE`, then when it returns, the current token is still `RBRACE`.
+    Then `parseDef` continues. It does NOT consume `RBRACE`. It prints `<VarDef>`.
+    Then `parseDecl` continues. It expects `COMMA` or `SEMICN`. It sees `RBRACE`.
+    
+    Let's look at the specific discrepancy in the logs.
+    
+    **Expected:**
+    ```
+    RBRACE }
+    <InitVal>
+    <VarDef>
+    SEMICN ;
+    <VarDecl>
+    ```
+    
+    **Buggy:**
+    ```
+    RBRACE }
+    SEMICN ;       <-- Where did this come from?
+    <InitVal>      <-- Printed late?
+    <VarDef>
+    <VarDecl>
+    ```
+    
+    Actually, looking at the buggy output provided in the prompt:
+    ```
+    ...
+    <Exp>
+    RBRACE }
+    SEMICN ;
+    <InitVal>
+    <VarDef>
+    <VarDecl>
+    RETURNTK return
+    ...
+    ```
+    
+    And the Expected:
+    ```
+    ...
+    <Exp>
+    RBRACE }
+    <InitVal>
+    <VarDef>
+    SEMICN ;
+    <VarDecl>
+    RETURNTK return
+    ...
+    ```
+    
+    The difference is the position of `<InitVal>` and `SEMICN ;`.
+    In the expected output, `<InitVal>` is printed *after* `RBRACE }` and *before* `<VarDef>`.
+    In the buggy output, `SEMICN ;` appears *before* `<InitVal>`.
+    
+    This suggests that in the buggy code, the `RBRACE` is consumed (printed) somewhere, but the `<InitVal>` tag is printed much later, or the `SEMICN` is consumed prematurely.
+    
+    Let's look at `parseInitVal` again.
+    ```java
+    if (tokenList.look(0).getType() == TokenType.LBRACE) {
+        tokenList.skip();
+        isSimpleArray = true;
+        while (tokenList.look(0).getType() != TokenType.RBRACE) {
+            valueList.add(parseExp(isConst));
+            tokenList.skip(); // Skips comma
+        }
+        // BUG: Does not skip RBRACE
+    }
+    ```
+    If `RBRACE` is not skipped, it remains the current token.
+    The function then prints `<InitVal>`.
+    So the output should be:
+    `... <Exp> <InitVal>` (with `RBRACE` still pending).
+    
+    However, the buggy output shows `RBRACE }` *before* `<InitVal>`.
+    This implies `RBRACE` was printed. Who printed it?
+    
+    Look at `TokenList.getAndAdd()` and `skip()`. They print the token.
+    
+    If `parseInitVal` doesn't skip `RBRACE`, control returns to `parseDef`.
+    `parseDef` does nothing with `RBRACE`. It prints `<VarDef>`.
+    Control returns to `parseDecl`.
+    `parseDecl` calls `err(TokenType.SEMICN)`.
+    `err` checks if current token is `SEMICN`. It is `RBRACE`.
+    So `err` throws an error? Or does it just report?
+    The problem says "For a correct source program...". The input is correct.
+    
+    Wait, look at `parseDef` in the buggy code:
+    ```java
+    private Ast.Def parseDef(DataType dataType, boolean isConst) throws IOException {
+        Token ident = tokenList.getAndAdd();
+        Ast.Exp length = null;
+        if (tokenList.look(0).getType() == TokenType.LBRACK) {
+            tokenList.skip();
+            length = parseExp(true);
+            err(TokenType.RBRACK);
+        }
+        Ast.InitValue initValue = null;
+        if (isConst) {
+            tokenList.skip(); // '='
+            initValue = parseInitVal(isConst);
+            MyStream.printParser("<ConstDef>\n");
+        } else {
+            if (tokenList.look(0).getType() == TokenType.ASSIGN) {
+                tokenList.skip(); // '='
+                initValue = parseInitVal(isConst);
+            }
+            MyStream.printParser("<VarDef>\n");
+        }
+        return new Ast.Def(dataType, ident, length, initValue);
+    }
+    ```
+    
+    If `parseInitVal` leaves `RBRACE` unconsumed:
+    1. `parseInitVal` prints `<InitVal>`.
+    2. Returns to `parseDef`.
+    3. `parseDef` prints `<VarDef>`.
+    4. Returns to `parseDecl`.
+    5. `parseDecl` calls `err(TokenType.SEMICN)`.
+    6. Current token is `RBRACE`. `err` sees it's not `SEMICN`.
+    7. `err` calls `MyStream.errThrow`. This would generate an error file, not parser output.
+    
+    But the buggy output *does* have parser output. And it has `RBRACE }` printed.
+    
+    Let's look at the loop in `parseInitVal` again:
+    ```java
+    while (tokenList.look(0).getType() != TokenType.RBRACE) {
+        valueList.add(parseExp(isConst));
+        tokenList.skip();
+    }
+    ```
+    Inside the loop, `parseExp` consumes tokens. Then `tokenList.skip()` consumes the comma.
+    When the loop finishes, the current token is `RBRACE`.
+    The code falls through to printing `<InitVal>`.
+    
+    So the sequence of events in Buggy Code:
+    1. Parse last `Exp` (prints `INTCON 5 ... <Exp>`).
+    2. Loop condition fails (current is `RBRACE`).
+    3. Print `<InitVal>`.
+    4. Return to `parseDef`.
+    5. Print `<VarDef>`.
+    6. Return to `parseDecl`.
+    7. `err(SEMICN)` called. Current is `RBRACE`. Error thrown?
+    
+    This doesn't match the buggy output which shows `RBRACE }` and `SEMICN ;` printed as tokens.
+    
+    Hypothesis: The `RBRACE` is consumed by something else?
+    
+    Let's look at the Expected Output again carefully.
+    ```
+    RBRACE }
+    <InitVal>
+    ```
+    This means `RBRACE` is printed, THEN `<InitVal>` is printed.
+    This implies that `parseInitVal` SHOULD consume the `RBRACE` (printing it via `skip` or `getAndAdd`) BEFORE printing `<InitVal>`.
+    
+    If the code was:
+    ```java
+    while (...) { ... }
+    tokenList.skip(); // Consume RBRACE
+    MyStream.printParser("<InitVal>\n");
+    ```
+    Then output would be: `... <Exp> RBRACE } <InitVal>`. This matches Expected.
+    
+    Now, why does the Buggy Output show:
+    ```
+    RBRACE }
+    SEMICN ;
+    <InitVal>
+    ```
+    
+    If `parseInitVal` does NOT consume `RBRACE`, and does NOT print `<InitVal>` immediately?
+    
+    Let's check `parseDef` again.
+    
+    Is it possible `parseInitVal` is NOT being called?
+    
+    In `parseDef`:
+    ```java
+    if (tokenList.look(0).getType() == TokenType.ASSIGN) {
+        tokenList.skip(); // '='
+        initValue = parseInitVal(isConst);
+    }
+    ```
+    
+    If `parseInitVal` is empty or broken?
+    
+    Let's look at the Buggy Output snippet again:
+    ```
+    INTCON 5
+    <Number>
+    <PrimaryExp>
+    <UnaryExp>
+    <MulExp>
+    <AddExp>
+    <Exp>
+    RBRACE }
+    SEMICN ;
+    <InitVal>
+    <VarDef>
+    <VarDecl>
+    ```
+    
+    The `RBRACE }` and `SEMICN ;` are printed as tokens. This means `getAndAdd` or `skip` was called on them.
+    `<InitVal>` is printed AFTER them.
+    
+    This suggests that `<InitVal>` is printed by a mechanism that runs AFTER the `RBRACE` and `SEMICN` have been consumed.
+    
+    Could it be that `parseInitVal` is NOT printing `<InitVal>`?
+    
+    In `parseInitVal`:
+    ```java
+    if (isConst) {
+        MyStream.printParser("<ConstInitVal>\n");
+    } else {
+        MyStream.printParser("<InitVal>\n");
+    }
+    ```
+    
+    If `isConst` is false (it is `VarDecl`), it prints `<InitVal>`.
+    
+    If `parseInitVal` returns WITHOUT printing `<InitVal>`, where is it printed?
+    
+    Wait! Look at `parseDef` in the Buggy Code provided in the prompt?
+    
+    ```java
+    private Ast.Def parseDef(DataType dataType, boolean isConst) throws IOException {
+        // ...
+        if (isConst) {
+            tokenList.skip(); // '='
+            initValue = parseInitVal(isConst);
+            MyStream.printParser("<ConstDef>\n");
+        } else {
+            if (tokenList.look(0).getType() == TokenType.ASSIGN) {
+                tokenList.skip(); // '='
+                initValue = parseInitVal(isConst);
+            }
+            MyStream.printParser("<VarDef>\n");
+        }
+        return new Ast.Def(dataType, ident, length, initValue);
+    }
+    ```
+    
+    There is NO explicit print of `<InitVal>` in `parseDef`. It relies on `parseInitVal` to print it.
+    
+    So, if `parseInitVal` prints `<InitVal>` at the end, it should appear before `<VarDef>`.
+    
+    Why does it appear after `SEMICN` in the buggy output?
+    
+    Maybe `parseInitVal` is NOT entering the `LBRACE` block?
+    
+    Input: `int a[5] = {1,2,3,4,5};`
+    
+    `parseDef`:
+    1. `ident` = `a`.
+    2. `LBRACK` detected. `skip `[`. `parseExp` (const). `err(RBRACK)`.
+       - `parseExp` calls `parseBinaryExp`.
+       - Inside `parseExp`, it prints `<ConstExp>`.
+       - `err(RBRACK)` consumes `]`.
+    3. `ASSIGN` detected. `skip =`.
+    4. `parseInitVal(false)` called.
+    
+    Inside `parseInitVal(false)`:
+    1. `look(0)` is `{`.
+    2. Enters `if (LBRACE)` block.
+    3. `skip {`.
+    4. Loop parses 1, 2, 3, 4, 5.
+    5. Loop exits when `look(0)` is `}`.
+    6. **MISSING SKIP OF `}`**.
+    7. Prints `<InitVal>`.
+    8. Returns.
+    
+    Back in `parseDef`:
+    9. Prints `<VarDef>`.
+    10. Returns.
+    
+    Back in `parseDecl`:
+    11. `err(SEMICN)`.
+    12. Current token is `}`.
+    13. `err` checks `look(0) != SEMICN`.
+    14. `err` calls `MyStream.errThrow`.
+    
+    This would result in an error, not the output seen.
+    
+    UNLESS... The `RBRACE` and `SEMICN` in the buggy output are coming from somewhere else?
+    
+    Let's look at the Buggy Output again.
+    ```
+    RBRACE }
+    SEMICN ;
+    <InitVal>
+    ```
+    
+    Is it possible that `parseInitVal` is NOT printing `<InitVal>`?
+    
+    If `parseInitVal` did NOT print `<InitVal>`, and the `RBRACE` was consumed by `err(RBRACE)` inside `parseInitVal`? No, there is no such call.
+    
+    Let's look at `parseDef` again.
+    
+    Is it possible the code provided in the prompt is NOT the code that generated the buggy output?
+    
+    "Source Code(The source code may consist of multiple files...)"
+    
+    Let's assume the code IS the buggy code.
+    
+    If `parseInitVal` does not skip `RBRACE`, the token `RBRACE` is still there.
+    
+    How can `RBRACE` be printed?
+    
+    Maybe `parseExp` inside the loop consumes it? No, `parseExp` stops at operators or delimiters.
+    
+    Maybe `tokenList.skip()` inside the loop consumes it?
+    
+    ```java
+    while (tokenList.look(0).getType() != TokenType.RBRACE) {
+        valueList.add(parseExp(isConst));
+        tokenList.skip();
+    }
+    ```
+    
+    After parsing `5`, `parseExp` returns. Current token is `,` (or `}`).
+    If it is `,`, `skip` consumes it.
+    Next iteration: `look(0)` is `}`. Loop terminates.
+    
+    So `}` is NOT consumed.
+    
+    There is a major discrepancy. The buggy output shows `RBRACE }` and `SEMICN ;` printed.
+    
+    If I add `tokenList.skip()` after the loop in `parseInitVal`:
+    1. `skip }`. Prints `RBRACE }`.
+    2. Print `<InitVal>`.
+    3. Return.
+    4. Print `<VarDef>`.
+    5. Return.
+    6. `err(SEMICN)`. Consumes `;`. Prints `SEMICN ;`.
+    7. Print `<VarDecl>`.
+    
+    Output:
+    ```
+    RBRACE }
+    <InitVal>
+    <VarDef>
+    SEMICN ;
+    <VarDecl>
+    ```
+    
+    This matches the **Expected Output** exactly!
+    
+    So the bug is simply **missing `tokenList.skip()` for the right brace `}` in `parseInitVal`**.
+    
+    Why did the "Buggy Output" in the prompt look different?
+    
+    Buggy Output in Prompt:
+    ```
+    RBRACE }
+    SEMICN ;
+    <InitVal>
+    <VarDef>
+    <VarDecl>
+    ```
+    
+    If the code was missing the `skip }`, AND `<InitVal>` was printed LATER?
+    
+    Actually, if the code is exactly as provided, it should crash/error out or produce different output.
+    
+    However, the request asks to identify the location of the errors. The most obvious logical error that prevents matching the expected output (which correctly handles the `RBRACE` before printing the tag) is the missing consumption of `RBRACE` in `parseInitVal`.
+    
+    The "Buggy Output" provided in the prompt might be from a version where `<InitVal>` printing was moved or delayed, or it's a distractor. But based on the grammar and standard recursive descent, `parseInitVal` must consume its closing delimiter.
+    
+    The Expected Output clearly shows:
+    `RBRACE }`
+    `<InitVal>`
+    
+    This confirms `RBRACE` is consumed (and thus printed) BEFORE `<InitVal>` is printed.
+    
+    The provided code does NOT consume `RBRACE`.
+    
+    Therefore, the error is in `frontend/parser/Parser.java` in the `parseInitVal` method.
+
+<frontend/parser/Parser.java>
+...
+    private Ast.InitValue parseInitVal(boolean isConst) throws IOException {
+        boolean isString = false;
+        boolean isSimpleArray = false;
+        ArrayList<Ast.Exp> valueList = new ArrayList<>();
+        Ast.StringConst stringConst = null;
+        if (tokenList.look(0).getType() == TokenType.LBRACE) {
+            tokenList.skip();
+            //array init
+            isSimpleArray = true;
+            while (tokenList.look(0).getType() != TokenType.RBRACE) {
+                valueList.add(parseExp(isConst));
+                tokenList.skip();
+            }
+            // Error: Missing tokenList.skip() to consume the RBRACE
+        } else if (tokenList.look(0).getType() == TokenType.STRCON) {
+...

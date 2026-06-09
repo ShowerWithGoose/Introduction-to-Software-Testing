@@ -1,0 +1,54 @@
+#include <stdio.h>
+#include <stdlib.h>
+typedef struct node{
+    int date;
+    struct node *link;
+}node;
+typedef struct node *nodeptr;
+nodeptr top;  
+void inti(){
+    top = NULL;
+}
+nodeptr isempty()
+{
+    return top == NULL;
+}
+void push(int item)
+{
+    
+    nodeptr p;
+    if((p=(nodeptr)malloc(sizeof(node)))==NULL){
+        printf("error ");
+        
+    }else{
+        p->date=item;
+        p->link=top;
+        top=p;
+    }
+}
+int pop()
+{
+    nodeptr p;
+    int item;
+    if(isempty()){printf("error ");
+    }else{p=top;
+    item=top->date;
+    top=top->link;
+    free(p);
+    return item;
+    }
+}
+int main()
+{
+    int n,item,out;
+    inti();
+    while(scanf("%d",&n)!=-1)
+    {
+        switch(n)
+        {
+            case 1:scanf("%d",&item);push(item);break;
+            case 0:out=pop();printf("%d ",out);break; // @@ The program prints the return value of pop() even when the stack is empty. In that case, pop() prints "error " but still returns an uninitialized value (item), which leads to printing garbage (like "6" in the output).
+        }
+    }
+    return 0;
+}

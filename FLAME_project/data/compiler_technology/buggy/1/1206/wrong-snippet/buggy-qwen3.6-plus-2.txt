@@ -1,0 +1,829 @@
+Based on the problem description and the test case, the program fails to detect missing semicolons (error type `i`) in three locations:
+1. Line 2: `printf("Hello SysY!\n")` is missing a semicolon.
+2. Line 9: `int a` is missing a semicolon.
+3. Line 13: `return 0` is missing a semicolon.
+
+The expected output is:
+```
+2 i
+9 i
+13 i
+```
+
+The buggy output is "No output file", which implies that either no errors were recorded, or the error recording logic failed, or the program crashed/exited before writing. However, looking at the `Parser.java` code, specifically the `consumeToken` method, it attempts to handle missing semicolons by adding an error to `errorList`.
+
+Let's analyze the `consumeToken` method in `Parser.java`:
+
+```java
+    public token consumeToken(token.Type type){
+        //提供所需要的类型消耗匹配，此时currentToken为下一个token，返回消耗的token
+        if(currentToken.type.equals(type)){
+            token temoToken = currentToken;
+            if(i<this.tokens.size()-1){
+                i=i+1;
+                currentToken=this.tokens.get(i);
+            }
+            return temoToken;
+        }else if(type== token.Type.SEMICN){
+            //缺少分号
+            errorList.getList().addError(new error(error.wrongType.i,this.tokens.get(i-1).lineno));
+            return new token(token.Type.SEMICN,";",this.tokens.get(i-1).lineno);
+        }else if(type== token.Type.RPARENT){
+            //缺少右括号
+            errorList.getList().addError(new error(error.wrongType.j,this.tokens.get(i-1).lineno));
+            return new token(token.Type.RPARENT,"）",this.tokens.get(i-1).lineno);
+        }else if(type== token.Type.RBRACK){
+            //缺少右括号
+            errorList.getList().addError(new error(error.wrongType.k,this.tokens.get(i-1).lineno));
+            return new token(token.Type.RBRACK,"）",this.tokens.get(i-1).lineno);
+        }else {
+            throw new RuntimeException("wrong at"+this.tokens.get(i-1).lineno+" "+currentToken);
+        }
+    }
+```
+
+The logic for handling missing semicolons seems correct in principle: if the current token is not a semicolon when one is expected, it records an error using the line number of the *previous* token (`this.tokens.get(i-1).lineno`).
+
+However, let's look at how `Stmt()` handles the `printf` statement:
+
+```java
+        }else if(currentToken.type.equals(token.Type.PRINTFTK)){
+            //'printf''('StringConst {','Exp}')'';'
+            token printfToken=consumeToken(token.Type.PRINTFTK);
+            token leftParentToken=consumeToken(token.Type.LPARENT);
+            token formatString=consumeToken(token.Type.STRCON);
+            ArrayList<token> commas = new ArrayList<>();
+            ArrayList<ExpNode> expNodes = new ArrayList<>();
+            while(currentToken.type.equals(token.Type.COMMA)){
+                commas.add(consumeToken(token.Type.COMMA));
+                expNodes.add(Exp());
+            }
+            token rightParentToken=consumeToken(token.Type.RPARENT);
+            token semicn=consumeToken(token.Type.SEMICN); // <--- Error detection happens here
+            return new StmtNode(StmtNode.stmtType.Printf,printfToken,leftParentToken,formatString,commas,expNodes,rightParentToken,semicn);
+        }
+```
+
+For the input `printf("Hello SysY!\n")`, the tokens are `PRINTFTK`, `LPARENT`, `STRCON`, `RPARENT`.
+1. `consumeToken(PRINTFTK)` consumes `printf`. `i` advances.
+2. `consumeToken(LPARENT)` consumes `(`. `i` advances.
+3. `consumeToken(STRCON)` consumes `"Hello..."`. `i` advances.
+4. The `while` loop checks `currentToken` (which is `)`). It is not `COMMA`, so the loop is skipped.
+5. `consumeToken(RPARENT)` consumes `)`. `i` advances.
+6. `consumeToken(SEMICN)` is called. The current token is likely the next statement's keyword or `{` or `}`. In the test case, the next line is `if (1)`. So the current token is `IFTK`.
+   - `currentToken.type` is `IFTK`, which is not `SEMICN`.
+   - It enters the `else if(type== token.Type.SEMICN)` block.
+   - It adds an error: `new error(error.wrongType.i, this.tokens.get(i-1).lineno)`.
+   - `i` currently points to `IFTK`. `i-1` points to `RPARENT` (the `)` of printf).
+   - The line number of `RPARENT` is 2. This matches the expected output `2 i`.
+
+So why is there no output?
+
+Let's look at `Compiler.java`:
+
+```java
+        try {
+            parser.print();
+            errorList.getList().errors.sort(Comparator.comparing(error:: getLineno));
+            for(error error: errorList.getList().errors){
+                out.wWrong(error.toString());
+                System.out.println(error.toString());
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+```
+
+It calls `parser.print()`. If `parser.print()` throws an exception or fails, the error reporting loop might not execute, or the output file might not be flushed/closed properly.
+
+Let's look at `Parser.print()`:
+```java
+    public void print()throws IOException {
+        compUnitNode.output();
+    }
+```
+
+And `CompUnitNode.output()`:
+```java
+    public void output() throws IOException{
+        for(DeclNode decl:declNodes){
+            decl.output();
+        }
+        for(FunDefNode funDefNode:funDefNodes){
+            funDefNode.output();
+        }
+        mainFuncDefNode.output();
+        out.write("<CompUnit>");
+    }
+```
+
+The `out.write` method in `print/out.java`:
+```java
+    public static void write(String content) throws IOException{
+        File outputFile = new File("parser.txt");
+        try (FileWriter writer = new FileWriter(outputFile, true)) {
+            writer.write(content+"\n");
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+```
+This opens and closes the file for *every single write*. This is inefficient but should work.
+
+However, notice that `parser.print()` is called *before* the errors are written to `error.txt`. If the parsing process encounters a fatal error (like the `RuntimeException` in `consumeToken`), it will crash before writing errors.
+
+But wait, `consumeToken` only throws `RuntimeException` if the expected token is NOT `SEMICN`, `RPARENT`, or `RBRACK`. For missing semicolons, it recovers by creating a dummy token.
+
+Let's re-examine the `Stmt()` logic for `if` and `return`.
+
+**Case 2: `if (1)` followed by empty lines and then `;`**
+Input:
+```
+    if (1)
+
+
+    /*********/
+    ;
+```
+Tokens: `IFTK`, `LPARENT`, `INTCON` (1), `RPARENT`, `SEMICN`.
+Wait, the grammar for `if` is: `'if' '(' Cond ')' Stmt [ 'else' Stmt ]`.
+After consuming `RPARENT`, it calls `Stmt()`.
+The next token is `SEMICN` (from the line with just `;`).
+Inside `Stmt()`:
+It checks `LBRACE`, `IFTK`, `FORTK`, `BREAKTK`, `CONTINUETK`, `RETURNTK`, `PRINTFTK`. None match.
+It goes to the `else` block.
+It looks for `ASSIGN` in the same line. `SEMICN` is not `ASSIGN`.
+So `index` remains `i` (or whatever initial value). `index > i` is false.
+It goes to the inner `else`: `[Exp] ';'`.
+`isExp()` checks if `currentToken` (SEMICN) is an expression start. It is not.
+So `expNode` is null.
+Then `token semicn=consumeToken(token.Type.SEMICN);`.
+Current token is `SEMICN`. It matches! So it consumes it normally. No error reported.
+This is correct behavior for `if(1);`. The `if` statement's body is an empty expression statement `;`.
+
+But wait, the test case says:
+```
+    if (1)
+
+
+    /*********/
+    ;
+```
+Is `if(1)` considered a complete statement without a body? No, the grammar requires a `Stmt` after `)`.
+The `Stmt` parsed here is the `;` on line 5.
+So `if (1) ;` is valid.
+Why is line 9 `int a` an error?
+
+**Case 3: `int a`**
+Input:
+```
+    int a // error 2
+
+    for (;;) {}
+```
+Tokens: `INTTK`, `IDENFR` (a), `FORTK`...
+In `BlockItem()`:
+`currentToken` is `INTTK`.
+It calls `Decl()`.
+`Decl()` calls `VarDecl()` because it's not `CONSTTK`.
+`VarDecl()`:
+`BType()` consumes `INTTK`.
+`VarDef()` is called.
+`VarDef()`:
+`consumeToken(IDENFR)` consumes `a`.
+Next token is `FORTK`.
+It checks for `LBRACK` (no).
+It checks for `ASSIGN` (no).
+Returns `VarDefNode`.
+Back in `VarDecl()`:
+Checks for `COMMA` (no).
+Calls `consumeToken(SEMICN)`.
+Current token is `FORTK`.
+It is not `SEMICN`.
+Enters `else if(type== token.Type.SEMICN)`.
+Adds error `i` with lineno `tokens.get(i-1).lineno`.
+`i` points to `FORTK`. `i-1` points to `IDENFR` (`a`).
+Line number of `a` is 9.
+Expected output: `9 i`. This matches.
+
+**Case 4: `return 0`**
+Input:
+```
+    return 0 // error 3
+}
+```
+Tokens: `RETURNTK`, `INTCON` (0), `RBRACE`.
+In `Stmt()`:
+Matches `RETURNTK`.
+`consumeToken(RETURNTK)`.
+Checks if `currentToken` (INTCON) is `SEMICN`. No.
+Checks `isExp()`. Yes.
+Calls `Exp()`.
+`Exp()` -> `AddExp()` -> ... -> `Primary()` -> `Number()` -> `consumeToken(INTCON)`.
+Back in `Stmt()`:
+`token semicn=consumeToken(token.Type.SEMICN);`.
+Current token is `RBRACE`.
+Not `SEMICN`.
+Enters `else if(type== token.Type.SEMICN)`.
+Adds error `i` with lineno `tokens.get(i-1).lineno`.
+`i` points to `RBRACE`. `i-1` points to `INTCON` (`0`).
+Line number of `0` is 13.
+Expected output: `13 i`. This matches.
+
+So the logic in `Parser.java` for detecting these errors seems correct. Why is the output "No output file"?
+
+Let's look at `Compiler.java` again.
+```java
+        try {
+            parser.print();
+            errorList.getList().errors.sort(Comparator.comparing(error:: getLineno));
+            for(error error: errorList.getList().errors){
+                out.wWrong(error.toString());
+                System.out.println(error.toString());
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+```
+
+If `parser.print()` throws an exception, the error writing loop is skipped.
+Does `parser.print()` throw an exception?
+It calls `compUnitNode.output()`.
+This recursively calls `output()` on all nodes.
+The `output()` methods call `out.write()`.
+`out.write()` catches exceptions internally and prints stack trace, but does NOT rethrow. So `parser.print()` should not throw `IOException` from `out.write()`.
+
+However, look at `FunDefNode.output()`:
+```java
+    public void output() {
+        try {
+            funcTypeNode.output();
+            out.write(ident.toString());
+            out.write(lparent.toString());
+            if(funcFParamsNode!=null){
+                funcFParamsNode.output();
+            }
+            out.write(rparent.toString());
+            blockNode.output();
+            out.write("<FuncDef>");
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+
+    }
+```
+It catches `IOException` and does nothing (just prints stack trace). It does NOT declare `throws IOException`.
+But `CompUnitNode.output()` declares `throws IOException`.
+If `FunDefNode.output()` swallows the exception, `CompUnitNode.output()` continues.
+
+Wait, look at `MainFuncDefNode.output()`:
+```java
+    public void output()throws IOException {
+        out.write(intToken.toString());
+        out.write(mainToken.toString());
+        out.write(lparent.toString());
+        out.write(rparent.toString());
+        blockNode.output();
+        out.write("<MainFuncDef>");
+    }
+```
+
+And `BlockNode.output()`:
+```java
+    public void output() throws IOException {
+        out.write(lbrace.toString());
+        for(BlockItemNode blockItemNode:blockItemNodes){
+            blockItemNode.output();
+        }
+        out.write(rbrace.toString());
+        out.write("<Block>");
+    }
+```
+
+If there are no exceptions, `parser.print()` completes.
+Then `errorList.getList().errors` is sorted and printed.
+
+Is it possible that `errorList` is empty?
+We traced the logic and it seemed like errors should be added.
+
+Let's look closely at `Lexer.java` and how tokens are generated.
+The input file has comments.
+`printf("Hello SysY!\n") // error 1`
+The lexer handles `//` comments.
+`if(ch=='/'){ ... if(cp!='\n') ... }`
+It skips until `\n`.
+So the tokens for line 2 are `PRINTFTK`, `LPARENT`, `STRCON`, `RPARENT`.
+Line 3 is empty/whitespace.
+Line 4: `if (1)`
+Tokens: `IFTK`, `LPARENT`, `INTCON`, `RPARENT`.
+Line 5, 6, 7: empty/whitespace/comment.
+Line 8: `;`
+Token: `SEMICN`.
+Line 9: `int a`
+Tokens: `INTTK`, `IDENFR`.
+Line 10: empty.
+Line 11: `for (;;) {}`
+Tokens: `FORTK`, `LPARENT`, `SEMICN`, `SEMICN`, `RPARENT`, `LBRACE`, `RBRACE`.
+Line 12: empty.
+Line 13: `return 0`
+Tokens: `RETURNTK`, `INTCON`.
+Line 14: `}`
+Token: `RBRACE`.
+
+The token stream looks correct.
+
+Is there a problem with `CompUnit()` parsing?
+```java
+    private CompUnitNode CompUnit() {
+        ArrayList<DeclNode> declNodes = new ArrayList<>();
+        ArrayList<FunDefNode> funDefNodes = new ArrayList<>();
+        MainFuncDefNode mainFuncDefNode;
+        while (this.tokens.get(i+1).type!= token.Type.MAINTK&&
+        this.tokens.get(i+2).type!= token.Type.LPARENT) {//不为main或函数声明，即为变量声明
+            DeclNode declNode=Decl();
+            declNodes.add(declNode);
+        }
+        while (this.tokens.get(i+1).type!= token.Type.MAINTK) {//不为main，即为函数声明
+            FunDefNode funDefNode=FuncDef();
+            funDefNodes.add(funDefNode);
+        }
+        mainFuncDefNode=MainFuncDef();
+        return new CompUnitNode(declNodes,funDefNodes,mainFuncDefNode);
+    }
+```
+This logic is very fragile. It assumes `i+1` and `i+2` exist.
+At the start, `i=0`. `currentToken` is the first token.
+The input starts with `int main() { ... }`.
+There are no global declarations or function definitions before `main`.
+So the first `while` loop condition:
+`this.tokens.get(1).type != MAINTK` -> `tokens[1]` is `MAINTK`?
+Tokens: `INTTK` (0), `MAINTK` (1), `LPARENT` (2)...
+`tokens.get(1).type` is `MAINTK`.
+So `tokens.get(1).type != MAINTK` is FALSE.
+The loop terminates immediately. Correct.
+
+Second `while` loop:
+`this.tokens.get(1).type != MAINTK` is FALSE.
+Loop terminates immediately. Correct.
+
+Then `MainFuncDef()` is called.
+`MainFuncDef()`:
+`consumeToken(INTTK)` -> consumes `int`. `i` becomes 1. `currentToken` is `MAINTK`.
+`consumeToken(MAINTK)` -> consumes `main`. `i` becomes 2. `currentToken` is `LPARENT`.
+`consumeToken(LPARENT)` -> consumes `(`. `i` becomes 3. `currentToken` is `RPARENT`.
+`consumeToken(RPARENT)` -> consumes `)`. `i` becomes 4. `currentToken` is `LBRACE`.
+`Block()` is called.
+
+`Block()`:
+`consumeToken(LBRACE)` -> consumes `{`. `i` becomes 5. `currentToken` is `PRINTFTK`.
+Loop `while(!currentToken.type.equals(token.Type.RBRACE))`:
+1. `BlockItem()` is called.
+   `currentToken` is `PRINTFTK`.
+   Not `CONSTTK`, `INTTK`, `CHARTK`.
+   Calls `Stmt()`.
+   `Stmt()` handles `printf`.
+   As analyzed before, it consumes `printf`, `(`, `str`, `)`.
+   Then `consumeToken(SEMICN)` fails to find `;`.
+   Adds error `2 i`.
+   Returns `StmtNode`.
+   `BlockItem` returns.
+   `Block` loop continues.
+   `currentToken` is now `IFTK` (from line 4).
+2. `BlockItem()` is called.
+   `currentToken` is `IFTK`.
+   Calls `Stmt()`.
+   `Stmt()` handles `if`.
+   Consumes `if`, `(`, `Cond()`, `)`.
+   `Cond()` -> `LOrExp()` -> ... -> `Primary()` -> `Number()` -> `consumeToken(INTCON)` (1).
+   Back in `Stmt()`, `rightParentToken` consumed `)`.
+   Calls `Stmt()` for the body.
+   `currentToken` is `SEMICN` (from line 8).
+   Inside nested `Stmt()`:
+   Goes to `else` block (not lval assign).
+   `isExp()` is false for `SEMICN`.
+   `consumeToken(SEMICN)` succeeds.
+   Returns `StmtNode` (Exp type).
+   Back in outer `Stmt()`, `ifStmt` is set.
+   Checks for `else`. `currentToken` is `INTTK` (line 9). No else.
+   Returns `StmtNode` (If type).
+   `BlockItem` returns.
+   `Block` loop continues.
+   `currentToken` is `INTTK`.
+3. `BlockItem()` is called.
+   `currentToken` is `INTTK`.
+   Is `CONSTTK`, `INTTK`, `CHARTK`.
+   Calls `Decl()`.
+   `Decl()` calls `VarDecl()`.
+   `VarDecl()` calls `BType()` -> `consumeToken(INTTK)`.
+   `VarDef()` -> `consumeToken(IDENFR)` (a).
+   Back in `VarDecl()`, `consumeToken(SEMICN)` fails.
+   Adds error `9 i`.
+   Returns `VarDeclNode`.
+   `DeclNode` returns.
+   `BlockItem` returns.
+   `Block` loop continues.
+   `currentToken` is `FORTK`.
+4. `BlockItem()` is called.
+   `currentToken` is `FORTK`.
+   Calls `Stmt()`.
+   `Stmt()` handles `for`.
+   Consumes `for`, `(`.
+   `ForStmt`? `currentToken` is `SEMICN`. No.
+   `consumeToken(SEMICN)` succeeds.
+   `Cond`? `currentToken` is `SEMICN`. No.
+   `consumeToken(SEMICN)` succeeds.
+   `ForStmt`? `currentToken` is `RPARENT`. No.
+   `consumeToken(RPARENT)` succeeds.
+   `Stmt()` for body.
+   `currentToken` is `LBRACE`.
+   Calls `Block()`.
+   `consumeToken(LBRACE)`.
+   Loop `while(!RBRACE)`. `currentToken` is `RBRACE`. Loop doesn't run.
+   `consumeToken(RBRACE)`.
+   Returns `BlockNode`.
+   Back in `for` stmt.
+   Returns `StmtNode`.
+   `BlockItem` returns.
+   `Block` loop continues.
+   `currentToken` is `RETURNTK`.
+5. `BlockItem()` is called.
+   `currentToken` is `RETURNTK`.
+   Calls `Stmt()`.
+   `Stmt()` handles `return`.
+   Consumes `return`.
+   `isExp()` true. `Exp()` consumes `0`.
+   `consumeToken(SEMICN)` fails.
+   Adds error `13 i`.
+   Returns `StmtNode`.
+   `BlockItem` returns.
+   `Block` loop continues.
+   `currentToken` is `RBRACE`.
+   Loop terminates.
+   `consumeToken(RBRACE)`.
+   Returns `BlockNode`.
+
+Back in `MainFuncDef()`.
+Returns `MainFuncDefNode`.
+
+Back in `CompUnit()`.
+Returns `CompUnitNode`.
+
+Parsing seems to complete successfully and record 3 errors.
+
+So why "No output file"?
+
+Check `print/out.java` again.
+```java
+    public static void wWrong(String content)throws IOException{
+        File outputFile = new File("error.txt");
+        try (FileWriter writer = new FileWriter(outputFile, true)) {
+            writer.write(content+"\n");
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+```
+This appends to `error.txt`.
+
+In `Compiler.java`:
+```java
+            for(error error: errorList.getList().errors){
+                out.wWrong(error.toString());
+                System.out.println(error.toString());
+            }
+```
+
+If `errorList` is empty, nothing is written.
+But we established errors are added.
+
+Is it possible that `errorList` is not static or initialized correctly?
+`errorList.java`:
+```java
+public class errorList {
+    private static final errorList instance=new errorList();
+    public  ArrayList<error> errors=new ArrayList<error>();
+    public static errorList getList(){
+        return instance;
+    }
+    public void addError(error error){
+        this.errors.add(error);
+
+    }
+}
+```
+This is a singleton. It should work.
+
+Wait! Look at `Lexer.java` constructor and `tokenize()`.
+```java
+    public Lexer(String src){
+        this.lineno=1;
+        this.filesrc=src;
+        this.tokens=new ArrayList<>();
+        try {
+            this.stream=new StreamReader(src);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+    public void tokenize(){
+        token token;
+        while((token=next())!=null){
+            if(token.type!=frontend.token.Type.disable)this.tokens.add(token);
+        }
+    }
+```
+
+And `Compiler.java`:
+```java
+        Lexer lexer=new Lexer(file);
+        lexer.tokenize();
+        //test1(lexer);//词法分析
+        Parser parser=new Parser(lexer.tokens);
+        parser.parse();
+        try {
+            parser.print();
+            errorList.getList().errors.sort(Comparator.comparing(error:: getLineno));
+            for(error error: errorList.getList().errors){
+                out.wWrong(error.toString());
+                System.out.println(error.toString());
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+```
+
+There is a subtle issue. `parser.print()` writes to `parser.txt`.
+`out.wWrong` writes to `error.txt`.
+
+If the program runs correctly, `error.txt` should contain the errors.
+The "Buggy Output" says "No output file". This usually means the file `error.txt` was not created or is empty.
+
+Is it possible that the `RuntimeException` in `consumeToken` IS thrown?
+In our trace, we assumed `consumeToken(SEMICN)` always hits the `else if(type== token.Type.SEMICN)` block when `;` is missing.
+This is true ONLY if `currentToken.type` is not `SEMICN`.
+
+What if `currentToken` is `null`?
+`consumeToken` accesses `currentToken.type`. If `currentToken` is null, `NullPointerException`.
+When does `currentToken` become null?
+In `consumeToken`:
+```java
+            if(i<this.tokens.size()-1){
+                i=i+1;
+                currentToken=this.tokens.get(i);
+            }
+```
+If `i` is at the last token, `currentToken` remains the last token. It does NOT become null.
+So `currentToken` is never null during parsing unless `tokens` is empty.
+
+However, look at the end of the input.
+After `return 0`, we have `}`.
+`Block()` consumes `}`.
+`MainFuncDef()` returns.
+`CompUnit()` returns.
+
+Is there any other place where `consumeToken` is called with a mismatch that isn't `SEMICN`, `RPARENT`, `RBRACK`?
+In `VarDef()`:
+```java
+        ident=consumeToken(token.Type.IDENFR);
+```
+If `currentToken` is not `IDENFR`, it throws `RuntimeException`.
+In our trace, `int a` -> `INTTK` consumed by `BType`, `IDENFR` (`a`) consumed by `VarDef`. Correct.
+
+In `BType()`:
+```java
+        if(currentToken.type.equals(token.Type.INTTK)){
+            intToken=consumeToken(token.Type.INTTK);
+            return new BTypeNode(intToken);
+        }else {
+            charToken=consumeToken(token.Type.CHARTK);
+            return new BTypeNode(charToken);
+        }
+```
+If `currentToken` is neither `INTTK` nor `CHARTK`, it calls `consumeToken(CHARTK)` which will fail and throw `RuntimeException` because `type` is not `SEMICN`/`RPARENT`/`RBRACK`.
+In our trace, `int a` -> `INTTK`. Correct.
+
+What about `FuncDef()`?
+The input has no function definitions before `main`.
+
+What about `MainFuncDef()`?
+`int main()`.
+`consumeToken(INTTK)`. OK.
+`consumeToken(MAINTK)`. OK.
+`consumeToken(LPARENT)`. OK.
+`consumeToken(RPARENT)`. OK.
+
+Everything seems fine.
+
+Let's look at the `Stmt()` logic for `if` again.
+```java
+        }else if(currentToken.type.equals(token.Type.IFTK)){
+            //'if' '(' Cond ')' Stmt [ 'else' Stmt ]
+            token ifToken=consumeToken(token.Type.IFTK);
+            token leftParentToken=consumeToken(token.Type.LPARENT);
+            CondNode condNode=Cond();
+            token rightParentToken=consumeToken(token.Type.RPARENT);
+            StmtNode ifStmt=Stmt();
+            token elseToken = null;
+            StmtNode elseStmt = null;
+            if(currentToken.type.equals(token.Type.ELSETK)){
+                elseToken=consumeToken(token.Type.ELSETK);
+                elseStmt=Stmt();
+            }
+            return new StmtNode(StmtNode.stmtType.If,ifToken,leftParentToken,condNode,rightParentToken,ifStmt,elseToken,elseStmt);
+        }
+```
+For `if (1)`, `Cond()` parses `1`.
+`consumeToken(RPARENT)` consumes `)`.
+`Stmt()` is called for the body.
+The next token is `SEMICN` (from line 8).
+Inside `Stmt()`:
+It falls through to the `else` block.
+`index` calculation:
+```java
+            int index=i;
+            for(int j=i;j<tokens.size();j++){
+                if(tokens.get(j).lineno!=currentToken.lineno)break;
+                if(tokens.get(j).type.equals(token.Type.ASSIGN))index=j;
+            }
+```
+`currentToken` is `SEMICN` (lineno 8).
+`j=i`. `tokens[i]` is `SEMICN`.
+`tokens[j].lineno` (8) == `currentToken.lineno` (8).
+`tokens[j].type` is `SEMICN`, not `ASSIGN`.
+Loop ends.
+`index` is `i`.
+`index > i` is false.
+Goes to `else`: `[Exp] ';'`.
+`isExp()` checks `SEMICN`. False.
+`expNode` is null.
+`token semicn=consumeToken(token.Type.SEMICN);`.
+`currentToken` is `SEMICN`. Matches!
+Consumes it.
+No error.
+
+This is correct. `if(1);` is valid.
+
+So, where is the bug?
+
+Re-read the "Buggy Output": **No output file**.
+This suggests `error.txt` is not created.
+
+In `Compiler.java`:
+```java
+        try {
+            parser.print();
+            errorList.getList().errors.sort(Comparator.comparing(error:: getLineno));
+            for(error error: errorList.getList().errors){
+                out.wWrong(error.toString());
+                System.out.println(error.toString());
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+```
+
+If `parser.print()` throws an exception, the rest is skipped.
+Does `parser.print()` throw an exception?
+It calls `compUnitNode.output()`.
+If any `output()` method throws an `IOException` that is NOT caught, it propagates.
+Most `output()` methods declare `throws IOException`.
+`FunDefNode.output()` catches it.
+`out.write()` catches it internally.
+
+Wait! `out.write()` catches exceptions internally.
+```java
+    public static void write(String content) throws IOException{
+        File outputFile = new File("parser.txt");
+        try (FileWriter writer = new FileWriter(outputFile, true)) {
+            writer.write(content+"\n");
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+```
+It declares `throws IOException` but catches `Exception` inside. So it NEVER throws `IOException`.
+So `parser.print()` will NOT throw `IOException`.
+
+So the loop SHOULD execute.
+
+Is `errorList.getList().errors` empty?
+We traced the parsing and found 3 errors should be added.
+
+Is it possible that `Parser` constructor or `parse()` fails?
+```java
+    public Parser(ArrayList<token> tokenList){
+        this.tokens=tokenList;
+        if(!tokenList.isEmpty())currentToken=tokenList.get(i);//首字符
+    }
+    public void parse(){
+        this.compUnitNode=CompUnit();
+    }
+```
+If `tokenList` is empty, `currentToken` is null.
+`CompUnit()` calls `tokens.get(i+1)`. `IndexOutOfBoundsException`.
+But the input is not empty.
+
+Let's look at the `Lexer` again.
+Does it produce tokens correctly?
+The `StreamReader` uses `PushbackReader`.
+`get()` returns `Character` or `null`.
+`unget(Character c)`.
+
+One potential issue: `Lexer.next()` returns `null` at EOF.
+`tokenize()` adds tokens until `null`.
+
+Is it possible that the `error` objects are not being created correctly?
+`new error(error.wrongType.i, this.tokens.get(i-1).lineno)`
+
+Let's look at the `error` class.
+```java
+public class error {
+    public enum wrongType{
+        a,b,c,d,e,f,g,h,i,j,k,l,m,none
+    }
+    wrongType wType;
+    int lineno;
+    public error(wrongType type,int lineno){
+        this.lineno=lineno;
+        this.wType=type;
+    }
+    // ...
+    @Override
+    public String toString() {
+        return this.lineno+" "+this.wType;
+    }
+}
+```
+`toString()` returns `lineno + " " + wType`.
+`wType` is an enum. `toString()` on enum returns the name (e.g., "i").
+So `2 i` is correct.
+
+There is one suspicious thing in `Compiler.java`.
+```java
+        try {
+            parser.print();
+            errorList.getList().errors.sort(Comparator.comparing(error:: getLineno));
+            for(error error: errorList.getList().errors){
+                out.wWrong(error.toString());
+                System.out.println(error.toString());
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+```
+
+If `parser.print()` works, and `errorList` has errors, they are written.
+
+What if `parser.print()` modifies `i` or `currentToken` in a way that causes issues? No, it just reads the AST.
+
+What if the `AST` is not built correctly?
+If `CompUnit()` throws an exception, `parser.parse()` throws it.
+`Compiler.java` does NOT catch exceptions from `parser.parse()`.
+```java
+        Parser parser=new Parser(lexer.tokens);
+        parser.parse(); // If this throws, the program crashes!
+        try {
+            parser.print();
+            ...
+```
+
+If `parser.parse()` throws a `RuntimeException` (from `consumeToken`), the program terminates abruptly.
+No `error.txt` is written.
+"No output file" fits this scenario.
+
+So, does `parser.parse()` throw a `RuntimeException`?
+We traced the parsing and didn't find any mismatched tokens that would trigger the `else` block in `consumeToken` EXCEPT for the missing semicolons, which are handled.
+
+However, look at `CompUnit()` again.
+```java
+        while (this.tokens.get(i+1).type!= token.Type.MAINTK&&
+        this.tokens.get(i+2).type!= token.Type.LPARENT) {
+```
+If `i+1` or `i+2` is out of bounds, `IndexOutOfBoundsException` (which is a `RuntimeException`).
+For `int main() { ... }`:
+`i=0`. `tokens[1]` is `MAINTK`. `tokens[2]` is `LPARENT`.
+Condition: `MAINTK != MAINTK` (False) && ...
+Short-circuit evaluation. The second part is NOT evaluated.
+So no exception.
+
+What if there are NO tokens?
+`Lexer` produces tokens.
+
+Is there a problem with `BlockItem()` distinguishing `Decl` and `Stmt`?
+```java
+    private BlockItemNode BlockItem() {
+        // BlockItem → Decl | Stmt
+        DeclNode declNode = null;
+        StmtNode stmtNode = null;
+        if(currentToken.type.equals(token.Type.CONSTTK)||
+                currentToken.type.equals(token.Type.INTTK)||
+                currentToken.type.equals(token.Type.CHARTK)){
+            declNode=Decl();
+        }else {
+            stmtNode=Stmt();
+        }
+        return new BlockItemNode(declNode,stmtNode);
+    }
+```
+For `int a`, `

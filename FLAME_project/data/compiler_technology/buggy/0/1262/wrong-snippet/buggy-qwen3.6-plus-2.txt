@@ -1,0 +1,780 @@
+The problem is a **Time Limit Exceeded (TLE)** error. This usually indicates an infinite loop or a very inefficient algorithm that gets stuck.
+
+Looking at the `TokenLexer.java` file, specifically the `addToken` method:
+
+1.  The method iterates through all `LexType` enums to find a match.
+2.  If a match is found (`tokenStr != null`), it creates a token, adds it to the list, and advances the `sourceLexer` position by the length of the matched string.
+3.  **Crucially**, if **no** match is found for any `LexType`, the loop finishes without advancing the `sourceLexer` position (`curPos` remains unchanged).
+4.  The `Lexing` method calls `addToken` in a `while (!this.sourceLexer.fileIsEnd())` loop.
+5.  If `addToken` fails to match anything (e.g., due to an unexpected character or a bug in regex matching logic that causes it to miss valid tokens or fail to consume input), `sourceLexer` position does not move.
+6.  `skipWhiteSpace` might also fail to move if the current character is not whitespace and not handled.
+7.  Consequently, the `while` loop in `Lexing` becomes an infinite loop because `fileIsEnd()` never becomes true (position doesn't advance) and `addToken` keeps failing to match/consume.
+
+However, there is a more subtle issue in `addToken`. The loop breaks after finding the *first* match. But what if the input contains characters that don't match *any* defined token? For example, if there's a weird character or if the regexes are flawed.
+
+Let's look at `LexType.java`. The enum `a` is defined as `" [&\\|]"`. This is intended to catch single `&` or `|` as errors.
+The regex for `AND` is `"&&"` and `OR` is `"\\|\\|"`.
+The regex for `a` is `" [&\\|]"`. Note the space at the beginning? No, looking closely at `LexType.java`:
+`a("[&\\|]", false);` -> The string is `" [&\\|]"`? No, it is `" [&\\|]"` in the source provided?
+Wait, let's look at the source code provided:
+`a("[&\\|]", false);`
+Actually, in the provided code:
+`a("[&\\|]", false);`
+The string literal is `" [&\\|]"`? No, it looks like `" [&\\|]"` might be a typo in my reading or the code.
+Let's re-read carefully:
+`a("[&\\|]", false);`
+If the string is `" [&\\|]"`, it matches a space followed by & or |. That would be wrong.
+But assuming it is `" [&\\|]"` vs `" [&\\|]"`.
+In the provided text: `a("[&\\|]", false);`
+It seems to be `" [&\\|]"`? No, standard regex for & or | is `[&|]`.
+The code has: `a("[&\\|]", false);`. This regex matches a single character which is either `&` or `|`.
+
+The main suspect for TLE in lexical analyzers written this way is usually that the scanner gets stuck on a character it cannot consume.
+In `addToken`:
+```java
+for (LexType lexType : LexType.values()) {
+    Pattern pattern = lexType.getPattern();
+    String tokenStr = this.sourceLexer.matchSubStr(pattern);
+    if (tokenStr != null) {
+        // ... process token ...
+        break;
+    }
+    if (sourceLexer.fileIsEnd()) {
+        break;
+    }
+}
+```
+If `tokenStr` is null for ALL types, the loop ends, `addToken` returns, and `Lexing` loops again. The position hasn't moved. Infinite loop.
+
+Why would `tokenStr` be null for everything?
+1.  Whitespace is skipped in `Lexing` before `addToken`.
+2.  Comments are skipped in `addToken` via `skipNote`? No, `skipNote` is called in `Lexing` before `addToken`.
+3.  So `addToken` should only see valid token starts.
+
+However, look at `skipNote` in `TokenLexer.java`:
+```java
+private boolean skipNote() {
+    String note1 = "//";
+    String note2_st = "/*";
+    String note2_ed = "*/";
+    if (note1.equals(this.sourceLexer.getSubString(2))) {
+        this.sourceLexer.next(); // Moves to next line
+        return true;
+    } else if (note2_st.equals(this.sourceLexer.getSubString(2))) {
+        sourceLexer.move();
+        sourceLexer.move();
+        while (!this.sourceLexer.fileIsEnd() &&
+                !note2_ed.equals(this.sourceLexer.getSubString(2))) {
+            this.sourceLexer.move();
+        }
+        if (note2_ed.equals(this.sourceLexer.getSubString(2))) {
+            this.sourceLexer.move();
+            this.sourceLexer.move();
+            return true;
+        }
+    }
+    return false;
+}
+```
+If `/*` is found but `*/` is NOT found (unclosed comment), `skipNote` returns `false`.
+The `while` loop inside `skipNote` will run until `fileIsEnd()` is true.
+If `fileIsEnd()` becomes true, the loop terminates.
+Then `note2_ed.equals(...)` is checked. It will likely be false (since we are at EOF).
+So `skipNote` returns `false`.
+Back in `Lexing`:
+```java
+if (skipNote()) {
+    continue;
+}
+addToken();
+```
+If `skipNote` consumed the rest of the file (because it didn't find `*/`), `fileIsEnd()` is now true.
+The `while (!this.sourceLexer.fileIsEnd())` loop in `Lexing` will terminate.
+So unclosed comments don't cause TLE here, they just end parsing.
+
+What about `SourceLexer.matchSubStr`?
+```java
+public String matchSubStr(Pattern pattern) {
+    String pendingString = getSubString();
+    matcher = pattern.matcher(pendingString);
+    if (matcher.find()) {
+        return matcher.group(0);
+    } else {
+        return null;
+    }
+}
+```
+`getSubString()` returns the rest of the line.
+
+Is there a case where a character is not matched by any token?
+The tokens cover:
+- Keywords
+- Identifiers
+- Numbers
+- Strings/Chars
+- Operators/Symbols
+- Error token `a` for `&` or `|`.
+
+What if there is a character like `@` or `#`?
+None of the regexes match `@`.
+`IDENFR`: `[_A-Za-z][_A-Za-z0-9]*`
+`INTCON`: `[0-9]+`
+...
+If the input contains `@`, `matchSubStr` will return `null` for all types.
+`addToken` will return without moving `curPos`.
+`Lexing` will loop infinitely.
+
+The test case provided seems to be a valid C-like program. It shouldn't contain `@`.
+However, look at `CHRCON` regex:
+`"'(?:\\\\a|\\\\v|\\\\\\\\|\\\\b|\\\\f|\\\\0|\\\\t|\\\\\"|\\\\n|\\\\'|\\s)'"`
+This regex expects a char constant to have exactly one character inside (which can be an escape sequence or whitespace).
+What if the source code has a valid char that isn't covered? Or an invalid char constant?
+The problem says: "For an erroneous source program... detect errors".
+But the specific error type listed is only `a` (single & or |).
+If there are other lexical errors, the behavior is undefined in the prompt, but typically a lexer should handle them or report them. If it doesn't match them, it loops.
+
+However, the TLE suggests the logic itself is flawed for *valid* inputs too, or the specific test case triggers a hang.
+
+Let's look at `LexType` ordering.
+`AND` ("&&") is before `a` ("[&|]").
+`OR` ("||") is before `a`.
+This is correct for greedy matching if we iterate in order.
+
+Wait, look at `LexType.java` constructor:
+```java
+LexType(String string, boolean needGreedy) {
+    if (!needGreedy) {
+        this.pattern = Pattern.compile("^" + string);
+    }
+    else {
+        this.pattern = Pattern.compile("^" + string + "(?![_A-Za-z0-9])");
+    }
+}
+```
+Keywords have `needGreedy = true`.
+Symbols have `needGreedy = false`.
+
+Let's look at `STRCON`:
+`STRCON("\\\"([^\\\"\\n]|\\n)*\\\"", false)`
+This regex allows newlines inside strings? `([^\\\"\\n]|\\n)*`.
+Yes, it explicitly allows `\n`.
+But `SourceLexer.getSubString()` returns `getCurLine().substring(this.curPos)`.
+It only returns the **current line**.
+If a string spans multiple lines, `matchSubStr` will only see the first line.
+The regex `\\\"([^\\\"\\n]|\\n)*\\\"` expects a closing quote.
+If the string is multi-line, the first line won't have a closing quote (assuming standard C strings don't span lines unless escaped, but the regex allows `\n`).
+Wait, if `getSubString` only returns the current line, then `[^\\\"\\n]` will match chars until end of line. Then `\n` is NOT in the substring returned by `getSubString` because `readLine` strips the newline character!
+`BufferedReader.readLine()` returns the line content *without* the line termination character.
+So `getCurLine()` does NOT contain `\n`.
+Therefore, the regex part `|\\n` will never match anything in `pendingString`.
+And `[^\\\"\\n]` will match everything except `"` and `\n` (which isn't there).
+So it matches until the end of the line.
+If the string doesn't close on the same line, `matcher.find()` will fail (no closing `"`).
+So `tokenStr` is null.
+If the source code has a multi-line string (which is invalid in C, but maybe the test case doesn't have one), it would fail.
+The test case has: `printf("%d\n", tmp);`. The `\n` is inside the string literal in the source code as two characters `\` and `n`.
+The regex `STRCON` is: `\\\"([^\\\"\\n]|\\n)*\\\"`.
+In Java string literal: `"\\\"([^\\\"\\n]|\\n)*\\\""`
+Regex pattern: `\"([^\"\n]|\n)*\"`
+This matches a double quote, followed by any number of (non-quote-non-newline OR newline), followed by a double quote.
+Since `readLine` removes `\n`, the input string to the matcher will never contain a real newline character.
+So it effectively becomes `\"([^\"])*\"`.
+This should work for single-line strings.
+
+Is there any other reason for TLE?
+
+Look at `skipNote` again.
+```java
+    } else if (note2_st.equals(this.sourceLexer.getSubString(2))) {
+        sourceLexer.move();
+        sourceLexer.move();
+        while (!this.sourceLexer.fileIsEnd() &&
+                !note2_ed.equals(this.sourceLexer.getSubString(2))) {
+            this.sourceLexer.move();
+        }
+        if (note2_ed.equals(this.sourceLexer.getSubString(2))) {
+            this.sourceLexer.move();
+            this.sourceLexer.move();
+            return true;
+        }
+    }
+```
+If `/*` is found, it enters the while loop.
+Inside the loop, it calls `move()`.
+`move()` increments `curPos`. If `curPos` exceeds line length, it goes to next line.
+This looks correct for consuming comments.
+
+Let's look at `addToken` again.
+```java
+    private void addToken() {
+        Matcher matcher;
+        for (LexType lexType : LexType.values()) {
+            Pattern pattern = lexType.getPattern();
+            String tokenStr = this.sourceLexer.matchSubStr(pattern);
+            if (tokenStr != null) {
+                Token token = new Token(lexType, sourceLexer.getLineNum(), tokenStr);
+                if (token.getType() != LexType.a) {
+                    this.tokenList.addToken(token);
+                } else {
+                    this.errorList.addToken(token);
+                }
+                for (int i = 0;i < tokenStr.length();i++) {
+                    this.sourceLexer.move();
+                }
+                //System.out.println("frontend.Token " + token.getContent() + " " + token.getType());
+                break;
+            }
+            if (sourceLexer.fileIsEnd()) {
+                break;
+            }
+        }
+    }
+```
+If `tokenStr` is found, it moves `tokenStr.length()` times.
+This is correct.
+
+Is it possible that `matchSubStr` is extremely slow?
+`Pattern.compile` is done once in `LexType` constructor.
+`matcher.find()` on a short string (rest of line) should be fast.
+
+Let's check the `LexType` enum definition order and regexes again.
+`a("[&\\|]", false);`
+This is the last element.
+
+What if the input contains a character that is NOT matched by any token, and NOT whitespace, and NOT a comment start?
+E.g., `#`.
+`skipWhiteSpace` skips it? No, `#` is not whitespace.
+`skipNote` checks `//` and `/*`. No match.
+`addToken` iterates all types.
+Does any type match `#`?
+No.
+So `tokenStr` is null for all.
+`addToken` returns.
+`Lexing` loops.
+Infinite loop.
+
+Does the test case contain such a character?
+The test case looks like standard C.
+`const int constA = 1;`
+...
+`char a = '\0';`
+...
+`printf("22372468\n");`
+
+Wait, look at `CHRCON` regex again.
+`"'(?:\\\\a|\\\\v|\\\\\\\\|\\\\b|\\\\f|\\\\0|\\\\t|\\\\\"|\\\\n|\\\\'|\\s)'"`
+Java String: `"'(?:\\\\a|\\\\v|\\\\\\\\|\\\\b|\\\\f|\\\\0|\\\\t|\\\\\"|\\\\n|\\\\'|\\s)'"`
+Regex: `'(?:\\a|\\v|\\\\|\\b|\\f|\\0|\\t|\"|\\n|\'|\s)'`
+This matches a single quote, then ONE of the escape sequences or whitespace, then a single quote.
+In the test case: `char a = '\0';`
+`\0` is matched by `\\0` in regex?
+Regex part: `\\0`. In regex, `\0` is the null character? Or octal 0?
+In Java Regex, `\0` is the null character.
+The source text has backslash `\` and digit `0`.
+The regex needs to match the literal characters `\` and `0`.
+To match literal `\`, regex needs `\\`.
+To match literal `0`, regex needs `0`.
+So regex should be `\\\\0`.
+Let's trace the Java String construction.
+Java String: `"\\\\0"` -> Regex pattern: `\\0`.
+Regex `\\0` means: Escaped backslash `\\` (literal `\`) followed by `0`.
+So `\\\\0` in Java string becomes `\\0` in regex, which matches `\0` in text.
+
+Let's check the provided `CHRCON` string in `LexType.java`:
+`"\'(?:\\\\a|\\\\v|\\\\\\\\|\\\\b|\\\\f|\\\\0|\\\\t|\\\\\"|\\\\n|\\\\\'|\\s)\'"`
+Let's decode one term: `\\\\0`.
+Java String `\\\\0` -> Characters: `\`, `\`, `0`.
+Regex Engine sees: `\\` (literal backslash) and `0` (literal zero).
+So it matches `\0` in source. Correct.
+
+What about `\\\\\\\\`?
+Java String `\\\\\\\\` -> 8 backslashes.
+Regex Engine sees: `\\` `\\` `\\` `\\`.
+Matches `\\` in source. Correct.
+
+What about `\\s`?
+Java String `\\s` -> Characters `\`, `s`.
+Regex Engine sees: `\s` (whitespace).
+So it matches any whitespace inside char quotes?
+`' '` would match.
+
+Is there a performance issue with `CHRCON` regex?
+It uses alternation `(?:...|...|...)`.
+It's anchored with `^` in `getPattern` because `needGreedy` is false.
+`Pattern.compile("^" + string)`.
+So it tries to match from the start.
+
+If the current character is `'`, it tries `CHRCON`.
+If it matches, good.
+If it doesn't match (e.g., invalid char constant like `''` or `'ab'`), it returns null.
+Then it tries other tokens.
+If no other token matches `'`, then `addToken` returns null match.
+Infinite loop.
+
+Does the test case have invalid char constants?
+`char a = '\0';` -> Valid.
+`char b = '\0';` -> Valid.
+`a4[0] = 'z';` -> Valid.
+`char a1 = 'a';` -> Valid.
+
+Wait, look at `IDENFR`.
+`IDENFR("[_A-Za-z][_A-Za-z0-9]*", false)`
+If we have `constA`, it matches.
+
+Is it possible that `skipNote` is inefficient?
+No, it just moves.
+
+Let's look at `SourceLexer.matchSubStr`.
+```java
+    public String matchSubStr(Pattern pattern) {
+        String pendingString = getSubString();
+        matcher = pattern.matcher(pendingString);
+        if (matcher.find()) {
+            return matcher.group(0);
+        } else {
+            return null;
+        }
+    }
+```
+`getSubString()` returns the rest of the line.
+If the line is very long, `pendingString` is long.
+But C lines are usually short.
+
+There is one major potential issue in `TokenLexer.addToken`.
+If `tokenStr` is found, it moves `tokenStr.length()` steps.
+But `matchSubStr` uses `matcher.find()`.
+`find()` searches for the pattern *anywhere* in the string if not anchored?
+But the pattern IS anchored with `^` in `LexType` constructor.
+`Pattern.compile("^" + string)`.
+So `find()` will only match at the beginning.
+Actually, `matcher.find()` with `^` anchor behaves like `matches()` for the prefix.
+However, `find()` finds the *next* match. Since it's anchored at 0, it checks index 0.
+If it fails, it returns false.
+
+So the logic seems sound for valid tokens.
+
+Why TLE?
+
+Check `LexType` enum values again.
+`a("[&\\|]", false);`
+
+If the input contains `&` alone.
+`AND` ("&&") fails.
+`a` ("[&|]") matches `&`.
+Token `a` is created.
+Added to error list.
+Position advances by 1.
+Correct.
+
+If the input contains `|` alone.
+`OR` ("||") fails.
+`a` ("[&|]") matches `|`.
+Correct.
+
+What if the input contains `&&`?
+`AND` matches.
+Correct.
+
+Is there a token missing?
+What about `.`? Not in C subset?
+What about `?` : ?
+Not in list.
+
+If the test case is the one provided, it is a VALID program.
+So no errors expected.
+Output should be tokens.
+
+If the program hangs on a VALID program, then a valid token is NOT being matched.
+
+Let's look at `STRCON` again.
+`STRCON("\\\"([^\\\"\\n]|\\n)*\\\"", false)`
+Regex: `\"([^\"\n]|\n)*\"`
+Source: `"abcde"`
+`getSubString` returns: `"abcde";` (rest of line)
+Matcher tries to match `\"...\"`.
+It matches `"abcde"`.
+`tokenStr` is `"abcde"`.
+Length 7.
+Move 7 times.
+Correct.
+
+Source: `"%d\n"`
+Matches.
+
+Source: `"%d %c\n"`
+Matches.
+
+What about `INTCON`?
+`INTCON("[0-9]+", false)`
+Regex: `^[0-9]+`
+Source: `123`
+Matches `123`.
+
+What about `IDENFR`?
+`IDENFR("[_A-Za-z][_A-Za-z0-9]*", false)`
+Regex: `^[_A-Za-z][_A-Za-z0-9]*`
+Source: `constA`
+Matches `constA`.
+
+Is it possible that `skipWhiteSpace` is the problem?
+```java
+    public void skipWhiteSpace() {
+        while (!fileIsEnd() && isWhiteSpace(getCurChar())) {
+            move();
+        }
+    }
+```
+`isWhiteSpace` uses `Character.isWhitespace`.
+This includes space, tab, newline?
+`getCurChar` returns `\n` if `lineIsEnd()`.
+`Character.isWhitespace('\n')` is true.
+So if `curPos` is at end of line, `getCurChar` returns `\n`.
+`skipWhiteSpace` calls `move()`.
+`move()` sees `curPos + 1 >= currentLineCapacity`.
+It increments `lineNum` and resets `curPos`.
+So it skips newlines correctly.
+
+Wait. `getCurChar`:
+```java
+    public char getCurChar() {
+        if (lineIsEnd()) {
+            return '\n';
+        } else if (fileIsEnd()) {
+            return '\0';
+        } else {
+            return getCurLine().charAt(curPos);
+        }
+    }
+```
+If `lineIsEnd()` is true, it returns `\n`.
+`skipWhiteSpace` consumes it.
+`move()` advances to next line.
+This seems correct.
+
+However, consider the case where `fileIsEnd()` is true.
+`getCurChar` returns `\0`.
+`Character.isWhitespace('\0')` is false.
+So `skipWhiteSpace` stops.
+
+Back to `addToken`.
+If `fileIsEnd()` is true, `Lexing` loop terminates.
+
+Is there any scenario where `fileIsEnd()` is false, but we are stuck?
+
+Let's look at `LexType` compilation.
+`Pattern.compile` can be expensive if done repeatedly, but it's done in `enum` static init.
+
+One possibility: **Catastrophic Backtracking** in Regex.
+`STRCON`: `\"([^\"\n]|\n)*\"`
+This is `(A|B)*`.
+If the string does NOT close, `find()` will try all combinations.
+But `find()` with `^` anchor.
+If the line is `"abc...` (no closing quote).
+The regex engine tries to match `\"`. Success.
+Then `([^\"\n]|\n)*`. Greedy. Consumes rest of line.
+Then tries to match `\"`. Fails (end of string).
+Backtracks.
+Since `[^\"\n]` and `\n` are mutually exclusive and deterministic, backtracking should be linear O(N).
+Unless `\n` was possible in the middle? But `readLine` strips `\n`.
+So it's just `[^"]*`. Linear.
+
+What about `IDENFR`? `[_A-Za-z][_A-Za-z0-9]*`. Linear.
+
+What about `CHRCON`?
+`'(?:\\a|...|\\s)'`
+Linear.
+
+Is there a regex with nested quantifiers?
+No.
+
+Let's look at `Compiler.java`.
+```java
+                try (OutputStream outputStream1 = new FileOutputStream(outputFileName1)){
+                    outputStream1.write(tokenLexer.getTokenList().toString().getBytes());
+                }
+```
+`tokenList.toString()` builds a huge string.
+If the token list is huge, this might take time/memory, but not TLE usually unless infinite tokens.
+
+If `addToken` matches an empty string?
+`tokenStr.length()` is 0.
+`move()` is called 0 times.
+Infinite loop.
+
+Can any regex match an empty string?
+`^...`
+`INTCON`: `[0-9]+` (1 or more). No.
+`IDENFR`: `[_A-Za-z]...` (1 or more). No.
+`STRCON`: `\"...\"` (at least 2 chars). No.
+`CHRCON`: `'...'` (at least 3 chars). No.
+`AND`: `&&`. No.
+`a`: `[&|]`. 1 char. No.
+`PLUS`: `\+`. 1 char. No.
+
+All tokens require at least 1 character.
+
+So, why TLE?
+
+Maybe `skipNote` is buggy?
+```java
+    } else if (note2_st.equals(this.sourceLexer.getSubString(2))) {
+        sourceLexer.move();
+        sourceLexer.move();
+        while (!this.sourceLexer.fileIsEnd() &&
+                !note2_ed.equals(this.sourceLexer.getSubString(2))) {
+            this.sourceLexer.move();
+        }
+        if (note2_ed.equals(this.sourceLexer.getSubString(2))) {
+            this.sourceLexer.move();
+            this.sourceLexer.move();
+            return true;
+        }
+    }
+```
+If `/*` is at end of file?
+`getSubString(2)` returns `/*` (if length >= 2).
+Moves twice.
+`fileIsEnd()` might be true.
+Loop doesn't run.
+Checks `note2_ed`. False.
+Returns false.
+`addToken` is called.
+Current pos is after `/*`.
+If `/*` was the last thing, `fileIsEnd()` is true.
+`Lexing` loop ends.
+
+If `/*` is followed by content but no `*/`.
+Loop runs to EOF.
+`fileIsEnd()` becomes true.
+Loop ends.
+Returns false.
+`Lexing` loop ends.
+
+Seems robust.
+
+Wait! Look at `SourceLexer.getSubString(int len)`.
+```java
+    public String getSubString(int len) {
+        if (fileIsEnd()) {
+            return "";
+        } else if (this.curPos + len >= getCurLine().length()) {
+            return getCurLine().substring(this.curPos);
+        } else {
+            return getCurLine().substring(this.curPos, this.curPos + len);
+        }
+    }
+```
+If `curPos + len > length`, it returns substring to end.
+In `skipNote`: `note2_st.equals(this.sourceLexer.getSubString(2))`.
+If line is `/`, `getSubString(2)` returns `/`.
+`/*` equals `/`? False.
+
+If line is `/*`, `getSubString(2)` returns `/*`.
+Match.
+
+Okay, I suspect the issue is in `LexType` regex for `STRCON` or `CHRCON` causing issues with specific inputs, OR the `addToken` loop not breaking correctly.
+
+But wait, look at `TokenLexer.addToken` again.
+```java
+            if (sourceLexer.fileIsEnd()) {
+                break;
+            }
+```
+This check is INSIDE the for-each loop.
+If `fileIsEnd()` becomes true DURING the matching process?
+`matchSubStr` doesn't change state.
+So `fileIsEnd()` status doesn't change inside the loop.
+
+Is it possible that `LexType.values()` iteration order is problematic?
+No.
+
+Let's look at the `CHRCON` regex again.
+`"'(?:\\\\a|\\\\v|\\\\\\\\|\\\\b|\\\\f|\\\\0|\\\\t|\\\\\"|\\\\n|\\\\'|\\s)'"`
+There is a space in `\\s`? No, `\s` is whitespace class.
+Does it match NEWLINE?
+`\s` matches `\n`, `\r`, `\t`, etc.
+But `getSubString` returns line WITHOUT newline.
+So `\s` will match space, tab.
+If source has `' '`, it matches.
+
+What if source has `'\n'`?
+Source text: backslash, n.
+Regex part: `\\\\n`.
+Java String `\\\\n` -> Regex `\\n`.
+Regex `\\n` matches literal newline character?
+In Java Regex, `\n` is newline. `\\n` is literal backslash followed by n?
+NO.
+In Java String: `"\\n"` is the string containing backslash and n.
+When compiled to Pattern: `\n`.
+Pattern `\n` matches a newline character.
+BUT the source text contains two characters: `\` and `n`.
+We want to match the literal sequence `\` `n`.
+Regex for literal `\` is `\\`.
+Regex for literal `n` is `n`.
+So we need `\\n` in Regex.
+To get `\\n` in Regex from Java String, we need `"\\\\n"`.
+
+Let's check the provided code:
+`\\\\n` in Java String.
+Characters: `\`, `\`, `\`, `n`? No.
+`"\\\\n"` -> `\`, `\`, `n`.
+Regex Engine sees: `\\` (literal backslash) and `n` (literal n).
+So it matches `\n` in source. Correct.
+
+Wait, look at `\\\\0`.
+`"\\\\0"` -> `\`, `\`, `0`.
+Regex: `\\0`.
+Matches `\0` in source. Correct.
+
+Look at `\\\\\"`.
+`"\\\\\""` -> `\`, `\`, `"`.
+Regex: `\\"`.
+Matches `\"` in source. Correct.
+
+Look at `\\\\'`.
+`"\\\\'"` -> `\`, `\`, `'`.
+Regex: `\\'`.
+Matches `\'` in source. Correct.
+
+Look at `\\\\\\\\`.
+`"\\\\\\\\"` -> 4 backslashes?
+Code: `\\\\\\\\`. 8 chars in source code string literal?
+`"\\\\\\\\"`
+Chars: `\`, `\`, `\`, `\`.
+Regex: `\\` `\\`.
+Matches `\\` in source. Correct.
+
+The regexes seem correct for escaping.
+
+So why TLE?
+
+One common cause of TLE in Java Lexers is **creating many objects** or **inefficient string operations**.
+But here, the structure is simple.
+
+Let's look at `SourceLexer.matchSubStr`.
+`matcher = pattern.matcher(pendingString);`
+This creates a new Matcher every time.
+For every token candidate, for every position.
+This is slow, but shouldn't TLE on small files unless infinite loop.
+
+I strongly suspect an **Infinite Loop** due to a character not being consumed.
+
+Which character?
+Look at `LexType` list.
+Is `.` covered? No.
+Is `?` covered? No.
+Is `:` covered? No.
+Is `~` covered? No.
+Is `^` covered? No.
+Is `` ` `` covered? No.
+
+If the test file `testfile.txt` contains ANY of these, it will hang.
+The provided test case in the prompt description is:
+`const int constA = 1;`
+...
+It does NOT contain those characters.
+
+However, the prompt says: "Test Case Input: ... [The Code] ... Buggy Output: ... Expected Output: ...".
+The "Test Case Input" shown IS the content of `testfile.txt`.
+It is a valid program.
+
+Is there a bug in `skipWhiteSpace`?
+```java
+    public void skipWhiteSpace() {
+        while (!fileIsEnd() && isWhiteSpace(getCurChar())) {
+            move();
+        }
+    }
+```
+If `getCurChar` returns `\0` (EOF), `isWhiteSpace` is false. Loop ends.
+
+If `getCurChar` returns a non-whitespace char. Loop ends.
+
+If `move()` doesn't advance?
+```java
+    public void move() {
+        if (curPos + 1 >= currentLineCapacity) {
+            lineNum++;
+            curPos = 0;
+            updateCurrentLineCapacity();
+        } else {
+            curPos++;
+        }
+    }
+```
+If `currentLineCapacity` is 0 (empty line)?
+`curPos` is 0.
+`0 + 1 >= 0` is true.
+`lineNum++`.
+`curPos = 0`.
+Advances to next line. Correct.
+
+What if `updateCurrentLineCapacity` fails?
+```java
+    private void updateCurrentLineCapacity() {
+        if (lineNum < fileCapacity) {
+            currentLineCapacity = lineCapacities.get(lineNum);
+        }
+    }
+```
+If `lineNum >= fileCapacity`, `currentLineCapacity` retains old value?
+But `fileIsEnd()` checks `lineNum >= fileCapacity`.
+So `move` is only called if `!fileIsEnd()`?
+No, `move` is called from `skipWhiteSpace` which checks `!fileIsEnd()`.
+And from `addToken` after matching.
+If `addToken` matches a token at the end of file?
+`fileIsEnd()` is false before match.
+Match consumes chars.
+`move` is called.
+If it crosses line boundary, `lineNum` increments.
+If `lineNum` becomes `fileCapacity`, `fileIsEnd()` becomes true.
+Next loop iteration in `Lexing` terminates.
+
+There is one subtle bug in `skipNote`.
+```java
+        while (!this.sourceLexer.fileIsEnd() &&
+                !note2_ed.equals(this.sourceLexer.getSubString(2))) {
+            this.sourceLexer.move();
+        }
+```
+If `*/` is split across lines?
+`getSubString(2)` only looks at current line.
+If `*` is at end of line 1, and `/` is at start of line 2.
+`getSubString(2)` on line 1 returns `*` (len 1).
+`*/` equals `*`? False.
+`move()` goes to line 2.
+`getSubString(2)` on line 2 returns `/...`.
+`*/` equals `/...`? False.
+So it misses the comment end!
+The loop continues until EOF.
+`skipNote` returns false.
+The `/*` and subsequent text were NOT treated as a comment.
+The `/*` characters are still in the stream?
+NO! `skipNote` CALLED `move()` repeatedly.
+It consumed the entire rest of the file!
+So `fileIsEnd()` is true.
+`Lexing` loop terminates.
+So the program finishes, but output is incomplete.
+This is not TLE.
+
+Unless... `move()` is stuck?
+No.
+
+I will bet on the `addToken` infinite loop due to an unmatched character.
+Even if the visible test case is clean, maybe there's a hidden character or the regex for `IDENFR` or `INTCON` is failing unexpectedly?
+
+Actually, look at `LexType.IDENFR`.
+`IDENFR("[_A-Za-z][_A-Za-z0-9]*", false)`
+If the source has `constA`, it matches.
+
+Wait, look at `LexType.INTCON`.
+`INTCON("[0-9]+", false)`
+
+Look at `LexType.CHRCON`.
+If the source has `'a'`, it matches.
+
+Is it possible that `Pattern.compile` throws an exception? No, it's in static init.
+
+I will identify the `addToken` method as the location, specifically the lack of handling for no-match scenarios, which leads to TLE if any character is unmatched. Even if the provided test case *should* work, this is the structural flaw causing TLE in general or potentially with specific whitespace/encoding issues in the test file not visible here.
+
+However, often in these assignments, TLE is caused by **Regex Catastrophic Backtracking** or

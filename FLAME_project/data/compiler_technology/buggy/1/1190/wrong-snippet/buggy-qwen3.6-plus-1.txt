@@ -1,0 +1,203 @@
+Based on the problem description and the test case, the program fails to detect syntax errors (specifically missing semicolons) in the input source code. The expected output indicates three errors of type 'i' (missing semicolon) at lines 2, 9, and 13.
+
+The input code is:
+```c
+int main() {
+    printf("Hello SysY!\n") // error 1 (Line 2: missing ;)
+
+    if (1)
+
+
+    /*********/
+    ;
+    int a // error 2 (Line 9: missing ;)
+
+    for (;;) {}
+
+    return 0 // error 3 (Line 13: missing ;)
+}
+```
+
+The `Parser.java` file contains logic to detect missing semicolons by checking `match(Token.Type.SEMICN)` and setting an error code on the previous token (`peekToken(-1).setErrorCode('i')`) if it's missing. However, the `print()` method in `Parser.java` only outputs the result of `compUnit.error()`. If the parsing process encounters an error and stops or doesn't correctly propagate the error string from the tokens where `setErrorCode` was called, the output will be empty or incorrect.
+
+Looking at `Parser.java`:
+1.  In `parseStmt`, for `PRINTFTK` (case 11), `RETURNTK` (case 8), and expression statements (case 2/default), there are checks for missing semicolons.
+2.  In `parseVarDecl` and `parseConstDecl`, there are checks for missing semicolons.
+
+The issue likely lies in how the errors are collected or outputted. The `Token.error()` method returns the formatted error string if `errorCode != 0`. The `Node.error()` methods recursively call `error()` on their children. If a node is not fully constructed because parsing stopped or skipped due to an error, its `error()` method might not include the error from the token where `setErrorCode` was called.
+
+However, a more fundamental issue in recursive descent parsers with error recovery is that if the parser doesn't advance past the error correctly, it might get stuck or fail to parse subsequent structures, leading to missing error reports or crashes. But here the output is empty ("Buggy Output:" is empty), suggesting `compUnit.error()` returns an empty string.
+
+Let's look at `parseStmt` for `printf`:
+```java
+            case PRINTFTK:
+                stmt.setType(11);
+                stmt.addToken(currentToken()); // 'printf'
+                advance();
+                stmt.addLParent(currentToken()); // '('
+                advance();
+                stmt.addStringConst(currentToken()); // StringConst
+                advance();
+                while (match(Token.Type.COMMA)) {
+                    stmt.addCommaList(currentToken()); // ','
+                    advance();
+                    stmt.addExpList(parseExp()); // Exp
+                }
+                if (match(Token.Type.RPARENT)) {
+                    stmt.addRParent(currentToken()); // ')'
+                    advance();
+                } else {
+                    peekToken(-1).setErrorCode('j');
+                }
+                if (match(Token.Type.SEMICN)) {
+                    stmt.addSemicn(currentToken()); // ';'
+                    advance();
+                } else {
+                    peekToken(-1).setErrorCode('i');
+                }
+                break;
+```
+If `;` is missing, `peekToken(-1).setErrorCode('i')` is called. This sets the error code on the token *before* the current one. The current token is likely the next keyword or identifier (e.g., `if` on line 4). The token before it is `)` from `printf(...)`. The `Stmt.toString()` and `Stmt.error()` methods include `semicn` if it exists. If `semicn` is null (because `;` was missing), `stmt.error()` does **not** automatically include the error code set on `peekToken(-1)` unless that token is part of the AST nodes stored in `stmt`.
+
+In `Stmt.error()` for case 11:
+```java
+            case 11:
+                if (token != null) {
+                    sb.append(token.error());
+                }
+                if (lParent != null) {
+                    sb.append(lParent.error());
+                }
+                if (stringConst != null) {
+                    sb.append(stringConst.error());
+                }
+                for (int i = 0; i < commaList.size(); i++) {
+                    sb.append(commaList.get(i).error());
+                    sb.append(expList.get(i).error());
+                }
+                if (rParent != null) {
+                    sb.append(rParent.error());
+                }
+                if (semicn != null) {
+                    sb.append(semicn.error());
+                }
+                break;
+```
+The `rParent` token is added. If `setErrorCode` was called on `rParent` (which is `peekToken(-1)` when `;` is missing? No, `peekToken(-1)` is the token before the current one. When checking for `;`, `currentToken` is the first token of the next statement (e.g., `if`). `peekToken(-1)` is the last token of the current statement, which is `)`. So `rParent` has the error code. `rParent.error()` will output the error.
+
+Wait, let's trace Error 1: `printf("Hello SysY!\n")` followed by `if`.
+1.  Parse `printf`.
+2.  Parse `"Hello..."`.
+3.  Expect `)`. Match `)`. `addRParent`. Advance. Current is `if` (or newline/whitespace skipped).
+4.  Expect `;`. Current is `if`. Not `;`.
+5.  `peekToken(-1)` is `)`. `setErrorCode('i')` on `)`.
+6.  `rParent` is `)`.
+7.  `stmt.error()` calls `rParent.error()`. `rParent` has error code 'i'. Output: `2 i`. This seems correct for Error 1.
+
+Let's trace Error 2: `int a` followed by `for`.
+1.  `parseBlockItem` sees `int`. Calls `parseDecl`.
+2.  `parseDecl` calls `parseVarDecl`.
+3.  `parseVarDecl` parses `int` (BType), `a` (VarDef).
+4.  Checks for `,`. Next is `for`. Not `,`.
+5.  Checks for `;`. Next is `for`. Not `;`.
+6.  `peekToken(-1)` is `a` (Ident). `setErrorCode('i')` on `a`.
+7.  `varDecl.addSemicn` is NOT called (semicn is null).
+8.  `VarDecl.error()`:
+    ```java
+    public String error() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(bType.error());
+        sb.append(varDefList.get(0).error());
+        // ...
+        sb.append(semicn.error()); // semicn is null! NullPointerException?
+        return sb.toString();
+    }
+    ```
+    If `semicn` is null, `semicn.error()` throws `NullPointerException`. This would crash the program or produce no output if caught silently (though no try-catch is visible in `error()` propagation).
+
+    Let's check `VarDecl.error()` again.
+    ```java
+    @Override
+    public String error() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(bType.error());
+        sb.append(varDefList.get(0).error());
+        for (int i = 0; i < commaList.size(); i++) {
+            sb.append(commaList.get(i).error());
+            sb.append(varDefList.get(i + 1).error());
+        }
+        sb.append(semicn.error()); // <--- ERROR HERE if semicn is null
+        return sb.toString();
+    }
+    ```
+    Same issue in `ConstDecl.error()`.
+
+    If `semicn` is null, this crashes. The "Buggy Output" is empty, which might mean the program crashed or the exception was swallowed somewhere, or the file writing failed.
+
+    To fix this, `VarDecl.error()` and `ConstDecl.error()` must check if `semicn` is null before calling `.error()`. If it is null, they should probably still report the error if it was set on the previous token, but the previous token's error is already captured in `varDefList.get(0).error()`? No, `setErrorCode` was called on `peekToken(-1)`, which is the last token of the VarDef (the identifier `a`). `VarDef.error()` iterates through its components. `ident` is `a`. `ident.error()` will return the error string.
+
+    So, if `VarDef.error()` correctly calls `ident.error()`, and `ident` has the error code, then `VarDecl.error()` doesn't need to call `semicn.error()` if `semicn` is null. It just needs to avoid the NPE.
+
+    Let's check `VarDef.error()`:
+    ```java
+    @Override
+    public String error() {
+        StringBuilder sb = new StringBuilder();
+        if (ident != null) {
+            sb.append(ident.error());
+        }
+        // ...
+        return sb.toString();
+    }
+    ```
+    Yes, `ident.error()` will return the error. So `VarDecl.error()` should just skip `semicn.error()` if `semicn` is null.
+
+    The same applies to `ConstDecl`.
+
+    There is also a similar issue in `Stmt.error()`?
+    In `Stmt.error()`, `semicn` is checked: `if (semicn != null) { sb.append(semicn.error()); }`. This is safe.
+
+    So the primary bug is in `VarDecl.error()` and `ConstDecl.error()` where `semicn.error()` is called without a null check.
+
+    Additionally, looking at `parseCompUnit`:
+    ```java
+    while (peekToken(1).getType() != Token.Type.MAINTK) {
+        compUnit.addFuncDef(parseFuncDef()); // {FuncDef}
+    }
+    ```
+    If there are no FuncDefs, and the next token is `int main`, this loop terminates. Correct.
+
+    Let's verify the location of the errors in the code.
+
+<frontend/Nodes/VarDecl.java>
+...
+    @Override
+    public String error() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(bType.error());
+        sb.append(varDefList.get(0).error());
+        for (int i = 0; i < commaList.size(); i++) {
+            sb.append(commaList.get(i).error());
+            sb.append(varDefList.get(i + 1).error());
+        }
+        sb.append(semicn.error());
+        return sb.toString();
+    }
+...
+
+<frontend/Nodes/ConstDecl.java>
+...
+    @Override
+    public String error() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(constToken.error());
+        sb.append(bType.error());
+        sb.append(constDefList.get(0).error());
+        for (int i = 0; i < commaList.size(); i++) {
+            sb.append(commaList.get(i).error());
+            sb.append(constDefList.get(i + 1).error());
+        }
+        sb.append(semicn.error());
+        return sb.toString();
+    }
+...

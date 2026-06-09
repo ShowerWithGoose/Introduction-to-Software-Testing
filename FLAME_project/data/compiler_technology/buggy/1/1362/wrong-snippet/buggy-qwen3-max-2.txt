@@ -1,0 +1,175 @@
+Looking at the test case input and comparing the buggy output with the expected output, I can see that there's an extra `RPARENT )` token being output in the buggy output that doesn't appear in the expected output.
+
+In the buggy output, after parsing the function `func_p()`, there's an extra:
+```
+RPARENT )
+```
+
+This appears right after the correct `RPARENT )` that should be there for the function parameter list.
+
+Looking at the parser code, the issue is likely in the `parseFuncDef` method in `Parser.java`. The problem is that when parsing a function definition with empty parameters (like `func_p()`), the code is adding the RPARENT token to the parse log twice.
+
+Let me trace through the code:
+
+1. In `parseFuncDef()`, it calls `assertToken(TokenType.RPARENT, parseSupporter.getLineNum())`
+2. The `assertToken` method calls `parseSupporter.checkToken(type)` which advances the index
+3. Then in `assertToken`, for `RPARENT`, it adds a component: `parseSupporter.addComponent("RPARENT" + " " + parseSupporter.getCurrentToken().getContent())`
+4. But looking at the `checkToken` method in `ParseSupporter`, it also seems like tokens are being added to the parse log elsewhere
+
+Wait, actually looking more carefully at the `assertToken` method:
+
+```java
+public CSTNode assertToken(TokenType type, int lineNum) throws RuntimeException {
+    try {
+        CSTNode node = parseSupporter.checkToken(type);
+        if (type == TokenType.SEMICN) {
+            parseSupporter.addComponent("SEMICN" + " " + parseSupporter.getCurrentToken().getContent());
+        } else if (type == TokenType.RBRACK) {
+            parseSupporter.addComponent("RBRACK" + " " + parseSupporter.getCurrentToken().getContent());
+        } else if (type == TokenType.RPARENT) {
+            parseSupporter.addComponent("RPARENT" + " " + parseSupporter.getCurrentToken().getContent());
+        }
+        return node;
+    } catch (RuntimeException e) {
+        return handleTokenException(type, lineNum, e);
+    }
+}
+```
+
+The issue is that `parseSupporter.checkToken(type)` already outputs the token information (as seen in the commented out System.out.println in checkToken), but then `assertToken` is adding it again to the parse log for certain token types including RPARENT.
+
+However, looking at the `checkToken` method in `ParseSupporter`:
+
+```java
+public CSTNode checkToken(TokenType type) throws RuntimeException {
+    Token token = lookAhead(0);
+    if (!(token.getType() == type)) {
+        throw new RuntimeException("Error!!"); //TODO
+    }
+   // System.out.println(token.getType() + " " + token.getContent()); // 输出到 控制台
+    advance(1);
+    return new TokenNode(token);
+}
+```
+
+The actual token output happens in the individual parsing methods, not in `checkToken`. For example, in `parseFuncDef`:
+
+```java
+funcDefNode.addChild(parseSupporter.checkToken(TokenType.LPARENT));
+parseSupporter.addComponent("LPARENT" + " " + parseSupporter.getCurrentToken().getContent());
+```
+
+But for the RPARENT, it uses `assertToken` which also calls `addComponent`. So the LPARENT is added once manually, but RPARENT is added by `assertToken`.
+
+However, looking at the expected output, both LPARENT and RPARENT should appear exactly once. The problem is that in the buggy output, there are two RPARENT entries for the function definition.
+
+Looking more carefully at the test case, the function `func_p()` has:
+- LPARENT (
+- RPARENT )
+
+But in the buggy output, there's an extra RPARENT ) right after.
+
+Actually, looking at the grammar and the code structure, I think the issue might be in how the `parseCallee` method handles function calls.
+
+In the main function, there's a function call `func_p()`, which should be parsed as a `CalleeNode`. Let's look at `parseCallee`:
+
+```java
+private CalleeNode parseCallee() throws Exception {
+    CalleeNode calleeNode = new CalleeNode();
+    calleeNode.addChild(parseSupporter.checkToken(TokenType.IDENFR));
+    parseSupporter.addComponent(TokenType.IDENFR + " " + parseSupporter.getCurrentToken().getContent());
+    calleeNode.addChild(parseSupporter.checkToken(TokenType.LPARENT));
+    parseSupporter.addComponent(TokenType.LPARENT + " " + parseSupporter.getCurrentToken().getContent());
+
+    ParseSupporter old = this.parseSupporter;
+    try {
+        this.parseSupporter = new ParseSupporter(old);
+        parseExp();
+        this.parseSupporter = old;
+        calleeNode.addChild(parseFuncRParams());
+    } catch (RuntimeException ignored) {
+    }
+    calleeNode.addChild(assertToken(TokenType.RPARENT, parseSupporter.getLineNum()));
+    return calleeNode;
+}
+```
+
+Here, `assertToken(TokenType.RPARENT, ...)` will add the RPARENT to the parse log. But also, in the `parseFuncDef` method, there's another `assertToken(TokenType.RPARENT, ...)` for the function definition itself.
+
+Wait, but that should be correct - the function definition has its own RPARENT, and the function call has its own RPARENT.
+
+Looking at the buggy output again:
+
+After `func_p` function definition:
+```
+RPARENT )
+RPARENT )
+```
+
+And in the main function call:
+```
+RPARENT )
+```
+
+So the issue is specifically with the function definition having two RPARENT outputs instead of one.
+
+Looking at `parseFuncDef`:
+
+```java
+private FuncDefNode parseFuncDef() throws Exception {
+    FuncDefNode funcDefNode = new FuncDefNode();
+
+    funcDefNode.addChild(parseFuncType());
+    funcDefNode.addChild(parseSupporter.checkToken(TokenType.IDENFR));
+    parseSupporter.addComponent("IDENFR" + " " + parseSupporter.getCurrentToken().getContent());
+    funcDefNode.addChild(parseSupporter.checkToken(TokenType.LPARENT));
+    parseSupporter.addComponent("LPARENT" + " " + parseSupporter.getCurrentToken().getContent());
+
+    if (parseSupporter.isFuncParaFirst()) {
+        funcDefNode.addChild(parseFuncPara());
+    }
+
+    funcDefNode.addChild(assertToken(TokenType.RPARENT, parseSupporter.getLineNum()));
+    parseSupporter.addComponent("RPARENT" + " " + parseSupporter.getCurrentToken().getContent());
+    funcDefNode.addChild(parseBlock());
+    parseSupporter.addParseLog("FuncDef");
+    return funcDefNode;
+}
+```
+
+Ah! Here's the bug! In `parseFuncDef`, after calling `assertToken(TokenType.RPARENT, ...)`, it **again** calls `parseSupporter.addComponent("RPARENT" + " " + parseSupporter.getCurrentToken().getContent())`.
+
+But the `assertToken` method already adds the RPARENT component internally. So this results in RPARENT being added twice.
+
+Looking at the `assertToken` method again:
+- It calls `parseSupporter.checkToken(type)` 
+- Then if type is RPARENT, it calls `parseSupporter.addComponent("RPARENT" + " " + ...)`
+
+Then back in `parseFuncDef`, it calls `parseSupporter.addComponent("RPARENT" + " " + ...)` again.
+
+This double-addition causes the extra RPARENT in the output.
+
+The same issue likely exists in other places where `assertToken` is used followed by manual `addComponent` calls.
+
+<frontend/parser/Parser.java>
+...
+    private FuncDefNode parseFuncDef() throws Exception {
+        FuncDefNode funcDefNode = new FuncDefNode();
+
+        funcDefNode.addChild(parseFuncType());
+        funcDefNode.addChild(parseSupporter.checkToken(TokenType.IDENFR));
+        parseSupporter.addComponent("IDENFR" + " " + parseSupporter.getCurrentToken().getContent());
+        funcDefNode.addChild(parseSupporter.checkToken(TokenType.LPARENT));
+        parseSupporter.addComponent("LPARENT" + " " + parseSupporter.getCurrentToken().getContent());
+
+        if (parseSupporter.isFuncParaFirst()) {
+            funcDefNode.addChild(parseFuncPara());
+        }
+
+        funcDefNode.addChild(assertToken(TokenType.RPARENT, parseSupporter.getLineNum()));
+        parseSupporter.addComponent("RPARENT" + " " + parseSupporter.getCurrentToken().getContent());
+        funcDefNode.addChild(parseBlock());
+        parseSupporter.addParseLog("FuncDef");
+        return funcDefNode;
+    }
+...

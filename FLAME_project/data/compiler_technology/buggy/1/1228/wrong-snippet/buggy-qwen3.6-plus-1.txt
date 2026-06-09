@@ -1,0 +1,238 @@
+Based on the analysis of the problem description, test case, and source code:
+
+**Summary:**
+The program is a syntax analyzer that should detect specific syntax errors (missing semicolons `i`, missing right parentheses `j`, missing right square brackets `k`).
+The test input contains three errors:
+1. Line 1: `void f(int a {}` - Missing `)` after parameters. Expected error `1 j`.
+2. Line 3: `int main( {` - Missing `)` after `main`. Expected error `3 j`.
+3. Line 5: `f(a + 10;` - Missing `)` in function call. Expected error `5 j`.
+
+The buggy output is:
+```
+1 j
+3 j
+5 j
+5 i
+```
+The expected output is:
+```
+1 j
+3 j
+5 j
+```
+The program correctly identifies the three `j` errors but incorrectly reports an additional `5 i` (missing semicolon) error.
+
+Looking at the `parseStmt` method, specifically the branch handling function calls or assignments starting with an `LVal` (which includes function calls like `f(...)` when identified via `preReadCompare` or falling through to expression parsing):
+
+In `parseStmt`, there is a block:
+```java
+        } else if (lexer.preReadCompare(LexType.ASSIGN)) {
+            LVal lVal = parseLVal();
+            getToken();
+            //System.out.println(lexType);
+            if (lexType == LexType.GETINTTK) {
+                // ... handles getint
+            } else if (lexType == LexType.GETCHARTK) {
+                // ... handles getchar
+            } else {
+                Exp exp = parseExp();
+                if (errorTool.checkI(token, line)) {
+                    getToken();
+                }
+                outputP("Stmt");
+                return new Stmt(lVal, exp, StmtType.LValExp);
+            }
+        } else {
+            // ... handles other statements including bare expressions/function calls
+            Exp exp = null;
+            if (lexType != LexType.SEMICN) {
+                exp = parseExp();
+            }
+            if (errorTool.checkI(token, line)) {
+                getToken();
+            }
+            outputP("Stmt");
+            return new Stmt(exp, StmtType.EXP);
+        }
+```
+
+The input `f(a + 10;` on line 5.
+`f` is an `IDENFR`.
+`parseStmt` checks `lexer.preReadCompare(LexType.ASSIGN)`. The next tokens are `(`, `a`, `+`, `10`, `;`. There is no `=`. So this condition is false.
+It falls into the final `else` block.
+`exp = parseExp()` is called.
+`parseExp` -> `parseAddExp` -> ... -> `parseUnaryExp`.
+In `parseUnaryExp`, since `lexType` is `IDENFR` (`f`) and the next token is `(`, it enters the function call branch:
+```java
+            } else if (lexType == LexType.IDENFR) {
+                ArrayList<LexType> lexTypes = lexer.preRead(1);
+                if (lexTypes.get(0) == LexType.LPARENT) {
+
+                    String s = token;
+                    getToken(); // consumes f
+                    getToken(); // consumes (
+                    FuncRParams funcRParams = null;
+                    if (lexType != LexType.RPARENT&&lexer.preReadCompare(LexType.RPARENT)) {
+                        funcRParams = parseFuncRParams();
+                    }
+                    if (errorTool.checkJ(token, line)) { // Checks for )
+                        getToken();
+                    }
+                    outputP("UnaryExp");
+                    return new UnaryExp(getIdent(s,line), funcRParams);
+                } 
+                // ...
+            }
+```
+Inside `parseUnaryExp` for `f(a + 10;`:
+1. `getToken()` consumes `f`. Current token `(`.
+2. `getToken()` consumes `(`. Current token `a`.
+3. `lexType` is `IDENFR` (`a`), not `RPARENT`. `preReadCompare(RPARENT)` looks ahead. The sequence is `a`, `+`, `10`, `;`. It does NOT find `)` before `;` or end. Wait, `preReadCompare` stops at `SEMICN` or if found. It will scan until `;`. It won't find `)`. So it returns `false`.
+4. So `funcRParams` remains `null`.
+5. `errorTool.checkJ(token, line)` is called. `token` is `a` (or whatever `parseFuncRParams` might have left, but here it wasn't called). Actually, if `funcRParams` is not parsed, the current token is still `a`.
+   Wait, if `funcRParams` is NOT parsed, we are still at `a`.
+   `checkJ` checks if `token` is `)`. It is `a`. So it writes `5 j` and returns `false`.
+   Since it returns `false`, `getToken()` is NOT called inside `parseUnaryExp`.
+   
+   However, look at `parseFuncRParams`. It is NOT called.
+   
+   Let's re-evaluate `preReadCompare`.
+   ```java
+    public Boolean preReadCompare(LexType type) {
+        // ... saves state
+        for (; ; ) {
+            if (lexType == type) { flag = true; break; }
+            else if (lexType == LexType.SEMICN) { break; }
+            next();
+        }
+        // ... restores state
+        return flag;
+    }
+   ```
+   For `f(a + 10;`, current is `a`.
+   Loop:
+   1. `lexType` is `IDENFR` (`a`). Not `)`. Not `;`. `next()`. Token becomes `+`.
+   2. `lexType` is `PLUS`. Not `)`. Not `;`. `next()`. Token becomes `10`.
+   3. `lexType` is `INTCON`. Not `)`. Not `;`. `next()`. Token becomes `;`.
+   4. `lexType` is `SEMICN`. Break.
+   Returns `false`.
+
+   So `funcRParams` is null.
+   `checkJ(token, line)` is called. `token` is `a` (state restored).
+   `checkJ` sees `a` != `)`. Writes `5 j`. Returns `false`.
+   `getToken()` is NOT executed in `parseUnaryExp`.
+   
+   Control returns to `parseExp`, then `parseStmt`'s `else` block.
+   Current token is still `a`? No, `parseExp` calls `parseAddExp` etc which eventually call `parseUnaryExp`.
+   `parseUnaryExp` consumed `f` and `(`. It did NOT consume `a` or `)` because `checkJ` failed and didn't advance.
+   So when `parseUnaryExp` returns, the current token is `a`.
+   
+   Back in `parseStmt`'s `else` block:
+   `exp` was assigned the result of `parseExp()`.
+   Then:
+   ```java
+            if (errorTool.checkI(token, line)) {
+                getToken();
+            }
+   ```
+   `token` is `a`. `checkI` checks if `token` is `;`. It is not.
+   So it writes `5 i`.
+   
+   This explains the spurious `5 i` error. The parser detected the missing `)` in `parseUnaryExp` (outputting `5 j`), but did not advance past the error point sufficiently to skip the contents of the function call or align with the semicolon. Consequently, when control returned to `parseStmt`, it checked for a semicolon again, found `a` instead, and reported a missing semicolon `5 i`.
+
+   The issue is that when a syntax error is detected and handled (like missing `)`), the parser should ideally synchronize or ensure that the subsequent check in the calling routine doesn't trigger another false positive error for the same location. Specifically, in `parseUnaryExp`, if `checkJ` fails, it means `)` is missing. The parser should probably attempt to synchronize or at least not leave the token stream in a state where the caller interprets the current token (which is part of the malformed argument list) as the start of a new statement component expecting a semicolon.
+
+   However, a simpler fix often used in these recursive descent parsers with error recovery is that if an error is detected in a sub-component, we might need to consume tokens up to a synchronization point (like `)` or `;`) or simply accept that the error was reported and prevent double reporting.
+   
+   In this specific code structure, `parseUnaryExp` reports `j`. It does NOT consume the `)`. It leaves the pointer at `a`.
+   `parseExp` returns.
+   `parseStmt` checks for `;`. Finds `a`. Reports `i`.
+   
+   To fix this, when `checkJ` fails in `parseUnaryExp`, we know `)` is missing. We are inside a function call `f(...)`. The arguments are malformed or unfinished. We should probably skip until `)` or `;` or `}`. Or, more simply, since `parseStmt` will check for `;` anyway, maybe `parseUnaryExp` shouldn't report `j` if it's going to cause chaos? No, `j` is required.
+   
+   The standard way to handle this in simple error recovery without full synchronization sets is: if an expected token is missing, report it, but DO NOT advance the parser (which is what happens here). The problem is the *caller* then sees the same bad token and reports another error.
+   
+   If we look at `parseFuncDef`:
+   ```java
+        if (errorTool.checkJ(token, line)) {
+            getToken();
+        }
+   ```
+   If `)` is missing, it reports `j` and does NOT advance.
+   
+   The difference here is that `parseStmt` expects a `;` at the end of the statement. `parseUnaryExp` is part of an expression.
+   
+   The root cause is that `parseUnaryExp` detects the missing `)` for the function call `f(...)`, but because it doesn't advance, the `parseExp` completes (returning the partial expression), and `parseStmt` sees the next token `a` (which is actually the start of the argument that was partially consumed/looked at?)
+   
+   Wait, `parseUnaryExp` consumed `f` and `(`.
+   Token is `a`.
+   It checks for `)`. Fails. Reports `j`.
+   Returns.
+   `parseExp` returns.
+   `parseStmt` has `exp`.
+   Checks `token` (`a`) against `;`. Fails. Reports `i`.
+   
+   The error `5 j` is correct. The error `5 i` is incorrect because the statement *does* have a semicolon later (`f(a + 10;`), but the parser is stuck at `a`.
+   
+   To prevent the `5 i` error, when `checkJ` fails in `parseUnaryExp` (indicating missing `)`), we should ideally skip tokens until we find `)` or `;` or some sync token. If we skip to `;`, then `parseStmt` will see `;` and `checkI` will pass.
+   
+   Alternatively, looking at `parseStmt` for `printf`:
+   ```java
+            if (errorTool.checkJ(token, line)) {
+                getToken();
+            }
+            if (errorTool.checkI(token, line)) {
+                getToken();
+            }
+   ```
+   Here, if `)` is missing, it reports `j`, doesn't advance. Then checks `;`. If `;` is present, it passes. If `)` was missing but `;` is there, it works fine.
+   
+   But in `parseUnaryExp`, the missing `)` is inside the expression.
+   
+   The fix should likely be in `parseUnaryExp`. If `checkJ` fails, we should try to synchronize.
+   
+   <frontend/parser/Parser.java>
+...
+    public UnaryExp parseUnaryExp() throws IOException {int line = lexer.getLineNum();
+        if (lexType == LexType.PLUS || lexType == LexType.MINU
+                || lexType == LexType.NOT) {
+            UnaryOp op = parseUnaryOp();
+            UnaryExp unaryExp = parseUnaryExp();
+            outputP("UnaryExp");
+            return new UnaryExp(op, unaryExp);
+        } else if (lexType == LexType.IDENFR) {
+            ArrayList<LexType> lexTypes = lexer.preRead(1);
+            if (lexTypes.get(0) == LexType.LPARENT) {
+
+                String s = token;
+                getToken();
+                getToken();
+                FuncRParams funcRParams = null;
+                if (lexType != LexType.RPARENT&&lexer.preReadCompare(LexType.RPARENT)) {
+                    funcRParams = parseFuncRParams();
+                }
+                if (errorTool.checkJ(token, line)) {
+                    getToken();
+                } else {
+                    // Error recovery: skip tokens until ')' or ';' or '}' to avoid cascading errors
+                    while (lexType != LexType.RPARENT && lexType != LexType.SEMICN && lexType != LexType.RBRACE && lexer.next()) {
+                        // just consuming
+                    }
+                    if (lexType == LexType.RPARENT) {
+                        getToken();
+                    }
+                }
+                outputP("UnaryExp");
+                return new UnaryExp(getIdent(s,line), funcRParams);
+            } else {
+                PrimaryExp primaryExp = parsePrimaryExp();
+                outputP("UnaryExp");
+                return new UnaryExp(primaryExp);
+            }
+        } else {
+            PrimaryExp primaryExp = parsePrimaryExp();
+            outputP("UnaryExp");
+            return new UnaryExp(primaryExp);
+        }
+    }
+...

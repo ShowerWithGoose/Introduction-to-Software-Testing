@@ -1,0 +1,63 @@
+#define _CRT_SECURE_NO_WARNINGS 
+#include<stdio.h>
+#include<string.h>
+#include<math.h>
+#include<stdlib.h>
+#include<ctype.h>
+struct part
+{
+    long long int xs;//系数
+    long long int zs;//指数
+};
+struct part sen1[100], sen2[100], ans[100000],mid;
+int main()
+{
+    int i = 0,j=0,k=0,p,q;
+
+    for (i = 0;; i++)
+    {
+        scanf("%lld %lld", &sen1[i].xs, &sen1[i].zs);
+        if (getchar() == '\n')
+            break;
+    }
+    for (j = 0;; j++)
+    {
+        scanf("%lld %lld", &sen2[j].xs, &sen2[j].zs);
+        if (getchar() == '\n')
+            break;
+    }
+    int n = 0;
+    for (p = 0; p < i+1; p++) // @@ [Loop bound is incorrect: should be p < i, not p < i+1, because i is already the count of terms after the loop ends. Same issue for q < j+1 below.]
+    {
+        for (q = 0; q < j+1; q++) // @@ [Loop bound is incorrect: should be q < j, not q < j+1, because j is the number of terms in sen2. This causes reading beyond valid input data.]
+        {
+            ans[n].xs = sen1[p].xs * sen2[q].xs;
+            ans[n].zs = sen1[p].zs + sen2[q].zs;
+            n++;
+        }
+    }
+    for (int j = 0; j < n; j++)
+    {
+        for (int i = j; i < n; i++)
+        {
+            if (ans[i].zs < ans[i + 1].zs) // @@ [Array index out-of-bounds: when i == n-1, ans[i+1] accesses ans[n], which is invalid. Also, this bubble-sort-like logic does not correctly handle merging like terms across non-adjacent positions.]
+            {
+                mid = ans[i];
+                ans[i] = ans[i + 1];
+                ans[i + 1] = mid;
+            }
+            else if (ans[i].zs == ans[i + 1].zs) // @@ [Same out-of-bounds issue as above. Additionally, combining terms only between adjacent elements during sorting leads to missed merges if same exponents are not adjacent after partial sorting.]
+            {
+                ans[i].xs = ans[i].xs + ans[i + 1].xs;
+                ans[i + 1].xs = 0;
+            }
+        }
+    }
+    for (int i = 0; i <n; i++)
+    {
+        if(ans[i].xs!=0)
+        {
+            printf("%lld %lld ", ans[i].xs, ans[i].zs);
+        }
+    }
+}

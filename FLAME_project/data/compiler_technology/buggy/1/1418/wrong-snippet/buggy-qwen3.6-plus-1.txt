@@ -1,0 +1,887 @@
+Based on the problem description and the test case, the program fails to output any error file (`error.txt`) when it should detect three "missing semicolon" errors (type `i`).
+
+The root cause lies in how the parser handles errors and the control flow in `Compiler.java`.
+1.  **Error Detection Logic**: The parsers (e.g., `VarDeclParser`, `StmtParser`) correctly identify missing semicolons and call `ErrorSave.error()`. This sets `GlobalData.Errorflag = true` and `GlobalData.Parserflag = false`.
+2.  **Control Flow in `Compiler.java`**:
+    *   The code checks `if(GlobalData.Parserflag)` to decide whether to write `parser.txt`. Since an error occurred, `Parserflag` is false, so `parser.txt` is not written. This is correct behavior for erroneous input (usually we don't output parse tree for invalid code).
+    *   However, the code then checks `if(GlobalData.Errorflag)` to write `error.txt`.
+    *   Looking at `Compiler.java`:
+        ```java
+        //Parser成功结果输出到 parser.txt
+        String ParserPrintFilePath = "parser.txt";
+        try {
+            bw = new BufferedWriter(new FileWriter(ParserPrintFilePath));
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        if(GlobalData.Parserflag) {
+            // ... writes to bw ...
+            bw.close();
+        }
+
+        //输出错误结果到 error.txt
+        if(GlobalData.Errorflag) {
+            ErrorPrint.run(GlobalData.Errors);
+        }
+        ```
+    *   If `GlobalData.Parserflag` is false, the `bw` (BufferedWriter for `parser.txt`) is opened but **never closed** because the `bw.close()` is inside the `if` block. While this might not directly prevent `error.txt` from being created, it's bad practice.
+    *   More importantly, let's look at `ErrorSave.java`. It sets `GlobalData.Errorflag = true`.
+    *   Let's look at `Compiler.java` again. Is there an exception thrown?
+    *   In `Lexer.java`, if an error 'a' occurs, it calls `ErrorSave.error`.
+    *   In `Parser.java`, no exceptions are thrown, just error recording.
+
+    Let's re-examine `Compiler.java` logic carefully.
+    ```java
+    //Parser成功结果输出到 parser.txt
+    String ParserPrintFilePath = "parser.txt";
+    try {
+        bw = new BufferedWriter(new FileWriter(ParserPrintFilePath));
+    } catch (IOException e) {
+        throw new RuntimeException(e);
+    }
+    if(GlobalData.Parserflag) {
+        StringBuilder sb = new StringBuilder();
+        ParserSuccessPrint parserSuccessPrint = new ParserSuccessPrint();
+        parserSuccessPrint.run(GlobalData.CompUnitNode, sb, parserSuccessPrint);
+
+        try {
+            bw.write(sb.toString());
+            bw.close();
+        } catch (IOException e) {
+            System.out.println("Comiler.java Line-64: BufferWriter Error");
+            throw new RuntimeException(e);
+        }
+    }
+
+    //输出错误结果到 error.txt
+    if(GlobalData.Errorflag) {
+        ErrorPrint.run(GlobalData.Errors);
+    }
+    ```
+    If `Parserflag` is false, `bw` remains open. The program continues to `if(GlobalData.Errorflag)`. `ErrorPrint.run` creates its own `BufferedWriter` for `error.txt`. This should work.
+
+    Why is the output "No output file"?
+    Perhaps the program crashes or exits before reaching the error printing part?
+    Or maybe `GlobalData.Errorflag` is not set?
+    
+    Let's look at `VarDeclParser.java` which handles `int a // error 2`.
+    ```java
+    //判断是不是 ';'
+    if(tt.getType() != TokenType.SEMICN) {
+        iterator.unread(2);
+        tt = iterator.next();
+        ErrorSave.error("Parser", tt.getLineno(), 'i');
+    }
+    else children.add(leafParser.run(tt));
+    ```
+    This looks correct. It adds an error.
+
+    Let's look at `StmtParser.java` for `printf("Hello SysY!\n") // error 1`.
+    The `printf` statement parsing:
+    ```java
+    //处理 printf
+    else if(tt.getType() == TokenType.PRINTFTK) {
+        // ...
+        tt = iterator.next(); // expects ')'
+        if(tt.getType() != TokenType.RPARENT) {
+             // ... error j
+        }
+        else children.add(leafParser.run(tt));
+        tt = iterator.next(); // expects ';'
+
+        if(tt.getType() != TokenType.SEMICN) {
+            iterator.unread(2);
+            tt = iterator.next();
+            ErrorSave.error("Parser", tt.getLineno(), 'i');
+        }
+        else children.add(leafParser.run(tt));
+    }
+    ```
+    In the input: `printf("Hello SysY!\n") // error 1`.
+    The next token after `)` is likely EOF or a newline/comment which is skipped by lexer. The lexer skips comments. So after `)`, the next token is `if` (from line 4).
+    So `tt` will be `IFTK`.
+    `tt.getType() != TokenType.SEMICN` is true.
+    `iterator.unread(2)`? Wait.
+    `tt` was read via `iterator.next()`.
+    Before that, `children.add(leafParser.run(tt))` consumed `)`.
+    Then `tt = iterator.next()` consumes `if` (skipping comment).
+    So `tt` is `if`.
+    `iterator.unread(2)` moves cursor back by 2.
+    Current cursor was at `if`. Unread 1 -> back to `)`. Unread 2 -> back to `(`? No, `TokensIterator.unread` decreases cursor index.
+    If cursor was at index `k` (token `if`), `unread(1)` makes it `k-1` (token `)`). `unread(2)` makes it `k-2` (token `(` of printf args? No, `(` was consumed earlier).
+    
+    Let's trace `printf` parsing more closely.
+    1. `tt = iterator.next()` gets `printf`.
+    2. `children.add(leafParser.run(iterator.next()))` gets `(`.
+    3. `children.add(leafParser.run(iterator.next()))` gets `"Hello..."`.
+    4. `tt = iterator.next()` gets `)`.
+    5. Check `tt != RPARENT`. It is `RPARENT`. So `children.add(leafParser.run(tt))`.
+    6. `tt = iterator.next()` gets next token. Lexer skips comment `// error 1`. Next token is `if` (line 4).
+    7. `tt` is `IFTK`.
+    8. `if(tt.getType() != TokenType.SEMICN)` is true.
+    9. `iterator.unread(2)`. Cursor was at `if`. Back 1 -> `)`. Back 2 -> `"`? No, `"` was consumed.
+       Tokens: `printf`, `(`, `"..."`, `)`, `if`.
+       Indices: 0, 1, 2, 3, 4.
+       Cursor starts at -1.
+       Step 1: next() -> 0 (`printf`).
+       Step 2: next() -> 1 (`(`).
+       Step 3: next() -> 2 (`"`).
+       Step 4: next() -> 3 (`)`). `tt` is `)`.
+       Step 5: next() -> 4 (`if`). `tt` is `if`.
+       `unread(2)` -> cursor becomes 2 (`"`).
+       `tt = iterator.next()` -> cursor becomes 3 (`)`).
+       `ErrorSave.error("Parser", tt.getLineno(), 'i')`.
+       The error line number reported is the line number of `)`.
+       The expected output says `2 i`. The `)` is on line 2. This matches.
+
+    So errors ARE being saved.
+    
+    Why "No output file"?
+    
+    Look at `Compiler.java` again.
+    
+    ```java
+    //调用 Parser 进行语法分析
+    Parser parser = new Parser();
+    parser.run();
+
+    //Parser成功结果输出到 parser.txt
+    String ParserPrintFilePath = "parser.txt";
+    try {
+        bw = new BufferedWriter(new FileWriter(ParserPrintFilePath));
+    } catch (IOException e) {
+        throw new RuntimeException(e);
+    }
+    if(GlobalData.Parserflag) {
+        // ...
+        bw.close();
+    }
+
+    //输出错误结果到 error.txt
+    if(GlobalData.Errorflag) {
+        ErrorPrint.run(GlobalData.Errors);
+    }
+    ```
+    
+    If `Parserflag` is false, `bw` is NOT closed.
+    Does this prevent subsequent file operations? Usually no, but it's a resource leak.
+    
+    Is it possible that `GlobalData.Errorflag` is false?
+    `ErrorSave.error` sets it to true.
+    
+    Wait, look at `Lexer.java`.
+    ```java
+    public void run() throws IOException {
+        Tokens tokens = Tokens.getInstance();
+        int ch;
+        while((ch = pr.read()) != -1) {
+            char c = (char) ch;
+            pr.unread(c);
+            Token token = this.next();
+            if (token != null) {
+                tokens.add(token);
+                colno++;
+            }
+        }
+    }
+    ```
+    
+    And `Compiler.java`:
+    ```java
+    try {
+        lexer.run();
+    } catch (IOException e) {
+        System.out.println("Comiler.java Line-34: Lexer Error");
+        throw new RuntimeException(e);
+    }
+    ```
+    
+    If `lexer.run` completes, tokens are generated.
+    
+    Let's check `CompUnitParser.java`.
+    It parses Decl, FuncDef, MainFuncDef.
+    
+    Input:
+    ```c
+    int main() {
+        printf("Hello SysY!\n") // error 1
+
+        if (1)
+
+
+        /*********/
+        ;
+        int a // error 2
+
+        for (;;) {}
+
+        return 0 // error 3
+    }
+    ```
+    
+    `CompUnitParser` expects `{Decl} {FuncDef} MainFuncDef`.
+    It sees `int main`. `int` is INTTK. `main` is IDENFR? No, `main` is MAINTK.
+    
+    In `CompUnitParser`:
+    ```java
+    //解析Decl
+    while (true) {
+        if(!iterator.isEnd()) {
+            Token first = iterator.next();
+            Token second = iterator.next();
+            Token third = iterator.next();
+            iterator.unread(3);
+            if(first.getType() == TokenType.CONSTTK) {
+                // ...
+            }
+            else if ((first.getType() == TokenType.INTTK || first.getType() == TokenType.CHARTK) && second.getType() == TokenType.IDENFR && third.getType() != TokenType.LPARENT) {
+                // ...
+            }
+            else break;
+        }
+        else break;
+    }
+    ```
+    First token: `int` (INTTK).
+    Second token: `main` (MAINTK).
+    Condition: `first == INTTK` (True) AND `second == IDENFR` (False, it is MAINTK).
+    So it breaks out of Decl loop. Correct.
+    
+    Next: FuncDef loop.
+    ```java
+    //解析FuncDef
+    while (true) {
+        if(!iterator.isEnd()) {
+            Token first = iterator.next();
+            Token second = iterator.next();
+            iterator.unread(2);
+            if(first.getType() == TokenType.VOIDTK || first.getType() == TokenType.CHARTK) {
+                // ...
+            }
+            else if(first.getType() == TokenType.INTTK && second.getType() == TokenType.IDENFR) {
+                 // ...
+            }
+            else break;
+        }
+        else break;
+    }
+    ```
+    First: `int` (INTTK).
+    Second: `main` (MAINTK).
+    Condition: `first == INTTK` (True) AND `second == IDENFR` (False).
+    So it breaks out of FuncDef loop. Correct.
+    
+    Next: `MainFuncDefParser`.
+    ```java
+    public SyntaxTreeNode run(TokensIterator iterator) {
+        // ...
+        //int main '('
+        children.add(leafParser.run(iterator.next())); // int
+        children.add(leafParser.run(iterator.next())); // main
+        children.add(leafParser.run(iterator.next())); // (
+        // ')'
+        Token tt = iterator.next(); // )
+        if(tt.getType() != TokenType.RPARENT) {
+            // error j
+        }
+        else children.add(leafParser.run(tt));
+        // Block
+        children.add(blockParser.run(iterator));
+        // ...
+    }
+    ```
+    This parses `int main() { ... }`.
+    
+    Inside `BlockParser`:
+    ```java
+    public SyntaxTreeNode run(TokensIterator iterator) {
+        // ...
+        // '{'
+        children.add(leafParser.run(iterator.next()));
+        Token tt = iterator.next();
+        while(tt.getType() != TokenType.RBRACE) {
+            iterator.unread(1);
+            BlockItemParser blockItemParser = new BlockItemParser();
+            children.add(blockItemParser.run(iterator));
+            tt = iterator.next();
+        }
+        children.add(leafParser.run(tt));
+        // ...
+    }
+    ```
+    
+    `BlockItemParser`:
+    ```java
+    public SyntaxTreeNode run(TokensIterator iterator) {
+        // ...
+        Token tt = iterator.next();
+        iterator.unread(1);
+        if(tt.getType() == TokenType.CONSTTK || tt.getType() == TokenType.INTTK || tt.getType() == TokenType.CHARTK) {
+            DeclParser declParser = new DeclParser();
+            children.add(declParser.run(iterator));
+        }
+        else {
+            StmtParser stmtParser = new StmtParser();
+            children.add(stmtParser.run(iterator));
+        }
+        // ...
+    }
+    ```
+    
+    First item in block: `printf`.
+    `tt` is `PRINTFTK`. Goes to `else` -> `StmtParser`.
+    
+    `StmtParser` handles `printf`. As analyzed before, it detects missing `;` and calls `ErrorSave.error`.
+    
+    Crucially, does `StmtParser` return normally? Yes.
+    Does it consume tokens correctly to allow parsing to continue?
+    In the error case for `printf`:
+    `iterator.unread(2)` puts cursor back to `"` (index 2 relative to printf start? No, global indices).
+    Then `tt = iterator.next()` reads `)` again.
+    The error is recorded.
+    But the parser state is now messy. It has re-read `)`.
+    The `StmtParser` returns.
+    
+    Back in `BlockParser`:
+    `children.add(blockItemParser.run(iterator));` finished.
+    `tt = iterator.next();`
+    The cursor was left at `)` (the one after printf).
+    So `tt` becomes `)`? No, `iterator.next()` advances.
+    If cursor was at `)` (index of `)`), `next()` returns token at `cursor + 1`.
+    
+    Let's re-trace `printf` error recovery in `StmtParser`.
+    Tokens: `printf` (0), `(` (1), `str` (2), `)` (3), `if` (4).
+    1. `tt = next()` -> `printf` (0). Cursor 0.
+    2. `next()` -> `(` (1). Cursor 1.
+    3. `next()` -> `str` (2). Cursor 2.
+    4. `tt = next()` -> `)` (3). Cursor 3.
+    5. Check `tt == RPARENT`. Yes. `children.add`.
+    6. `tt = next()` -> `if` (4). Cursor 4.
+    7. `tt != SEMICN`.
+    8. `unread(2)`. Cursor 4 -> 3 -> 2. Cursor is now 2 (`str`).
+    9. `tt = next()`. Cursor 3. `tt` is `)`.
+    10. `ErrorSave.error`.
+    11. Return from `StmtParser`.
+    
+    Back in `BlockParser`:
+    `blockItemParser.run` returned.
+    `tt = iterator.next()`. Cursor was 3. `next()` returns token at 4 (`if`).
+    `tt` is `if`.
+    Loop `while(tt.getType() != RBRACE)` continues.
+    `iterator.unread(1)`. Cursor 4 -> 3.
+    `BlockItemParser.run`.
+    `tt = next()`. Cursor 4. `tt` is `if`.
+    `tt != CONST/INT/CHAR`.
+    `StmtParser.run`.
+    
+    `StmtParser` handles `if`.
+    `tt = next()` -> `if` (4).
+    `children.add(leafParser.run(tt))`.
+    `children.add(leafParser.run(next()))` -> `(` (5).
+    `CondParser.run`.
+    `CondParser` calls `LOrExpParser`.
+    `LOrExpParser` -> `LAndExpParser` -> `EqExpParser` -> `RelExpParser` -> `AddExpParser` -> `MulExpParser` -> `UnaryExpParser` -> `PrimaryExpParser`.
+    `PrimaryExpParser`:
+    `tt = next()` -> `1` (6).
+    `tt != LPARENT`. `tt == INTCON`.
+    `NumberParser`.
+    Returns.
+    
+    Back in `StmtParser` (if branch):
+    `tt = next()` -> expects `)`.
+    Current cursor after `1` is 6. `next()` -> 7.
+    Token 7 is `)`?
+    Input: `if (1)`.
+    Tokens: `if`(4), `(`(5), `1`(6), `)`(7).
+    Yes.
+    `tt == RPARENT`.
+    `children.add`.
+    `StmtParser stmtParser = new StmtParser();`
+    `children.add(stmtParser.run(iterator));`
+    
+    Next token after `)` is newline/comments, then `;` (line 7)?
+    Input:
+    ```
+        if (1)
+
+
+        /*********/
+        ;
+    ```
+    Lexer skips comments and whitespace.
+    After `)`, next token is `;` (from line 7).
+    
+    `StmtParser.run`:
+    `tt = next()` -> `;`.
+    `tt != LBRACE`, `IFTK`, etc.
+    `tt == SEMICN`.
+    `children.add(leafParser.run(tt))`.
+    Returns `<Stmt>`.
+    
+    Back in `if` handling `StmtParser`:
+    `tt = next()`.
+    Current cursor at `;`. `next()` -> next token.
+    Next token is `int` (line 9).
+    `tt` is `INTTK`.
+    `tt != ELSETK`.
+    `iterator.unread(1)`. Cursor back to `int`.
+    
+    Back in `BlockParser`:
+    `tt = iterator.next()`. Cursor at `int`. `next()` -> `int`.
+    `tt` is `INTTK`.
+    Loop continues.
+    `iterator.unread(1)`.
+    `BlockItemParser`.
+    `tt = next()` -> `int`.
+    `tt == INTTK`.
+    `DeclParser`.
+    
+    `DeclParser` -> `VarDeclParser`.
+    `VarDeclParser`:
+    `BTypeParser` consumes `int`.
+    `VarDefParser` consumes `a`.
+    `tt = next()`.
+    Next token after `a`?
+    Input: `int a // error 2`.
+    Next token is `for` (line 11).
+    `tt` is `FORTK`.
+    `tt != SEMICN`.
+    `iterator.unread(2)`.
+    Cursor was at `for`. Unread 1 -> `a`. Unread 2 -> `int`?
+    Tokens: `int`(idx i), `a`(idx i+1), `for`(idx i+2).
+    Cursor at `for` (i+2).
+    `unread(2)` -> cursor i (`int`).
+    `tt = next()` -> cursor i+1 (`a`).
+    `ErrorSave.error("Parser", tt.getLineno(), 'i')`.
+    Line number of `a` is 9. Expected `9 i`. Matches.
+    
+    Returns from `VarDeclParser`.
+    Returns from `DeclParser`.
+    Returns from `BlockItemParser`.
+    
+    Back in `BlockParser`:
+    `tt = iterator.next()`.
+    Cursor was at `a` (i+1). `next()` -> `for` (i+2).
+    `tt` is `FORTK`.
+    Loop continues.
+    `iterator.unread(1)`.
+    `BlockItemParser`.
+    `tt = next()` -> `for`.
+    `StmtParser`.
+    
+    `StmtParser` handles `for`.
+    Parses `for (;;) {}`.
+    This is valid.
+    
+    After `for` stmt, next token is `return` (line 13).
+    `BlockParser` loop continues.
+    `BlockItemParser`.
+    `StmtParser`.
+    
+    `StmtParser` handles `return`.
+    `tt = next()` -> `return`.
+    `children.add`.
+    `tt = next()` -> `0`.
+    `tt != SEMICN`.
+    Check if Exp. `0` is INTCON. Yes.
+    `iterator.unread(1)`.
+    `ExpParser`.
+    `ExpParser` -> `AddExpParser` ... -> `PrimaryExpParser`.
+    `PrimaryExpParser` consumes `0`.
+    Back in `StmtParser`:
+    `tt = next()`.
+    Next token after `0`?
+    Input: `return 0 // error 3`.
+    Next token is `}` (line 14).
+    `tt` is `RBRACE`.
+    `tt != SEMICN`.
+    `iterator.unread(2)`.
+    Cursor at `}`. Unread 1 -> `0`. Unread 2 -> `return`.
+    `tt = next()` -> `0`.
+    `ErrorSave.error("Parser", tt.getLineno(), 'i')`.
+    Line number of `0` is 13. Expected `13 i`. Matches.
+    
+    Returns from `StmtParser`.
+    Returns from `BlockItemParser`.
+    
+    Back in `BlockParser`:
+    `tt = iterator.next()`.
+    Cursor at `0`. `next()` -> `}`.
+    `tt` is `RBRACE`.
+    Loop terminates.
+    `children.add(leafParser.run(tt))`.
+    Returns from `BlockParser`.
+    
+    Returns from `MainFuncDefParser`.
+    Returns from `CompUnitParser`.
+    
+    So `GlobalData.Errors` contains 3 errors.
+    `GlobalData.Errorflag` is true.
+    `GlobalData.Parserflag` is false.
+    
+    In `Compiler.java`:
+    ```java
+    if(GlobalData.Parserflag) {
+        // ...
+        bw.close();
+    }
+
+    //输出错误结果到 error.txt
+    if(GlobalData.Errorflag) {
+        ErrorPrint.run(GlobalData.Errors);
+    }
+    ```
+    
+    The code SHOULD produce `error.txt`.
+    
+    Why "No output file"?
+    
+    Maybe `ErrorPrint.run` fails?
+    ```java
+    public static void run(List<Error> errors) {
+        //Errors排序
+        errors.sort((e1, e2) -> Integer.compare(e1.getLineno(), e2.getLineno()));
+
+        //输出到 error.txt
+        try {
+            BufferedWriter bw = new BufferedWriter(new FileWriter("error.txt"));
+            for(Error error: errors) {
+                bw.write(error.getLineno() + " " + error.getErrorType());
+                bw.newLine();
+            }
+            bw.close();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+    ```
+    
+    This looks fine.
+    
+    Is it possible that `Compiler.java` throws an exception earlier?
+    
+    Look at `bw` in `Compiler.java`.
+    ```java
+    try {
+        bw = new BufferedWriter(new FileWriter(ParserPrintFilePath));
+    } catch (IOException e) {
+        throw new RuntimeException(e);
+    }
+    if(GlobalData.Parserflag) {
+        // ...
+        bw.close();
+    }
+    ```
+    If `Parserflag` is false, `bw` is not closed.
+    Then `ErrorPrint.run` tries to create `error.txt`.
+    
+    Is it possible that the un-closed `bw` locks the file system or causes an issue? Unlikely in Java unless `parser.txt` is locked, but `error.txt` is a different file.
+    
+    Wait! Look at the beginning of `Compiler.java`.
+    
+    ```java
+    try {
+        bw = new BufferedWriter(new FileWriter("lexer.txt"));
+    } catch (IOException e) {
+        System.out.println("Comiler.java Line-25: BufferWriter Error");
+        return;
+    }
+
+    // ... lexer.run() ...
+
+    //Lexer成功结果输出到 lexer.txt
+    try {
+        if(GlobalData.Lexerflag) {
+            for(Token token: tokens) {
+                bw.write(token.getType() + " " + token.getName() + "\n");
+            }
+        }
+        bw.close();
+    } catch (IOException e) {
+        System.out.println("Comiler.java Line-46: BufferWriter Error");
+        return;
+    }
+    ```
+    
+    Here `bw` is used for `lexer.txt` and closed.
+    
+    Then later:
+    ```java
+    //Parser成功结果输出到 parser.txt
+    String ParserPrintFilePath = "parser.txt";
+    try {
+        bw = new BufferedWriter(new FileWriter(ParserPrintFilePath));
+    } catch (IOException e) {
+        throw new RuntimeException(e);
+    }
+    if(GlobalData.Parserflag) {
+        // ...
+        bw.close();
+    }
+    ```
+    
+    If `Parserflag` is false, `bw` is NOT closed.
+    
+    Then:
+    ```java
+    //输出错误结果到 error.txt
+    if(GlobalData.Errorflag) {
+        ErrorPrint.run(GlobalData.Errors);
+    }
+    ```
+    
+    There is no explicit `return` or `exit` before this.
+    
+    However, if `Parserflag` is false, `bw` (which points to `parser.txt`) is left open.
+    In some environments, having an open writer might not prevent other files from being written, but it's sloppy.
+    
+    BUT, looking at the provided "Buggy Output": **No output file**.
+    This usually means the program crashed or terminated prematurely without writing anything, OR the output directory is empty.
+    
+    If `ErrorPrint.run` threw an exception, it would propagate to `main` and print a stack trace (unless caught). `main` doesn't catch `RuntimeException` from `ErrorPrint`.
+    
+    Is it possible `GlobalData.Errors` is empty?
+    We traced the logic and found errors should be added.
+    
+    Let's check `ErrorSave.error` again.
+    ```java
+    public static void error(String process, int lineno, char errorType) {
+        GlobalData.Errorflag = true;
+
+        if(process.equals("Lexer")) {
+            GlobalData.Lexerflag = false;
+        }
+        if(process.equals("Parser")) {
+            GlobalData.Parserflag = false;
+        }
+
+        Error error = new Error(process, lineno, errorType);
+        GlobalData.Errors.add(error);
+    }
+    ```
+    
+    One subtle thing: `GlobalData.Parserflag` is initially `true`.
+    When the first error occurs, it becomes `false`.
+    
+    Is it possible that the parser crashes due to infinite recursion or index out of bounds?
+    
+    In `StmtParser` `printf` error handling:
+    `iterator.unread(2)`.
+    If cursor is small, `unread` handles it:
+    ```java
+    public void unread(int n) {
+        while(n > 0) {
+            if(cursor > -1) {
+                cursor--;
+                n--;
+            }
+            else break;
+        }
+    }
+    ```
+    If cursor is 4, `unread(2)` -> 2. OK.
+    
+    What if `iterator.next()` returns `null`?
+    `TokensIterator.next()`:
+    ```java
+    public Token next() {
+        if(cursor < tokens.size()-1) {
+            cursor++;
+            return tokens.get(cursor);
+        }
+        else return null;
+    }
+    ```
+    
+    In `printf` case, `if` exists. OK.
+    In `return` case, `}` exists. OK.
+    
+    Let's look at `CompUnitParser` again.
+    It assumes `MainFuncDef` is always present and parses it.
+    If the input was malformed such that `MainFuncDef` couldn't be parsed, it might crash.
+    But here `int main() { ... }` is structurally correct except for internal stmts.
+    
+    Wait, look at `Compiler.java` imports and package structure.
+    The code seems complete.
+    
+    Is it possible that `GlobalData.Errorflag` is NOT true?
+    Only if `ErrorSave.error` is never called.
+    But we traced it being called.
+    
+    Let's look at the `StmtParser` logic for `printf` again.
+    
+    ```java
+    //处理 printf
+    else if(tt.getType() == TokenType.PRINTFTK) {
+        ExpParser expParser = new ExpParser();
+
+        //'printf''('StringConst {','Exp}
+        children.add(leafParser.run(tt));
+        children.add(leafParser.run(iterator.next()));
+        children.add(leafParser.run(iterator.next()));
+        tt = iterator.next();
+        while(tt.getType() == TokenType.COMMA) {
+            children.add(leafParser.run(tt));
+            children.add(expParser.run(iterator));
+            tt = iterator.next();
+        }
+        // ')' ';'
+        if(tt.getType() != TokenType.RPARENT) {
+            iterator.unread(2);
+            tt = iterator.next();
+            ErrorSave.error("Parser", tt.getLineno(), 'j');
+        }
+        else children.add(leafParser.run(tt));
+        tt = iterator.next();
+
+        if(tt.getType() != TokenType.SEMICN) {
+            iterator.unread(2);
+            tt = iterator.next();
+            ErrorSave.error("Parser", tt.getLineno(), 'i');
+        }
+        else children.add(leafParser.run(tt));
+    }
+    ```
+    
+    If `tt` is `)` (correct), it goes to `else children.add(leafParser.run(tt))`.
+    Then `tt = iterator.next()`.
+    If next token is `if` (because comment skipped), `tt` is `IFTK`.
+    `tt != SEMICN`.
+    `iterator.unread(2)`.
+    `tt = iterator.next()`.
+    `ErrorSave.error`.
+    
+    This logic holds.
+    
+    So why no output?
+    
+    Hypothesis: The program crashes in `ParserSuccessPrint` or somewhere else because `GlobalData.CompUnitNode` is partially constructed or null?
+    No, `CompUnitNode` is assigned.
+    
+    Hypothesis: `ErrorPrint.run` crashes?
+    `errors.sort`. If `errors` is null? No, initialized in `GlobalData`.
+    
+    Hypothesis: The file `error.txt` is created but empty?
+    "No output file" suggests the file doesn't exist.
+    
+    Let's look at `Compiler.java` one last time.
+    
+    ```java
+    //输出错误结果到 error.txt
+    if(GlobalData.Errorflag) {
+        ErrorPrint.run(GlobalData.Errors);
+    }
+    ```
+    
+    If `GlobalData.Errorflag` is false, nothing happens.
+    
+    Why would `GlobalData.Errorflag` be false?
+    Only if `ErrorSave.error` was never called.
+    
+    Did we miss a case where parsing fails BEFORE errors are detected?
+    
+    In `VarDeclParser`:
+    ```java
+    //判断是不是 ';'
+    if(tt.getType() != TokenType.SEMICN) {
+        iterator.unread(2);
+        tt = iterator.next();
+        ErrorSave.error("Parser", tt.getLineno(), 'i');
+    }
+    ```
+    
+    If `tt` is `null`?
+    `iterator.next()` returns `null` if end of tokens.
+    `tt.getType()` would throw `NullPointerException`.
+    
+    In `int a // error 2`:
+    Tokens: `int`, `a`, `for`.
+    `tt` is `for`. Not null.
+    
+    In `return 0 // error 3`:
+    Tokens: `return`, `0`, `}`.
+    `tt` is `}`. Not null.
+    
+    In `printf(...) // error 1`:
+    Tokens: `printf`, `(`, `str`, `)`, `if`.
+    `tt` is `if`. Not null.
+    
+    So NPE is unlikely.
+    
+    Wait! Look at `Compiler.java` line 64 area.
+    
+    ```java
+        if(GlobalData.Parserflag) {
+            StringBuilder sb = new StringBuilder();
+            ParserSuccessPrint parserSuccessPrint = new ParserSuccessPrint();
+            parserSuccessPrint.run(GlobalData.CompUnitNode, sb, parserSuccessPrint);
+
+            try {
+                bw.write(sb.toString());
+                bw.close();
+            } catch (IOException e) {
+                System.out.println("Comiler.java Line-64: BufferWriter Error");
+                throw new RuntimeException(e);
+            }
+        }
+    ```
+    
+    If `Parserflag` is false, `bw` is NOT closed.
+    
+    Then `ErrorPrint.run` is called.
+    
+    Is it possible that the un-closed `bw` prevents the JVM from exiting cleanly or flushing buffers? No, `error.txt` is independent.
+    
+    However, notice that `bw` is declared at the top of `main`.
+    
+    ```java
+    BufferedWriter bw;
+    ```
+    
+    If `Parserflag` is false, `bw` remains open.
+    
+    There is a known issue in some online judges or strict environments where unclosed resources might cause issues, but typically not "No output file" for a *different* file.
+    
+    Let's look at `ErrorSave.java` again.
+    
+    ```java
+    public static void error(String process, int lineno, char errorType) {
+        GlobalData.Errorflag = true;
+        // ...
+    }
+    ```
+    
+    Is it possible that `GlobalData` is reset? No, it's static.
+    
+    Actually, there is a very subtle bug in `Compiler.java`.
+    
+    If `GlobalData.Parserflag` is false, the code skips writing `parser.txt`.
+    But `bw` was opened for `parser.txt`.
+    
+    If the program ends, the OS closes the file handle.
+    
+    Let's look at the `Lexer` output part.
+    
+    ```java
+    try {
+        if(GlobalData.Lexerflag) {
+            for(Token token: tokens) {
+                bw.write(token.getType() + " " + token.getName() + "\n");
+            }
+        }
+        bw.close();
+    } catch (IOException e) {
+        System.out.println("Comiler.java Line-46: BufferWriter Error");
+        return;
+    }
+    ```
+    
+    If `Lexerflag` is false (due to lexer error), `bw` is still closed.
+    
+    In our case, `Lexerflag` is true.
+    
+    So `lexer.txt` is written and `bw` is closed.
+    
+    Then `bw` is re-assigned for `parser.txt`.
+    
+    If `Parser

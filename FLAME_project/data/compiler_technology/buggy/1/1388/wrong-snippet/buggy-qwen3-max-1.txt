@@ -1,0 +1,178 @@
+Looking at the test case input and the expected vs actual output, I can see that the program is only detecting one missing semicolon error (on line 2) but should detect three missing semicolon errors (on lines 2, 9, and 13).
+
+The test case input has:
+1. `printf("Hello SysY!\n")` - missing semicolon (line 2)
+2. `int a` - missing semicolon (line 9) 
+3. `return 0` - missing semicolon (line 13)
+
+The issue appears to be in the `Stmt()` method in the `Grammar.java` file. Looking at the code, I can see that when parsing statements, the method handles missing semicolons by adding error 'i' and inserting a fake semicolon token, but it may not be properly continuing to parse subsequent statements after encountering an error.
+
+Specifically, in the `Stmt()` method, there are several places where missing semicolons are handled, but the logic for handling the case where there's just an `Exp` followed by no semicolon might not be working correctly for all cases.
+
+Looking more closely at the `Stmt()` method, I notice that in the final `Exp` handling section:
+
+```java
+child = Exp();
+if(child != null) {
+    stmt.children.add(child);
+    child.parent = stmt;
+
+
+    if(!Objects.equals(tokens.get(curPos).word, ";")){
+        int curLine = tokens.get(curPos-1).line;
+        errors.add(new Error(curLine, "i"));
+        Token missToken = new Token(";", LexType.SEMICN, curLine);
+        stmt.children.add(missToken.token2node( stmt));
+        return stmt;  // This returns even when it shouldn't continue parsing
+    }
+    stmt.children.add(tokens.get(curPos).token2node(stmt));
+    curPos++;
+
+    return stmt.children.isEmpty() ? null : stmt;
+}
+```
+
+The problem is that when it encounters a missing semicolon after an `Exp`, it adds the error and returns the statement, but this might prevent proper parsing of subsequent statements.
+
+However, looking even more carefully, I think the real issue is in how the parser handles the case where there's no expression at all. In the test case, we have lines like `int a` which is a `VarDecl`, not a `Stmt`. 
+
+Looking at the `VarDecl()` method, I can see it properly handles missing semicolons:
+
+```java
+if(!Objects.equals(tokens.get(curPos).word, ";")){
+    int curLine = tokens.get(curPos-1).line;
+    errors.add(new Error(curLine, "i"));
+    Token missToken = new Token(";", LexType.SEMICN, curLine);
+    varDecl.children.add(missToken.token2node(varDecl));
+    return varDecl;
+}
+```
+
+But the issue might be that after encountering the first error, the parser's state (`curPos`) gets corrupted and it can't properly parse the subsequent `VarDecl` and `return` statements.
+
+Actually, looking at the `BlockItem()` method, I see the core issue:
+
+```java
+private GramNode BlockItem() {
+    // BlockItem → Decl | Stmt
+    if(curPos >= tokens.size() - 1 ){
+        return null;
+    }
+
+    int startPos = curPos;
+    GramNode blockItem = new GramNode();
+    blockItem.gramType = GramType.BlockItem;
+
+    GramNode child = Decl();
+    if(child != null){
+        blockItem.children.add(child);
+    } else {
+        child = Stmt();
+        if (child != null) {
+            blockItem.children.add(child);
+        } else {
+            curPos = startPos;
+            return null;
+        }
+    }
+
+    child.parent = blockItem;
+
+    System.out.println("blockItem");
+    return blockItem;
+}
+```
+
+The problem is that when `Decl()` or `Stmt()` fails completely (returns null), it resets `curPos` to `startPos` and returns null. However, in cases where `Decl()` or `Stmt()` partially succeeds but encounters a missing semicolon error, they return a valid node but the parser may not advance `curPos` correctly to allow parsing the next `BlockItem`.
+
+Looking at the `VarDecl()` method again, when it encounters a missing semicolon, it adds the error and returns the `varDecl` node, but it doesn't advance `curPos` past the point where the semicolon should be. This means the next token is still whatever came after the missing semicolon, which could cause parsing issues for subsequent statements.
+
+The same issue exists in other methods like `Stmt()` when handling missing semicolons.
+
+<frontend/Grammar.java>
+...
+    private GramNode VarDecl() {
+        // VarDecl → BType VarDef { ',' VarDef } ';'
+        int startPos = curPos;
+        GramNode varDecl = new GramNode();
+        varDecl.gramType = GramType.VarDecl;
+
+        GramNode bType = BType();
+        if(bType == null) {
+            curPos = startPos;
+            return null;
+        }
+        varDecl.children.add(bType);
+        bType.parent = varDecl;
+
+        GramNode varDef = VarDef();
+        if(varDef == null) {
+            curPos = startPos;
+            return null;
+        }
+        varDecl.children.add(varDef);
+        varDef.parent = varDecl;
+
+        while (Objects.equals(tokens.get(curPos).word, ",")) {
+            varDecl.children.add(tokens.get(curPos).token2node(varDecl));
+            curPos++;
+
+            varDef = VarDef();
+            if(varDef == null) {
+                curPos = startPos;
+                return null;
+            }
+            varDecl.children.add(varDef);
+            varDef.parent = varDecl;
+        }
+
+        if(!Objects.equals(tokens.get(curPos).word, ";")){
+            int curLine = tokens.get(curPos-1).line;
+            errors.add(new Error(curLine, "i"));
+            Token missToken = new Token(";", LexType.SEMICN, curLine);
+            varDecl.children.add(missToken.token2node(varDecl));
+            return varDecl;
+        }
+        varDecl.children.add(tokens.get(curPos).token2node(varDecl));
+        curPos++;
+
+        System.out.println("varDecl");
+        return varDecl;
+    }
+...
+    private GramNode Stmt() {
+        /*
+         Stmt → **LVal '=' Exp ';'
+            | [Exp] ';'
+            | **Block
+            | **'if' '(' Cond ')' Stmt [ 'else' Stmt ]
+            | **'for' '(' [ForStmt] ';' [Cond] ';' [ForStmt] ')' Stmt 
+            | **'break' ';' 
+            | **'continue' ';'
+            | **'return' [Exp] ';'
+            | **LVal '=' 'getint''('')'';'
+            | **LVal '=' 'getchar''('')'';'
+            | **'printf''('StringConst {','Exp}')'';'
+        */
+...
+        child = Exp();
+        if(child != null) {
+            stmt.children.add(child);
+            child.parent = stmt;
+
+
+            if(!Objects.equals(tokens.get(curPos).word, ";")){
+                int curLine = tokens.get(curPos-1).line;
+                errors.add(new Error(curLine, "i"));
+                Token missToken = new Token(";", LexType.SEMICN, curLine);
+                stmt.children.add(missToken.token2node( stmt));
+                return stmt;
+            }
+            stmt.children.add(tokens.get(curPos).token2node(stmt));
+            curPos++;
+
+            return stmt.children.isEmpty() ? null : stmt;
+        }
+...
+    }
+...

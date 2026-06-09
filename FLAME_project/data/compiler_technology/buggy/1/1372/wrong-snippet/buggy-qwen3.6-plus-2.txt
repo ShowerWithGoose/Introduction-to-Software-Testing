@@ -1,0 +1,705 @@
+Based on the analysis of the problem description, test case, and source code:
+
+1.  **Problem Analysis**:
+    *   The test input contains syntax errors (missing `)`).
+    *   Error 1: `void f(int a {}` -> Missing `)` after parameters. The last token before the expected `)` is `a` (Ident) on line 1. Expected error line: 1.
+    *   Error 2: `int main( {` -> Missing `)` after `(`. The last token before the expected `)` is `(` (LPARENT) on line 3. Expected error line: 3.
+    *   Error 3: `f(a + 10;` -> Missing `)` in function call. The last token before the expected `)` is `10` (IntConst) on line 5. Expected error line: 5.
+    *   **Expected Output**: `1 j`, `3 j`, `5 j`.
+    *   **Buggy Output**: `1 j`, `4 j`, `7 j`.
+
+2.  **Code Analysis**:
+    *   The `Parser.java` uses `tokens.getErrLine()` to determine the line number for missing terminal errors (`i`, `j`, `k`).
+    *   In `TokenList.java`, `getErrLine()` is defined as:
+        ```java
+        public int getErrLine() {
+            if( index == 0 ) {
+                return 1;
+            } else {
+                return tokens.get(index-1).getLineNum();
+            }
+        }
+        ```
+    *   This method returns the line number of the *previous* token (`index - 1`).
+    *   Let's trace Error 2 (`int main( {`):
+        *   Tokens: `int`(3), `main`(3), `(`(3), `{`(3).
+        *   Parser processes `int`, `main`, `(`. Index moves to `{`.
+        *   Parser expects `)`. Current token is `{`. Mismatch.
+        *   `handleTerminal` calls `tokens.getErrLine()`.
+        *   `index` points to `{` (index 3, assuming 0-based). `tokens.get(index-1)` is `(`. Line 3.
+        *   Wait, the buggy output says 4. Why?
+        *   Let's look at `Lexer.java`. It increments `lineNumber` when it sees `\n`.
+        *   Input:
+            ```
+            void f(int a {} // error 1
+            
+            int main( { // error 2
+            ```
+            Line 1: `void f(int a {}`
+            Line 2: (Empty)
+            Line 3: `int main( {`
+            
+            If the lexer correctly assigns line numbers, `(` is on line 3.
+            
+            Let's look at Error 3: `f(a + 10;` on line 5 (assuming line 4 is empty or part of previous block? No, line 4 is `    int a = 10;`).
+            Input:
+            ```
+            void f(int a {} // line 1
+            
+            int main( { // line 3
+                int a = 10; // line 4
+                f(a + 10; // line 5
+                return 0; // line 6
+            } // line 7
+            ```
+            
+            Buggy Output for Error 3 is `7 j`.
+            Expected Output for Error 3 is `5 j`.
+            
+            The discrepancy suggests that `getErrLine()` is not returning the line of the token immediately preceding the error, but perhaps a token much further back, or the `index` management is flawed during error recovery or backtracking.
+            
+            However, looking closely at `handleTerminal`:
+            ```java
+            public void handleTerminal(Node node, LexType correctType) {
+                Token token = tokens.getThis();
+                lineNum = token.getLineNum(); // This updates parser's lineNum but doesn't use it for error reporting directly
+                
+                if (correctType != termiNode.getToken().getLexType()) {
+                    if (correctType == LexType.SEMICN) {
+                        errors.getErrors().add(new Error(tokens.getErrLine(), "i"));
+                    } ...
+                    return; // IMPORTANT: It returns without consuming the token
+                }
+                tokens.goNext();
+                node.add(termiNode);
+            }
+            ```
+            
+            When an error is detected, `goNext()` is NOT called. The index remains at the erroneous token.
+            `getErrLine()` returns `tokens.get(index-1).getLineNum()`.
+            
+            Let's re-evaluate Error 2: `int main( {`.
+            Tokens: `int`(3), `main`(3), `(`(3), `{`(3).
+            1. `handleFuncDef` calls `handleTerminal` for `int`. OK. Index 1.
+            2. `handleTerminal` for `main` (IDENFR). OK. Index 2.
+            3. `handleTerminal` for `(`. OK. Index 3.
+            4. Checks params. None.
+            5. `handleTerminal` for `)`. Current token is `{` (Index 3).
+               Mismatch.
+               `getErrLine()` returns `tokens.get(2).getLineNum()`. Token at index 2 is `(`. Line 3.
+               So Error 2 should be line 3.
+               
+            Why does the buggy output say 4?
+            
+            Let's look at Error 1: `void f(int a {}`.
+            Tokens: `void`(1), `f`(1), `(`(1), `int`(1), `a`(1), `{`(1), `}`(1).
+            1. `void`. OK.
+            2. `f`. OK.
+            3. `(`. OK.
+            4. Params: `int`. OK. `a`. OK.
+            5. Expect `)`. Current is `{`.
+               Mismatch.
+               `getErrLine()` returns `tokens.get(index-1)`. Index is at `{`. Previous is `a`. Line 1.
+               Output: `1 j`. Matches expected.
+            
+            Why does Error 2 fail?
+            Maybe the empty line 2 causes issues? No, lexer skips whitespace.
+            
+            Let's look at Error 3: `f(a + 10;`.
+            Tokens: `f`(5), `(`(5), `a`(5), `+`(5), `10`(5), `;`(5).
+            Inside `handleStmt`, it detects `isExp()` (starts with IDENFR `f`).
+            It marks position.
+            Calls `handleExp()`.
+            `handleExp` -> `handleAddExp` -> ... -> `handleUnaryExp`.
+            `handleUnaryExp` sees `f` and next is `(`.
+            1. `handleTerminal` for `f` (IDENFR). OK.
+            2. `handleTerminal` for `(`. OK.
+            3. `isExp()` checks next token `a`. True.
+            4. `handleFuncRParams()`.
+               `handleExp()`... consumes `a`, `+`, `10`.
+               Returns.
+            5. Back in `handleUnaryExp`: `handleTerminal(node, LexType.RPARENT)`.
+               Current token is `;`.
+               Mismatch.
+               `getErrLine()` returns `tokens.get(index-1)`. Index is at `;`. Previous is `10`. Line 5.
+               Output should be `5 j`.
+               
+            The buggy output is `7 j`. Line 7 is `}`.
+            
+            This implies that for Errors 2 and 3, the parser is consuming tokens incorrectly or the `index` is advancing past the error point before `getErrLine` is called, OR `getErrLine` is referencing a much earlier token.
+            
+            Wait, look at `handleCompUnit`:
+            ```java
+            while (true) {
+                if (tokens.preview(1).getLexType() == LexType.MAINTK) {
+                     node.add(handleMainFuncDef());
+                     break;
+                } else if (tokens.preview(2).getLexType() == LexType.LPARENT) {
+                     node.add(handleFuncDef());
+                } else {
+                     node.add(handleDecl());
+                }
+            }
+            ```
+            
+            In `handleFuncDef`:
+            ```java
+            public Node handleFuncDef() {
+                Node node = new Node(GrammarType.FUNCDEF);
+                node.add(handleFuncType());
+                handleTerminal(node, LexType.IDENFR);
+                handleTerminal(node, LexType.LPARENT);
+                if (verifyTerminal(LexType.INTTK) || verifyTerminal(LexType.CHARTK)) {
+                    node.add(handleFuncFParams());
+                }
+                handleTerminal(node, LexType.RPARENT); // Error 2 happens here
+                node.add(handleBlock());
+                return node;
+            }
+            ```
+            
+            If `handleTerminal` fails (returns early), the parser continues execution in `handleFuncDef`.
+            It proceeds to `node.add(handleBlock())`.
+            `handleBlock` expects `{`.
+            In Error 2 case: `int main( {`.
+            After failing `)`, current token is `{`.
+            `handleBlock` calls `handleTerminal(node, LexType.LBRACE)`.
+            Current token is `{`. Match!
+            `goNext()`. Index advances.
+            Then `while(!verifyTerminal(LexType.RBRACE))`.
+            Next token is `int` (line 4).
+            `handleBlockItem` -> `handleDecl` -> `handleVarDecl`.
+            Parses `int a = 10;`.
+            Then next token is `f` (line 5).
+            `handleBlockItem` -> `handleStmt`.
+            Parses `f(a + 10;`.
+            Inside `handleStmt`, it tries to parse `f(a+10;`.
+            As analyzed before, this fails at `)`.
+            But wait, if Error 2 was reported, why is Error 3 reported later?
+            
+            The issue is likely that `handleTerminal` reports the error but DOES NOT STOP the parsing flow logically for the parent structure if the parent doesn't check return values (which it doesn't, `handleTerminal` is void).
+            
+            However, the specific bug in line numbers (4 instead of 3, 7 instead of 5) suggests that `getErrLine` is picking up the line number of the token *before* the one we think it is.
+            
+            Let's look at `TokenList.getErrLine` again.
+            ```java
+            public int getErrLine() {
+                if( index == 0 ) {
+                    return 1;
+                } else {
+                    return tokens.get(index-1).getLineNum();
+                }
+            }
+            ```
+            
+            If `index` has advanced unexpectedly, `index-1` would be wrong.
+            
+            Consider `handleFuncDef` again.
+            If `handleTerminal` for `)` fails, it returns.
+            Then `handleBlock()` is called.
+            `handleBlock` consumes `{`.
+            
+            Is it possible that `handleFuncDef` is NOT being called for `main`?
+            `handleCompUnit`:
+            `tokens.preview(1)` is `main`?
+            Input: `void f...` then `int main...`
+            
+            After parsing `void f(int a {}`, the parser is at `{` (from `f`'s body? No, `f` didn't have a body parsed because `handleFuncDef` continued).
+            
+            Actually, `void f(int a {}` is parsed by `handleFuncDef`.
+            1. `void`
+            2. `f`
+            3. `(`
+            4. `int a` (params)
+            5. Fail `)`. Error reported (Line 1).
+            6. Continue to `handleBlock()`.
+            7. Current token `{`. Match. Consume.
+            8. Next token `}`. Match `RBRACE`. Loop ends.
+            9. Consume `}`.
+            
+            So `void f` is fully "parsed" (with error).
+            Next token is `int` (Line 3).
+            
+            Back in `handleCompUnit` loop.
+            `tokens.preview(1)` is `main`?
+            Current token is `int`. `preview(1)` is `main`.
+            Condition `tokens.preview(1).getLexType() == LexType.MAINTK` is TRUE.
+            Calls `handleMainFuncDef()`.
+            
+            `handleMainFuncDef`:
+            ```java
+            public Node handleMainFuncDef() {
+                Node node = new Node(GrammarType.MAINFUNCDEF);
+                handleTerminal(node, LexType.INTTK); // Consumes int (Line 3)
+                handleTerminal(node, LexType.MAINTK); // Consumes main (Line 3)
+                handleTerminal(node, LexType.LPARENT); // Consumes ( (Line 3)
+                handleTerminal(node, LexType.RPARENT); // Expects ). Current is { (Line 3).
+                // Mismatch.
+                // Error reported.
+                // getErrLine() returns tokens.get(index-1).
+                // Index is at {. Previous is (. Line 3.
+                // So Error should be 3.
+                
+                // BUT buggy output is 4.
+                
+                node.add(handleBlock()); 
+            }
+            ```
+            
+            Why would it be 4?
+            Only if `index` was pointing to something on line 4, or `index-1` was something on line 4.
+            
+            If `handleTerminal` for `LPARENT` consumed the token, index is at `{`.
+            
+            Is it possible `handleMainFuncDef` is NOT called?
+            If `preview(1)` check failed?
+            
+            Let's look at `handleCompUnit` logic again.
+            ```java
+            if (tokens.preview(1).getLexType() == LexType.MAINTK) {
+                node.add(handleMainFuncDef());
+                break;
+            } else if (tokens.preview(2).getLexType() == LexType.LPARENT) {
+                node.add(handleFuncDef());
+            } else {
+                node.add(handleDecl());
+            }
+            ```
+            
+            If `void f` parsing left the token stream at `}` (Line 1).
+            Next token `int` (Line 3).
+            `preview(1)` from `int` is `main`. Correct.
+            
+            There is a subtle bug in `handleTerminal` or `TokenList`.
+            
+            Actually, look at `Lexer.java` handling of `&` and `|`.
+            It adds an error but also adds a Token `AND` or `OR`.
+            
+            Look at `TokenList.getErrLine`.
+            
+            What if the error is in `handleBlock`?
+            
+            Let's look at the third error: `7 j`.
+            Expected `5 j`.
+            Line 7 is `}`.
+            
+            If the parser skipped `f(a+10;` entirely?
+            
+            Hypothesis: The parser is skipping tokens or lines due to incorrect error recovery or lookahead.
+            
+            However, the most likely culprit for "Wrong Line Number" in these types of assignments is usually how `getErrLine` calculates the previous token, specifically if `goNext` was called when it shouldn't have been, or if `backtrack` messed up the index.
+            
+            In `handleStmt`, there is backtracking:
+            ```java
+            int pos = tokens.mark();
+            Node tryNode = handleExp();
+            if (verifyTerminal(LexType.SEMICN)) {
+               ...
+            } else {
+               if (tokens.preview(1).getLexType() == LexType.GETINTTK) {
+                   tokens.backtrack(pos);
+                   ...
+               }
+               ...
+            }
+            ```
+            
+            If `handleExp` consumes tokens and then we backtrack, `index` is restored.
+            
+            Let's look at `handleUnaryExp` inside `handleExp` for `f(a+10;`.
+            It identifies `f` as IDENFR and `(` as next.
+            It consumes `f`.
+            It consumes `(`.
+            It calls `handleFuncRParams`.
+            `handleFuncRParams` calls `handleExp`.
+            `handleExp` parses `a+10`.
+            Returns.
+            Back in `handleUnaryExp`, it calls `handleTerminal(node, LexType.RPARENT)`.
+            Current token is `;`.
+            Mismatch.
+            `getErrLine()` uses `index-1`.
+            Index is at `;`. `index-1` is `10`. Line 5.
+            
+            Why 7?
+            
+            If `handleFuncRParams` failed to parse `a+10` correctly?
+            
+            Actually, look at `handleFuncDef` vs `handleMainFuncDef`.
+            
+            Is it possible that `int main( {` is parsed as a `FuncDef` instead of `MainFuncDef`?
+            `preview(1)` is `main`. `MAINTK`.
+            `handleMainFuncDef` is called.
+            
+            Wait! Look at `handleMainFuncDef`:
+            ```java
+            handleTerminal(node, LexType.INTTK);
+            handleTerminal(node, LexType.MAINTK);
+            handleTerminal(node, LexType.LPARENT);
+            handleTerminal(node, LexType.RPARENT);
+            node.add(handleBlock());
+            ```
+            
+            If `handleTerminal` for `RPARENT` fails, it returns.
+            Then `handleBlock()` is called.
+            Current token is `{`.
+            `handleBlock` consumes `{`.
+            Then it parses items.
+            Item 1: `int a = 10;` (Line 4).
+            Item 2: `f(a + 10;` (Line 5).
+            
+            Inside `handleStmt` for `f(a+10;`:
+            It goes to `isExp()` branch.
+            `handleExp()` -> `handleUnaryExp()`.
+            `f` is IDENFR. Next is `(`.
+            Consumes `f`.
+            Consumes `(`.
+            `isExp()` checks next token `a`. Yes.
+            `handleFuncRParams()`.
+            `handleExp()` parses `a`.
+            `handleAddExp` parses `+ 10`.
+            Returns.
+            Back in `handleUnaryExp`: `handleTerminal(RPARENT)`.
+            Current is `;`.
+            Error `j`.
+            Line 5.
+            
+            So where does 7 come from?
+            
+            Maybe `handleFuncRParams` is NOT called?
+            `isExp()` implementation:
+            ```java
+            public boolean isExp() {
+                return verifyTerminal(LexType.LPARENT) || verifyTerminal(LexType.IDENFR) || verifyTerminal(LexType.INTCON) ||
+                        verifyTerminal(LexType.CHRCON) || verifyTerminal(LexType.PLUS) || verifyTerminal(LexType.MINU) ||
+                        verifyTerminal(LexType.NOT);
+            }
+            ```
+            
+            If `handleFuncRParams` is called, it expects `Exp`.
+            
+            What if `handleUnaryExp` logic is flawed?
+            
+            Let's look at the Buggy Output again: `1 j`, `4 j`, `7 j`.
+            Error 1: Line 1. Correct.
+            Error 2: Line 4. Expected 3.
+            Error 3: Line 7. Expected 5.
+            
+            Notice that 4 is the line AFTER 3.
+            7 is the line AFTER 6 (return 0) or the end of the block?
+            
+            If `getErrLine` returned the line of the CURRENT token instead of the previous one?
+            Error 2: Current token `{` is on Line 3. Still 3.
+            Error 3: Current token `;` is on Line 5. Still 5.
+            
+            What if the Lexer line counting is off?
+            
+            Let's look at `Lexer.skipWhiteSpace`.
+            ```java
+            while(Character.isWhitespace(currentChar)) {
+                if(currentChar == '\n') {lineNumber++;}
+                this.next();
+            }
+            ```
+            
+            If the file starts with `void...`, line 1.
+            
+            There is a known issue in some parsers where if `handleTerminal` fails, the parser might attempt to synchronize by skipping tokens, but this code doesn't show explicit synchronization.
+            
+            However, look at `handleCompUnit`.
+            
+            If `handleMainFuncDef` is NOT entered, and `handleFuncDef` is entered?
+            `preview(2)` is `(`?
+            `int`(3) `main`(3) `(`(3).
+            `preview(1)` is `main`. `preview(2)` is `(`.
+            
+            If `handleFuncDef` was called:
+            `handleFuncType` -> `int`.
+            `handleTerminal(IDENFR)` -> `main`.
+            `handleTerminal(LPARENT)` -> `(`.
+            Params? `verifyTerminal(INTTK)`? No, next is `{`.
+            `handleTerminal(RPARENT)` -> Fails.
+            Error reported. Line 3.
+            `handleBlock()` -> `{`.
+            
+            Same result.
+            
+            Let's look at `TokenList.getErrLine` again.
+            
+            ```java
+            public int getErrLine() {
+                if( index == 0 ) {
+                    return 1;
+                } else {
+                    return tokens.get(index-1).getLineNum();
+                }
+            }
+            ```
+            
+            If `index` is 0, it returns 1.
+            
+            Is it possible that `index` is reset or modified incorrectly?
+            
+            Let's look at `handleStmt` backtracking.
+            
+            If `handleExp` in `handleStmt` consumes `f(a+10` and fails?
+            
+            Actually, there is a possibility that `handleUnaryExp` is NOT recognizing `f(...)` as a function call because of the way `isExp` is used in `handleUnaryExp`:
+            
+            ```java
+            if (verifyTerminal(LexType.IDENFR) && tokens.preview(1).getLexType() == LexType.LPARENT) {
+                handleTerminal(node, LexType.IDENFR);
+                handleTerminal(node, LexType.LPARENT);
+                if (isExp()) {
+                    node.add(handleFuncRParams());
+                }
+                handleTerminal(node, LexType.RPARENT);
+            }
+            ```
+            
+            If `isExp()` returns false?
+            `isExp` checks `verifyTerminal`.
+            `verifyTerminal` checks `tokens.getThis()`.
+            After consuming `(`, `getThis()` is `a`.
+            `a` is IDENFR. `isExp` returns true.
+            
+            So `handleFuncRParams` IS called.
+            
+            The only explanation for the line numbers being shifted (3->4, 5->7) is if the tokens themselves have wrong line numbers assigned by the Lexer, OR `getErrLine` is looking at the wrong index.
+            
+            If `getErrLine` looked at `index` (current) instead of `index-1` (previous):
+            Error 2: Current `{` is Line 3.
+            Error 3: Current `;` is Line 5.
+            
+            Still doesn't match 4 and 7.
+            
+            What if `handleBlock` in `handleMainFuncDef` consumes the `{` and then `handleBlockItem` processes `int a = 10;`?
+            
+            If the error for `main` was NOT reported at `)`, but later?
+            
+            If `handleTerminal` for `)` in `main` DID NOT report an error?
+            Why?
+            `correctType` is `RPARENT`.
+            `termiNode.getToken().getLexType()` is `LBRACE`.
+            They are different.
+            It enters the `if`.
+            Adds error `j`.
+            
+            Unless... `tokens.getErrLine()` is throwing an exception or returning garbage? No, it's simple.
+            
+            Let's look at the `Lexer` again.
+            
+            ```java
+            } else if (currentChar == '&') {
+                next();
+                if (currentChar == '&') {
+                    next();
+                    tokenArrayList.add(new Token(LexType.AND, lineNumber, "&&"));
+                } else {
+                    errorArrayList.getErrors().add(new Error(lineNumber, "a"));
+                    tokenArrayList.add(new Token(LexType.AND, lineNumber, "&&")); // <--- BUG HERE?
+                }
+            }
+            ```
+            
+            This creates a fake `&&` token.
+            
+            But there are no `&` in the input.
+            
+            Let's look at the `Parser` `handleTerminal` again.
+            
+            ```java
+            public void handleTerminal(Node node, LexType correctType) {
+                Token token = tokens.getThis();
+                lineNum = token.getLineNum();
+                Node termiNode = new Node(token);
+                
+                if (correctType != termiNode.getToken().getLexType()) {
+                    if (correctType == LexType.SEMICN) {
+                        errors.getErrors().add(new Error(tokens.getErrLine(), "i"));
+                    } else if (correctType == LexType.RPARENT) {
+                        errors.getErrors().add(new Error(tokens.getErrLine(), "j"));
+                    } else if (correctType == LexType.RBRACK) {
+                        errors.getErrors().add(new Error(tokens.getErrLine(), "k"));
+                    }
+                    return;
+                }
+                tokens.goNext();
+                node.add(termiNode);
+            }
+            ```
+            
+            The code looks correct for reporting.
+            
+            The error must be in `TokenList.getErrLine` or how `index` is managed.
+            
+            If `goNext()` is called BEFORE `handleTerminal` checks? No.
+            
+            Wait! Look at `handleFuncDef` and `handleMainFuncDef`.
+            
+            In `handleMainFuncDef`:
+            ```java
+            handleTerminal(node, LexType.INTTK);
+            handleTerminal(node, LexType.MAINTK);
+            handleTerminal(node, LexType.LPARENT);
+            handleTerminal(node, LexType.RPARENT);
+            ```
+            
+            If `handleTerminal` for `LPARENT` succeeds, `goNext()` is called.
+            Index moves to `{`.
+            
+            Then `handleTerminal` for `RPARENT` is called.
+            `tokens.getThis()` is `{`.
+            Mismatch.
+            `tokens.getErrLine()` returns `tokens.get(index-1)`.
+            `index` is at `{`. `index-1` is `(`.
+            
+            If the token `(` has line number 4?
+            
+            Input:
+            ```
+            void f(int a {} // 1
+            
+            int main( { // 3
+            ```
+            
+            If the Lexer skipped the newline after `{} ` and counted line 2, then `int` is line 3.
+            
+            Is it possible the empty line 2 is causing `lineNumber` to be 2 when `int` is read?
+            
+            `skipWhiteSpace` increments `lineNumber` for `\n`.
+            
+            After `}` on line 1.
+            Next char `\n`. `lineNumber` becomes 2.
+            Next char `\n` (empty line). `lineNumber` becomes 3.
+            Next char `i`.
+            Token `int` gets line 3.
+            
+            So `(` is line 3.
+            
+            Why 4?
+            
+            Maybe `getErrLine` is using `tokens.get(index).getLineNum()`?
+            If it used current token `{` (Line 3). Still 3.
+            
+            There is one specific scenario:
+            If `handleBlock` is called INSIDE `handleMainFuncDef` BEFORE the error is reported? No.
+            
+            Let's look at `handleCompUnit` again.
+            
+            ```java
+            while (true) {
+                if (tokens.preview(1).getLexType() == LexType.MAINTK) {
+                    node.add(handleMainFuncDef());
+                    break;
+                } 
+                // ...
+            }
+            ```
+            
+            If `handleMainFuncDef` is NOT called, but `handleFuncDef` is?
+            
+            If `preview(1)` is NOT `MAINTK`?
+            
+            `tokens.getThis()` is `int`.
+            `tokens.preview(1)` is `main`.
+            
+            Unless `main` is not recognized as `MAINTK`?
+            
+            `reserves` map in `Lexer`:
+            `entry("main", LexType.MAINTK)`
+            
+            It should be.
+            
+            I will bet on the `getErrLine` implementation being slightly off in how it handles the `index` relative to the error, specifically that it should probably report the line of the *last successfully parsed token* which might be tracked differently, OR the `index` is one step further than expected due to a `goNext` in a previous successful call that wasn't accounted for.
+            
+            However, the most suspicious part is `TokenList.getErrLine`.
+            
+            If I change `tokens.get(index-1)` to `tokens.get(index)`?
+            Error 2: `{` is Line 3.
+            Error 3: `;` is Line 5.
+            
+            If I change it to `tokens.get(index+1)`?
+            
+            Let's look at the provided solution format. I need to output the code snippet.
+            
+            The error is likely in `frontend/TokenList.java` in the `getErrLine` method, or `frontend/Parser.java` in how it calls it.
+            
+            Given the shift (3->4, 5->7), it looks like it's reporting the line of the NEXT token after the error point?
+            Error 2: Next token after `{` is `int` (Line 4).
+            Error 3: Next token after `;` is `return` (Line 6)? No, 7 is `}`.
+            
+            If it reported `index+1`:
+            Error 2: `index` at `{` (3). `index+1` is `int` (4). MATCHES 4.
+            Error 3: `index` at `;` (5). `index+1` is `return` (6). Does not match 7.
+            
+            Wait, `return 0;` is line 6. `}` is line 7.
+            
+            If `handleStmt` for `f(a+10;` fails, does it consume `;`?
+            `handleTerminal` for `;` is called LATER in `handleStmt`?
+            
+            In `handleStmt`:
+            ```java
+            } else {
+                if (tokens.preview(1).getLexType() == LexType.GETINTTK) {
+                   // ...
+                } else if ...
+                } else {
+                   tokens.backtrack(pos);
+                   node.add(handleLVal());
+                   handleTerminal(node, LexType.ASSIGN);
+                   node.add(handleExp());
+                   handleTerminal(node, LexType.SEMICN);
+                }
+            }
+            ```
+            
+            If it falls into the `LVal = Exp ;` branch?
+            `handleLVal()` consumes `f`.
+            `handleTerminal(ASSIGN)` expects `=`. Current is `(`.
+            Mismatch!
+            Error `i` (Missing semicolon? No, missing assign).
+            But `handleTerminal` only reports `i`, `j`, `k`.
+            `ASSIGN` mismatch doesn't report an error in `handleTerminal`?
+            
+            ```java
+            if (correctType != termiNode.getToken().getLexType()) {
+                if (correctType == LexType.SEMICN) { ... }
+                else if (correctType == LexType.RPARENT) { ... }
+                else if (correctType == LexType.RBRACK) { ... }
+                return;
+            }
+            ```
+            
+            It returns silently for other mismatches!
+            
+            So `handleTerminal(ASSIGN)` fails silently.
+            Then `node.add(handleExp())`.
+            `handleExp` starts at `(`.
+            `handleUnaryExp` sees `(`.
+            `handlePrimaryExp` sees `(`.
+            Consumes `(`.
+            Parses `a+10`.
+            Expects `)`.
+            Current is `;`.
+            Mismatch `j`.
+            Error reported.
+            `getErrLine()`.
+            
+            If `getErrLine` is `index+1`:
+            Index at `;` (5). Next is `return` (6).
+            
+            Still not 7.
+            
+            I will identify `frontend/TokenList.java` `getErrLine` as the likely location, as it is the sole determinant of the error line number.
+
+<frontend/TokenList.java>
+...
+    public int getErrLine() {
+        if( index == 0 ) {
+            return 1;
+        } else {
+            return tokens.get(index-1).getLineNum();
+        }
+    }
+
+}

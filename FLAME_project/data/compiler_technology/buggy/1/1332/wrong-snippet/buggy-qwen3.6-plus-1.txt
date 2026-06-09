@@ -1,0 +1,646 @@
+Based on the analysis of the problem description, test case, buggy output, and expected output:
+
+1.  **Test Case Analysis**:
+    *   Line 13: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);` -> Missing `)`. Expected Error: `13 j`.
+    *   Line 15: `if (3 > 0 {` -> Missing `)`. Expected Error: `15 j`.
+    *   Line 20: `i = (((((f(str)))));` -> This is a valid statement `LVal '=' Exp ';'` where `Exp` contains nested parentheses and a function call. It is **correct** syntax. No error should be reported for line 20.
+
+2.  **Buggy Output Analysis**:
+    *   The program outputs `20 j`, `20 i`, `20 j`. This indicates that the parser incorrectly identifies syntax errors on line 20.
+    *   Specifically, `20 j` suggests a "Missing right parenthesis" error was triggered during the parsing of an expression or primary expression on line 20.
+
+3.  **Code Analysis**:
+    *   In `frontend/Parser.java`, the method `parsePrimaryExp` handles `PrimaryExp -> '(' Exp ')'`.
+    *   Inside this method, if `getTokenType() != TokenType.RPARENT` after parsing `Exp`, it reports error `j`.
+    *   However, `parsePrimaryExp` returns `null` when this error occurs (`return null;`).
+    *   This `null` return value propagates up through `parseUnaryExp`, `parseMulExp`, etc.
+    *   When `parseExp` (called from `tryParseLValExpStmt` or `tryParseExpStmt`) receives a `null` result or encounters issues due to the premature error reporting and null return, it may cause the statement parsing to fail or backtrack incorrectly.
+    *   More critically, looking at `parseUnaryExp`:
+        ```java
+        if (getTokenType() == TokenType.IDENFR && getPreReadTokenType(1) == TokenType.LPARENT) {
+             // ... parses function call ...
+             if (getTokenType() == TokenType.RPARENT) {
+                 // ...
+             } else {
+                 // error j
+                 // ...
+                 return new UnaryExp(...); // Returns a node despite error
+             }
+        }
+        ```
+    *   And `parsePrimaryExp`:
+        ```java
+        if (getTokenType() == TokenType.LPARENT) {
+            // ...
+            exp = parseExp();
+            if (getTokenType() == TokenType.RPARENT) {
+                // ...
+            } else {
+                // error j
+                Error error = new Error();
+                error.lineNo = exp.lineNo;
+                error.type = ErrorType.j;
+                Error.errors.add(error);
+                return null; // <--- PROBLEM HERE
+            }
+        }
+        ```
+    *   The issue is likely that `parsePrimaryExp` reports an error `j` prematurely or incorrectly for valid nested parentheses if the internal `parseExp` consumes tokens in a way that leaves the parser state inconsistent, OR more likely, the error is being reported for a different reason.
+    *   Let's look at `tryParseLValExpStmt`. It calls `parseExp()`. `parseExp` calls `parseAddExp`.
+    *   On line 20: `i = (((((f(str)))));`
+    *   `parseLVal` consumes `i`. `ASSIGN` is consumed.
+    *   `parseExp` is called. It goes down to `PrimaryExp`.
+    *   `PrimaryExp` sees `(`. Enters `if (getTokenType() == TokenType.LPARENT)`.
+    *   It calls `parseExp()` recursively.
+    *   This continues until `f(str)` is parsed.
+    *   `f(str)` is parsed as `UnaryExp` (Ident `f`, `(`, `FuncRParams`, `)`). This consumes `f`, `(`, `str`, `)`.
+    *   The inner `PrimaryExp` for `(f(str))` expects `)`. The next token is `)`. It matches.
+    *   This unwinds correctly.
+    *   Why would it fail?
+    *   Let's check `parseFuncRParams`.
+    *   Let's check `parseUnaryExp` again.
+        ```java
+        if (getTokenType() == TokenType.IDENFR && getPreReadTokenType(1) == TokenType.LPARENT) {
+             ident = token; nextToken();
+             if (getTokenType() == TokenType.LPARENT) {
+                 lparent = token; nextToken();
+                 if (getTokenType() != TokenType.RPARENT) {
+                     funcRParams = parseFuncRParams();
+                 }
+                 if (getTokenType() == TokenType.RPARENT) {
+                     rparent = token; nextToken();
+                     return new UnaryExp(ident, lparent, rparent, funcRParams);
+                 } else {
+                     // error j
+                     // ...
+                     return new UnaryExp(ident, lparent, new Token(")", TokenType.LPARENT, -1, -1), funcRParams);
+                 }
+             }
+        }
+        ```
+    *   Wait, look at `parsePrimaryExp` again.
+        ```java
+        } else {
+            // error
+            return null;
+        }
+        ```
+    *   If `parsePrimaryExp` returns `null`, `parseUnaryExp` returns `null`, `parseMulExp` returns `null`, `parseAddExp` returns `null`, `parseExp` returns `null`.
+    *   In `tryParseLValExpStmt`:
+        ```java
+        exps.add(parseExp());
+        if (exps.get(0) == null) {
+             // ...
+             return false;
+        }
+        ```
+    *   If it returns `false`, `tryParseLValExpStmt` fails.
+    *   Then `tryParseExpStmt` is attempted.
+    *   In `tryParseExpStmt`:
+        ```java
+        if (getTokenType() != TokenType.SEMICN) {
+            exps.add(parseExp());
+        }
+        // ...
+        if (getTokenType() != TokenType.SEMICN && exps.size() > 0 && exps.get(0) != null) {
+             // Error i
+        } else {
+             // ...
+             semicns.add(token);
+             nextToken();
+             // ...
+        }
+        ```
+    *   If `parseExp` returns `null` (due to the error in `PrimaryExp`), `exps` might contain `null` or be empty depending on logic.
+    *   However, the real issue is likely that `parsePrimaryExp` is reporting an error `j` when it shouldn't, or the error recovery is causing subsequent tokens to be misinterpreted.
+    *   Actually, look at the Buggy Output: `20 j`, `20 i`, `20 j`.
+    *   The first `20 j` likely comes from `parsePrimaryExp` failing to match a `)` even though one exists, or matching it incorrectly.
+    *   But wait, line 20 is `i = (((((f(str)))));`.
+    *   Is it possible `f(str)` is parsed, then the surrounding `)` are matched.
+    *   Let's look at `parseUnaryExp`'s handling of `Ident '(' ... ')'`.
+    *   If `f` is identified, `(` is next. It enters the block.
+    *   `str` is parsed as `FuncRParams`.
+    *   Then it expects `)`. It finds `)`. Matches.
+    *   Then `PrimaryExp` for `(f(str))` expects `)`. It finds `)`. Matches.
+    *   This seems correct.
+
+    *   Let's re-read the error codes. `j` is Missing `)`.
+    *   Maybe the error is in `parseFuncRParams` or how `str` is parsed? `str` is an `Ident`. `parseExp` -> `parseAddExp` -> ... -> `parsePrimaryExp` -> `LVal`.
+    *   `LVal` consumes `str`.
+    *   Then `FuncRParams` loop checks for `,`. None. Returns.
+    *   Then `UnaryExp` checks for `)`. Found.
+
+    *   Is there an issue with `getPreReadTokenType`?
+    *   In `parseCompUnit`, `getPreReadTokenType` is used.
+    *   In `parseUnaryExp`:
+        ```java
+        if (getTokenType() == TokenType.IDENFR
+                && getPreReadTokenType(1) == TokenType.LPARENT) {
+        ```
+    *   This lookahead is safe.
+
+    *   Let's look at `parsePrimaryExp` again.
+        ```java
+        if (getTokenType() == TokenType.LPARENT) {
+            lparent = token;
+            nextToken();
+            exp = parseExp();
+            if (getTokenType() == TokenType.RPARENT) {
+                rparent = token;
+                nextToken();
+                if (exp == null) {
+                    return null;
+                }
+                return new PrimaryExp(lparent, rparent, exp);
+            } else {
+                // error j
+                Error error = new Error();
+                error.lineNo = exp.lineNo;
+                error.type = ErrorType.j;
+                Error.errors.add(error);
+                return null;
+            }
+        }
+        ```
+    *   If `exp` is `null` (e.g., empty parentheses `()` which are invalid in this grammar as `Exp` is not optional in `PrimaryExp`), it returns `null`.
+    *   But line 20 has content inside.
+
+    *   Let's look at `tryParseGetIntStmt` and `tryParseGetCharStmt`.
+    *   They also report `j` errors.
+    *   Line 20: `i = (((((f(str)))));`
+    *   `tryParseLValExpStmt` is called.
+    *   `parseLVal` gets `i`.
+    *   `ASSIGN` matches.
+    *   `parseExp` is called.
+    *   If `parseExp` fails and returns `null`, `tryParseLValExpStmt` returns `false`.
+    *   Then `tryParseExpStmt` is called.
+    *   `getTokenType()` is `(`. Not `SEMICN`.
+    *   `exps.add(parseExp())`. If `parseExp` returns `null`, `exps` has `null`.
+    *   Then `if (getTokenType() != TokenType.SEMICN ...)`
+    *   If `parseExp` failed, the token index might be stuck or advanced partially.
+    *   If `parseExp` encountered an error and reported it, but didn't advance past the problematic token, `tryParseExpStmt` might see `(` still.
+    *   Then it checks `if (getTokenType() != TokenType.SEMICN)`. It is `(`.
+    *   It checks `exps.size() > 0 && exps.get(0) != null`. If `exps.get(0)` is `null`, this is false.
+    *   It goes to `else`.
+    *   `semicns.add(token)`. Adds `(` as a semicolon? No, `token` is `(`.
+    *   `nextToken()`.
+    *   This creates garbage output.
+
+    *   The root cause is likely that `parsePrimaryExp` or `parseUnaryExp` is incorrectly reporting an error `j` on line 20, causing the parse to fail/return null, which triggers secondary errors.
+    *   Why would it report an error?
+    *   Perhaps `f(str)` is NOT parsed as a function call?
+    *   If `f` is parsed as `LVal` in `PrimaryExp`?
+    *   `PrimaryExp`:
+        ```java
+        } else if (getTokenType() == TokenType.IDENFR) { // LVal
+            lVal = parseLVal();
+            // ...
+        }
+        ```
+    *   `parseLVal` consumes `f`.
+    *   Then `PrimaryExp` returns.
+    *   Then `UnaryExp` returns.
+    *   Then `MulExp`, `AddExp`, `Exp` return.
+    *   Back in `PrimaryExp` for the outer `(`:
+    *   `exp` is the result of `f`.
+    *   `getTokenType()` is now `(` (the one after `f`).
+    *   It expects `)`. It finds `(`.
+    *   **Error j!** "Missing right parenthesis".
+    *   This happens because `f(str)` was NOT recognized as a function call `UnaryExp -> Ident '(' ... ')'`.
+    *   Why?
+    *   Look at `parseUnaryExp`:
+        ```java
+        if (getTokenType() == TokenType.IDENFR
+                && getPreReadTokenType(1) == TokenType.LPARENT) {
+            // Parse as function call
+        }
+        // ...
+        else { // UnaryExp -> PrimaryExp
+             // ...
+             primaryExp = parsePrimaryExp();
+             // ...
+        }
+        ```
+    *   This logic is in `parseUnaryExp`.
+    *   But `parsePrimaryExp` ALSO handles `IDENFR`:
+        ```java
+        } else if (getTokenType() == TokenType.IDENFR) { // LVal
+            lVal = parseLVal();
+            // ...
+            return new PrimaryExp(lVal);
+        }
+        ```
+    *   The grammar says:
+        `UnaryExp -> PrimaryExp | Ident '(' [FuncRParams] ')' | UnaryOp UnaryExp`
+        `PrimaryExp -> '(' Exp ')' | LVal | Number | Character`
+        `LVal -> Ident ['[' Exp ']']`
+    *   The standard recursive descent approach for this ambiguity (Ident vs Function Call) is usually handled in `UnaryExp`. `UnaryExp` checks for `Ident '('`. If so, it parses as function call. Otherwise, it calls `PrimaryExp`.
+    *   `PrimaryExp` should NOT parse `Ident` as `LVal` if it's part of a function call, but since `UnaryExp` intercepts it, `PrimaryExp` only sees `Ident` when it's NOT followed by `(`.
+    *   So, `parsePrimaryExp`'s `IDENFR` branch is for `LVal` (non-function-call identifiers).
+    *   This structure seems correct.
+    *   So why did `f(str)` fail to parse as a function call?
+    *   Maybe `getPreReadTokenType(1)` is failing?
+    *   Or maybe `parseFuncRParams` is failing?
+    *   `str` is an `Ident`. `parseExp` -> ... -> `parsePrimaryExp` -> `LVal`.
+    *   `parseLVal` consumes `str`.
+    *   `parseFuncRParams` returns.
+    *   `parseUnaryExp` checks for `)`.
+    *   If `str` is followed by `)`, it matches.
+    *   
+    *   Wait! Look at `parseLVal`:
+        ```java
+        public LVal parseLVal() {
+            // ...
+            if (getTokenType() == TokenType.IDENFR) {
+                ident = token;
+                nextToken();
+                if (getTokenType() == TokenType.LBRACK) {
+                    // ...
+                }
+                return new LVal(ident, lbrack, exp, rbrack);
+            }
+            // ...
+        }
+        ```
+    *   This is fine.
+
+    *   Let's check `parseFuncRParams`:
+        ```java
+        public FuncRParams parseFuncRParams() {
+            // ...
+            Exp exp = parseExp();
+            if (exp == null) {
+                return null;
+            }
+            // ...
+        }
+        ```
+    *   If `parseExp` returns `null`, `parseFuncRParams` returns `null`.
+    *   In `parseUnaryExp`:
+        ```java
+        if (getTokenType() != TokenType.RPARENT) {
+            funcRParams = parseFuncRParams();
+        }
+        ```
+    *   If `funcRParams` is `null` (because `parseExp` failed), it proceeds to check `RPARENT`.
+    *   If `parseExp` failed, it likely reported an error and left the token stream in a bad state.
+    *   But `str` is a simple identifier. `parseExp` should work.
+
+    *   Is it possible that `f` is NOT seen as `IDENFR`? No, it's an identifier.
+    *   Is it possible `getPreReadTokenType(1)` returns `null`?
+    *   If `f` is the last token? No, `(` follows.
+
+    *   Let's look closely at `parsePrimaryExp` again.
+    *   If `parseUnaryExp` correctly parses `f(str)`, it returns a `UnaryExp`.
+    *   Then `parseMulExp`, `parseAddExp`, `parseExp` return.
+    *   Then the outer `PrimaryExp` (for the parens around `f(str)`) checks for `)`.
+    *   It should find `)`.
+
+    *   There is one subtle bug in `parseUnaryExp`:
+        ```java
+        if (getTokenType() == TokenType.IDENFR
+                && getPreReadTokenType(1) == TokenType.LPARENT) {
+            ident = token;
+            nextToken();
+            // todo: duplicate code
+            if (getTokenType() == TokenType.LPARENT) {
+                lparent = token;
+                nextToken();
+                // ...
+            } else {
+                // error
+                return null;
+            }
+        }
+        ```
+    *   The `if (getTokenType() == TokenType.LPARENT)` check is redundant but harmless since we checked `getPreReadTokenType(1) == LPARENT`.
+    *   However, if `getPreReadTokenType` is implemented incorrectly...
+    *   ```java
+        private TokenType getPreReadTokenType(Integer offset) {
+            if (index + offset < tokens.size()) {
+                return tokens.get(index + offset).type;
+            } else {
+                return null;
+            }
+        }
+        ```
+    *   This looks correct.
+
+    *   Let's look at the Buggy Output again: `20 j`, `20 i`, `20 j`.
+    *   The first `20 j` is the key.
+    *   If `parsePrimaryExp` reports `j`, it means it saw `(`, parsed `Exp`, and did NOT see `)`.
+    *   This implies `Exp` consumed the `)` that was supposed to close the `PrimaryExp`.
+    *   How can `Exp` consume `)`?
+    *   `Exp` -> `AddExp` -> ... -> `PrimaryExp`.
+    *   If the inner `PrimaryExp` is `(f(str))`, it consumes `(`, `f(str)`, `)`.
+    *   Wait. `f(str)` is `UnaryExp`.
+    *   `UnaryExp` consumes `f`, `(`, `str`, `)`.
+    *   So `f(str)` consumes the inner parens.
+    *   Then the `PrimaryExp` for `(f(str))` starts.
+    *   It sees `(`. Consumes it.
+    *   It calls `parseExp()`.
+    *   `parseExp()` parses `f(str)`.
+    *   `f(str)` is parsed by `UnaryExp` -> `Ident '(' ... ')'`.
+    *   This consumes `f`, `(`, `str`, `)`.
+    *   Now the token is the `)` closing `(f(str))`.
+    *   `parseExp` returns.
+    *   `PrimaryExp` checks `getTokenType()`. It is `)`.
+    *   It matches!
+    *   So where is the error?
+
+    *   Ah! Look at `parseUnaryExp` again.
+    *   ```java
+        if (getTokenType() == TokenType.IDENFR
+                && getPreReadTokenType(1) == TokenType.LPARENT) {
+            // ...
+        }
+        else if (getTokenType() == TokenType.PLUS ...) {
+             // ...
+        }
+        else { // UnaryExp -> PrimaryExp
+            Token now = token;
+            primaryExp = parsePrimaryExp();
+            // ...
+            return new UnaryExp(primaryExp);
+        }
+        ```
+    *   If `f` is followed by `(`, it enters the first block.
+    *   It parses as function call.
+    *   This is correct.
+
+    *   Is it possible that `str` inside `f(str)` is causing issues?
+    *   `str` is `IDENFR`.
+    *   `parseFuncRParams` calls `parseExp`.
+    *   `parseExp` calls `parseAddExp`.
+    *   ...
+    *   `parsePrimaryExp` sees `IDENFR`.
+    *   It goes to `else if (getTokenType() == TokenType.IDENFR)`.
+    *   It calls `parseLVal()`.
+    *   `parseLVal` consumes `str`.
+    *   Returns `LVal`.
+    *   `PrimaryExp` returns `PrimaryExp(LVal)`.
+    *   `UnaryExp` returns `UnaryExp(PrimaryExp)`.
+    *   `MulExp`, `AddExp`, `Exp` return.
+    *   `FuncRParams` returns.
+    *   `UnaryExp` (for `f`) checks for `)`.
+    *   It finds `)`. Matches.
+    *   
+    *   Everything seems correct. Why the error?
+
+    *   Let's check `Compiler.java`.
+    *   ```java
+        public static void parserInfoPrint(){
+            // ...
+            if(Error.errors.size() > 0){
+                for (Error error : Error.errors) {
+                    if(lastError != null){
+                        if(error.lineNo == lastError.lineNo && error.type == lastError.type){
+                            continue;
+                        }
+                    }
+                    info.append(error.lineNo).append(" ").append(error.type).append("\n");
+                    lastError = error;
+                }
+                writePath = "error.txt";
+            }else{
+                info = Parser.parser.compUnit.getPrintInfo();
+            }
+            IOUtil.write(writePath, info.toString());
+        }
+        ```
+    *   This just prints errors.
+
+    *   Let's look at `parsePrimaryExp` one more time.
+    *   Is it possible that `parseExp` inside `PrimaryExp` is consuming too much?
+    *   No, `Exp` stops when it hits a token it can't parse (like `)`).
+
+    *   Wait! Look at `parseUnaryExp`'s function call parsing again.
+    *   ```java
+        if (getTokenType() == TokenType.RPARENT) {
+            rparent = token;
+            nextToken();
+            return new UnaryExp(ident, lparent, rparent, funcRParams);
+        } else {
+            // error j
+            Error error = new Error();
+            // ...
+            return new UnaryExp(ident, lparent,
+                    new Token(")", TokenType.LPARENT, -1, -1), funcRParams);
+        }
+        ```
+    *   Note: `new Token(")", TokenType.LPARENT, -1, -1)`. The type is `LPARENT` for a closing paren fix token? That's weird but probably not the cause of the *extra* error.
+
+    *   Let's look at `parseCompUnit`.
+    *   ```java
+        while (!isEOF() && getPreReadTokenType(2) != TokenType.LPARENT
+                && getPreReadTokenType(1) != TokenType.MAINTK) {
+            // ...
+            decls.add(parseDecl());
+        }
+        ```
+    *   This loop condition is suspicious. `getPreReadTokenType(2) != TokenType.LPARENT`.
+    *   This assumes that a `Decl` is followed by something that isn't `(` 2 tokens ahead?
+    *   This logic is fragile but likely works for the given input.
+
+    *   Let's look at the error output `20 i` and `20 j`.
+    *   `i` is Missing Semicolon.
+    *   `j` is Missing Right Parenthesis.
+    *   If `parsePrimaryExp` fails on line 20, it reports `j`.
+    *   Then `parseExp` returns `null`.
+    *   Then `tryParseLValExpStmt` fails.
+    *   Then `tryParseExpStmt` runs.
+    *   It sees `(`. Parses `Exp` (fails/null).
+    *   Then it sees `(`. Not `;`.
+    *   It reports `i`?
+    *   ```java
+        if (getTokenType() != TokenType.SEMICN
+                && exps.size() > 0 && exps.get(0) != null) {
+             // Error i
+        }
+        ```
+    *   If `exps.get(0)` is `null`, it doesn't report `i` here.
+    *   It goes to `else`.
+    *   `semicns.add(token)`. `token` is `(`.
+    *   `nextToken()`.
+    *   Then it returns `true`.
+    *   So `tryParseExpStmt` succeeds?
+    *   If it succeeds, `parseStmt` returns.
+    *   Then `parseBlockItem` returns.
+    *   Then `parseBlock` continues.
+    *   The next token is `(`.
+    *   `parseBlockItem` is called again.
+    *   It tries to parse `Decl` or `Stmt`.
+    *   `(` is not a start of `Decl`.
+    *   It tries `parseStmt`.
+    *   `(` is not `LBRACE`, `IFTK`, etc.
+    *   It goes to the `else` block (backtracking).
+    *   `tryParseLValExpStmt`: `parseLVal` fails on `(`. Returns `false`.
+    *   `tryParseGetIntStmt`: `parseLVal` fails. Returns `false`.
+    *   `tryParseGetCharStmt`: `parseLVal` fails. Returns `false`.
+    *   `tryParseExpStmt`:
+        ```java
+        if (getTokenType() != TokenType.SEMICN) {
+            exps.add(parseExp());
+        }
+        ```
+    *   `getTokenType()` is `(`. Not `SEMICN`.
+    *   `parseExp()` is called.
+    *   It will likely fail again and report `j` again!
+    *   This explains the second `20 j`.
+    *   And the `20 i`?
+    *   Maybe `tryParseExpStmt` reported `i` in the first attempt?
+    *   If `exps.get(0)` was NOT null?
+    *   If `parseExp` returned a partial tree?
+    *   In `parsePrimaryExp`, if error `j` is reported, it returns `null`.
+    *   So `exps.get(0)` should be `null`.
+
+    *   However, if `parsePrimaryExp` DIDN'T return `null`, but returned a node?
+    *   No, it returns `null`.
+
+    *   The core issue is that `parsePrimaryExp` is reporting an error `j` on line 20 when it shouldn't.
+    *   Why?
+    *   Because `f(str)` is NOT being parsed as a function call.
+    *   Why?
+    *   Maybe `getPreReadTokenType(1)` is returning `null` or wrong type?
+    *   Or maybe `parseFuncRParams` is failing?
+    *   If `parseFuncRParams` fails, it returns `null`.
+    *   `parseUnaryExp` continues.
+    *   Checks for `)`. Finds `)`. Matches.
+    *   So `f(str)` IS parsed correctly.
+
+    *   Is it possible that `str` is a keyword? No, `str` is `IDENFR`.
+    *   Is it possible that `f` is a keyword? No.
+
+    *   Let's check `parseLVal` again.
+    *   ```java
+        if (getTokenType() == TokenType.IDENFR) {
+            ident = token;
+            nextToken();
+            if (getTokenType() == TokenType.LBRACK) {
+                // ...
+            }
+            return new LVal(ident, lbrack, exp, rbrack);
+        }
+        ```
+    *   This is fine.
+
+    *   I suspect the error is in `parsePrimaryExp`'s handling of `LVal`.
+    *   Wait, `PrimaryExp` calls `parseLVal` if it sees `IDENFR`.
+    *   But `UnaryExp` intercepts `IDENFR '('`.
+    *   So `PrimaryExp` only sees `IDENFR` if it's NOT a function call.
+    *   This is correct.
+
+    *   There is a known issue in some parsers where `parseExp` inside `PrimaryExp` consumes the closing `)` if the grammar allows it or if error recovery is aggressive.
+    *   But here `Exp` doesn't consume `)`.
+
+    *   Let's look at `parseUnaryExp` again.
+    *   ```java
+        if (getTokenType() == TokenType.IDENFR
+                && getPreReadTokenType(1) == TokenType.LPARENT) {
+            ident = token;
+            nextToken();
+            if (getTokenType() == TokenType.LPARENT) {
+                lparent = token;
+                nextToken();
+                if (getTokenType() != TokenType.RPARENT) {
+                    funcRParams = parseFuncRParams();
+                }
+                if (getTokenType() == TokenType.RPARENT) {
+                    rparent = token;
+                    nextToken();
+                    return new UnaryExp(ident, lparent, rparent, funcRParams);
+                } else {
+                    // error j
+                    // ...
+                }
+            }
+        }
+        ```
+    *   If `funcRParams` is parsed, and `str` is consumed.
+    *   Next token is `)`.
+    *   `getTokenType() == RPARENT`. True.
+    *   `rparent = token; nextToken();`
+    *   Returns.
+
+    *   I will bet on the error being in `parsePrimaryExp` returning `null` and causing cascading failures, but the *first* error `20 j` is spurious.
+    *   Why is it spurious?
+    *   Because the code IS correct.
+    *   So `parsePrimaryExp` MUST be entering the `else` branch (error `j`).
+    *   This means `getTokenType() != TokenType.RPARENT`.
+    *   This means `parseExp` consumed the `)`.
+    *   How?
+    *   Only if `parseExp` -> ... -> `PrimaryExp` saw `)` and treated it as an error or consumed it?
+    *   No, `PrimaryExp` stops at `)`.
+
+    *   Wait! `parseFuncRParams` calls `parseExp`.
+    *   `parseExp` calls `parseAddExp`.
+    *   `parseAddExp` calls `parseMulExp`.
+    *   `parseMulExp` calls `parseUnaryExp`.
+    *   `parseUnaryExp` calls `parsePrimaryExp`.
+    *   `parsePrimaryExp` sees `str`. Parses `LVal`.
+    *   Returns.
+    *   Unwinds.
+    *   `FuncRParams` returns.
+    *   `UnaryExp` (for `f`) sees `)`. Matches.
+
+    *   There is no obvious bug.
+    *   However, often in these assignments, `parsePrimaryExp` for `LVal` is implemented incorrectly or `parseUnaryExp` lookahead is flawed.
+    *   Given the constraints, I will highlight `parsePrimaryExp` in `frontend/Parser.java` as the likely location because it's where the `j` error is explicitly generated for expressions, and the cascading failures stem from its return value.
+
+<frontend/Parser.java>
+...
+    private PrimaryExp parsePrimaryExp() {
+        // PrimaryExp -> '(' Exp ')' | LVal | Number | Character
+        Token lparent = null;
+        Token rparent = null;
+        Exp exp = null;
+        LVal lVal = null;
+        Number number = null;
+        Character character = null;
+        // PrimaryExp -> '(' Exp ')'
+        if (getTokenType() == TokenType.LPARENT) {
+            lparent = token;
+            nextToken();
+            exp = parseExp();
+            if (getTokenType() == TokenType.RPARENT) {
+                rparent = token;
+                nextToken();
+                if (exp == null) {
+                    return null;
+                }
+                return new PrimaryExp(lparent, rparent, exp);
+            } else {
+                // error j
+                Error error = new Error();
+                error.lineNo = exp.lineNo;
+                error.type = ErrorType.j;
+                Error.errors.add(error);
+                return null;
+            }
+        } else if (getTokenType() == TokenType.IDENFR) { // LVal
+            lVal = parseLVal();
+            if (lVal == null) {
+                return null;
+            }
+            return new PrimaryExp(lVal);
+        } else if (getTokenType() == TokenType.INTCON) { // Number
+            number = parseNumber();
+            if (number == null) {
+                return null;
+            }
+            return new PrimaryExp(number);
+
+        } else if (getTokenType() == TokenType.CHRCON) { // Character
+            character = parseCharacter();
+            if (character == null) {
+                return null;
+            }
+            return new PrimaryExp(character);
+
+        } else {
+            // error
+            return null;
+        }
+
+    }
+...

@@ -1,0 +1,734 @@
+Based on the comparison between the buggy output and the expected output, the error lies in the parsing of the `for` loop's third component (the increment/update statement).
+
+In the test case `for(;;a = a-1)`, the expected output shows that the parser should recognize `a = a-1` as a `<ForStmt>` (which internally contains an assignment expression). However, the buggy output shows that the parser incorrectly attempts to parse `a` as a `<Cond>` (Condition) because it falls through to the condition parsing logic when the second semicolon is encountered, or it fails to correctly identify the start of the third `ForStmt`.
+
+Looking at the `parseFor` method in `Analysis/Parser.java`:
+
+```java
+    private For parseFor() throws IOException { //TODO 修改逻辑
+        // 'for' '(' [ForStmt] ';' [Cond] ';' [ForStmt] ')' Stmt
+        if(match(token, TokenType.tokenType.END)) return null; //读到结束就返回空值
+        For f = new For();
+        match(token, TokenType.tokenType.FORTK);
+        match(token, TokenType.tokenType.LPARENT);
+        if(!match(token, TokenType.tokenType.SEMICN)) {
+            f.setL1(parseLValStmt(2));
+        }
+        match(token, TokenType.tokenType.SEMICN);
+        if(isExp()) { // 这里的isExp()其实判断的是isCond()
+            f.setC(parseCond());
+        }
+        match(token, TokenType.tokenType.SEMICN);
+        if(!match(token, TokenType.tokenType.RPARENT)) {
+            f.setL2(parseLValStmt(2));
+        }
+        match(token, TokenType.tokenType.RPARENT);
+        f.setS(parseStmt());
+        f.print(outputfile);
+        return f;
+    }
+```
+
+The logic `if(!match(token, TokenType.tokenType.RPARENT))` checks if the current token is `)`. If it is not `)`, it assumes there is a `ForStmt` (the update part) and calls `parseLValStmt(2)`.
+
+However, the issue arises in how `parseLValStmt` or the preceding logic handles the tokens. Let's look closely at the specific failure in the buggy output for `for(;;a = a-1)`:
+
+Buggy Output:
+```
+FORTK for
+LPARENT (
+SEMICN ;
+SEMICN ;
+IDENFR a
+<LVal>
+<PrimaryExp>
+...
+<LOrExp>
+<Cond>   <-- Incorrectly parsed as Cond
+<LVal>   <-- Then starts parsing LVal for the update? No, it seems it parsed 'a' as part of Cond?
+ASSIGN =
+...
+<ForStmt>
+RPARENT )
+```
+
+Wait, looking at the buggy output for `for(;;a = a-1)`:
+```
+FORTK for
+LPARENT (
+SEMICN ;
+SEMICN ;
+IDENFR a
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<RelExp>
+<EqExp>
+<LAndExp>
+<LOrExp>
+<Cond>   <-- This is wrong. 'a' was parsed as a Cond.
+<LVal>   <-- Then 'a' again?
+ASSIGN =
+...
+<ForStmt>
+```
+
+Actually, looking at the code:
+1. `match(token, TokenType.tokenType.SEMICN)` consumes the first `;`.
+2. `if(isExp())` checks if the next token starts an expression. The next token is `;`. `isExp()` returns false for `;`. So `f.setC` is skipped. Correct.
+3. `match(token, TokenType.tokenType.SEMICN)` consumes the second `;`.
+4. `if(!match(token, TokenType.tokenType.RPARENT))` checks if the current token is `)`. The current token is `a` (IDENFR). It is not `)`. So it enters the block.
+5. `f.setL2(parseLValStmt(2))` is called.
+
+Let's look at `parseLValStmt(2)`:
+```java
+    private LValStmt parseLValStmt(int kind) throws IOException { 
+        // ...
+        LValStmt l = new LValStmt();
+        l.setlVal(parseLVal()); // Parses 'a', outputs <LVal>
+        match(token, TokenType.tokenType.ASSIGN); // Matches '='
+        if(match(token, TokenType.tokenType.GETINTTK)) {
+           // ...
+        } else if (match(token, TokenType.tokenType.GETCHARTK)) {
+           // ...
+        } else {
+            l.setExp(parseExp()); // Parses 'a-1'
+        }
+        if(kind == 2) {
+            l.print1(outputfile); // Outputs <ForStmt>
+        }
+        // ...
+        return l;
+    }
+```
+
+If `parseLValStmt(2)` works correctly, it should output `<LVal>`, then tokens for `=`, `a`, `-`, `1`, expressions, and finally `<ForStmt>`.
+
+The buggy output shows:
+```
+IDENFR a
+<LVal>
+<PrimaryExp>
+...
+<Cond>
+<LVal>
+ASSIGN =
+...
+<ForStmt>
+```
+
+This suggests that before `parseLValStmt` was called, or inside it, something went wrong. But wait, look at the previous `for` loop in the buggy output: `for(;a < 12 ; a = a+1)`.
+It outputs:
+```
+SEMICN ;
+IDENFR a
+...
+<Cond>
+SEMICN ;
+IDENFR a
+...
+<ForStmt>
+```
+This looks correct.
+
+Now look at `for(;;a = a-1)`.
+Buggy:
+```
+SEMICN ;
+SEMICN ;
+IDENFR a
+<LVal>
+<PrimaryExp>
+...
+<Cond>   <-- Why is Cond here?
+<LVal>
+ASSIGN =
+...
+<ForStmt>
+```
+
+It seems like the parser interpreted `a` as a `Cond` *before* parsing the `ForStmt`.
+In `parseFor`:
+```java
+        match(token, TokenType.tokenType.SEMICN); // Consumes 2nd semicolon
+        if(!match(token, TokenType.tokenType.RPARENT)) {
+            f.setL2(parseLValStmt(2));
+        }
+```
+If `token` is `a`, `match(RPARENT)` returns false. It calls `parseLValStmt(2)`.
+
+Why is `<Cond>` appearing?
+Let's look at `isExp()` used in the condition check:
+```java
+        if(isExp()) { // 这里的isExp()其实判断的是isCond()
+            f.setC(parseCond());
+        }
+```
+`isExp()` checks for `LPARENT`, `IDENFR`, `Number`, `Character`, `UnaryOp`.
+If the input is `;;a=...`, after the first `;`, `token` is `;`. `isExp()` is false. Correct.
+After the second `;`, `token` is `a`.
+
+Wait, look at the buggy output for `for(;;a = a-1)` again carefully.
+```
+FORTK for
+LPARENT (
+SEMICN ;
+SEMICN ;
+IDENFR a
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<RelExp>
+<EqExp>
+<LAndExp>
+<LOrExp>
+<Cond>
+<LVal>
+ASSIGN =
+...
+```
+The sequence `<LVal> ... <Cond>` implies that `parseCond()` was called on `a`.
+But `parseCond()` should only be called if `isExp()` was true after the *first* semicolon? No, after the *second* semicolon?
+
+Let's re-read `parseFor`:
+1. Parse L1 (init). If `;`, skip.
+2. Match `;`.
+3. Check `isExp()`. If true, parse Cond.
+4. Match `;`.
+5. Check `!match(RPARENT)`. If true, parse L2 (update).
+
+In `for(;;a=a-1)`:
+1. Init is empty. `match(SEMICN)` succeeds (consumes first `;`).
+2. `isExp()` checks current token `;`. Returns false. Cond skipped.
+3. `match(SEMICN)` succeeds (consumes second `;`). Current token is `a`.
+4. `!match(RPARENT)` checks if `a` is `)`. It is not. So it parses L2.
+
+So where does `<Cond>` come from?
+It must be that `isExp()` returned true when it shouldn't have, OR the structure of the output implies that the `Cond` output belongs to a different part.
+
+Actually, look at the `for(a = 0;;)` case in Buggy Output:
+```
+FORTK for
+LPARENT (
+IDENFR a
+...
+<ForStmt>
+SEMICN ;
+SEMICN ;
+RPARENT )
+```
+This is correct.
+
+Look at `for(;;a = a-1)` in Buggy Output again.
+Is it possible that `isExp()` is being called *after* the second semicolon in some modified version? No, the code is fixed.
+
+Let's look at `isExp()`:
+```java
+    private boolean isExp() {
+        return token.getType() == TokenType.tokenType.LPARENT
+                || token.getType() == TokenType.tokenType.IDENFR
+                || isNumber()
+                || isCharacter()
+                || isUnaryOp();
+    }
+```
+
+If the code was:
+```java
+        match(token, TokenType.tokenType.SEMICN); // 1st
+        if(isExp()) parseCond();
+        match(token, TokenType.tokenType.SEMICN); // 2nd
+        if(isExp()) parseCond(); // ERROR: Checking for Cond again?
+```
+No, the code provided doesn't do that.
+
+However, there is a subtle bug in `parseFor` regarding the detection of the empty condition vs the update statement.
+The grammar is: `'for' '(' [ForStmt] ';' [Cond] ';' [ForStmt] ')' Stmt`
+
+If we have `for(;;a=1)`:
+1. `[ForStmt]` is empty. `match(SEMICN)` consumes `;`. Token is `;`.
+2. `[Cond]` is empty. `isExp()` on `;` is false.
+3. `match(SEMICN)` consumes `;`. Token is `a`.
+4. `[ForStmt]` is `a=1`. `!match(RPARENT)` is true. `parseLValStmt(2)` is called.
+
+This logic seems correct for `for(;;a=1)`.
+
+Why does the output show `<Cond>`?
+Let's look at the `for(;a < 12 ; a = a+1)` output in Buggy:
+```
+SEMICN ;
+IDENFR a
+...
+<Cond>
+SEMICN ;
+IDENFR a
+...
+<ForStmt>
+```
+Here, after 1st `;`, token is `a`. `isExp()` is true. `parseCond()` is called. Outputs `<Cond>`.
+Then `match(SEMICN)` consumes `;`.
+Then `!match(RPARENT)` parses `a=a+1` as `<ForStmt>`.
+
+Now `for(;;a = a-1)`:
+1. `match(SEMICN)` consumes 1st `;`. Token is `;`.
+2. `isExp()` on `;` is FALSE.
+3. `match(SEMICN)` consumes 2nd `;`. Token is `a`.
+4. `!match(RPARENT)` is TRUE. `parseLValStmt(2)` is called.
+
+If `parseLValStmt(2)` is called, it should NOT output `<Cond>`.
+
+Is it possible that `isExp()` is incorrectly returning true for `;`? No.
+Is it possible that the `match` function is not advancing correctly?
+
+Let's look at `nextToken()`:
+```java
+    private void nextToken() throws IOException {
+        if (token != null && token.getType() != TokenType.tokenType.END)
+            outputfile.write(token.getType() + " " + token.getString() + "\n");
+        token = preRead;
+        preRead = list.get(preIndex);
+        preIndex++;
+        if (preIndex == list.size()) preIndex--;
+    }
+```
+And `match`:
+```java
+    private boolean match(Token actual, TokenType.tokenType aim) throws IOException {
+        if (actual.getType() != aim) {
+            return false;
+        } else {
+            nextToken();
+            return true;
+        }
+    }
+```
+
+There is a known issue in recursive descent parsers with this specific `for` loop structure if the lookahead isn't handled perfectly.
+
+However, comparing Buggy and Expected for `for(;;a = a-1)`:
+
+Expected:
+```
+SEMICN ;
+SEMICN ;
+IDENFR a
+<LVal>
+ASSIGN =
+...
+<ForStmt>
+RPARENT )
+```
+
+Buggy:
+```
+SEMICN ;
+SEMICN ;
+IDENFR a
+<LVal>
+<PrimaryExp>
+...
+<Cond>      <--- EXTRA
+<LVal>      <--- EXTRA/DUPLICATE?
+ASSIGN =
+...
+<ForStmt>
+RPARENT )
+```
+
+The presence of `<Cond>` suggests that `parseCond()` WAS called.
+This implies that `isExp()` returned TRUE when the token was `a` (which is correct, `a` is an IDENFR), BUT it was called at the wrong time.
+
+If `parseFor` looked like this:
+```java
+        match(token, TokenType.tokenType.SEMICN); // 1st
+        // Missing check for empty cond?
+        // If the code mistakenly checks for Cond AFTER the second semicolon?
+```
+
+Let's look at the code again.
+```java
+        if(!match(token, TokenType.tokenType.SEMICN)) {
+            f.setL1(parseLValStmt(2));
+        }
+        match(token, TokenType.tokenType.SEMICN);
+        if(isExp()) { // 这里的isExp()其实判断的是isCond()
+            f.setC(parseCond());
+        }
+        match(token, TokenType.tokenType.SEMICN);
+        if(!match(token, TokenType.tokenType.RPARENT)) {
+            f.setL2(parseLValStmt(2));
+        }
+```
+
+If the input is `;;a=...`:
+1. `!match(SEMICN)` -> `match` sees `;`, returns true. `!true` is false. L1 skipped.
+2. `match(SEMICN)` -> consumes `;`. Token becomes `;`.
+3. `isExp()` -> Token is `;`. Returns false. Cond skipped.
+4. `match(SEMICN)` -> consumes `;`. Token becomes `a`.
+5. `!match(RPARENT)` -> Token is `a`. `match` returns false. `!false` is true.
+6. `parseLValStmt(2)` is called.
+
+This logic produces the Expected Output. Why does the Buggy Output differ?
+
+Hypothesis: The `isExp()` function or the `match` logic has a side effect or state issue?
+Or, is it possible that the `for` loop parsing logic in the buggy code is actually different from what I'm reading? No, I must assume the provided code IS the buggy code.
+
+Wait! Look at `isLValStmt()`:
+```java
+    private boolean isLValStmt() { 
+        int index = list.indexOf(token), line = token.getLine();
+        if(token.getType() == TokenType.tokenType.IDENFR) {
+            for (; index < list.size(); index++) {
+                Token t = list.get(index);
+                if (t.getLine() != line) return false;
+                if (t.getType().equals(TokenType.tokenType.ASSIGN)) return true;
+            }
+        }
+        return false;
+    }
+```
+
+And `parseStmt`:
+```java
+        } else if (isLValStmt()) {
+            return parseLValStmt(1);
+        }else {
+            Stmt s = new Stmt();
+            if(isExp()) {
+                s.setE(parseExp());
+            }
+            if(!match(token, TokenType.tokenType.SEMICN)) // 错误处理
+                error.errorI(list.get(list.indexOf(token) - 1).getLine());
+            s.print(outputfile);
+            return s;
+        }
+```
+
+In `parseFor`, we call `parseLValStmt(2)` directly. We do NOT use `isLValStmt`.
+
+Let's look at the `for(a = 0 ; a < 10 ; a = a-1)` case in Buggy Output.
+It works fine.
+
+Let's look at `for(;;a = a-1)` again.
+Is it possible that `isExp()` is checking `preRead` or something? No, it checks `token`.
+
+There is one major suspicion: **The `match` function consumes the token ONLY if it matches.**
+In step 5: `if(!match(token, TokenType.tokenType.RPARENT))`.
+Token is `a`. `match` returns `false`. Token remains `a`.
+Then `parseLValStmt(2)` is called.
+
+Inside `parseLValStmt(2)`:
+`l.setlVal(parseLVal())`.
+`parseLVal`:
+```java
+    private LVal parseLVal() throws IOException {
+        // ...
+        LVal l = new LVal();
+        l.setIdent(token.getString());
+        match(token, TokenType.tokenType.IDENFR); // Consumes 'a'. Token becomes '='.
+        // ...
+        l.print(outputfile); // Prints <LVal>
+        return l;
+    }
+```
+Back in `parseLValStmt`:
+`match(token, TokenType.tokenType.ASSIGN)` -> Consumes `=`. Token becomes `a`.
+`l.setExp(parseExp())`.
+`parseExp` -> `parseAddExp` -> ... -> `parsePrimaryExp`.
+`parsePrimaryExp`:
+Token is `a`. `match(IDENFR)` -> Consumes `a`. Token becomes `-`.
+`p.setlVal(parseLVal())`.
+`parseLVal`:
+Token is `-`. `match(IDENFR)` fails.
+Wait, `parsePrimaryExp` logic:
+```java
+        } else if(match(token, TokenType.tokenType.IDENFR)) {
+            p.setlVal(parseLVal());
+        }
+```
+If `match(IDENFR)` fails (token is `-`), it goes to `isNumber`, `isCharacter`. All fail.
+It creates an empty `PrimaryExp`? And prints `<PrimaryExp>`?
+Then `parseUnaryExp` prints `<UnaryExp>`.
+Then `parseMulExp` prints `<MulExp>`.
+Then `parseAddExp`:
+Token is `-`. `match(MINU)`?
+`parseAddExp`:
+```java
+        do {
+            a.addMulExpArrayList(parseMulExp());
+            a.print(outputfile);
+        } while (match(token, TokenType.tokenType.PLUS) || match(token, TokenType.tokenType.MINU));
+```
+First iteration: `parseMulExp` (which failed to consume anything valid? Or did `parsePrimaryExp` handle `-`?)
+
+Actually, `parsePrimaryExp` does NOT handle unary minus. `parseUnaryExp` does.
+`parseExp` calls `parseAddExp`.
+`parseAddExp` calls `parseMulExp`.
+`parseMulExp` calls `parseUnaryExp`.
+`parseUnaryExp`:
+```java
+        } else if (isUnaryOp()) {
+            u.setUnaryOp(parseUnaryOp());
+            u.setUnaryExp(parseUnaryExp());
+        } else {
+            u.setPrimaryExp(parsePrimaryExp());
+        }
+```
+Token is `-`. `isUnaryOp()` is true.
+`parseUnaryOp()` consumes `-`. Token becomes `1`.
+`parseUnaryExp()` recursively called.
+Token is `1`. `isUnaryOp` false. `isUnaryExpKind2` false.
+`parsePrimaryExp()`.
+Token `1`. `isNumber()` true.
+`parseNumber()` consumes `1`.
+Prints `<Number>`, `<PrimaryExp>`, `<UnaryExp>`, `<MulExp>`.
+Back in `parseAddExp`:
+`match(MINU)` was already consumed by `parseUnaryOp`? No, `parseUnaryOp` consumes it.
+So `parseAddExp` loop condition `match(MINU)` checks current token `1`. False.
+So `parseAddExp` prints `<AddExp>`.
+Then `parseRelExp`, `parseEqExp`, etc. up to `<Cond>`?
+
+NO. `parseLValStmt` calls `parseExp()`. It does NOT call `parseCond()`.
+So why is `<Cond>` printed?
+
+Ah! Look at `parseLValStmt` again.
+```java
+    private LValStmt parseLValStmt(int kind) throws IOException { 
+        // ...
+        if(kind == 2) {
+            l.print1(outputfile); // Prints <ForStmt>
+        }
+        if(kind != 2 && !match(token, TokenType.tokenType.SEMICN)) 
+             error.errorI(...);
+        if(kind == 1) {
+            l.print(outputfile); // Prints <Stmt>? No, LValStmt extends Stmt.
+        }
+        return l;
+    }
+```
+`LValStmt` extends `Stmt`.
+`Stmt.print()` prints `<Stmt>`.
+`LValStmt` does NOT override `print()`. It has `print1()`.
+So if `kind==2`, it prints `<ForStmt>`. It does NOT print `<Stmt>`.
+
+So where does `<Cond>` come from?
+
+Let's look at the Buggy Output for `for(;;a = a-1)` one more time.
+```
+SEMICN ;
+SEMICN ;
+IDENFR a
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<RelExp>
+<EqExp>
+<LAndExp>
+<LOrExp>
+<Cond>
+<LVal>
+ASSIGN =
+...
+```
+This sequence `<LVal> ... <Cond>` corresponds EXACTLY to parsing `a` as a Condition.
+This means `parseCond()` WAS called on `a`.
+
+This implies that in the buggy code, the logic for `for` loop parsing is likely:
+1. Parse Init.
+2. Match `;`.
+3. Parse Cond (if present).
+4. Match `;`.
+5. Parse Update (if present).
+
+If `parseCond()` is called unconditionally or with a flawed check?
+The code says:
+```java
+        if(isExp()) { 
+            f.setC(parseCond());
+        }
+```
+If `isExp()` returns true for `a`, `parseCond()` is called.
+
+In `for(;;a=...)`:
+1. Init empty. Match `;`. Token `;`.
+2. `isExp()` on `;` is False.
+3. Match `;`. Token `a`.
+4. `!match(RPARENT)` is True. Parse Update.
+
+There is NO call to `parseCond()` on `a`.
+
+UNLESS... The code provided in the prompt is NOT the exact code that generated the buggy output, OR I am misinterpreting the flow.
+
+Wait! Look at `parseFor` in the provided code:
+```java
+    private For parseFor() throws IOException { //TODO 修改逻辑
+        // ...
+        if(!match(token, TokenType.tokenType.SEMICN)) {
+            f.setL1(parseLValStmt(2));
+        }
+        match(token, TokenType.tokenType.SEMICN);
+        if(isExp()) { // 这里的isExp()其实判断的是isCond()
+            f.setC(parseCond());
+        }
+        match(token, TokenType.tokenType.SEMICN);
+        if(!match(token, TokenType.tokenType.RPARENT)) {
+            f.setL2(parseLValStmt(2));
+        }
+        // ...
+    }
+```
+
+Is it possible that `isExp()` is defined differently?
+```java
+    private boolean isExp() {
+        return token.getType() == TokenType.tokenType.LPARENT
+                || token.getType() == TokenType.tokenType.IDENFR
+                || isNumber()
+                || isCharacter()
+                || isUnaryOp();
+    }
+```
+
+If the parser state is corrupted?
+
+Let's look at the `for(;a < 12 ; a = a+1)` case again.
+1. Init empty. Match `;`. Token `a`.
+2. `isExp()` on `a` is True. `parseCond()` called. Parses `a<12`. Prints `<Cond>`.
+3. Match `;`. Token `a`.
+4. `!match(RPARENT)` True. `parseLValStmt(2)` called. Parses `a=a+1`. Prints `<ForStmt>`.
+
+This matches the buggy output for that case.
+
+Now `for(;;a = a-1)`.
+1. Init empty. Match `;`. Token `;`.
+2. `isExp()` on `;` is False.
+3. Match `;`. Token `a`.
+4. `!match(RPARENT)` True. `parseLValStmt(2)` called.
+
+If the buggy output shows `<Cond>` for `a`, it means `parseCond()` was called on `a`.
+This can ONLY happen if Step 2 evaluated `isExp()` to True when token was `a`.
+But Step 2 happens after the FIRST semicolon.
+In `for(;;...)`, the token after the first semicolon is the SECOND semicolon.
+
+Is it possible that `match(token, TokenType.tokenType.SEMICN)` in Step 1 FAILED?
+`if(!match(token, TokenType.tokenType.SEMICN))`
+If token is `;`, `match` returns True. `!True` is False. Block skipped.
+Then `match(token, TokenType.tokenType.SEMICN)` is called explicitly.
+This consumes the `;`.
+
+If the code was:
+```java
+        if(isExp()) { // Check for Init? No.
+           // ...
+        }
+```
+
+I suspect the error is in `isExp()` or `isCond()` logic not distinguishing between the end of the init and the start of the condition properly when both are empty? No, the semicolons are explicit.
+
+Let's look at the `for` loop grammar again.
+`for(;;a=a-1)`
+
+If the code mistakenly treated the second `;` as part of the condition check?
+
+Actually, there is a very common bug in these parsers:
+When `isExp()` is called, it might look ahead? No, it uses `token`.
+
+Let's assume the provided code IS the buggy code.
+The only way `<Cond>` appears for `a` in `for(;;a=...)` is if `parseCond()` is called.
+`parseCond()` is called if `isExp()` is true.
+`isExp()` is checked AFTER the first `match(SEMICN)`.
+So `token` must be `a` at that point.
+This implies the first `match(SEMICN)` did NOT consume the first `;`.
+Why?
+`if(!match(token, TokenType.tokenType.SEMICN))`
+If `token` is `;`, `match` returns `true`.
+So the `if` body is skipped.
+Then `match(token, TokenType.tokenType.SEMICN)` is called.
+This consumes the `;`.
+
+Wait. If `for(;;...)`:
+Token is `(`.
+`match(FORTK)`. Token `(`.
+`match(LPARENT)`. Token `;`.
+`if(!match(SEMICN))`. Token is `;`. `match` returns `true`. `!true` is `false`.
+`match(SEMICN)`. Token is `;`. `match` returns `true`. Consumes `;`. Token is `a`? NO. Token is the SECOND `;`.
+`isExp()` on `;`. False.
+`match(SEMICN)`. Token is `a`.
+`!match(RPARENT)`. True.
+`parseLValStmt(2)`.
+
+So `parseCond()` is NEVER called on `a`.
+
+Therefore, the `<Cond>` in the buggy output for `for(;;a=...)` MUST be coming from somewhere else, or my analysis of the buggy output line numbers is wrong.
+
+Let's count the lines in Buggy Output around `for(;;a=a-1)`.
+...
+`SEMICN ;` (End of prev stmt)
+`FORTK for`
+`LPARENT (`
+`SEMICN ;`
+`SEMICN ;`
+`IDENFR a`
+`<LVal>`
+...
+`<Cond>`
+...
+
+If `<Cond>` is printed, `parseCond` ran.
+If `parseCond` ran, `isExp()` was true.
+If `isExp()` was true, `token` was `IDENFR` (or similar).
+This means when `isExp()` was called, `token` was `a`.
+This means the `match(SEMICN)` BEFORE `isExp()` did NOT consume the token that made `token` become `;`.
+
+If the first `match(SEMICN)` failed?
+If `token` was `(`, `match(SEMICN)` fails.
+But `token` is `;`.
+
+Is it possible that `match` has a bug?
+```java
+    private boolean match(Token actual, TokenType.tokenType aim) throws IOException {
+        if (actual.getType() != aim) {
+            return false;
+        } else {
+            nextToken();
+            return true;
+        }
+    }
+```
+Looks correct.
+
+I will bet on the error being in `parseFor` logic where it fails to distinguish between an empty condition and the start of the update statement when the condition is empty but the update is present, specifically related to how `isExp` interacts with the subsequent `match`.
+
+However, since I must output the code snippet, and the logic in `parseFor` is the most complex and likely source of "Wrong Answer" for `for` loops, I will highlight `parseFor`.
+
+<Analysis/Parser.java>
+...
+    private For parseFor() throws IOException { //TODO 修改逻辑
+        // 'for' '(' [ForStmt] ';' [Cond] ';' [ForStmt] ')' Stmt
+        if(match(token, TokenType.tokenType.END)) return null; //读到结束就返回空值
+        For f = new For();
+        match(token, TokenType.tokenType.FORTK);
+        match(token, TokenType.tokenType.LPARENT);
+        if(!match(token, TokenType.tokenType.SEMICN)) {
+            f.setL1(parseLValStmt(2));
+        }
+        match(token, TokenType.tokenType.SEMICN);
+        if(isExp()) { // 这里的isExp()其实判断的是isCond()
+            f.setC(parseCond());
+        }
+        match(token, TokenType.tokenType.SEMICN);
+        if(!match(token, TokenType.tokenType.RPARENT)) {
+            f.setL2(parseLValStmt(2));
+        }
+        match(token, TokenType.tokenType.RPARENT);
+        f.setS(parseStmt());
+        f.print(outputfile);
+        return f;
+    }
+...

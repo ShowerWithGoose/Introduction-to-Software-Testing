@@ -1,0 +1,807 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The task is to implement a syntax analyzer that outputs syntax component names (e.g., `<Stmt>`) and lexical tokens. It must also detect specific syntax errors: missing semicolon (`i`), missing right parenthesis (`j`), and missing right square bracket (`k`).
+2.  **Test Case Input**:
+    ```c
+    int main() {
+        printf("Hello SysY!\n") // error 1: missing ';' after printf call
+        if (1)
+        /*********/
+        ;
+        int a // error 2: missing ';' after var decl
+        for (;;) {}
+        return 0 // error 3: missing ';' after return
+    }
+    ```
+3.  **Expected Output**:
+    ```
+    2 i
+    9 i
+    13 i
+    ```
+4.  **Buggy Output**: Empty (or program hangs/crashes, indicated by "Time Limit Exceeded" or empty output in the prompt context).
+5.  **Error Location Identification**:
+    *   The `Lexer.java` uses a `static` instance (`instance`) in its `getInstance` method. If the `Compiler` or test harness runs multiple times or if the `Lexer` state isn't reset properly, this can cause issues, but more importantly, look at `Parser.java`.
+    *   In `Parser.java`, the `parseStmt` method handles `printf`.
+    *   Let's trace `printf("Hello SysY!\n")` on line 2.
+    *   `parseStmt` sees `PRINTFTK`. It advances.
+    *   It matches `LPARENT`. Advances.
+    *   It matches `STRCON`. Advances.
+    *   It checks for `COMMA` loop (none).
+    *   It checks for `RPARENT`. The next token is `)` (from `)` on line 2). It matches `RPARENT` and advances.
+    *   It checks for `SEMICN`. The next token is likely the start of the next line or `if`. It is NOT `SEMICN`.
+    *   It calls `recordError(getPreviousToken().getLineNumber(), "i")`. `getPreviousToken()` returns the `)` token. The line number of `)` is 2. So it records `2 i`. This looks correct for Error 1.
+    *   However, the parser continues. It returns from `parseStmt`.
+    *   Back in `parseBlock`, it loops `while (!getCurrentToken().getValue().equals("}"))`.
+    *   The current token is now `IFTK` (start of `if (1)`).
+    *   `parseBlockItem` is called. It sees `IFTK` is not a decl, so calls `parseStmt`.
+    *   `parseStmt` sees `IFTK`.
+    *   It matches `IFTK`, advances.
+    *   Matches `LPARENT`, advances.
+    *   Parses `Cond`. `Cond` -> `LOrExp` ... -> `PrimaryExp`.
+    *   `PrimaryExp` sees `INTCON` (1). Matches it.
+    *   Back in `parseStmt` (if branch): Checks for `RPARENT`. Current token is `)`. Matches `RPARENT`, advances.
+    *   Calls `parseStmt` recursively for the body of the `if`.
+    *   The next token is `/*********/`. The Lexer skips comments. So the next token is `;` (on line 5/6 area? No, line 4 is `if (1)`, line 5 is comment, line 6 is `;`).
+    *   Wait, the input is:
+        ```
+        if (1)
+        
+        
+        /*********/
+        ;
+        ```
+    *   After `if (1)`, the recursive `parseStmt` is called.
+    *   The current token is `;` (SEMICN).
+    *   In `parseStmt`:
+        *   It checks `isLVal` (false).
+        *   It checks `LBRACE` (false).
+        *   It checks `IFTK` (false).
+        *   ...
+        *   It falls through to the final `else` block: `// 处理 [Exp] ';' 的情况`.
+        *   It checks `if (getCurrentToken().getTokenType() != LexType.SEMICN)`. It IS `SEMICN`, so it skips `parseExp`.
+        *   It checks `if (getCurrentToken().getTokenType() == LexType.SEMICN)`. It IS `SEMICN`.
+        *   It adds `SEMICN` node and `advance()`.
+        *   Returns `stmtNode`.
+    *   So the `if` statement is parsed successfully as `if (1) ;`.
+    *   Back in `parseBlock`. Current token is `INTTK` (`int a`).
+    *   `parseBlockItem` sees `INTTK`. Calls `parseDecl`.
+    *   `parseDecl` calls `parseVarDecl`.
+    *   `parseVarDecl` parses `BType` (`int`), `VarDef` (`a`).
+    *   Checks for `SEMICN`. Current token is `FORTK` (`for`). Not `SEMICN`.
+    *   Records error `i` with line number of `getPreviousToken()` which is `a` (IDENFR). Line number of `a` is 9 (based on expected output `9 i`).
+    *   Returns `varDeclNode`.
+    *   Back in `parseBlock`. Current token is `FORTK`.
+    *   `parseBlockItem` calls `parseStmt`.
+    *   `parseStmt` handles `FORTK`.
+    *   ... parses `for (;;) {}`.
+    *   Back in `parseBlock`. Current token is `RETURNTK`.
+    *   `parseBlockItem` calls `parseStmt`.
+    *   `parseStmt` handles `RETURNTK`.
+    *   Matches `RETURNTK`, advances.
+    *   Checks if next is `SEMICN`. Next is `INTCON` (`0`). Not `SEMICN`.
+    *   Calls `parseExp`.
+    *   `parseExp` -> `parseAddExp` -> ... -> `parsePrimaryExp` -> `parseNumber`.
+    *   `parseNumber` consumes `0`.
+    *   Back in `parseStmt` (return branch).
+    *   Checks for `SEMICN`. Current token is `RBRACE` (`}`). Not `SEMICN`.
+    *   Records error `i` with line number of `getPreviousToken()` which is `0` (INTCON). Line number of `0` is 13 (based on expected output `13 i`).
+    *   Returns `stmtNode`.
+    *   Back in `parseBlock`. Current token is `RBRACE`.
+    *   Loop ends. Matches `RBRACE`. Advances.
+    *   Returns `blockNode`.
+    *   Back in `parseMainFuncDef`. Returns.
+    *   Back in `parseCompUnit`. Loop ends.
+    *   Parser finishes.
+
+    The logic seems to produce the correct errors `2 i`, `9 i`, `13 i`. Why "Time Limit Exceeded" or empty output?
+
+    Let's look closely at `Lexer.java`.
+    The `Lexer` is a singleton.
+    ```java
+    public static Lexer getInstance(String inputFile) throws IOException {
+        if (instance == null) {
+            instance = new Lexer(inputFile);
+        }
+        return instance;
+    }
+    ```
+    In `Compiler.java`:
+    ```java
+    Lexer lexer = Lexer.getInstance(sourceFile);
+    while (true) {
+        lexer.next();
+        if (lexer.getToken() == null || lexer.getLexType() == null) {
+            break;
+        }
+        // ... add to tokens
+    }
+    ```
+    This part reads all tokens into the `tokens` list.
+
+    Then:
+    ```java
+    Parser parser = new Parser(tokens);
+    SyntaxTreeNode syntaxTree = parser.parseCompUnit();
+    ```
+
+    If the parser enters an infinite loop, it would cause TLE.
+    
+    Look at `parseBlock`:
+    ```java
+    while (!getCurrentToken().getValue().equals("}")) {
+        blockNode.addChild(parseBlockItem());
+    }
+    ```
+    If `parseBlockItem` does not advance the token stream when it encounters an unexpected token, this loop will be infinite.
+
+    Look at `parseBlockItem`:
+    ```java
+    private SyntaxTreeNode parseBlockItem() {
+        SyntaxTreeNode blockItemNode = new SyntaxTreeNode("BlockItem");
+        if (getCurrentToken().getTokenType() == LexType.INTTK ||
+                getCurrentToken().getTokenType() == LexType.CHARTK ||
+                getCurrentToken().getTokenType() == LexType.CONSTTK) {
+            blockItemNode.addChild(parseDecl());
+        } else {
+            blockItemNode.addChild(parseStmt());
+        }
+        return blockItemNode;
+    }
+    ```
+
+    Look at `parseStmt`.
+    If `parseStmt` encounters a token it doesn't expect at the beginning, what happens?
+    
+    The `parseStmt` logic:
+    1. Checks for `IDENFR` (LVal assignment). If it fails the `=` check, it resets `currentTokenIndex`.
+    2. Checks for `LBRACE`, `IFTK`, `FORTK`, `BREAKTK`, `CONTINUETK`, `RETURNTK`, `PRINTFTK`.
+    3. Else: `[Exp] ';'`.
+
+    What if the current token is something completely invalid for a statement, e.g., an error token or EOF?
+    If `getCurrentToken()` is `null`, `parseStmt` will crash (NPE) on `getCurrentToken().getTokenType()`.
+    
+    However, the TLE suggests an infinite loop.
+
+    Let's look at `parseUnaryExp`:
+    ```java
+    else if (isUnaryOp()) {
+        unaryExpNode.addChild(parseUnaryOp());
+        advance(); // 跳过当前的一元运算符
+        // 解析 UnaryExp
+        unaryExpNode.addChild(parseUnaryExp());
+    }
+    ```
+    `parseUnaryOp` creates a node but does NOT advance. `advance()` is called after. This is correct.
+
+    Let's look at `parsePrimaryExp`:
+    ```java
+    } else {
+        // 匹配左值表达式 LVal
+        primaryExpNode.addChild(parseLVal());
+    }
+    ```
+    `parseLVal`:
+    ```java
+    if (getCurrentToken().getTokenType() == LexType.IDENFR) {
+        // ...
+        advance();
+    } else {
+        System.out.println("Error: Expected Ident in LVal");
+        // System.exit(currentTokenIndex);
+    }
+    ```
+    If `parseLVal` is called when the current token is NOT `IDENFR`, it prints an error but **does not advance**. It returns a node.
+    If `parsePrimaryExp` calls `parseLVal` when the token is not `IDENFR` (and not `(`, `INTCON`, `CHRCON`), `parseLVal` fails to advance.
+    `parsePrimaryExp` returns.
+    `parseUnaryExp` (if it came from there) returns.
+    `parseMulExp` calls `parseUnaryExp`. If `parseUnaryExp` didn't advance, `parseMulExp` might loop if it expects operators? No, `parseMulExp` checks for `* / %`. If not present, it returns.
+    
+    Where is the infinite loop?
+
+    Consider `parseBlockItem` calling `parseStmt`.
+    If `parseStmt` falls into the `else` block (`[Exp] ';'`):
+    ```java
+    } else {
+        // 处理 [Exp] ';' 的情况
+        if (getCurrentToken().getTokenType() != LexType.SEMICN) {
+            stmtNode.addChild(parseExp());
+        }
+
+        // 匹配 ';'
+        if (getCurrentToken().getTokenType() == LexType.SEMICN) {
+            stmtNode.addChild(new SyntaxTreeNode("SEMICN", ";"));
+            advance(); // 跳过 ';'
+        } else {
+            // 缺少分号，记录错误 i
+            recordError(getPreviousToken().getLineNumber(), "i");
+        }
+    }
+    ```
+    If `parseExp()` is called and it cannot parse anything (e.g. current token is `}`), does it advance?
+    `parseExp` -> `parseAddExp` -> `parseMulExp` -> `parseUnaryExp` -> `parsePrimaryExp`.
+    `parsePrimaryExp`:
+    - Not `(`.
+    - `isNumber()`? No.
+    - `isCharacter()`? No.
+    - Else: `parseLVal()`.
+    `parseLVal()`:
+    - Not `IDENFR`. Prints error, does NOT advance. Returns empty/partial node.
+    
+    So `parseExp` returns without advancing.
+    Back in `parseStmt` (else block):
+    `getCurrentToken()` is still the same (e.g., `}`).
+    Check `!= SEMICN`. True.
+    Check `== SEMICN`. False.
+    Records error `i`.
+    Returns `stmtNode`.
+    
+    Back in `parseBlockItem`. Returns.
+    Back in `parseBlock`.
+    `while (!getCurrentToken().getValue().equals("}"))`
+    The token is STILL `}`.
+    Wait, if the token is `}`, the loop condition `!getCurrentToken().getValue().equals("}")` is FALSE. The loop terminates.
+    
+    So where is the infinite loop?
+
+    Maybe the issue is in `parseCompUnit`?
+    ```java
+    while (getCurrentToken() != null) {
+        if (isMainFuncDef()) { ... }
+        else if (...) { ... }
+        else if (...) { ... }
+        else {
+            System.out.println("Error: Unrecognized token in CompUnit");
+            // System.exit(currentTokenIndex);
+            break;
+        }
+    }
+    ```
+    This breaks.
+
+    Let's look at `Lexer` again.
+    Is it possible `Lexer.next()` hangs?
+    ```java
+    while ((ch = reader.read()) != -1) {
+       // ...
+    }
+    ```
+    If `reader.read()` blocks? No, it's a file.
+
+    Let's look at the `ErrorChecker` in `Compiler.java`.
+    It runs `errorChecker.checkErrors()`. This reads the file line by line.
+    Then `Lexer` reads the file character by character.
+
+    Is it possible the `Lexer` singleton is retaining state from a previous run if this code is part of a larger test harness? The prompt says "Time Limit Exceeded".
+
+    However, looking at `Parser.java`, specifically `parseStmt`'s handling of `LVal` assignment attempt:
+    ```java
+    if (getCurrentToken().getTokenType() == LexType.IDENFR) {
+        int savedTokenIndex = currentTokenIndex; 
+        SyntaxTreeNode possibleLValNode = parseLVal(); 
+
+        // 检查下一个 Token 是否是赋值符号 '='
+        if (getCurrentToken() != null && getCurrentToken().getTokenType() == LexType.ASSIGN) {
+             // ...
+        } else {
+            // 如果不是赋值语句，退回之前保存的位置，继续往后解析
+            currentTokenIndex = savedTokenIndex;
+        }
+    }
+    ```
+    If it resets `currentTokenIndex`, it effectively "un-parses" the LVal.
+    Then it proceeds to the `if (!isLVal)` block.
+    
+    If the token is `IDENFR` but NOT followed by `=`, it resets.
+    Then it goes to `if (!isLVal)`.
+    It checks `LBRACE`, `IFTK`, etc.
+    If it's just an `IDENFR` standing alone (which is invalid as a statement unless it's a function call `Ident(...)`, but `parseStmt` doesn't handle bare function calls except via `UnaryExp` in the `[Exp] ';'` case?
+    
+    Wait, `UnaryExp` handles `Ident '(' ... ')'`.
+    `PrimaryExp` handles `LVal` (which is `Ident`).
+    So `Exp` can be just an `Ident`.
+    
+    If we have `a;` (valid expression statement).
+    1. `parseStmt` sees `IDENFR`.
+    2. Saves index.
+    3. `parseLVal` consumes `a`.
+    4. Next token is `;`. Not `=`.
+    5. Resets index to before `a`.
+    6. `isLVal` is false.
+    7. Enters `else` block of `if (!isLVal)`.
+    8. Falls to final `else` (`[Exp] ';'`).
+    9. `getCurrentToken()` is `IDENFR` (`a`). Not `SEMICN`.
+    10. Calls `parseExp()`.
+    11. `parseExp` -> ... -> `parsePrimaryExp`.
+    12. `parsePrimaryExp` sees `IDENFR`. Not `(`, Number, Char.
+    13. Calls `parseLVal()`.
+    14. `parseLVal` consumes `a`.
+    15. Returns.
+    16. Back in `parseStmt`.
+    17. Checks `SEMICN`. Consumes `;`.
+    
+    This works.
+
+    What if we have an error like `if (1)` followed by `int a`?
+    We established this works.
+
+    Let's look at `parseFuncDef` vs `parseMainFuncDef`.
+    In `parseCompUnit`:
+    ```java
+    if (isMainFuncDef()) {
+        compUnitNode.addChild(parseMainFuncDef());
+    } else if (getCurrentToken().getTokenType() == LexType.INTTK || ...) {
+         // Check if FuncDef or Decl
+         Token nextToken = getNextKToken(1);
+         if (nextToken != null && nextToken.getTokenType() == LexType.IDENFR) {
+             if (getNextKToken(2) != null && getNextKToken(2).getTokenType() == LexType.LPARENT) {
+                 compUnitNode.addChild(parseFuncDef());
+             } else {
+                 compUnitNode.addChild(parseDecl());
+             }
+         }
+    }
+    ```
+    
+    The input starts with `int main()`.
+    `isMainFuncDef()` checks `getCurrentToken().getValue().equals("int")` AND `getNextKToken(1).getValue().equals("main")`.
+    This is true.
+    It calls `parseMainFuncDef()`.
+
+    Inside `parseMainFuncDef`:
+    Matches `int`, `main`, `(`, `)`.
+    Calls `parseBlock()`.
+
+    Inside `parseBlock()`:
+    Matches `{`.
+    Loop `while (!getCurrentToken().getValue().equals("}"))`.
+
+    First item: `printf("Hello SysY!\n")`.
+    `parseBlockItem` -> `parseStmt`.
+    `parseStmt` handles `PRINTFTK`.
+    Matches `printf`, `(`, `String`, `)`.
+    Missing `;`. Records error `2 i`.
+    Does NOT advance past the missing semicolon (because it's not there).
+    Current token is now whatever follows `)`.
+    In the source:
+    ```
+    printf("Hello SysY!\n") // error 1
+
+    if (1)
+    ```
+    After `)`, the lexer skips whitespace/newlines/comments.
+    The next token is `IFTK` (`if`).
+
+    So `parseStmt` returns.
+    `parseBlock` loop continues.
+    Current token is `IFTK`.
+    `parseBlockItem` -> `parseStmt`.
+    `parseStmt` handles `IFTK`.
+    Matches `if`, `(`.
+    Parses `Cond` (`1`).
+    Matches `)`.
+    Calls `parseStmt` recursively.
+    
+    Current token is `;` (after the comment block).
+    Recursive `parseStmt`:
+    Not LVal.
+    Not Block.
+    Not If/For/Break/Continue/Return/Printf.
+    Falls to `[Exp] ';'`.
+    Current token is `;`.
+    Skips `parseExp`.
+    Matches `;`. Advances.
+    Returns.
+    
+    Back in `if`'s `parseStmt`. Returns.
+    Back in `parseBlock`.
+    Current token is `INTTK` (`int`).
+    `parseBlockItem` -> `parseDecl`.
+    `parseVarDecl`.
+    Parses `int`, `a`.
+    Next token is `FORTK` (`for`).
+    Missing `;`. Records error `9 i`.
+    Returns.
+    
+    Back in `parseBlock`.
+    Current token is `FORTK`.
+    `parseBlockItem` -> `parseStmt`.
+    `parseStmt` handles `FORTK`.
+    Matches `for`, `(`.
+    First part: `getCurrentToken()` is `;`.
+    `if (getCurrentToken().getTokenType() != LexType.SEMICN)` -> False. Skips `parseForStmt`.
+    Matches `;`. Advances.
+    
+    Second part (Cond): `getCurrentToken()` is `;`.
+    `if (getCurrentToken().getTokenType() != LexType.SEMICN)` -> False. Skips `parseCond`.
+    Matches `;`. Advances.
+    
+    Third part (ForStmt): `getCurrentToken()` is `)`.
+    `if (getCurrentToken().getTokenType() != LexType.RPARENT)` -> False. Skips `parseForStmt`.
+    
+    Matches `)`. Advances.
+    
+    Parses body `Stmt`.
+    Current token is `{`.
+    `parseStmt` -> `parseBlock`.
+    Matches `{`.
+    Loop `while (!... "}")`.
+    Current token is `}`. Loop doesn't run.
+    Matches `}`. Advances.
+    Returns block.
+    Returns for-stmt.
+    
+    Back in outer `parseBlock`.
+    Current token is `RETURNTK`.
+    `parseBlockItem` -> `parseStmt`.
+    `parseStmt` handles `RETURNTK`.
+    Matches `return`.
+    Next is `0`. Not `;`.
+    Parses `Exp` (`0`).
+    Next is `}`. Not `;`.
+    Records error `13 i`.
+    Returns.
+    
+    Back in outer `parseBlock`.
+    Current token is `}`.
+    Loop ends.
+    Matches `}`.
+    Returns.
+    
+    Everything seems correct logically. Why TLE?
+
+    Ah, look at `Lexer.java` `symbols` map initialization:
+    ```java
+    symbols.put("&", LexType.AND);
+    symbols.put("|", LexType.OR);
+    ```
+    And `keywords` map.
+
+    Look at `Lexer.next()` logic for symbols:
+    ```java
+    } else { // 处理符号
+        String symbol = String.valueOf(currentChar);
+        reader.mark(1);
+        ch = reader.read();
+        if (ch != -1) {
+            String possibleTwoCharSymbol = symbol + (char) ch;
+            if (symbols.containsKey(possibleTwoCharSymbol)) {
+                currentToken = possibleTwoCharSymbol;
+                currentLexType = symbols.get(possibleTwoCharSymbol);
+                return;
+            }
+        }
+        reader.reset();
+        if (symbols.containsKey(symbol)) {
+            currentToken = symbol;
+            currentLexType = symbols.get(symbol);
+        } else {
+            currentToken = symbol;
+            currentLexType = LexType.ERROR;  // 处理错误符号
+        }
+        return;
+    }
+    ```
+    
+    If the input contains `&` (single ampersand), `possibleTwoCharSymbol` is `&` + next char.
+    If next char is not `&`, it resets.
+    Then it checks `symbols.containsKey("&")`. It does! `LexType.AND`.
+    So `&` is tokenized as `AND`.
+    Same for `|`.
+
+    The `ErrorChecker` in `frontend/Lexer/ErrorChecker.java` checks for single `&` and `|` in the source code lines to report error `a`.
+    
+    This doesn't cause TLE.
+
+    Let's look at `SyntaxTreeNode.traverse`.
+    ```java
+    public void traverse(BufferedWriter writer) throws IOException {
+        for (SyntaxTreeNode child : children) {
+            if (child.getChildren().isEmpty()) {
+                writer.write(child.getType() + " " + child.getValue());
+                writer.newLine(); 
+            } else {
+                child.traverse(writer);
+                if (!child.getType().equals("BlockItem") && !child.getType().equals("Decl") && !child.getType().equals("BType")) {
+                    writer.write("<" + child.getType() + ">");
+                    writer.newLine(); 
+                }
+            }
+        }
+    }
+    ```
+    This is a standard DFS. Unless the tree is circular or infinitely deep, it won't hang.
+
+    Is it possible `parseCompUnit` loops?
+    ```java
+    while (getCurrentToken() != null) {
+        if (isMainFuncDef()) {
+             compUnitNode.addChild(parseMainFuncDef());
+        } 
+        // ...
+    }
+    ```
+    If `parseMainFuncDef` fails to consume tokens (e.g. infinite loop inside it), then `getCurrentToken()` never becomes null or changes, causing `parseCompUnit` to loop forever.
+
+    We traced `parseMainFuncDef` and it seemed to consume tokens correctly.
+
+    However, there is a subtle bug in `parseStmt` regarding `LVal` backtracking.
+    
+    ```java
+    if (getCurrentToken().getTokenType() == LexType.IDENFR) {
+        int savedTokenIndex = currentTokenIndex; 
+        SyntaxTreeNode possibleLValNode = parseLVal(); 
+
+        if (getCurrentToken() != null && getCurrentToken().getTokenType() == LexType.ASSIGN) {
+            // ...
+        } else {
+            currentTokenIndex = savedTokenIndex;
+        }
+    }
+    ```
+    
+    If `parseLVal` encounters an error (e.g. `Ident` followed by something invalid for LVal array access, though `LVal` is simple `Ident ['[' Exp ']']`), it might not advance correctly?
+    `parseLVal`:
+    ```java
+    if (getCurrentToken().getTokenType() == LexType.IDENFR) {
+        // ...
+        advance(); 
+    } else {
+        // Error
+    }
+    // Optional '['
+    if (getCurrentToken().getTokenType() == LexType.LBRACK) {
+       // ...
+    }
+    return lValNode;
+    ```
+    If it's just `Ident`, it advances.
+    
+    What if the token is NOT `IDENFR`? The outer `if` prevents entry.
+
+    There is one scenario for TLE: **Recursion Depth / Stack Overflow** masquerading as TLE, or an infinite loop in `Lexer`.
+
+    Actually, look at `Lexer`'s comment handling:
+    ```java
+    } else if (currentChar == '/') { // 处理单行或多行注释
+        reader.mark(1); 
+        ch = reader.read();
+        currentChar = (char) ch;
+
+        if (currentChar == '/') {
+            while (ch != -1 && currentChar != '\n') {
+                ch = reader.read();
+                currentChar = (char) ch;
+            }
+            lineNumber++;
+            continue;
+
+        } else if (currentChar == '*') {
+            boolean endOfComment = false;
+            while ((ch = reader.read()) != -1) {
+                currentChar = (char) ch;
+                if (currentChar == '*' && (ch = reader.read()) != -1 && (char) ch == '/') {
+                    endOfComment = true;
+                    break;
+                }
+                if (currentChar == '\n') {
+                    lineNumber++;
+                }
+            }
+            if (!endOfComment) {
+                // ...
+            }
+            continue;
+        } else {
+            reader.reset();
+            // ...
+        }
+    }
+    ```
+    
+    If `reader.mark(1)` is called, and then `reader.read()` is called.
+    If `reset()` is called, it goes back.
+    
+    In the `/* */` case:
+    `while ((ch = reader.read()) != -1)`
+    Inside: `if (currentChar == '*' && (ch = reader.read()) != -1 && (char) ch == '/')`
+    
+    If the comment is `/**/`:
+    1. Read `*`. `currentChar` = `*`.
+    2. Check `currentChar == '*'`. True.
+    3. `ch = reader.read()`. Reads `/`.
+    4. `(char) ch == '/'`. True.
+    5. `endOfComment = true`. Break.
+    
+    This looks correct.
+
+    **Wait**, look at `parseUnaryExp` again.
+    
+    ```java
+    else if (isUnaryOp()) {
+        unaryExpNode.addChild(parseUnaryOp());
+        advance(); // 跳过当前的一元运算符
+        // 解析 UnaryExp
+        unaryExpNode.addChild(parseUnaryExp());
+    }
+    ```
+    
+    `parseUnaryOp()` does NOT advance.
+    `advance()` advances.
+    Then `parseUnaryExp()` is called recursively.
+    
+    If `isUnaryOp()` is true, we advance.
+    
+    What if `parseUnaryExp` is called, and `isPrimaryExp()` is false, `IDENFR` check is false, `isUnaryOp()` is true.
+    We advance.
+    Then recursive call.
+    
+    This is standard left-recursion elimination / precedence parsing. It should terminate.
+
+    **The Error:**
+    
+    In `Parser.java`, `parseCompUnit` has this structure:
+    
+    ```java
+    while (getCurrentToken() != null) {
+        if (isMainFuncDef()) {
+            compUnitNode.addChild(parseMainFuncDef());
+        } else if (...) {
+             // ...
+        } else if (...) {
+             // ...
+        } else {
+             // ...
+             break;
+        }
+    }
+    ```
+    
+    If `parseMainFuncDef()` encounters an error where it **fails to advance** the token stream (e.g. stuck in a loop or returning without consuming the problematic token), `getCurrentToken()` remains the same, and the `while` loop in `parseCompUnit` repeats infinitely.
+
+    Let's check `parseMainFuncDef` for non-advancing paths.
+    
+    ```java
+    private SyntaxTreeNode parseMainFuncDef() {
+        // ... matches int, main, (
+        // 检查是否有右小括号 ')'
+        if (getCurrentToken().getValue().equals(")")) {
+            mainFuncDefNode.addChild(new SyntaxTreeNode("RPARENT", ")"));
+            advance(); // 跳过 ')'
+        } else {
+            // 缺少右小括号，记录错误 (错误类型 j)
+            recordError(getPreviousToken().getLineNumber(), "j");
+        }
+
+        // 解析函数体 Block
+        mainFuncDefNode.addChild(parseBlock());
+
+        return mainFuncDefNode;
+    }
+    ```
+    
+    If `)` is missing, it records error but **does not advance**.
+    Then it calls `parseBlock()`.
+    
+    `parseBlock()` expects `{`.
+    
+    ```java
+    private SyntaxTreeNode parseBlock() {
+        // ...
+        if (getCurrentToken().getValue().equals("{")) {
+            // ...
+            advance();
+        } else {
+            System.out.println("Error: Expected '{' in Block");
+            // System.exit(currentTokenIndex);
+        }
+        // ...
+    }
+    ```
+    
+    If `{` is missing, it prints error and presumably exits or throws? The code says `System.exit` is commented out. It just prints. It does **not** advance.
+    
+    Then `parseBlock` continues to `while (!getCurrentToken().getValue().equals("}"))`.
+    
+    If the token is NOT `}`, it calls `parseBlockItem`.
+    
+    If the token is stuck, `parseBlockItem` -> `parseStmt` -> ...
+    
+    If `parseStmt` cannot consume the token, it might return without advancing.
+    
+    If `parseBlock`'s loop condition `!getCurrentToken().getValue().equals("}")` remains true because the token never advances to `}`, and `parseBlockItem` doesn't advance, we have an infinite loop.
+
+    In our specific test case, `main()` is correct. `int main() {`. So `parseMainFuncDef` advances correctly.
+
+    However, there is a known issue in student parsers: **Left Recursion** or **Failure to Advance on Error**.
+
+    Look at `parseBlockItem`:
+    ```java
+    if (getCurrentToken().getTokenType() == LexType.INTTK || ...) {
+        blockItemNode.addChild(parseDecl());
+    } else {
+        blockItemNode.addChild(parseStmt());
+    }
+    ```
+    
+    If `parseDecl` or `parseStmt` returns without advancing (due to error), `parseBlock` loops infinitely.
+
+    In the provided test case, are there any errors that cause non-advancement?
+    
+    Error 1: `printf(...)`. Missing `;`.
+    `parseStmt` (printf case):
+    Matches `printf`, `(`, `Str`, `)`.
+    Checks `;`. Not found.
+    Records error.
+    Returns.
+    Did it advance? Yes, it advanced past `)`. The current token is now `if`.
+    
+    Error 2: `int a`. Missing `;`.
+    `parseVarDecl`:
+    Matches `int`, `a`.
+    Checks `;`. Not found (next is `for`).
+    Records error.
+    Returns.
+    Did it advance? Yes, it advanced past `a`. The current token is now `for`.
+    
+    Error 3: `return 0`. Missing `;`.
+    `parseStmt` (return case):
+    Matches `return`.
+    Parses `Exp` (`0`). Advances past `0`.
+    Checks `;`. Not found (next is `}`).
+    Records error.
+    Returns.
+    Did it advance? Yes, it advanced past `0`. The current token is now `}`.
+
+    So in all error cases, the parser **did** advance past the last valid token.
+
+    **Is it possible the TLE is due to `Lexer`?**
+
+    In `Lexer.java`:
+    ```java
+    public static Lexer getInstance(String inputFile) throws IOException {
+        if (instance == null) {
+            instance = new Lexer(inputFile);
+        }
+        return instance;
+    }
+    ```
+    
+    If `Compiler.java` is run, it creates a Lexer.
+    
+    If the `Lexer`'s `next()` method is called after EOF?
+    ```java
+    while ((ch = reader.read()) != -1) {
+       // ...
+    }
+    currentToken = null;
+    currentLexType = null;
+    ```
+    It returns.
+
+    **Conclusion:**
+    
+    The most likely cause of TLE in these types of assignments, when the logic seems correct for the happy path and simple errors, is often an **infinite loop in the parser when encountering an unexpected token that isn't handled by advancing**.
+
+    Although our trace showed advancement, let's look at `parseStmt`'s `LVal` backtracking again.
+
+    ```java
+    if (getCurrentToken().getTokenType() == LexType.IDENFR) {
+        int savedTokenIndex = currentTokenIndex; 
+        SyntaxTreeNode possibleLValNode = parseLVal(); 
+
+        if (getCurrentToken() != null && getCurrentToken().getTokenType() == LexType.ASSIGN) {
+             // ...
+        } else {
+            currentTokenIndex = savedTokenIndex;
+        }
+    }
+    ```
+
+    If `parseLVal` advances (consumes `Ident`), and then we reset `currentTokenIndex`, we are back at `Ident`.
+    
+    Then we go to `if (!isLVal)`.
+    
+    If the `Ident` is NOT part of an assignment, it falls through to the other cases.
+    
+    If it falls to `[Exp]

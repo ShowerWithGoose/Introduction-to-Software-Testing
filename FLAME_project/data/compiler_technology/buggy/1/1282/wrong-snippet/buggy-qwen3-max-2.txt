@@ -1,0 +1,816 @@
+Based on the problem description and test case, the program should output syntax component names like `<Stmt>`, `<VarDecl>`, etc. for correct source code, but the buggy output shows "No output file". This indicates that the AST dumping logic is not working correctly.
+
+Looking at the expected output, we can see that syntax components are printed after their children (post-order traversal), and the final line is `<CompUnit>`. However, in the `DumpAST.dump()` method, the code writes `<CompUnit>` at the end after calling `dump(compUnit.explore())`.
+
+The issue is in the `DumpAST.java` file. The current implementation calls `dump(compUnit.explore())` first, then writes `<CompUnit>`, but it should integrate the CompUnit node properly into the recursive dumping process.
+
+Looking more closely at the `dump` method in `DumpAST.java`, the problem is that the main `dump(CompUnit compUnit)` method handles `CompUnit` specially by writing `<CompUnit>` at the very end, but the recursive `dump(ArrayList<Object> nodes)` method doesn't handle the root `CompUnit` object itself - it only processes the result of `compUnit.explore()`.
+
+However, the real issue is more fundamental. Looking at the expected output, we can see that `<CompUnit>` appears as the very last line, which matches the current implementation. But the problem is that no output file is being generated at all.
+
+Wait, looking at the test case input and expected output more carefully, I notice that the expected output includes many syntax component names like `<Stmt>`, `<VarDecl>`, `<Block>`, etc., but the current `DumpAST.dump()` method should be generating these.
+
+The key insight is in the `frontend()` method in `Compiler.java`. Notice this sequence:
+
+```java
+CompUnit compUnit = new CompUnit(tokenStream);
+// TODO 下一行为参与语法分析评测时的特地设置
+errorHandle(errorTable);
+if (Config.dumpAST) {
+    DumpAST.dump(compUnit);
+}
+```
+
+The `errorHandle(errorTable)` is called immediately after creating the `CompUnit`, and if there are any errors in the error table, it will exit with code 1 and dump errors instead of AST.
+
+But the test case is a correct program, so why would there be errors? 
+
+Looking at the lexer code, specifically the handling of `&` and `|` characters:
+
+In `Lexer.java`, when encountering a single `&` or `|`, it adds an error to the error table but still creates an `AND` or `OR` token:
+
+```java
+case '&' -> {
+    fgetc();
+    if (c == '&') {
+        this.gotToken(TokenType.AND, "&&");
+    } else {
+        this.gotToken(TokenType.AND, "&");
+        this.errorTable.addErrorRecord(this.line, ErrorType.ILLEGAL_AND_OR,
+                "Got '" + c + "'(ASCII:" + (int) c + ") when expected '&'");
+        ungetc();
+    }
+}
+```
+
+This means that even for correct programs, if there are no actual `&` or `|` characters, this shouldn't trigger. But wait, the test case doesn't contain any `&` or `|` characters.
+
+Actually, looking more carefully at the `Compiler.java` file, I see the issue:
+
+```java
+// Stage2 语法分析
+// 创建CompUnit(AST) -> 错误处理 -> [输出CompUnit(AST)]
+CompUnit compUnit = new CompUnit(tokenStream);
+// TODO 下一行为参与语法分析评测时的特地设置
+errorHandle(errorTable);
+```
+
+The comment says "TODO 下一行为参与语法分析评测时的特地设置" (TODO: next line is a special setting for syntax analysis evaluation). This suggests that the `errorHandle(errorTable)` call might be misplaced.
+
+But the real problem is likely in the `CompUnit` parsing logic. Looking at the `CompUnit.java` constructor:
+
+```java
+while (stream.getNext(2).type() != TokenType.LPARENT) {
+    decls.add(Decl.parse(stream));
+}
+// FuncDef → FuncType $Ident$ '(' [FuncFParams] ')' Block
+// MainFuncDef → 'int' $'main'$ '(' ')' Block
+while (stream.getNext(1).type() != TokenType.MAINTK) {
+    funcDefs.add(new FuncDef(stream));
+}
+mainFuncDef = new MainFuncDef(stream);
+```
+
+The condition `stream.getNext(2).type() != TokenType.LPARENT` is used to decide whether to parse a declaration. But what if we have a variable declaration like `int a = 0;`? The tokens would be `[INTTK, IDENFR, ASSIGN, ...]`, so `getNext(2)` would be `ASSIGN`, not `LPARENT`, so it would be parsed as a declaration, which is correct.
+
+However, the issue might be that the parser is encountering an unexpected token and adding errors to the error table, causing the program to exit before reaching the AST dumping code.
+
+But the most likely culprit is actually in the `DumpAST.java` file. Looking at the `dump` method:
+
+```java
+public static void dump(CompUnit compUnit) throws IOException {
+    out = new BufferedWriter(new FileWriter(Config.dumpASTFileName));
+    dump(compUnit.explore());
+    out.write("<CompUnit>");
+    out.close();
+}
+```
+
+This writes `<CompUnit>` without a newline at the end! But the expected output shows `<CompUnit>` as the last line, and it should have a newline.
+
+However, the bigger issue is that the recursive `dump` method writes newlines after each syntax component (`out.write("<" + branchNode.getClass().getSimpleName() + ">" + "\n");`), but the final `<CompUnit>` is written without a preceding newline from the recursive dump.
+
+But the test case shows "No output file", which suggests the file isn't being created at all, not that it has formatting issues.
+
+Wait, looking back at the `Compiler.java` file, I notice:
+
+```java
+tryContinue(1);
+// Stage2 语法分析
+// 创建CompUnit(AST) -> 错误处理 -> [输出CompUnit(AST)]
+CompUnit compUnit = new CompUnit(tokenStream);
+// TODO 下一行为参与语法分析评测时的特地设置
+errorHandle(errorTable);
+if (Config.dumpAST) {
+    DumpAST.dump(compUnit);
+}
+tryContinue(2);
+```
+
+And the `tryContinue` method:
+
+```java
+private static void tryContinue(int nowStage) {
+    if (Config.stages <= nowStage) {
+        exit(0);
+    }
+}
+```
+
+If `Config.stages` is set to 1, then after `tryContinue(1)`, it would exit before doing syntax analysis. But the problem states this is for syntax analysis, so `Config.stages` should be 2.
+
+Actually, looking at the `global/Config.java`:
+
+```java
+/* 总共进行阶段数
+   ==== 前端 ====
+   1. 词法分析，生成TokenStream
+   2. 语法分析，生成CompUnit(AST)
+ */
+public static int stages = 2;
+```
+
+So stages is 2 by default, which means it should proceed to syntax analysis.
+
+The real issue is likely that during parsing, some error is being added to the error table, causing `errorHandle` to exit with code 1 before reaching the AST dump.
+
+Looking at the test case input:
+```c
+int main() {
+    printf("21373119");
+    int a = 0;
+    {
+        int a = 1;
+        printf("%d",a); // 输出 1
+    }
+    return 0;
+}
+```
+
+This should parse correctly. But let's check if there are any missing semicolons or other issues.
+
+Actually, I think the problem is in the `CompUnit` parsing logic. The condition `while (stream.getNext(2).type() != TokenType.LPARENT)` assumes that declarations don't have `LPARENT` as the third token, but what about the main function? The main function starts with `int main()`, so tokens are `[INTTK, MAINTK, LPARENT, ...]`, so `getNext(2)` would be `LPARENT`, which would stop the declaration parsing loop.
+
+But what about variable declarations inside blocks? Those are handled by `BlockItem.parse()`, not by the top-level `CompUnit` parsing.
+
+Wait, the issue might be that the parser is not handling the block statements correctly, and errors are being added.
+
+But looking more carefully at the expected output, I notice that it includes lines like:
+```
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+<InitVal>
+<VarDef>
+SEMICN ;
+<VarDecl>
+```
+
+This suggests that the AST nodes are being explored correctly.
+
+The most likely issue is in the `DumpAST.dump()` method. Let me look at it again:
+
+```java
+public static void dump(CompUnit compUnit) throws IOException {
+    out = new BufferedWriter(new FileWriter(Config.dumpASTFileName));
+    dump(compUnit.explore());
+    out.write("<CompUnit>");
+    out.close();
+}
+```
+
+The problem is that `out.write("<CompUnit>");` doesn't include a newline, but more importantly, it's written after the recursive dump. However, the expected output ends with `<CompUnit>` as the last line, which is correct.
+
+But wait, the expected output shows:
+```
+...
+<Block>
+<MainFuncDef>
+<CompUnit>
+```
+
+So `<CompUnit>` should be the very last line. The current implementation should produce this.
+
+However, I notice that in the `dump(ArrayList<Object> nodes)` method, when it encounters an `ASTNode`, it calls `dump(branchNode.explore())` and then writes the syntax component name. This is post-order traversal, which matches the expected output.
+
+But there's a critical bug: the `dump(CompUnit compUnit)` method calls `dump(compUnit.explore())` which processes all the children, but then it writes `<CompUnit>` without a newline. However, the expected output shows `<CompUnit>` on its own line, so it should be `out.write("<CompUnit>\n");`.
+
+But the bigger issue might be that the file is not being flushed or closed properly, but `out.close()` should handle that.
+
+Actually, looking at the test case again: "Buggy Output: No output file". This means the `parser.txt` file is not being created at all.
+
+This suggests that the program is exiting before reaching `DumpAST.dump(compUnit)`. The most likely reason is that `errorHandle(errorTable)` is being called and finding errors in the error table.
+
+Why would there be errors in a correct program?
+
+Looking back at the lexer, I see that in the `lexSymbolComment()` method, for single `&` and `|` characters, it adds an error to the error table. But the test case doesn't contain these characters.
+
+Wait, but what about the `-` character? In the grammar, there's a distinction between the minus operator and the dash. But the test case uses `-` in `return 0;` which is just the integer 0, no minus sign.
+
+Actually, looking at the test case input again, I don't see any problematic characters.
+
+Let me check the `CompUnit` parsing logic more carefully. The first while loop condition is:
+
+```java
+while (stream.getNext(2).type() != TokenType.LPARENT) {
+    decls.add(Decl.parse(stream));
+}
+```
+
+For the test case, the first tokens are:
+`[INTTK, MAINTK, LPARENT, RPARENT, LBRACE, ...]`
+
+So `stream.getNext(2)` at the beginning would be `LPARENT` (since position 0 is `INTTK`, position 1 is `MAINTK`, position 2 is `LPARENT`). So the condition `stream.getNext(2).type() != TokenType.LPARENT` is false, so the while loop doesn't execute, which is correct because there are no top-level declarations before main.
+
+Then the second while loop:
+```java
+while (stream.getNext(1).type() != TokenType.MAINTK) {
+    funcDefs.add(new FuncDef(stream));
+}
+```
+
+At this point, `stream.getNow()` is `INTTK` (position 0), so `stream.getNext(1)` is `MAINTK`, so the condition is false, and the while loop doesn't execute, which is correct because there are no function definitions before main.
+
+Then it parses `mainFuncDef = new MainFuncDef(stream);`, which should work.
+
+So the parsing should succeed without errors.
+
+But wait, there's another possibility. In the `Compiler.java` file, after lexical analysis, there's:
+
+```java
+tryContinue(1);
+```
+
+And `tryContinue(1)` checks if `Config.stages <= 1`. Since `Config.stages = 2`, it continues.
+
+Then after syntax analysis setup, there's:
+
+```java
+tryContinue(2);
+```
+
+Which checks if `Config.stages <= 2`. Since `Config.stages = 2`, this condition is true, so it calls `exit(0)` before reaching the semantic analysis stage.
+
+But that's after the AST dumping code, so it should be fine.
+
+Wait, no, the structure is:
+
+```java
+CompUnit compUnit = new CompUnit(tokenStream);
+// TODO 下一行为参与语法分析评测时的特地设置
+errorHandle(errorTable);
+if (Config.dumpAST) {
+    DumpAST.dump(compUnit);
+}
+tryContinue(2);  // This is after the dump
+```
+
+So the dump should happen.
+
+I think the real issue is in the `DumpAST.dump()` method. Let me look at it once more:
+
+```java
+public static void dump(CompUnit compUnit) throws IOException {
+    out = new BufferedWriter(new FileWriter(Config.dumpASTFileName));
+    dump(compUnit.explore());
+    out.write("<CompUnit>");
+    out.close();
+}
+```
+
+The problem is that `out.write("<CompUnit>");` doesn't end with a newline, but that wouldn't prevent file creation.
+
+However, there's a more serious issue: if an exception occurs during `dump(compUnit.explore())`, the `out.close()` might not be called, but that would typically still create a partial file.
+
+Given that the output is "No output file", the most likely explanation is that the program is exiting due to errors before reaching the dump code.
+
+Looking back at the `MainFuncDef` constructor:
+
+```java
+rparentToken = stream.consumeOrError(place, ErrorType.MISSING_RPARENT, TokenType.RPARENT);
+```
+
+This uses `consumeOrError`, which adds an error to the error table if the token is not found, but doesn't throw an exception (since `parserThrowable` is true by default, but `consumeOrError` doesn't throw, it just adds to error table).
+
+In the test case, `main()` has proper parentheses, so this should be fine.
+
+Wait a minute! I think I found the issue. In the `Compiler.java` file:
+
+```java
+// Stage2 语法分析
+// 创建CompUnit(AST) -> 错误处理 -> [输出CompUnit(AST)]
+CompUnit compUnit = new CompUnit(tokenStream);
+// TODO 下一行为参与语法分析评测时的特地设置
+errorHandle(errorTable);
+```
+
+The comment says this is a "special setting for syntax analysis evaluation". This suggests that for the syntax analysis phase, they want to check for errors immediately after parsing.
+
+But in a correct program, there should be no errors. However, let's consider the possibility that the lexer is adding spurious errors.
+
+Looking at the `lexSymbolComment()` method again, specifically the handling of `-`:
+
+```java
+case '-' -> this.gotToken(TokenType.MINU, "-");
+```
+
+This seems fine.
+
+Actually, I think the issue might be in the `CompUnit` parsing logic. Let's trace through the test case step by step:
+
+1. Tokens: `[INTTK, MAINTK, LPARENT, RPARENT, LBRACE, PRINTFTK, LPARENT, STRCON, RPARENT, SEMICN, INTTK, IDENFR, ASSIGN, INTCON, SEMICN, LBRACE, INTTK, IDENFR, ASSIGN, INTCON, SEMICN, PRINTFTK, LPARENT, STRCON, COMMA, IDENFR, RPARENT, SEMICN, RBRACE, RETURNTK, INTCON, SEMICN, RBRACE, EOF]`
+
+2. In `CompUnit` constructor:
+   - `stream.getNext(2)` is `LPARENT` (tokens[2]), so first while loop doesn't run
+   - `stream.getNext(1)` is `MAINTK` (tokens[1]), so second while loop doesn't run  
+   - Parse `MainFuncDef`
+
+3. In `MainFuncDef`:
+   - Consume `INTTK` ✓
+   - Consume `MAINTK` ✓  
+   - Consume `LPARENT` ✓
+   - Consume `RPARENT` ✓ (using `consumeOrError`)
+   - Parse `Block`
+
+4. In `Block`:
+   - Consume `LBRACE` ✓
+   - Parse `BlockItem`s until `RBRACE`
+
+The first `BlockItem` is `printf("21373119");`, which should be parsed as a `Stmt_Printf`.
+
+This should work fine.
+
+I'm starting to think the issue might be in the `DumpAST` class itself. Let me look at the recursive `dump` method:
+
+```java
+private static void dump(ArrayList<Object> nodes) throws IOException {
+    for (Object node : nodes) {
+        if (node != null) {
+            if (node instanceof ASTNode branchNode) {
+                dump(branchNode.explore());
+                out.write("<" + branchNode.getClass().getSimpleName() + ">" + "\n");
+            } else if (node instanceof ASTNodeWithOption<?> branchNodeWithOption) {
+                dump(branchNodeWithOption.extract().explore());
+                out.write("<" + branchNodeWithOption.getClass().getSimpleName() + ">" + "\n");
+            } else if (node instanceof Token leafNode) {
+                out.write(leafNode.type().toString() + " " + leafNode.strVal() + "\n");
+            }
+        }
+    }
+}
+```
+
+This looks correct. It recursively dumps children, then writes the parent node name.
+
+But wait! The `CompUnit` class implements `ASTNode`, so `compUnit.explore()` returns an `ArrayList<Object>` containing decls, funcDefs, and mainFuncDef.
+
+When `dump(compUnit.explore())` is called, it will process each of these items. For each `Decl`, `FuncDef`, and `MainFuncDef`, since they implement `ASTNode`, it will recursively dump their children and then write their class names like `<MainFuncDef>`.
+
+Finally, after `dump(compUnit.explore())` returns, it writes `<CompUnit>`.
+
+This matches the expected output.
+
+Given that the output is "No output file", I suspect the issue is that an exception is being thrown during parsing, and since `parserThrowable` is true by default, it's causing a runtime exception that terminates the program before reaching the error handling or AST dumping code.
+
+Looking at various parsing methods, I see many calls to `consumeOrThrow`, which will throw a `RuntimeException` if the expected token is not found.
+
+In particular, let's look at the `Stmt_Printf` constructor:
+
+```java
+stringConst = stream.consumeOrThrow(place, TokenType.STRCON);
+```
+
+This should be fine for `"21373119"` and `"%d"`.
+
+But what about the comma in `printf("%d",a);`? The code:
+
+```java
+while (stream.isNow(TokenType.COMMA)) {
+    commaTokens.add(stream.consumeOrThrow(place, TokenType.COMMA));
+    exps.add(new Exp(stream));
+}
+```
+
+This should work.
+
+I think I need to focus on the fact that the expected output includes `<Stmt>` multiple times, but according to the problem description, `<Stmt>` should be output before completing the analysis of the Stmt component.
+
+Wait, no, the problem says: "Before completing the analysis of any syntax components in the grammar (except for <BlockItem>, <Decl>, <BType>), output the name of the current syntax component on a new line"
+
+But the output format shows the syntax component name AFTER the terminal tokens, which suggests post-order traversal, which is what the current `DumpAST` implementation does.
+
+Actually, re-reading: "output the information of each word line by line in the order recognized by lexical analysis. Before completing the analysis of any syntax components... output the name of the current syntax component"
+
+This is ambiguous, but the expected output shows terminals first, then non-terminals, which is post-order.
+
+Given all this, I think the most likely location of the error is in the `DumpAST.java` file, specifically in how it handles the root `CompUnit` node.
+
+But wait! Looking at the `dump(CompUnit compUnit)` method again:
+
+```java
+public static void dump(CompUnit compUnit) throws IOException {
+    out = new BufferedWriter(new FileWriter(Config.dumpASTFileName));
+    dump(compUnit.explore());
+    out.write("<CompUnit>");
+    out.close();
+}
+```
+
+The issue is that `out.write("<CompUnit>");` does not include a newline character `\n`. However, the expected output shows `<CompUnit>` as the last line, and in text files, the last line should end with a newline.
+
+But more importantly, if the `dump(compUnit.explore())` call doesn't output anything (due to some error), then only `<CompUnit>` would be written without a newline.
+
+However, the problem states "No output file", not "Empty output file" or "File with just <CompUnit>".
+
+This suggests the file is never created, which means `DumpAST.dump(compUnit)` is never called.
+
+Going back to `Compiler.java`, the only way this happens is if `errorHandle(errorTable)` exits the program before reaching the dump code.
+
+So why would `errorTable` have errors for a correct program?
+
+Let me check the `Lexer` again for any spurious error additions.
+
+In the `lexSymbolComment()` method:
+
+```java
+case '&' -> {
+    fgetc();
+    if (c == '&') {
+        this.gotToken(TokenType.AND, "&&");
+    } else {
+        this.gotToken(TokenType.AND, "&");
+        this.errorTable.addErrorRecord(this.line, ErrorType.ILLEGAL_AND_OR,
+                "Got '" + c + "'(ASCII:" + (int) c + ") when expected '&'");
+        ungetc();
+    }
+}
+case '|' -> {
+    fgetc();
+    if (c == '|') {
+        this.gotToken(TokenType.OR, "||");
+    } else {
+        this.gotToken(TokenType.OR, "|");
+        this.errorTable.addErrorRecord(this.line, ErrorType.ILLEGAL_AND_OR,
+                "Got '" + c + "'(ASCII:" + (int) c + ") when expected '|'");
+        ungetc();
+    }
+}
+```
+
+This adds an error for single `&` or `|`, but the test case doesn't contain these.
+
+However, what about other characters? The test case contains `-` in the grammar rules, but not in the actual code.
+
+Wait, the test case has `return 0;` - no minus signs.
+
+I think I need to consider that the parser might be adding errors for missing semicolons or other issues.
+
+Looking at the `VarDecl` constructor:
+
+```java
+semicnToken = stream.consumeOrError(place, ErrorType.MISSING_SEMICN, TokenType.SEMICN);
+```
+
+This uses `consumeOrError`, which adds an error to the error table if the semicolon is missing. But in the test case, semicolons are present.
+
+Similarly, `Stmt_LValAssign`:
+
+```java
+semicnToken = stream.consumeOrError(place, ErrorType.MISSING_SEMICN, TokenType.SEMICN);
+```
+
+All statements in the test case have semicolons.
+
+Given all this, I'm starting to think the issue might be in the `CompUnit` parsing logic's lookahead.
+
+Let's reconsider the first while loop condition:
+
+```java
+while (stream.getNext(2).type() != TokenType.LPARENT) {
+    decls.add(Decl.parse(stream));
+}
+```
+
+What if the stream is at the end? `getNext(2)` might return null, and calling `.type()` on null would throw a NullPointerException.
+
+Looking at the `TokenStream.getNext()` method:
+
+```java
+public Token getNext(int offset) {
+    if (this.hasNext()) {
+        return this.list.get(this.pos + offset);
+    } else {
+        return null;
+    }
+}
+```
+
+And `hasNext()` checks if the current token is EOF.
+
+So if `pos + offset` is beyond the list size, `getNext(offset)` returns null.
+
+Then `stream.getNext(2).type()` would throw a NullPointerException when `getNext(2)` returns null.
+
+This would happen if there are fewer than 3 tokens remaining in the stream.
+
+In the test case, at the beginning, there are plenty of tokens, so this shouldn't be an issue.
+
+But what about after parsing the main function? No, the `CompUnit` constructor only does this lookahead at the beginning.
+
+Actually, for the test case, at the start:
+- pos = 0
+- tokens[0] = INTTK
+- tokens[1] = MAINTK  
+- tokens[2] = LPARENT
+- So getNext(2) returns tokens[2], which is LPARENT, so the loop doesn't execute.
+
+This is correct.
+
+I think I've been overcomplicating this. Let's look at the expected output again. It includes:
+
+```
+INTTK int
+MAINTK main
+LPARENT (
+RPARENT )
+LBRACE {
+PRINTFTK printf
+...
+```
+
+This is the lexical token output, followed by syntax components.
+
+The fact that the buggy output is "No output file" suggests that either:
+1. The program crashes before creating the file
+2. The error table has entries, so it outputs to error.txt instead
+
+Given that this is a correct program, #2 shouldn't happen unless there's a bug in the parser that incorrectly adds errors.
+
+Looking at the `Stmt_Printf` constructor again:
+
+```java
+rparentToken = stream.consumeOrError(place, ErrorType.MISSING_RPARENT, TokenType.RPARENT);
+semicnToken = stream.consumeOrError(place, ErrorType.MISSING_SEMICN, TokenType.SEMICN);
+```
+
+This should work for `printf("21373119");` and `printf("%d",a);`.
+
+But what about the second printf: `printf("%d",a);` - after parsing the string and the comma and the expression `a`, it expects `RPARENT` and `SEMICN`, which are there.
+
+I think the issue might be in the `LVal` parsing for `a` in `printf("%d",a);`.
+
+In `LVal` constructor:
+
+```java
+rbrackToken = lbrackToken != null ? stream.consumeOrError(place, ErrorType.MISSING_RBRACK, TokenType.RBRACK) : null;
+```
+
+Since `a` is a simple identifier with no brackets, `lbrackToken` is null, so `rbrackToken` is null, which is fine.
+
+This should work.
+
+Given the time I've spent, I think the most likely location of the error is in the `DumpAST.java` file, specifically in the main `dump` method not properly handling the output.
+
+But wait! Looking at the `global/Config.java`:
+
+```java
+// 语法分析后，是否输出CompUnit(AST)、输出的文件名
+public static boolean dumpAST = false;
+public static String dumpASTFileName = "parser.txt";
+```
+
+And in `Compiler.java`:
+
+```java
+if (Config.dumpAST) {
+    DumpAST.dump(compUnit);
+}
+```
+
+By default, `dumpAST` is false! So the AST is never dumped.
+
+But the problem says this is for syntax analysis, and the expected output is to `parser.txt`.
+
+Looking at the `setConfigByArgs` method:
+
+```java
+// Syntax Analysis: -S
+case "-S" -> {
+    stages = 2;
+    dumpAST = true;
+};
+```
+
+So to enable AST dumping, the program needs to be run with the `-S` flag.
+
+However, the problem description doesn't mention command-line arguments, and the test environment likely runs it with the appropriate flags.
+
+But in the `Compiler.java` main method:
+
+```java
+public static void main(String[] args) {
+    Config.setConfigByArgs(args);
+    try {
+        SourceCode sourceCode = new SourceCode(Config.inputFilename);
+        frontend(sourceCode);
+    } catch (IOException e) {
+        e.printStackTrace();
+    }
+}
+```
+
+If no arguments are passed, `Config.dumpAST` remains false, so no AST is dumped.
+
+But the problem states this is for syntax analysis, so presumably the test runner passes `-S`.
+
+Given that the expected output is provided, we must assume that `dumpAST` is true.
+
+I think I need to accept that the issue is likely in the `DumpAST` class's handling of the root node.
+
+But there's one more possibility. In the `dump(ArrayList<Object> nodes)` method, what if `nodes` is null or contains null values that cause issues?
+
+Looking at various `explore()` methods, they all return `new ArrayList<>()`, so they shouldn't be null.
+
+After careful consideration, I believe the error is in the `CompUnit.java` file's parsing logic. The lookahead conditions are flawed.
+
+Specifically, the condition `stream.getNext(2).type() != TokenType.LPARENT` assumes that the third token being LPARENT indicates a function definition, but what if we have a variable declaration like `int a[10];`? The tokens would be `[INTTK, IDENFR, LBRACK, ...]`, so `getNext(2)` would be `LBRACK`, not `LPARENT`, so it would be parsed as a declaration, which is correct.
+
+But for the main function, it works as expected.
+
+However, there's a edge case: what if the input is just `int main() {}` with no other tokens? At the beginning, `getNext(2)` would be `LPARENT`, so no declarations are parsed, which is correct.
+
+I think the real issue is that the parser is not handling the block statements correctly, and errors are being added to the error table.
+
+Looking at the `Block` constructor:
+
+```java
+while (stream.getNow().type() != TokenType.RBRACE) {
+    blockItems.add(BlockItem.parse(stream));
+}
+```
+
+This should work.
+
+But what if the stream reaches EOF before finding RBRACE? Then `stream.getNow().type()` would be EOF, and the loop would continue, calling `BlockItem.parse(stream)` with EOF, which would likely cause errors.
+
+In the test case, the braces are balanced, so this shouldn't happen.
+
+Given the time I've spent, I'll go with the `DumpAST.java` file as the most likely location, specifically the main `dump` method not writing a newline for `<CompUnit>`, but that doesn't explain "No output file".
+
+Wait! What if an exception is thrown in `dump(compUnit.explore())`, and because of that, `out.close()` is not called, and the BufferedWriter doesn't flush its contents to the file?
+
+In Java, if you don't close a BufferedWriter, the data might not be written to the file.
+
+But the code does call `out.close()` in a finally-like manner (though not in a try-finally block).
+
+If an exception occurs during `dump(compUnit.explore())`, the `out.close()` line would not be executed, and the file might not be properly written.
+
+Looking at the `dump(ArrayList<Object> nodes)` method, it could throw an IOException, which would propagate up.
+
+But the method signature says `throws IOException`, so it should be handled.
+
+In `DumpAST.dump(CompUnit compUnit)`, if `dump(compUnit.explore())` throws an IOException, then `out.write("<CompUnit>")` and `out.close()` would not be executed.
+
+This could result in no file being created, or a file with partial content.
+
+But the problem says "No output file", which suggests the file is never created.
+
+In Java, `new FileWriter(filename)` creates the file immediately, even if you don't write anything to it.
+
+So if `DumpAST.dump()` is called, the file should exist, even if empty.
+
+This suggests that `DumpAST.dump()` is never called, which means the program exits before that point.
+
+Therefore, the error must be that `errorHandle(errorTable)` finds errors and exits.
+
+Why would there be errors in a correct program?
+
+Let me check the `Lexer` one more time for any unconditional error additions.
+
+In the `lexSymbolComment()` method, for `/`:
+
+```java
+case '/' -> {
+    fgetc();
+    if (c == '/' || c == '*') {
+        this.lexComment();
+        return;
+    } else {
+        ungetc();
+        this.gotToken(TokenType.DIV, "/");
+    }
+}
+```
+
+This seems fine.
+
+For `!`:
+
+```java
+case '!' -> {
+    fgetc();
+    if (c == '=') {
+        this.gotToken(TokenType.NEQ, "!=");
+    } else {
+        ungetc();
+        this.gotToken(TokenType.NOT, "!");
+    }
+}
+```
+
+Fine.
+
+I think I have to conclude that the issue is in the `CompUnit` parsing logic's lookahead causing it to misparse something, leading to errors being added to the error table.
+
+But given the expected output includes `<VarDecl>` for the variable declarations, the parsing must be working to some extent.
+
+Perhaps the issue is that the `errorTable` is being checked too early. In the `Compiler.java` file, after creating the `CompUnit`, it immediately calls `errorHandle(errorTable)`, but maybe during the `CompUnit` construction, errors are added for things that are actually valid.
+
+Looking at the `VarDef` constructor:
+
+```java
+rbrackToken = lbrackToken != null ? stream.consumeOrError(place, ErrorType.MISSING_RBRACK, TokenType.RBRACK) : null;
+```
+
+For a simple variable like `int a = 0;`, `lbrackToken` is null, so no error is added.
+
+For array variables, it would check for RBRACK.
+
+The test case doesn't have array variables, so this is fine.
+
+I'm running out of ideas. Let's look at the expected output again. It includes:
+
+```
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+<InitVal>
+<VarDef>
+SEMICN ;
+<VarDecl>
+```
+
+This suggests that the `Number` node is being created for the integer constants.
+
+In the `Number` class:
+
+```java
+intConst = stream.consumeOrThrow(place, TokenType.INTCON);
+```
+
+This should work for `0` and `1`.
+
+But what if the stream is not positioned correctly?
+
+I think the most plausible explanation is that the `CompUnit` parsing logic is flawed, and it's consuming tokens incorrectly, leading to errors.
+
+Specifically, the lookahead in `CompUnit` might be off by one.
+
+Let's simulate the token stream position:
+
+- Initially, pos = 0, token = INTTK
+- `getNext(2)` = token at pos+2 = 2 = LPARENT
+- So no declarations are parsed
+- Then `getNext(1)` = token at pos+1 = 1 = MAINTK
+- So no function definitions are parsed
+- Then parse MainFuncDef, which consumes tokens 0-4: INTTK, MAINTK, LPARENT, RPARENT, LBRACE
+- Now pos = 5
+
+This seems correct.
+
+Given all this, I think the error must be in the `DumpAST` class. Perhaps the issue is that the `explore()` method of `CompUnit` is not returning the right structure.
+
+Looking at `CompUnit.explore()`:
+
+```java
+@Override
+public ArrayList<Object> explore() {
+    ArrayList<Object> ret = new ArrayList<>();
+    ret.addAll(decls);
+    ret.addAll(funcDefs);
+    ret.add(mainFuncDef);
+    return ret;
+}
+```
+
+This returns a list with mainFuncDef as the last element.
+
+When `dump(compUnit.explore())` is called, it will process mainFuncDef last, which will output `<MainFuncDef>` as the last syntax component before `<CompUnit>`.
+
+This matches the expected output.
+
+I think I have to go with the `DumpAST.java` file as the location, specifically the main `dump` method.
+
+<output/DumpAST.java>
+public static void dump(CompUnit compUnit) throws IOException {
+    out = new BufferedWriter(new FileWriter(Config.dumpASTFileName));
+    dump(compUnit.explore());
+    out.write("<CompUnit>");
+    out.close();
+}

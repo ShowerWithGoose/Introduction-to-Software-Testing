@@ -1,0 +1,543 @@
+Based on the problem description and the provided code, the issue is that the program produces **no output file** (`parser.txt` is empty or not created correctly, or `error.txt` is empty when it shouldn't be, but here the expected output is a valid parse tree). The test case input is a valid C-like program.
+
+The `Compiler.java` main method checks `if (!lexer.isHasError() && !parser.hasError())`. If this condition is false, it goes to the `else` block to write errors. If `parser.txt` is empty, it implies either:
+1. An error was detected incorrectly (lexer or parser).
+2. The `postOrderPrint` did not write anything.
+3. The file writing logic failed silently or the condition led to the error branch which wrote nothing because the error list was empty or sorted incorrectly.
+
+Let's look at `Lexer.java`. There is a suspicious logic for handling comments and operators.
+Specifically, look at the handling of `/` and `*`.
+```java
+// 检查是否为多行注释开始
+if (currentChar == '/'&& curPos< curLine.length() && curLine.charAt(curPos) == '*' ) {
+    // 进入多行注释
+    flag = 1;
+    curPos = curPos + 1;
+    continue; // 继续下一个字符
+}
+```
+If the current character is `/`, `nextChar()` has already advanced `curPos`. So `curLine.charAt(curPos)` checks the *next* character. This looks correct for detecting `/*`.
+
+However, look at the single line comment detection:
+```java
+if (currentChar == '/' && curPos< curLine.length() && curLine.charAt(curPos) == '/') {
+    break; // 退出当前行的处理
+}
+```
+This also looks correct.
+
+Now look at the operator handling logic order in `Lexer.java`:
+```java
+// 检查是否是操作符
+else {
+    String operator = String.valueOf(currentChar);
+    // 处理多字符运算符
+    if (currentChar == '+' || currentChar == '-' || currentChar == '*' || currentChar == '/' || currentChar == '%') {
+        tokens.add(new Token(operator, Type.valueOf(operator.equals("+") ? "PLUS" :
+                operator.equals("-") ? "MINU" :
+                        operator.equals("*") ? "MULT" :
+                                operator.equals("/") ? "DIV" : "MOD"), lineNum));
+    }
+    else if (currentChar == '&' && peekChar() == '&') {
+       // ...
+    } 
+    // ... other operators ...
+    
+    else if((currentChar == '&' && peekChar() != '&') ) {
+        tokens.add(new Token("&&", Type.AND, lineNum));
+        this.hasError = true;
+        ErrorInformation error = new ErrorInformation(lineNum,'a');
+        this.errorInformation.add(error);
+    } else if ( (currentChar == '|' && peekChar() != '|')) {
+        tokens.add(new Token("||", Type.OR, lineNum));
+        this.hasError = true;
+        ErrorInformation error = new ErrorInformation(lineNum,'a');
+        this.errorInformation.add(error);
+    }
+}
+```
+There is a logical flow issue here. The first `if` handles `+ - * / %`.
+The `else if` chain follows.
+The last two `else if` blocks handle error cases for `&` and `|`.
+However, notice that `currentChar == '/'` is handled in the first `if`.
+What if `currentChar` is `/` and the next char is `*` or `/`?
+The code checks for comments *before* entering the `else` block for operators.
+```java
+// 检查是否为多行注释开始
+if (currentChar == '/'&& curPos< curLine.length() && curLine.charAt(curPos) == '*' ) {
+   // ...
+   continue;
+}
+// ...
+if (currentChar == '/' && curPos< curLine.length() && curLine.charAt(curPos) == '/') {
+    break; 
+}
+```
+If it's not a comment, it falls through to the `else` block.
+Inside the `else` block:
+```java
+if (currentChar == '+' || ... || currentChar == '/' ...) {
+   // Adds DIV token
+}
+```
+This means if we have `/` followed by something that isn't `*` or `/` (e.g., `/ 5`), it correctly adds a `DIV` token.
+
+Let's look at `Parser.java`.
+In `parseCompUnit`:
+```java
+private void parseCompUnit() {
+    while (currentToken != null) {
+        if(currentToken.getType() == Type.INTTK && checkNext().getType() == Type.MAINTK){
+            ASTNode main = parseMain();
+            compUnitNode.addChild(main);
+        }else if (judge.isFuncDef(currentToken,checkNext(),checkNext2())) {
+            ASTNode funcDefNode = parseFuncDef();
+            compUnitNode.addChild(funcDefNode);
+        } else if (judge.isDecl(currentToken)) {
+            ASTNode declNode = parseDecl();
+            compUnitNode.addChild(declNode);
+        }
+    }
+}
+```
+If none of the conditions are met, the loop continues infinitely because `currentToken` is never consumed. This is a major bug. However, for the given input `int main() {...}`, the first condition `INTTK` and `MAINTK` should match.
+
+Let's trace `parseMain`:
+```java
+private ASTNode parseMain() {
+    ASTNode main = new ASTNode(SynComponent.MainFuncDef,true,null,false);
+    main.addChild(new ASTNode(null, false, currentToken, true));
+    consume();//int
+    main.addChild(new ASTNode(null, false, currentToken, true));
+    consume();//main
+    main.addChild(new ASTNode(null, false, currentToken, true));
+    consume();//(
+    if (currentToken.getType() == Type.RPARENT) {
+        main.addChild(new ASTNode(null, false, currentToken, true));
+        consume(); // Expecting ')'
+    } else {
+        hasError = true;
+        errors.add(new ErrorInformation(beforeLine(),'j'));
+    }
+
+    main.addChild(parseBlock());
+
+    return main;
+}
+```
+Input: `int main() { ... }`
+1. `currentToken` is `int`. Added. Consumed. `currentToken` is `main`.
+2. `main` added. Consumed. `currentToken` is `(`.
+3. `(` added. Consumed. `currentToken` is `)`.
+4. `currentToken` is `)`. Matches `RPARENT`. Added. Consumed. `currentToken` is `{`.
+5. `parseBlock()` is called.
+
+`parseBlock`:
+```java
+private ASTNode parseBlock() {
+    ASTNode blockNode = new ASTNode(SynComponent.Block,true,null,false);
+    blockNode.addChild(new ASTNode(null,false,currentToken,true));
+    consume();//{
+    while (!currentToken.getType().equals(Type.RBRACE)) {
+        ASTNode blockItemNode = parseBlockItem();
+        blockNode.addChild(blockItemNode);
+    }
+    blockNode.addChild(new ASTNode(null,false,currentToken,true));
+    consume(); // Expecting '}'
+    return blockNode;
+}
+```
+1. `currentToken` is `{`. Added. Consumed. `currentToken` is `printf`.
+2. Loop: `printf` is not `}`. `parseBlockItem()` called.
+
+`parseBlockItem`:
+```java
+private ASTNode parseBlockItem() {
+    if (judge.isDecl(currentToken)) {
+        return parseDecl();
+    } else {
+        return parseStmt();
+    }
+}
+```
+`judge.isDecl` checks for `CONSTTK` or `BType` (`INTTK`/`CHARTK`). `printf` is `PRINTFTK`. So it goes to `parseStmt()`.
+
+`parseStmt`:
+```java
+ASTNode stmtNode = new ASTNode(SynComponent.Stmt,true,null,false);
+if (judge.isLVal(currentToken) && checkNext().getType()!=Type.LPARENT ) {
+   // ...
+} else if (judge.isBlock(currentToken)) {
+   // ...
+} else if (currentToken.getType() == Type.IFTK) {
+   // ...
+} 
+// ...
+else if (currentToken.getType() == Type.PRINTFTK) { // 'printf' '(' StringConst {',' Exp} ')' ';'
+    parsePrintfStmt(stmtNode);
+} 
+// ...
+```
+`currentToken` is `PRINTFTK`. It matches `Type.PRINTFTK`. `parsePrintfStmt(stmtNode)` is called.
+
+`parsePrintfStmt`:
+```java
+private void parsePrintfStmt(ASTNode node) {
+    ASTNode printfNode = new ASTNode(null, false, currentToken, true);
+    node.addChild(printfNode);
+    consume(); // consume 'printf' -> currentToken is (
+    node.addChild(new ASTNode(null,false,currentToken,true));
+    consume(); // consume ( -> currentToken is "21373119"
+
+    if (currentToken.getType() == Type.STRCON) {
+        ASTNode stringNode = new ASTNode(null, false, currentToken, true);
+        node.addChild(stringNode);
+        consume(); // consume string -> currentToken is )
+    }
+    while (currentToken != null && currentToken.getType() == Type.COMMA) {
+        // ...
+    }
+
+    if (currentToken != null && currentToken.getType() == Type.RPARENT) {
+        node.addChild(new ASTNode(null, false, currentToken, true));
+        consume(); // consume ) -> currentToken is ;
+    } else {
+        this.hasError = true;
+        errors.add(new ErrorInformation(beforeLine(), 'j'));
+    }
+
+    if (currentToken != null && currentToken.getType() == Type.SEMICN) {
+        node.addChild(new ASTNode(null, false, currentToken, true));
+        consume(); // consume ; -> currentToken is int
+    } else {
+        this.hasError = true;
+        errors.add(new ErrorInformation(beforeLine(), 'i'));
+    }
+}
+```
+This seems to parse `printf("21373119");` correctly. `stmtNode` now contains the printf structure.
+Back in `parseStmt`, it returns `stmtNode`.
+Back in `parseBlockItem`, it returns `stmtNode`.
+Back in `parseBlock`, it adds `stmtNode` to `blockNode`.
+Loop continues. `currentToken` is `INTTK` (from `int a = 0;`).
+
+`parseBlockItem` called with `INTTK`.
+`judge.isDecl(INTTK)` is true (`isBType` returns true).
+`parseDecl()` is called.
+
+`parseDecl`:
+```java
+private ASTNode parseDecl() {
+    if (currentToken.getType().equals(Type.CONSTTK)) {
+        return parseConstDecl();
+    } else return parseVarDecl();
+}
+```
+Calls `parseVarDecl()`.
+
+`parseVarDecl`:
+```java
+private ASTNode parseVarDecl() {
+    ASTNode varDeclNode = new ASTNode(SynComponent.VarDecl,true,null,false);
+    ASTNode bTypeNode = parseBType(); // Consumes INTTK
+    varDeclNode.addChild(bTypeNode);
+    do {
+        ASTNode varDefNode = parseVarDef();
+        varDeclNode.addChild(varDefNode);
+        if (currentToken != null && currentToken.getType().equals(Type.COMMA)) {
+            varDeclNode.addChild(new ASTNode(null, false, currentToken, true));
+            consume(); 
+        } else {
+            break;
+        }
+    } while (currentToken != null);
+
+    if (currentToken != null && currentToken.getType() == Type.SEMICN) {
+        varDeclNode.addChild(new ASTNode(null, false, currentToken, true));
+        consume();
+    } else {
+        this.hasError = true;
+        errors.add(new ErrorInformation(beforeLine(),'i'));
+    }
+    return varDeclNode;
+}
+```
+`parseBType` consumes `INTTK`. `currentToken` becomes `a` (IDENFR).
+`parseVarDef` is called.
+
+`parseVarDef`:
+```java
+private ASTNode parseVarDef() {
+    ASTNode node = new ASTNode(SynComponent.VarDef, false, null, false);
+    node.addChild(new ASTNode(null, false, currentToken, true));
+    consume(); // ident a -> currentToken is =
+
+    // Check array... no.
+
+    // Check init val
+    if (currentToken.getType() == Type.ASSIGN) {
+        node.addChild(new ASTNode(null, false, currentToken, true));
+        consume(); // = -> currentToken is 0
+        node.addChild(parseInitVal()); 
+    }
+    return node;
+}
+```
+`parseInitVal` is called with `0` (INTCON).
+
+`parseInitVal`:
+```java
+private ASTNode parseInitVal() {
+    ASTNode node = new ASTNode(SynComponent.InitVal, false, null, false);
+    if (currentToken.getType() == Type.LBRACE) {
+       // ...
+    } else if (currentToken.getType() == Type.STRCON) {
+       // ...
+    } else {
+        // Single expression
+        node.addChild(parseExp());
+    }
+    return node;
+}
+```
+Calls `parseExp()`.
+
+`parseExp` -> `parseAddExp` -> `parseMulExp` -> `parseUnaryExp` -> `parsePrimaryExp`.
+
+`parsePrimaryExp`:
+```java
+private ASTNode parsePrimaryExp() {
+    ASTNode priNode = new ASTNode(SynComponent.PrimaryExp, true, null, true);
+    if (currentToken.getType() == Type.LPARENT) {
+       // ...
+    } else if (currentToken.getType() == Type.INTCON) {
+        ASTNode node = new ASTNode(SynComponent.Number,false,null,false);
+        node.addChild(new ASTNode(null, false, currentToken, true));
+        priNode.addChild(node);
+        consume(); // Consumes 0 -> currentToken is ;
+    } 
+    // ...
+    return priNode;
+}
+```
+Returns `PrimaryExp` containing `Number` containing `0`.
+Unwinding: `UnaryExp` -> `MulExp` -> `AddExp` -> `Exp`.
+`InitVal` gets `Exp`.
+`VarDef` gets `InitVal`.
+`VarDecl` gets `VarDef`.
+Back in `parseVarDecl`, loop checks for comma. `currentToken` is `;`. Not comma. Breaks.
+Checks for semicolon. `currentToken` is `;`. Matches. Consumes `;`. `currentToken` is `{` (start of inner block).
+Returns `VarDecl`.
+
+Back in `parseBlock`, `VarDecl` added.
+Loop continues. `currentToken` is `{`.
+`parseBlockItem` called.
+`judge.isDecl({)` is false.
+`parseStmt` called.
+`judge.isBlock({)` is true.
+`parseBlock` called recursively.
+
+Inner `parseBlock`:
+Consumes `{`. `currentToken` is `int`.
+Loop: `int` is not `}`.
+`parseBlockItem` called.
+`judge.isDecl(int)` is true.
+`parseDecl` -> `parseVarDecl`.
+Parses `int a = 1;`.
+After parsing, `currentToken` is `printf`.
+Inner `parseBlock` loop continues.
+`parseBlockItem` called with `printf`.
+`parseStmt` -> `parsePrintfStmt`.
+Parses `printf("%d",a);`.
+After parsing, `currentToken` is `}`.
+Inner `parseBlock` loop condition `!currentToken.getType().equals(Type.RBRACE)` is false.
+Exits loop.
+Adds `}`. Consumes `}`. `currentToken` is `return`.
+Returns inner `Block`.
+
+Back in outer `parseStmt` (which called `parseBlock` for the inner block), it returns the `Block` node?
+Wait, look at `parseStmt` again.
+```java
+} else if (judge.isBlock(currentToken)) {
+    ASTNode blockNode = parseBlock();
+    stmtNode.addChild(blockNode);
+}
+```
+Yes, it adds the block to `stmtNode`.
+Then `parseStmt` returns `stmtNode`.
+Back in outer `parseBlockItem`, returns `stmtNode`.
+Back in outer `parseBlock`, adds `stmtNode`.
+Loop continues. `currentToken` is `return`.
+`parseBlockItem` called.
+`parseStmt` called.
+Matches `RETURNTK`.
+`parseReturnStmt(stmtNode)` called.
+
+`parseReturnStmt`:
+```java
+private void parseReturnStmt(ASTNode returnNode) {
+    int pos1 = currentToken.getLineNum();
+    returnNode.addChild(new ASTNode(null, false, currentToken, true));
+    consume(); // return -> currentToken is 0
+    
+    if (currentToken != null) {
+        if (currentToken.getType() == Type.SEMICN) {
+           // ...
+        } else {
+            int pos2 = currentToken.getLineNum();
+            if(pos2 == pos1) {
+                ASTNode expNode = parseExp(); 
+                if (expNode != null) {
+                    returnNode.addChild(expNode); 
+                }
+                if (currentToken != null && currentToken.getType() == Type.SEMICN) {
+                    returnNode.addChild(new ASTNode(null, false, currentToken, true));
+                    consume(); // ; -> currentToken is }
+                } else {
+                   // Error i
+                }
+            } else {
+               // ...
+            }
+        }
+    }
+}
+```
+`pos1` is line of `return`. `pos2` is line of `0`. They are likely same line.
+Parses `Exp` (0).
+Checks for `;`. Consumes `;`. `currentToken` is `}`.
+Returns.
+
+Back in outer `parseStmt`, returns `stmtNode`.
+Back in outer `parseBlockItem`, returns `stmtNode`.
+Back in outer `parseBlock`, adds `stmtNode`.
+Loop continues. `currentToken` is `}`.
+Loop exits.
+Adds `}`. Consumes `}`. `currentToken` is `null` (end of file).
+Returns `Block`.
+
+Back in `parseMain`, adds `Block`.
+Returns `MainFuncDef`.
+
+Back in `parseCompUnit`, adds `MainFuncDef`.
+Loop continues. `currentToken` is `null`.
+Loop exits.
+
+`parse()` returns.
+`Compiler.java`:
+`if (!lexer.isHasError() && !parser.hasError())`
+If no errors, `postOrderPrint` is called.
+
+So why "No output file"?
+Maybe `lexer.isHasError()` is true?
+Or `parser.hasError()` is true?
+
+Let's re-examine `Lexer.java` for potential false positive errors.
+The input is:
+```c
+int main() {
+    printf("21373119");
+    int a = 0;
+    {
+        int a = 1;
+        printf("%d",a); // 输出 1
+    }
+    return 0;
+}
+```
+Look at the comment handling in `Lexer.java`.
+```java
+// 检查是否为多行注释开始
+if (currentChar == '/'&& curPos< curLine.length() && curLine.charAt(curPos) == '*' ) {
+    flag = 1;
+    curPos = curPos + 1;
+    continue; 
+}
+
+// 如果当前在多行注释中，则跳过处理
+if (flag == 1) {
+    int endCommentIndex = curLine.indexOf("*/", curPos - 1); 
+    if (endCommentIndex != -1) {
+        flag = 0; 
+        curPos = endCommentIndex + 2;
+        continue;
+    } else {
+        break; 
+    }
+}
+
+if (currentChar == '/' && curPos< curLine.length() && curLine.charAt(curPos) == '/') {
+    break; 
+}
+```
+Line: `    printf("%d",a); // 输出 1`
+Tokens generated so far on this line: `printf`, `(`, `"%d"`, `,`, `a`, `)`, `;`.
+Then space. `skipWhitespace` skips spaces.
+`currentChar` becomes `/`.
+`curPos` is index of `/`.
+`curLine.charAt(curPos)` is `/` (the second `/` of `//`).
+Wait. `nextChar()` returns `currentChar` and increments `curPos`.
+So if `curPos` was pointing to the first `/`, `nextChar()` returns `/` and `curPos` points to the second `/`.
+Then `curLine.charAt(curPos)` checks the second `/`.
+So `currentChar == '/'` and `curLine.charAt(curPos) == '/'` is TRUE.
+It executes `break`. This breaks the `while (curPos < curLine.length())` loop.
+This is correct for single-line comments.
+
+What about multi-line comment flag `flag`?
+It is initialized to 0 at start of `tokenize`.
+It persists across lines because it's a local variable in `tokenize`?
+No, `int flag = 0;` is inside `tokenize()` but outside the `for` loop over lines.
+```java
+public void tokenize() {
+    int flag = 0;
+    for (Map.Entry<Integer, String> entry : allLines.entrySet()) {
+        // ...
+    }
+}
+```
+So `flag` persists across lines. This is correct for multi-line comments spanning multiple lines.
+
+Is there any other error?
+Look at `Compiler.java` again.
+```java
+BufferedReader reader = new BufferedReader(new FileReader("C:\\Users\\86136\\Desktop\\hw2_Lexer\\hw2_Lexer\\testfile.txt"));
+```
+The path is hardcoded. If the test environment doesn't have this exact path, it throws `FileNotFoundException`.
+The catch block:
+```java
+} catch (FileNotFoundException e) {
+    System.err.println("File not found: " + e.getMessage());
+} catch (IOException e) {
+    System.err.println("IO Error: " + e.getMessage());
+}
+```
+If an exception occurs, the program prints to `stderr` and exits. It does **not** create `parser.txt` or `error.txt`.
+The problem states "Buggy Output: No output file". This strongly suggests an exception occurred before files were written, or the files were created but empty/closed improperly.
+However, usually "No output file" in these automated judging systems means the file `parser.txt` (or `error.txt`) was not generated at all or is empty when it shouldn't be.
+If `FileReader` throws an exception, the `writer` variables might not even be initialized if the exception happens before `new FileWriter`.
+Wait:
+```java
+BufferedWriter parserWriter = new BufferedWriter(new FileWriter(parserOutputFileName));
+BufferedWriter errorWriter = new BufferedWriter(new FileWriter(errorOutputFileName));
+```
+These are created **before** the `FileReader`?
+No:
+```java
+try {
+    BufferedReader reader = new BufferedReader(new FileReader("C:\\...\\testfile.txt"));
+    BufferedWriter parserWriter = new BufferedWriter(new FileWriter(parserOutputFileName));
+    BufferedWriter errorWriter = new BufferedWriter(new FileWriter(errorOutputFileName));
+    // ...
+```
+They are all inside the `try` block.
+If `FileReader` fails, it jumps to `catch`. `parserWriter` and `errorWriter` are never created. Thus, no files are created.
+The hardcoded path `C:\\Users\\86136\\Desktop\\hw2_Lexer\\hw2_Lexer\\testfile.txt` is almost certainly incorrect for the testing environment. The input format says "The test program is provided in **testfile.txt**". It should use the relative path `"testfile.txt"`, just like `parserOutputFileName` and `errorOutputFileName`.
+
+Therefore, the error is the hardcoded absolute path in `Compiler.java`.
+
+<Compiler.java>
+...
+        try {
+            BufferedReader reader = new BufferedReader(new FileReader("C:\\Users\\86136\\Desktop\\hw2_Lexer\\hw2_Lexer\\testfile.txt"));
+            BufferedWriter parserWriter = new BufferedWriter(new FileWriter(parserOutputFileName));
+...

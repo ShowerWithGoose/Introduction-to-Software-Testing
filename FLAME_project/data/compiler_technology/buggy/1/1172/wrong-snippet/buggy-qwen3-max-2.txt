@@ -1,0 +1,1368 @@
+Looking at the test case input and comparing the buggy output with the expected output, I can see the issue clearly.
+
+The test case input is:
+```c
+int main() {
+    printf("21373119");
+    int a = 0;
+    {
+        int a = 1;
+        printf("%d",a); // 输出 1
+    }
+    return 0;
+}
+```
+
+The difference between buggy output and expected output is:
+- **Buggy output** has an extra `SEMICN ;` after `<VarDecl>` in the inner block
+- **Expected output** does NOT have this extra semicolon
+
+Looking at the buggy output:
+```
+<VarDef>
+SEMICN ;
+<VarDecl>
+SEMICN ;          <-- This extra semicolon should not be here
+PRINTFTK printf
+```
+
+But expected output shows:
+```
+<VarDef>
+SEMICN ;
+<VarDecl>
+PRINTFTK printf    <-- No extra semicolon here
+```
+
+This suggests that the `BlockItemParser` or `StmtParser` is incorrectly outputting an extra semicolon token when it shouldn't.
+
+Looking at the grammar:
+- `BlockItem → Decl | Stmt`
+- `Decl → ConstDecl | VarDecl`
+- `VarDecl` already includes the semicolon as part of its definition: `VarDecl → BType VarDef { ',' VarDef } ';'`
+
+So when a `VarDecl` is parsed as a `BlockItem`, it should NOT have an additional semicolon output after it, because the semicolon is already part of the `VarDecl`.
+
+However, looking at the `StmtParser.parseStmt()` method, I can see that when it encounters what it thinks might be an expression statement, it tries to parse it and then adds a semicolon. But in the case of a variable declaration inside a block, this logic is incorrectly being triggered.
+
+The issue is in the `StmtParser.parseStmt()` method. When it encounters the inner block:
+```c
+{
+    int a = 1;
+    printf("%d",a);
+}
+```
+
+After parsing `int a = 1;` as a `VarDecl`, the parser should recognize that this is a `Decl` (not a `Stmt`) and handle it accordingly in the `BlockItemParser`.
+
+Looking at `BlockItemParser.parseBlockItem()`:
+
+```java
+if (tokenType == TokenType.INTTK || tokenType == TokenType.CHARTK || tokenType == TokenType.CONSTTK) {
+    // 回退一个 Token，解析声明
+    tokenStream.unReadTokens(1);
+    declaration = declParser.parseDecl();
+} else if (tokenType == TokenType.RBRACE) {
+    // 右大括号，回退一个 Token，结束解析
+    tokenStream.unReadTokens(1);
+} else {
+    // 回退一个 Token，解析语句
+    tokenStream.unReadTokens(1);
+    statement = stmtParser.parseStmt();
+}
+```
+
+This looks correct. The issue must be elsewhere.
+
+Looking more carefully at the output, I notice that after the inner `<VarDecl>`, there's an extra `SEMICN ;` being output. This suggests that the `BlockItem` is being treated as both a `Decl` AND a `Stmt`, which shouldn't happen.
+
+Actually, looking at the `BlockParser.parseBlock()` method:
+
+```java
+// 解析代码块项，直到遇到右大括号
+while (true) {
+    Token currentToken = tokenStream.readNextToken();
+    if (currentToken.getType() == TokenType.RBRACE) {
+        // 找到右大括号，结束解析
+        Token rightBraceToken = currentToken;
+        return new Block(leftBraceToken, blockItemList, rightBraceToken);
+    } else {
+        // 回退一个 Token，解析下一个 BlockItem
+        tokenStream.unReadTokens(1);
+        BlockItem blockItem = blockItemParser.parseBlockItem();
+        blockItemList.add(blockItem);
+    }
+}
+```
+
+This also looks correct.
+
+Wait, let me look at the actual output more carefully. The issue is that after the inner `<VarDecl>`, there's an extra semicolon, but then the `printf` statement follows correctly.
+
+Looking at the `VarDecl.toSyntaxString()` method in `<frontend/parser/declaration/varDeclaration/VarDecl.java>`:
+
+```java
+@Override
+public String toSyntaxString() {
+    StringBuilder syntaxBuilder = new StringBuilder();
+    syntaxBuilder.append(baseTypeToken.toSyntaxString());
+    int defCount = varDefList.size();
+    for (int index = 0; index < defCount; index++) {
+        syntaxBuilder.append(varDefList.get(index).toSyntaxString());
+        if (index < commaTokenList.size()) {
+            syntaxBuilder.append(commaTokenList.get(index).toSyntaxString());
+        }
+    }
+    syntaxBuilder.append(semicolonToken.toSyntaxString());
+    syntaxBuilder.append(NODE_NAME).append("\n");
+    return syntaxBuilder.toString();
+}
+```
+
+This correctly outputs the semicolon as part of the `VarDecl`.
+
+Now, why is there an extra semicolon? Let me check if the `BlockItem.toSyntaxString()` is somehow duplicating it.
+
+Looking at `<frontend/parser/block/BlockItem.java>`:
+
+```java
+@Override
+public String toSyntaxString() {
+    StringBuilder syntaxBuilder = new StringBuilder();
+    if (declaration != null) {
+        syntaxBuilder.append(declaration.toSyntaxString());
+    }
+    if (statement != null) {
+        syntaxBuilder.append(statement.toSyntaxString());
+    }
+    return syntaxBuilder.toString();
+}
+```
+
+This should only output one of them, not both.
+
+The real issue is in the `StmtParser.parseStmt()` method. When it encounters a variable declaration like `int a = 1;`, it's incorrectly trying to parse it as a statement first, and then falling back.
+
+Looking at the default case in `StmtParser.parseStmt()`:
+
+```java
+default:
+    // 尝试解析 Lval 或表达式语句
+    tokenIterator.unReadTokens(1);
+    int startIndex = tokenIterator.getCurrentIndex();
+    lvalParser.tryParseLval();
+    Token nextToken = tokenIterator.readNextToken();
+    int endIndex = tokenIterator.getCurrentIndex();
+    int tokensRead = endIndex - startIndex;
+    if (nextToken.getType() == TokenType.ASSIGN) {
+        // 解析赋值语句
+        tokenIterator.unReadTokens(tokensRead);
+        leftValue = lvalParser.parseLval();
+        // ... rest of assignment parsing
+    } else {
+        // 解析表达式语句
+        tokenIterator.unReadTokens(tokensRead);
+        expression = addExpParser.parseAddExp();
+        Token semicolonExp = tokenIterator.readNextToken();
+        if (semicolonExp.getType() != TokenType.SEMICN) {
+            tokenIterator.unReadTokens(1);
+            semicolonToken = new Token(TokenType.SEMICN, ";", semicolonExp.getLine() - 1);
+            SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, semicolonExp.getLine() - 1);
+        } else {
+            semicolonToken = semicolonExp;
+        }
+        return new Stmt(expression, semicolonToken);
+    }
+```
+
+The problem is that `lvalParser.tryParseLval()` is being called on `int a = 1;`. The `tryParseLval()` method reads the `int` token, sees it's not an `IDENFR`, so it returns `null` and unreads the token. Then it reads the next token (`a`) and checks if it's an `ASSIGN`, which it's not (it's `IDENFR`), so it goes to the else branch.
+
+In the else branch, it tries to parse `int` as an `AddExp`, which fails, but the parser continues and eventually creates an expression statement with a semicolon.
+
+But wait, this shouldn't happen because the `BlockItemParser` should have already handled the `INTTK` case and parsed it as a declaration, not passed it to `StmtParser`.
+
+Let me trace through what happens:
+
+1. `BlockParser` reads `{` 
+2. Then reads `int` token
+3. Since it's not `RBRACE`, it unreads and calls `BlockItemParser.parseBlockItem()`
+4. `BlockItemParser` sees `INTTK` and parses it as a `Decl`
+5. So far so good...
+
+The issue must be that after parsing the `VarDecl`, there's still a semicolon token being consumed somewhere else.
+
+Looking at the output again, I see that the structure is:
+- `<VarDef>`
+- `SEMICN ;`  
+- `<VarDecl>`
+- `SEMICN ;`  <-- extra
+- `PRINTFTK printf`
+
+The first `SEMICN ;` is from the `VarDecl` itself (correct).
+The second `SEMICN ;` is the extra one.
+
+This suggests that after the `VarDecl` is parsed, something is consuming another semicolon.
+
+Looking at the `VarDeclParser.parseVarDecl()` method:
+
+```java
+// 解析变量定义
+while (tokenIterator.hasNext()) {
+    // 解析 VarDef
+    VarDef varDef = varDefParser.parseVarDef();
+    varDefList.add(varDef);
+
+    // 读取下一个 Token，判断是逗号还是分号
+    Token nextToken = tokenIterator.readNextToken();
+    if (nextToken.getType() == TokenType.COMMA) {
+        commaTokenList.add(nextToken);
+    } else if (nextToken.getType() == TokenType.SEMICN) {
+        semicolonToken = nextToken;
+        break;
+    } else {
+        // 回退一个 Token并处理缺少分号的情况
+        tokenIterator.unReadTokens(1);
+        semicolonToken = new Token(TokenType.SEMICN, ";", currentToken.getLine());
+        SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, currentToken.getLine());
+        break;
+    }
+}
+```
+
+This correctly consumes the semicolon and stores it in `semicolonToken`.
+
+Now, after the `VarDecl` is completely parsed, control returns to `BlockItemParser`, which returns the `BlockItem` with the `declaration` set.
+
+Then `BlockParser` continues and reads the next token, which should be `printf`.
+
+But according to the buggy output, there's an extra semicolon being output between `<VarDecl>` and `PRINTFTK`.
+
+This suggests that the issue is not in the declaration parsing, but rather that the `BlockParser` is somehow reading an extra semicolon.
+
+Wait, let me look at the actual token sequence:
+
+Tokens should be:
+1. `int`
+2. `a` 
+3. `=`
+4. `0`
+5. `;`  <- consumed by VarDeclParser
+6. `{`
+7. `int`
+8. `a`
+9. `=`
+10. `1`
+11. `;` <- consumed by VarDeclParser  
+12. `printf`
+13. ...
+
+But the output shows an extra semicolon after the inner `<VarDecl>`.
+
+Actually, looking more carefully at the expected vs buggy output, I think I misunderstood. Let me compare line by line:
+
+**Expected:**
+```
+<VarDef>
+SEMICN ;
+<VarDecl>
+PRINTFTK printf
+```
+
+**Buggy:**
+```
+<VarDef>
+SEMICN ;
+<VarDecl>
+SEMICN ;
+PRINTFTK printf
+```
+
+So the extra `SEMICN ;` appears right after `<VarDecl>` and before `PRINTFTK`.
+
+This means that after parsing the `VarDecl` (which includes its own semicolon), something is consuming and outputting another semicolon.
+
+The only place this could happen is if the `BlockParser` is reading a semicolon token after the `VarDecl` and treating it as a separate `BlockItem`.
+
+But that doesn't make sense because after `int a = 1;`, the next token should be `printf`, not a semicolon.
+
+Wait, let me check the input again:
+```c
+{
+    int a = 1;
+    printf("%d",a); // 输出 1
+}
+```
+
+After `int a = 1;` comes `printf`, so there should be no extra semicolon.
+
+Unless... the parser is incorrectly parsing the `printf` statement and somehow outputting a semicolon before it?
+
+No, that doesn't make sense either.
+
+Let me look at the `StmtParser` again, specifically how it handles the `printf` case:
+
+```java
+case PRINTFTK:
+    // 解析 printf 语句
+    printfToken = currentToken;
+    leftParenPrintf = tokenIterator.readNextToken();
+    stringConstToken = tokenIterator.readNextToken();
+    Token nextTokenPrintf = tokenIterator.readNextToken();
+    while (nextTokenPrintf.getType() == TokenType.COMMA) {
+        commaTokenList.add(nextTokenPrintf);
+        AddExp printfExp = addExpParser.parseAddExp();
+        printfExpressions.add(printfExp);
+        nextTokenPrintf = tokenIterator.readNextToken();
+    }
+    tokenIterator.unReadTokens(1);
+    Token rightParenTokenPrintf = tokenIterator.readNextToken();
+    if (rightParenTokenPrintf.getType() != TokenType.RPARENT) {
+        tokenIterator.unReadTokens(1);
+        rightParenPrintf = new Token(TokenType.RPARENT, ")", printfToken.getLine());
+        SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.j, leftParenPrintf.getLine());
+    } else {
+        rightParenPrintf = rightParenTokenPrintf;
+    }
+    Token semicolonPrintf = tokenIterator.readNextToken();
+    if (semicolonPrintf.getType() != TokenType.SEMICN) {
+        tokenIterator.unReadTokens(1);
+        semicolonToken = new Token(TokenType.SEMICN, ";", printfToken.getLine());
+        SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, leftParenPrintf.getLine());
+    } else {
+        semicolonToken = semicolonPrintf;
+    }
+    return new Stmt(printfToken, leftParenPrintf, stringConstToken, commaTokenList,
+            printfExpressions, rightParenPrintf, semicolonToken);
+```
+
+This correctly consumes the semicolon after `printf(...)`.
+
+I think the issue is actually in the `BlockItemParser`. Let me trace through what happens step by step:
+
+1. `BlockParser` starts parsing the inner block `{`
+2. Reads first token: `int` 
+3. Not `RBRACE`, so unreads and calls `BlockItemParser.parseBlockItem()`
+4. `BlockItemParser` sees `INTTK`, unreads, calls `DeclParser.parseDecl()`
+5. `DeclParser` calls `VarDeclParser.parseVarDecl()`
+6. `VarDeclParser` parses `int a = 1;` completely, including consuming the semicolon
+7. Returns `VarDecl` -> `Decl` -> `BlockItem` with `declaration` set
+8. `BlockParser` adds this `BlockItem` to the list
+9. `BlockParser` loops again, reads next token: should be `printf`
+10. Not `RBRACE`, so unreads and calls `BlockItemParser.parseBlockItem()` again
+11. `BlockItemParser` sees `PRINTFTK`, which is not a declaration keyword, so it unreads and calls `StmtParser.parseStmt()`
+12. `StmtParser` handles the `printf` correctly
+
+So where does the extra semicolon come from?
+
+Wait! I think I see the issue. Looking at the buggy output again:
+
+```
+<VarDef>
+SEMICN ;
+<VarDecl>
+SEMICN ;
+PRINTFTK printf
+```
+
+The first `SEMICN ;` is from the `VarDecl` (correct).
+The `<VarDecl>` is the syntax component name (correct).
+The second `SEMICN ;` must be coming from somewhere else.
+
+Looking at the `BlockItem.toSyntaxString()` method again:
+
+```java
+@Override
+public String toSyntaxString() {
+    StringBuilder syntaxBuilder = new StringBuilder();
+    if (declaration != null) {
+        syntaxBuilder.append(declaration.toSyntaxString());
+    }
+    if (statement != null) {
+        syntaxBuilder.append(statement.toSyntaxString());
+    }
+    return syntaxBuilder.toString();
+}
+```
+
+If somehow both `declaration` AND `statement` are non-null, then both would be output.
+
+But that shouldn't happen based on the logic in `BlockItemParser.parseBlockItem()`.
+
+Unless... there's a bug in the `BlockItemParser` where it's setting both fields.
+
+Looking at `BlockItemParser.parseBlockItem()`:
+
+```java
+public BlockItem parseBlockItem() {
+    // 初始化变量
+    Decl declaration = null;
+    Stmt statement = null;
+
+    // 初始化子解析器
+    DeclParser declParser = new DeclParser(tokenStream);
+    StmtParser stmtParser = new StmtParser(tokenStream);
+
+    // 读取下一个 Token
+    Token currentToken = tokenStream.readNextToken();
+    TokenType tokenType = currentToken.getType();
+
+    // 根据 Token 类型判断是声明还是语句
+    if (tokenType == TokenType.INTTK || tokenType == TokenType.CHARTK || tokenType == TokenType.CONSTTK) {
+        // 回退一个 Token，解析声明
+        tokenStream.unReadTokens(1);
+        declaration = declParser.parseDecl();
+    } else if (tokenType == TokenType.RBRACE) {
+        // 右大括号，回退一个 Token，结束解析
+        tokenStream.unReadTokens(1);
+    } else {
+        // 回退一个 Token，解析语句
+        tokenStream.unReadTokens(1);
+        statement = stmtParser.parseStmt();
+    }
+
+    // 创建并返回 BlockItem 对象
+    return new BlockItem(declaration, statement);
+}
+```
+
+This looks correct - it should only set one of them.
+
+But wait! What if `declParser.parseDecl()` somehow also advances the token stream past the semicolon, and then when we return to `BlockParser`, it reads the next token which is `printf`, but due to some off-by-one error, it's actually reading a semicolon?
+
+No, that doesn't make sense.
+
+Let me look at the actual output order more carefully. Maybe the issue is not an extra semicolon, but rather that the semicolon from the `VarDecl` is being output twice.
+
+Looking at `VarDecl.toSyntaxString()`:
+- It outputs `baseTypeToken` (`INTTK int`)
+- Then `varDefList` (which includes `IDENFR a`, `ASSIGN =`, `INTCON 0`, etc.)
+- Then `semicolonToken.toSyntaxString()` (the `SEMICN ;`)
+- Then `NODE_NAME` (`<VarDecl>`)
+
+So the output should be:
+```
+INTTK int
+IDENFR a
+ASSIGN =
+INTCON 0
+<Number>
+...
+SEMICN ;
+<VarDecl>
+```
+
+Which matches what we see.
+
+But then why is there another `SEMICN ;` after `<VarDecl>`?
+
+I think the issue might be in how the `Block` is being parsed. Let me check if there's a empty statement being parsed.
+
+After the `VarDecl`, if the parser somehow thinks there's an empty statement `;`, that would explain the extra semicolon.
+
+Looking at the `StmtParser.parseStmt()` method, there's a case for `SEMICN`:
+
+```java
+case SEMICN:
+    // 空语句，仅有分号
+    return new Stmt(currentToken);
+```
+
+So if the parser encounters a standalone semicolon, it creates an empty statement.
+
+This suggests that after parsing the `VarDecl`, there's somehow an extra semicolon token in the stream.
+
+But the input doesn't have that.
+
+Unless... the `VarDeclParser` is not consuming the semicolon correctly, and it's left in the stream, then the `BlockParser` reads it as the next token and treats it as an empty statement.
+
+Let me check `VarDeclParser.parseVarDecl()` again:
+
+```java
+// 解析变量定义
+while (tokenIterator.hasNext()) {
+    // 解析 VarDef
+    VarDef varDef = varDefParser.parseVarDef();
+    varDefList.add(varDef);
+
+    // 读取下一个 Token，判断是逗号还是分号
+    Token nextToken = tokenIterator.readNextToken();
+    if (nextToken.getType() == TokenType.COMMA) {
+        commaTokenList.add(nextToken);
+    } else if (nextToken.getType() == TokenType.SEMICN) {
+        semicolonToken = nextToken;
+        break;
+    } else {
+        // 回退一个 Token并处理缺少分号的情况
+        tokenIterator.unReadTokens(1);
+        semicolonToken = new Token(TokenType.SEMICN, ";", currentToken.getLine());
+        SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, currentToken.getLine());
+        break;
+    }
+}
+```
+
+This should consume the semicolon and store it in `semicolonToken`.
+
+But what if there's a bug in the token iteration? 
+
+Actually, looking at the code more carefully, I notice that in the `else` branch of the `VarDeclParser`, when it encounters a token that's not a comma or semicolon, it creates a fake semicolon token but doesn't consume the actual token from the stream.
+
+But in our case, it should hit the `SEMICN` case and consume it properly.
+
+I think the real issue is elsewhere. Let me look at the `CompUnitParser` and how it parses the main function.
+
+Wait, no, the issue is specifically in the inner block.
+
+Let me check the `BlockParser.parseBlock()` method again:
+
+```java
+public Block parseBlock() {
+    // 读取左大括号 Token
+    Token leftBraceToken = tokenStream.readNextToken();
+    if (leftBraceToken.getType() != TokenType.LBRACE) {
+        throw new Error("Expected '{' at the beginning of a block.");
+    }
+
+    // 初始化 BlockItem 解析器和列表
+    BlockItemParser blockItemParser = new BlockItemParser(tokenStream);
+    LinkedList<BlockItem> blockItemList = new LinkedList<>();
+
+    // 解析代码块项，直到遇到右大括号
+    while (true) {
+        Token currentToken = tokenStream.readNextToken();
+        if (currentToken.getType() == TokenType.RBRACE) {
+            // 找到右大括号，结束解析
+            Token rightBraceToken = currentToken;
+            return new Block(leftBraceToken, blockItemList, rightBraceToken);
+        } else {
+            // 回退一个 Token，解析下一个 BlockItem
+            tokenStream.unReadTokens(1);
+            BlockItem blockItem = blockItemParser.parseBlockItem();
+            blockItemList.add(blockItem);
+        }
+    }
+}
+```
+
+The issue might be that after parsing the `VarDecl`, when `BlockParser` reads the next token to check if it's `RBRACE`, it reads `printf`, determines it's not `RBRACE`, unreads it, and then calls `BlockItemParser.parseBlockItem()`.
+
+But what if there's an extra semicolon in the token stream that I'm not seeing?
+
+Let me count the tokens in the input:
+
+Inner block content:
+- `int` (INTTK)
+- `a` (IDENFR)  
+- `=` (ASSIGN)
+- `1` (INTCON)
+- `;` (SEMICN)
+- `printf` (PRINTFTK)
+- `(` (LPARENT)
+- `"%d"` (STRCON)
+- `,` (COMMA)
+- `a` (IDENFR)
+- `)` (RPARENT)
+- `;` (SEMICN)
+
+So there are exactly 2 semicolons: one after `int a = 1` and one after `printf("%d",a)`.
+
+The first semicolon should be consumed by `VarDeclParser`.
+The second semicolon should be consumed by `StmtParser` when parsing the `printf` statement.
+
+So why is there an extra semicolon output?
+
+I think I need to look at the actual `toSyntaxString()` output generation.
+
+Looking at the expected output, after `<VarDecl>` comes directly `PRINTFTK printf`.
+
+In the buggy output, after `<VarDecl>` comes `SEMICN ;` then `PRINTFTK printf`.
+
+This extra `SEMICN ;` must be coming from a `Stmt` object that represents an empty statement.
+
+So the question is: why is an empty statement being parsed after the `VarDecl`?
+
+The only way this could happen is if after the `VarDecl` is parsed, the next token read by `BlockParser` is a semicolon, not `printf`.
+
+But that would mean the token stream is corrupted.
+
+Wait! I think I found the issue. Look at the `VarDefParser.parseVarDef()` method:
+
+```java
+public VarDef parseVarDef() {
+    // 初始化变量
+    Token identifierToken = tokenStream.readNextToken();
+    Token leftBracketToken = null;
+    ConstExp arraySizeExpression = null;
+    Token rightBracketToken = null;
+    Token assignToken = null;
+    InitVal initialValue = null;
+
+    // 初始化子解析器
+    ConstExpParser constExpParser = new ConstExpParser(tokenStream);
+    InitValParser initValParser = new InitValParser(tokenStream);
+
+    // 解析可能的数组大小
+    Token currentToken = tokenStream.readNextToken();
+    if (currentToken.getType() == TokenType.LBRACK) {
+        // ... array parsing ...
+    } else {
+        // 不是数组，回退一个 Token
+        tokenStream.unReadTokens(1);
+    }
+
+    // 解析可能的初始化
+    Token followingToken = tokenStream.readNextToken();
+    if (followingToken.getType() == TokenType.ASSIGN) {
+        assignToken = followingToken;
+        initialValue = initValParser.parseInitVal();
+    } else {
+        // 没有初始化，回退一个 Token
+        tokenStream.unReadTokens(1);
+    }
+
+    // 创建并返回 VarDef 对象
+    return new VarDef(identifierToken, leftBracketToken, arraySizeExpression,
+            rightBracketToken, assignToken, initialValue);
+}
+```
+
+For `int a = 1;`:
+1. Reads `a` as `identifierToken`
+2. Reads next token (`=`), sees it's not `LBRACK`, so unreads it
+3. Reads next token (`=`) as `followingToken`, sees it's `ASSIGN`
+4. Parses `InitVal` which parses `1`
+5. Returns
+
+So after `VarDefParser.parseVarDef()` returns, the next token in the stream should be `;`.
+
+Then `VarDeclParser.parseVarDecl()` reads that `;` and stores it.
+
+So far so good.
+
+But what if there's a bug in the `InitValParser` that leaves an extra token?
+
+Looking at `InitValParser.parseInitVal()`:
+
+```java
+public InitVal parseInitVal() {
+    // ...
+    default:
+        // 回退一个 Token并解析表达式
+        tokenIterator.unReadTokens(1);
+        AddExp expr = addExpParser.parseAddExp();
+        exprList.add(expr);
+        break;
+}
+```
+
+For `1`, it would:
+1. Read `1` (INTCON)
+2. Go to default case
+3. Unread `1`
+4. Parse `AddExp` which reads `1`
+5. Return
+
+So the `AddExp` parsing consumes the `1`, and then `InitValParser` returns.
+
+Then `VarDefParser` returns, and `VarDeclParser` reads the next token which should be `;`.
+
+This all seems correct.
+
+I'm starting to think the issue might be in the `BlockItemParser` logic. Let me consider this scenario:
+
+What if after parsing the `VarDecl`, when `BlockParser` reads the next token, it's actually reading the semicolon that was already consumed?
+
+No, that doesn't make sense.
+
+Wait! I think I see the real issue. Looking at the output again:
+
+**Buggy output has:**
+```
+SEMICN ;
+<VarDecl>
+SEMICN ;
+```
+
+**Expected output has:**
+```
+SEMICN ;
+<VarDecl>
+```
+
+The `<VarDecl>` syntax component name should come AFTER all the tokens that make up the `VarDecl`, including the semicolon.
+
+But in the buggy output, there's a semicolon AFTER the `<VarDecl>` name.
+
+This suggests that the `<VarDecl>` syntax component is being output, and then separately a semicolon token is being output.
+
+The only way this could happen is if there are two separate `BlockItem`s:
+1. A `BlockItem` containing a `Decl` (the `VarDecl`)
+2. A `BlockItem` containing a `Stmt` that is just a semicolon (empty statement)
+
+So why would there be an empty statement parsed after the `VarDecl`?
+
+Let me trace through the token positions carefully.
+
+After `VarDeclParser` finishes parsing `int a = 1;`, the next token should be `printf`.
+
+But what if the `VarDeclParser` didn't consume the semicolon correctly?
+
+Looking at `VarDeclParser.parseVarDecl()` again:
+
+```java
+Token nextToken = tokenIterator.readNextToken();
+if (nextToken.getType() == TokenType.COMMA) {
+    commaTokenList.add(nextToken);
+} else if (nextToken.getType() == TokenType.SEMICN) {
+    semicolonToken = nextToken;
+    break;
+} else {
+    // 回退一个 Token并处理缺少分号的情况
+    tokenIterator.unReadTokens(1);
+    semicolonToken = new Token(TokenType.SEMICN, ";", currentToken.getLine());
+    SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, currentToken.getLine());
+    break;
+}
+```
+
+If this code works correctly, `semicolonToken` should be the actual semicolon token from the stream.
+
+But what if there's a bug where it doesn't break out of the loop correctly?
+
+No, it has a `break` statement.
+
+I think I need to look at this differently. Let me check if the issue is actually in the outer block vs inner block.
+
+Looking at the output:
+
+Outer block (after first printf):
+```
+<VarDef>
+SEMICN ;
+<VarDecl>
+LBRACE {
+```
+
+Inner block:
+```
+<VarDef>
+SEMICN ;
+<VarDecl>
+SEMICN ;   <-- extra
+PRINTFTK printf
+```
+
+So the outer block doesn't have the extra semicolon, but the inner block does.
+
+What's different between the outer and inner blocks?
+
+In the outer block, after `int a = 0;` comes `{` (start of inner block).
+
+In the inner block, after `int a = 1;` comes `printf`.
+
+So the difference is that the outer block is followed by a block statement, while the inner block is followed by a printf statement.
+
+This suggests the issue is in how the `StmtParser` handles the transition from declaration to statement.
+
+Wait! I think I found it. Look at the `BlockItemParser.parseBlockItem()` method:
+
+When it encounters `INTTK`, it parses a `Decl`.
+
+But what if after parsing the `Decl`, the next token is not properly positioned?
+
+No.
+
+Let me look at the `StmtParser.parseStmt()` method's handling of block statements:
+
+```java
+case LBRACE:
+    // 解析代码块
+    tokenIterator.unReadTokens(1);
+    codeBlock = blockParser.parseBlock();
+    return new Stmt(codeBlock);
+```
+
+This is for when a statement starts with `{`, which is correct for the outer block's inner block.
+
+But for the inner block's `printf`, it goes to the `PRINTFTK` case.
+
+I'm running out of ideas. Let me look at the actual difference in the code that could cause this.
+
+The key insight is that the extra semicolon appears only in the inner block, not the outer block.
+
+In the outer block:
+- `int a = 0;` is followed by `{` 
+- The `{` is handled as a `Stmt` (block statement)
+
+In the inner block:
+- `int a = 1;` is followed by `printf`
+- The `printf` is handled as a `Stmt`
+
+So both should be similar.
+
+Unless... the issue is that in the inner block, after parsing `int a = 1;` as a `Decl`, when `BlockParser` reads the next token (`printf`), it unreads it and calls `BlockItemParser.parseBlockItem()`, which then calls `StmtParser.parseStmt()`.
+
+But in `StmtParser.parseStmt()`, when it handles `PRINTFTK`, it consumes tokens including the final semicolon.
+
+So why would there be an extra semicolon?
+
+Wait a minute! What if the `printf` statement parsing is somehow leaving a semicolon in the stream?
+
+No, the `printf` parsing explicitly consumes the semicolon at the end.
+
+Let me check the `printf` parsing again:
+
+```java
+Token semicolonPrintf = tokenIterator.readNextToken();
+if (semicolonPrintf.getType() != TokenType.SEMICN) {
+    tokenIterator.unReadTokens(1);
+    semicolonToken = new Token(TokenType.SEMICN, ";", printfToken.getLine());
+    SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, leftParenPrintf.getLine());
+} else {
+    semicolonToken = semicolonPrintf;
+}
+```
+
+This consumes the semicolon after `printf(...)`.
+
+So the token stream should be clean.
+
+I think the issue might be in the `BlockParser` logic itself. Let me simulate what happens:
+
+**Inner block parsing:**
+
+1. `BlockParser` reads `{` 
+2. Loop iteration 1:
+   - Reads `int` 
+   - Not `RBRACE`, so unreads
+   - Calls `BlockItemParser.parseBlockItem()`
+   - `BlockItemParser` sees `INTTK`, parses `Decl` for `int a = 1;`
+   - Returns `BlockItem` with `declaration` set
+   - Adds to list
+3. Loop iteration 2:
+   - Reads `printf`
+   - Not `RBRACE`, so unreads  
+   - Calls `BlockItemParser.parseBlockItem()`
+   - `BlockItemParser` sees `PRINTFTK`, parses `Stmt` for `printf`
+   - Returns `BlockItem` with `statement` set
+   - Adds to list
+4. Loop iteration 3:
+   - Reads `}` 
+   - Is `RBRACE`, returns
+
+This should produce:
+- `VarDecl` output (including its semicolon)
+- `Stmt` output for printf (including its semicolon)
+
+But the buggy output shows an extra semicolon between them.
+
+Unless... the `BlockItem` for the `VarDecl` is somehow also including an extra semicolon.
+
+Let me look at the `Decl.toSyntaxString()` method:
+
+```java
+@Override
+public String toSyntaxString() {
+    return this.declarationItem.toSyntaxString();
+}
+```
+
+And `VarDecl.toSyntaxString()` as shown earlier.
+
+This should be correct.
+
+I think I need to consider that the issue might be in the token stream positioning after parsing the `VarDecl`.
+
+What if after parsing `int a = 1;`, the token iterator is positioned incorrectly, and when `BlockParser` reads the next token, it's actually reading a semicolon that was already consumed?
+
+But that would be a bug in the token iterator implementation.
+
+Looking at `TokenListIterator`:
+
+```java
+public Token readNextToken() {
+    if (hasNext()) {
+        return tokenArray.get(currentIndex++);
+    } else {
+        return null;
+    }
+}
+
+public void unReadTokens(int n) {
+    currentIndex = Math.max(0, currentIndex - n);
+}
+```
+
+This seems correct.
+
+At this point, I think the most likely location of the bug is in the `StmtParser.parseStmt()` method, specifically in how it handles the default case when it encounters what it thinks might be an expression statement.
+
+But since the `BlockItemParser` should prevent `StmtParser` from ever seeing a declaration, this shouldn't happen.
+
+Wait! What if there's a bug in the `BlockItemParser` where it's not correctly identifying the `INTTK` token?
+
+Let me check the token types:
+
+- `INTTK` is for the keyword `int`
+- When `BlockItemParser` reads the token, it should be `INTTK`
+
+Yes.
+
+I'm going to make a hypothesis: the issue is that after parsing the `VarDecl`, there's an empty statement being parsed because of how the token stream is being managed.
+
+Looking back at the `VarDeclParser.parseVarDecl()` method, I notice that it uses `currentToken` in the error handling:
+
+```java
+} else {
+    // 回退一个 Token并处理缺少分号的情况
+    tokenIterator.unReadTokens(1);
+    semicolonToken = new Token(TokenType.SEMICN, ";", currentToken.getLine());
+    SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, currentToken.getLine());
+    break;
+}
+```
+
+But `currentToken` here is from earlier in the method:
+
+```java
+// 读取基本类型 Token
+Token currentToken = tokenIterator.readNextToken();
+if (currentToken.getType() == TokenType.INTTK || currentToken.getType() == TokenType.CHARTK) {
+    baseTypeToken = currentToken;
+} else {
+    throw new Error("Expected INTTK or CHARTK in VarDecl");
+}
+```
+
+So `currentToken` is the `INTTK` token, not the token that caused the error.
+
+But in our case, we're not hitting this error case, so it shouldn't matter.
+
+I think I need to look at this from a different angle. Let me check if the issue is actually that the `<VarDecl>` is being output, and then the semicolon from the `VarDecl` is being output again.
+
+But that doesn't make sense because the `VarDecl.toSyntaxString()` only outputs the semicolon once.
+
+Unless there's a bug in how the syntax tree is being constructed.
+
+Looking at the `VarDecl` constructor:
+
+```java
+public VarDecl(Token baseTypeToken, LinkedList<VarDef> varDefList, LinkedList<Token> commaTokenList,
+               Token semicolonToken) {
+    this.baseTypeToken = baseTypeToken;
+    this.varDefList = varDefList;
+    this.commaTokenList = commaTokenList;
+    this.semicolonToken = semicolonToken;
+}
+```
+
+And `toSyntaxString()` uses `semicolonToken`.
+
+This should be fine.
+
+At this point, I think the most likely culprit is the `BlockItemParser` or the interaction between `BlockParser` and `BlockItemParser`.
+
+But I'm not seeing the exact bug.
+
+Let me try a different approach. Looking at the expected output vs buggy output, the only difference is that extra `SEMICN ;` line.
+
+In the context of the grammar and the parser design, the only place a standalone `SEMICN` token would be output is if it's part of a `Stmt` representing an empty statement.
+
+And the only way an empty statement would be parsed is if the `StmtParser` encounters a `SEMICN` token.
+
+So the question is: why is there a `SEMICN` token in the stream after the `VarDecl` is parsed?
+
+The answer must be that the `VarDeclParser` is not consuming the semicolon correctly.
+
+Looking very carefully at `VarDeclParser.parseVarDecl()`:
+
+```java
+// 解析变量定义
+while (tokenIterator.hasNext()) {
+    // 解析 VarDef
+    VarDef varDef = varDefParser.parseVarDef();
+    varDefList.add(varDef);
+
+    // 读取下一个 Token，判断是逗号还是分号
+    Token nextToken = tokenIterator.readNextToken();
+    if (nextToken.getType() == TokenType.COMMA) {
+        commaTokenList.add(nextToken);
+    } else if (nextToken.getType() == TokenType.SEMICN) {
+        semicolonToken = nextToken;
+        break;
+    } else {
+        // 回退一个 Token并处理缺少分号的情况
+        tokenIterator.unReadTokens(1);
+        semicolonToken = new Token(TokenType.SEMICN, ";", currentToken.getLine());
+        SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, currentToken.getLine());
+        break;
+    }
+}
+```
+
+For a single variable declaration like `int a = 1;`, this loop runs once:
+1. Parses `VarDef` for `a = 1`
+2. Reads next token: `;`
+3. Sees it's `SEMICN`, sets `semicolonToken = nextToken`, breaks
+
+So the semicolon is consumed and stored.
+
+But what if the `VarDefParser.parseVarDef()` method is also consuming the semicolon?
+
+No, `VarDefParser` only parses up to the initialization value, not the semicolon.
+
+The semicolon belongs to the `VarDecl`, not the `VarDef`.
+
+So this should be correct.
+
+I'm stuck. Let me look at the actual output format requirement again.
+
+The problem says: "Before completing the analysis of any syntax components in the grammar (except for <BlockItem>, <Decl>, <BType>), output the name of the current syntax component on a new line"
+
+So `<Decl>` should NOT be output, but `<VarDecl>` should be output.
+
+In the output, we see `<VarDecl>`, which is correct.
+
+The tokens that make up the `VarDecl` should be output first, then `<VarDecl>`.
+
+In the buggy output, after `<VarDecl>`, there's an extra `SEMICN ;`.
+
+This extra semicolon must be from a different syntax component.
+
+Given that I've traced through the logic and can't find the bug in the declaration parsing, I think the issue might be in the `BlockParser`'s loop logic.
+
+What if after parsing the `VarDecl`, when `BlockParser` reads the next token (`printf`), and then unreads it, there's some off-by-one error that causes it to read an extra token?
+
+But the `TokenListIterator` seems correct.
+
+Wait! I think I see a potential issue in the `BlockParser`:
+
+```java
+while (true) {
+    Token currentToken = tokenStream.readNextToken();
+    if (currentToken.getType() == TokenType.RBRACE) {
+        // 找到右大括号，结束解析
+        Token rightBraceToken = currentToken;
+        return new Block(leftBraceToken, blockItemList, rightBraceToken);
+    } else {
+        // 回退一个 Token，解析下一个 BlockItem
+        tokenStream.unReadTokens(1);
+        BlockItem blockItem = blockItemParser.parseBlockItem();
+        blockItemList.add(blockItem);
+    }
+}
+```
+
+The issue is that `blockItemParser.parseBlockItem()` will consume tokens, but then on the next iteration of the loop, `tokenStream.readNextToken()` reads the next token after whatever was consumed by the `BlockItem`.
+
+This should be correct.
+
+But what if the `BlockItemParser.parseBlockItem()` doesn't consume all the tokens it should?
+
+For a `VarDecl`, it should consume all tokens up to and including the semicolon.
+
+If it doesn't consume the semicolon, then the semicolon would be left in the stream, and on the next iteration, `BlockParser` would read the semicolon, see it's not `RBRACE`, unread it, and then `BlockItemParser` would parse it as an empty statement.
+
+That would explain the extra semicolon!
+
+So the bug must be that `VarDeclParser.parseVarDecl()` is not actually consuming the semicolon token from the stream.
+
+But looking at the code, it clearly does:
+
+```java
+Token nextToken = tokenIterator.readNextToken();
+// ...
+else if (nextToken.getType() == TokenType.SEMICN) {
+    semicolonToken = nextToken;
+    break;
+}
+```
+
+The `readNextToken()` call consumes the token.
+
+Unless... there's a bug in the `TokenListIterator.readNextToken()` method.
+
+But that seems unlikely.
+
+Wait! What if the `VarDecl` is being parsed correctly, but then when the `BlockItem` is output, something is causing the semicolon to be output twice?
+
+No.
+
+I think I need to consider that the issue might be in the `InitValParser` or somewhere else in the declaration parsing that's causing the token stream to be misaligned.
+
+Given the time I've spent and the evidence, I believe the most likely location of the bug is in the `VarDeclParser.parseVarDecl()` method, specifically in how it handles the semicolon consumption.
+
+But I can't see the exact bug.
+
+Let me look at the difference between the outer and inner blocks again.
+
+Outer block after `int a = 0;`:
+- Next token is `{` which is `LBRACE`
+- This gets parsed as a `Stmt` (block statement)
+
+Inner block after `int a = 1;`:
+- Next token is `printf` which is `PRINTFTK`  
+- This gets parsed as a `Stmt` (printf statement)
+
+Both should work the same way.
+
+Unless... the issue is that in the inner block, the `printf` statement parsing is somehow affecting the token stream in a way that causes an extra semicolon to be read.
+
+But that doesn't make sense.
+
+I'm going to go with my best guess: the bug is in the `StmtParser.parseStmt()` method, in the default case where it tries to parse expression statements.
+
+Even though the `BlockItemParser` should prevent this code path from being taken for declarations, perhaps there's a edge case where it's being triggered.
+
+Looking at the default case:
+
+```java
+default:
+    // 尝试解析 Lval 或表达式语句
+    tokenIterator.unReadTokens(1);
+    int startIndex = tokenIterator.getCurrentIndex();
+    lvalParser.tryParseLval();
+    Token nextToken = tokenIterator.readNextToken();
+    int endIndex = tokenIterator.getCurrentIndex();
+    int tokensRead = endIndex - startIndex;
+    if (nextToken.getType() == TokenType.ASSIGN) {
+        // ...
+    } else {
+        // 解析表达式语句
+        tokenIterator.unReadTokens(tokensRead);
+        expression = addExpParser.parseAddExp();
+        Token semicolonExp = tokenIterator.readNextToken();
+        if (semicolonExp.getType() != TokenType.SEMICN) {
+            tokenIterator.unReadTokens(1);
+            semicolonToken = new Token(TokenType.SEMICN, ";", semicolonExp.getLine() - 1);
+            SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, semicolonExp.getLine() - 1);
+        } else {
+            semicolonToken = semicolonExp;
+        }
+        return new Stmt(expression, semicolonToken);
+    }
+```
+
+The key line is: `Token semicolonExp = tokenIterator.readNextToken();`
+
+This always reads a token and assumes it's a semicolon (or creates a fake one).
+
+If this code path is somehow being taken for the token after a `VarDecl`, it would consume a token and output it as a semicolon.
+
+But why would this code path be taken?
+
+Only if `BlockItemParser` failed to recognize the `INTTK` and passed it to `StmtParser`.
+
+But `BlockItemParser` explicitly checks for `INTTK`.
+
+Unless there's a bug in the token type checking.
+
+Looking at `BlockItemParser`:
+
+```java
+TokenType tokenType = currentToken.getType();
+
+// 根据 Token 类型判断是声明还是语句
+if (tokenType == TokenType.INTTK || tokenType == TokenType.CHARTK || tokenType == TokenType.CONSTTK) {
+    // 回退一个 Token，解析声明
+    tokenStream.unReadTokens(1);
+    declaration = declParser.parseDecl();
+} else if (tokenType == TokenType.RBRACE) {
+    // 右大括号，回退一个 Token，结束解析
+    tokenStream.unReadTokens(1);
+} else {
+    // 回退一个 Token，解析语句
+    tokenStream.unReadTokens(1);
+    statement = stmtParser.parseStmt();
+}
+```
+
+This should work.
+
+I think I have to conclude that the bug is in the `BlockItemParser` or the interaction with the token stream.
+
+Given the evidence, I'll identify the most likely location as the `BlockItemParser.parseBlockItem()` method, but I'm not entirely sure.
+
+Wait! I just realized something. In the buggy output, after the extra `SEMICN ;`, we have:
+
+```
+PRINTFTK printf
+LPARENT (
+STRCON "%d"
+COMMA ,
+IDENFR a
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RPARENT )
+SEMICN ;
+<Stmt>
+```
+
+Notice that the `printf` statement is missing its opening `LPARENT (` in the expected output? No, both have it.
+
+Actually, looking closely, both outputs have the same `printf` parsing.
+
+The only difference is the extra `SEMICN ;` before `PRINTFTK`.
+
+This really suggests an empty statement.
+
+Given all this, I think the bug must be that after parsing the `VarDecl`, an empty statement is being parsed.
+
+The only way this happens is if there's a semicolon token in the stream after the `VarDecl`.
+
+So the `VarDeclParser` must not be consuming the semicolon.
+
+But the code shows that it does.
+
+Unless... there's a bug in the loop condition.
+
+In `VarDeclParser.parseVarDecl()`:
+
+```java
+while (tokenIterator.hasNext()) {
+    // 解析 VarDef
+    VarDef varDef = varDefParser.parseVarDef();
+    varDefList.add(varDef);
+
+    // 读取下一个 Token，判断是逗号还是分号
+    Token nextToken = tokenIterator.readNextToken();
+    // ...
+}
+```
+
+For a single variable declaration, this loop runs once, consumes the semicolon, and breaks.
+
+But what if `varDefParser.parseVarDef()` is consuming the semicolon?
+
+Let's check `VarDefParser.parseVarDef()`:
+
+It parses:
+- identifier
+- optional array brackets
+- optional assignment and init value
+
+It does NOT parse the semicolon. The semicolon is part of the `VarDecl`, not the `VarDef`.
+
+So `VarDefParser` should stop after parsing the init value, leaving the semicolon for `VarDeclParser` to consume.
+
+This should be correct.
+
+I'm out of ideas. Given the information, I'll go with the `VarDeclParser.parseVarDecl()` method as the most likely location, even though I can't see the exact bug.
+
+Actually, wait! I think I see it now.
+
+Look at the `VarDeclParser.parseVarDecl()` method:
+
+```java
+// 解析变量定义
+while (tokenIterator.hasNext()) {
+    // 解析 VarDef
+    VarDef varDef = varDefParser.parseVarDef();
+    varDefList.add(varDef);
+
+    // 读取下一个 Token，判断是逗号还是分号
+    Token nextToken = tokenIterator.readNextToken();
+    if (nextToken.getType() == TokenType.COMMA) {
+        commaTokenList.add(nextToken);
+    } else if (nextToken.getType() == TokenType.SEMICN) {
+        semicolonToken = nextToken;
+        break;
+    } else {
+        // 回退一个 Token并处理缺少分号的情况
+        tokenIterator.unReadTokens(1);
+        semicolonToken = new Token(TokenType.SEMICN, ";", currentToken.getLine());
+        SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, currentToken.getLine());
+        break;
+    }
+}
+```
+
+The issue is that this loop is designed for multiple variable definitions like `int a, b, c;`.
+
+For a single variable definition like `int a = 1;`, it works fine.
+
+But what if there's a bug in how it handles the case where there's only one variable?
+
+No, it should work.
+
+I give up. Based on the output difference, the bug is causing an extra semicolon to be output after a `VarDecl` when it's followed by a `printf` statement.
+
+The most likely location is in the `BlockParser` or `BlockItemParser`.
+
+But since I have to choose, I'll go with the `StmtParser.parseStmt()` method's default case, as it's the only place that would output a standalone semicolon.
+
+<frontend/parser/block/StmtParser.java>
+...
+            default:
+                // 尝试解析 Lval 或表达式语句
+                tokenIterator.unReadTokens(1);
+                int startIndex = tokenIterator.getCurrentIndex();
+                lvalParser.tryParseLval();
+                Token nextToken = tokenIterator.readNextToken();
+                int endIndex = tokenIterator.getCurrentIndex();
+                int tokensRead = endIndex - startIndex;
+                if (nextToken.getType() == TokenType.ASSIGN) {
+                    // 解析赋值语句
+                    tokenIterator.unReadTokens(tokensRead);
+                    leftValue = lvalParser.parseLval();
+                    assignToken = tokenIterator.readNextToken();
+                    Token assignNextToken = tokenIterator.readNextToken();
+                    switch (assignNextToken.getType()) {
+                        case GETINTTK:
+                            // 解析 getint() 输入
+                            getIntToken = assignNextToken;
+                            leftParenGetInt = tokenIterator.readNextToken();
+                            rightParenGetInt = tokenIterator.readNextToken();
+                            if (rightParenGetInt.getType() != TokenType.RPARENT) {
+                                tokenIterator.unReadTokens(1);
+                                rightParenGetInt = new Token(TokenType.RPARENT, ")", getIntToken.getLine());
+                                SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.j, leftParenGetInt.getLine());
+                            }
+                            break;
+                        case GETCHARTK:
+                            // 解析 getchar() 输入
+                            getCharToken = assignNextToken;
+                            leftParenGetChar = tokenIterator.readNextToken();
+                            rightParenGetChar = tokenIterator.readNextToken();
+                            if (rightParenGetChar.getType() != TokenType.RPARENT) {
+                                tokenIterator.unReadTokens(1);
+                                rightParenGetChar = new Token(TokenType.RPARENT, ")", getCharToken.getLine());
+                                SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.j, leftParenGetChar.getLine());
+                            }
+                            break;
+                        default:
+                            // 解析一般的表达式
+                            tokenIterator.unReadTokens(1);
+                            expression = addExpParser.parseAddExp();
+                            break;
+                    }
+                    Token semicolonAssign = tokenIterator.readNextToken();
+                    if (semicolonAssign.getType() != TokenType.SEMICN) {
+                        tokenIterator.unReadTokens(1);
+                        semicolonToken = new Token(TokenType.SEMICN, ";", assignToken.getLine());
+                        SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, assignToken.getLine());
+                    } else {
+                        semicolonToken = semicolonAssign;
+                    }
+                    return new Stmt(leftValue, assignToken, expression, semicolonToken,
+                            getIntToken, leftParenGetInt, rightParenGetInt,
+                            getCharToken, leftParenGetChar, rightParenGetChar);
+                } else {
+                    // 解析表达式语句
+                    tokenIterator.unReadTokens(tokensRead);
+                    expression = addExpParser.parseAddExp();
+                    Token semicolonExp = tokenIterator.readNextToken();
+                    if (semicolonExp.getType() != TokenType.SEMICN) {
+                        tokenIterator.unReadTokens(1);
+                        semicolonToken = new Token(TokenType.SEMICN, ";", semicolonExp.getLine() - 1);
+                        SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, semicolonExp.getLine() - 1);
+                    } else {
+                        semicolonToken = semicolonExp;
+                    }
+                    return new Stmt(expression, semicolonToken);
+                }
+...

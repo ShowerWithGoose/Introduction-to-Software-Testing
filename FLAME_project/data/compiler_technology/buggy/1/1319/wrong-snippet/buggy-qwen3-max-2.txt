@@ -1,0 +1,243 @@
+Looking at the test case input and comparing the buggy output with the expected output, I can see that the main issue is in the `BlockNode` visitor method in the `ASTPrinter` class. 
+
+The problem is that when processing a block with multiple nested blocks or statements, the current implementation doesn't properly output `<Stmt>` for each `BlockItem` that is a statement. Specifically, looking at the expected output, after each `</Block>` there should be a `<Stmt>` line, but the buggy output is missing some of these.
+
+The issue is in the `visitBlock` method - it writes the block content but doesn't ensure that each `BlockItem` (whether it's a Decl or Stmt) gets properly wrapped with the appropriate syntax component markers. However, looking more closely at the `visitDeclBlock` and `visitStmtBlock` methods, I notice they have commented out lines that would output `<BlockItem>`.
+
+But the real issue is that the `visitBlock` method in `ASTPrinter` is not correctly handling the sequence of outputs. Looking at the expected vs actual output, the main discrepancy is that nested blocks are not being followed by `<Stmt>` tags properly.
+
+Actually, looking more carefully at the code structure, I see that the `visitStmtBlock` method calls `stmtBlock.getStmtNode().accept(this)` but doesn't output `<Stmt>` itself - it relies on the individual statement visitors to output `<Stmt>`. This seems correct.
+
+The real issue appears to be in the `visitBlock` method itself. Let me trace through what should happen:
+
+1. A block starts with `LBRACE {`
+2. Each BlockItem (which could be a Decl or Stmt) is processed
+3. Block ends with `RBRACE }`
+4. Then `<Block>` is output
+5. Since a Block is used as a Stmt, the `visitBlockStmt` should output `<Stmt>` after the block
+
+Looking at the expected output, after each `</Block>` there is indeed a `<Stmt>`, which suggests that `visitBlockStmt` is working correctly.
+
+Wait, let me look at the actual discrepancy. In the buggy output, after the first nested block:
+```
+LBRACE {
+RBRACE }
+<Block>
+<Stmt>
+LBRACE {
+RBRACE }
+<Block>
+<Stmt>
+RBRACE }
+<Block>
+<MainFuncDef>
+```
+
+But in the expected output, there's an extra `<Stmt>` before the `RBRACE }` that closes the main function block:
+```
+<Block>
+<Stmt>
+RBRACE }
+<Block>
+<Stmt>
+```
+
+Actually, looking more carefully at the test input, the main function has multiple statements:
+1. `{}` (empty block)
+2. `{{}}` (nested empty blocks)  
+3. `printf("testblock");`
+4. Complex nested block with `int a = 5;`
+5. `if` statement
+6. `return 0;`
+
+The buggy output is missing the `printf` statement entirely and all the complex nested structure after it.
+
+This suggests that the parser is not correctly parsing all the statements in the main function block. Looking at the `parseBlock` method in `Parser.java`, I see:
+
+```java
+private BlockNode parseBlock() {
+    List<BlockItemNode> blockItemNodes = null;
+    match("LBRACE");
+    while (!match("RBRACE")) {
+        if (blockItemNodes == null)
+            blockItemNodes = new ArrayList<>();
+        blockItemNodes.add(parseBlockItem());
+    }
+    return new BlockNode(blockItemNodes);
+}
+```
+
+The issue is with the condition `while (!match("RBRACE"))`. The `match` method consumes the token if it matches, so this loop will consume the `RBRACE` token and exit, which is correct.
+
+But looking at the `parseStmt` method, there's a problematic section:
+
+```java
+else {
+    int temp = pos, f;
+    for (f = pos; !tokens.get(f).type.equals("SEMICN") && tokens.get(f).n == tokens.get(pos).n; f++){
+        if (tokens.get(f).type.equals("ASSIGN")){
+            temp = f;
+            break;
+        }
+    }
+    if (temp > pos){
+        // ... assignment handling
+    }
+    else {
+        // [Exp] ';'
+        ExpNode exp;
+        if (currentToken().type.equals("SEMICN"))
+            exp = null;
+        else
+            exp = parseExp();
+        match("SEMICN");
+        return new ExpStmt(exp);
+    }
+}
+```
+
+This logic is flawed because it's trying to lookahead to determine if there's an assignment, but it's not handling the case where we have a simple statement like `printf(...)` correctly.
+
+Looking at the beginning of `parseStmt`, I see that `PRINTFTK` is handled correctly in its own branch. So why is the printf statement missing?
+
+Actually, looking at the test input again:
+```c
+int main() {
+    {
+    }
+    {
+        {
+        }
+    }
+    printf("testblock");
+    // ... more statements
+}
+```
+
+The issue might be that after parsing the second nested block `{{}}`, the parser is incorrectly consuming or skipping the `printf` token.
+
+Looking at the `parseBlockItem` method:
+```java
+private BlockItemNode parseBlockItem() {
+    if (isDecl()) {
+        return new DeclBlock(parseDecl());
+    } else {
+        return new StmtBlock(parseStmt());
+    }
+}
+```
+
+And `isDecl()` checks:
+```java
+private boolean isDecl() {
+    return currentToken().type.equals("CONSTTK") || (isBType() && peekNextToken().type.equals("IDENFR") && !Objects.requireNonNull(peekNextToken(2)).type.equals("LPARENT"));
+}
+```
+
+For the `printf` token, `isDecl()` returns false, so it should go to `parseStmt()`, which should handle the `PRINTFTK` case.
+
+But wait, in the buggy output, I see that after the second block, it goes directly to `RBRACE }` without processing the `printf` statement. This suggests that the parser is incorrectly thinking it has reached the end of the block.
+
+Looking at the `parseBlock` method again:
+```java
+while (!match("RBRACE")) {
+```
+
+The `match("RBRACE")` will return true when it encounters a `RBRACE` token, causing the loop to exit. But if there are still tokens like `PRINTFTK` before the final `RBRACE`, this shouldn't happen.
+
+I think the real issue is in the `parseStmt` method's handling of block statements. When it encounters `LBRACE`, it calls `parseBlock()`, which consumes tokens until the matching `RBRACE`. But then, after returning from `parseBlock()`, the parser should continue to the next statement.
+
+However, looking at the buggy output, it seems like after parsing the second complex block structure, the parser is not continuing to parse the remaining statements.
+
+Actually, looking more carefully at the expected output vs buggy output, I notice that the buggy output completely skips everything after the second block, including the `printf` statement, the complex nested block with variable declaration, the `if` statement, and the `return` statement.
+
+This suggests that the parser is encountering an error or incorrectly determining the end of the block.
+
+Looking at the `parseBlock` method, the condition `while (!match("RBRACE"))` means that as soon as it sees a `RBRACE`, it stops. But in the test input, after the second block `{{}}`, there should be more statements before the final `RBRACE` of the main function.
+
+Wait, let me count the braces in the test input:
+```c
+int main() {
+    {           // 1 open
+    }           // 1 close
+    {           // 2 open
+        {       // 3 open
+        }       // 3 close
+    }           // 2 close
+    printf("testblock");
+    {           // 4 open
+        {       // 5 open
+            {   // 6 open
+                { // 7 open
+                    int a = 5;
+                } // 7 close
+            }     // 6 close
+        }         // 5 close
+    }             // 4 close
+    if (testblock == 0) {
+        {
+            printf("  ");
+        }
+    }
+    return 0;
+}               // main function close
+```
+
+So there should be many more statements parsed. The fact that the buggy output stops after the second block suggests that the parser is incorrectly consuming the final `RBRACE` of the main function too early.
+
+Looking at the `parseBlock` method again, I think the issue is that when parsing the second block `{{}}`, the inner `parseBlock()` call for the innermost `{}` consumes its `RBRACE`, then the outer `parseBlock()` call consumes its `RBRACE`, and then somehow the parser thinks it's done with the main function block.
+
+But that doesn't make sense because there are more tokens after that.
+
+Actually, I think I found the real issue. Looking at the `parseStmt` method, when it handles a block statement:
+
+```java
+if (match("LBRACE")) {
+    // Block → '{' { BlockItem } '}'
+    BlockNode block = parseBlock();
+    return new BlockStmt(block);
+}
+```
+
+The `match("LBRACE")` consumes the `LBRACE` token, then `parseBlock()` is called. But `parseBlock()` starts with `match("LBRACE")` again! This is wrong.
+
+Looking at `parseBlock()`:
+```java
+private BlockNode parseBlock() {
+    List<BlockItemNode> blockItemNodes = null;
+    match("LBRACE");
+    while (!match("RBRACE")) {
+        if (blockItemNodes == null)
+            blockItemNodes = new ArrayList<>();
+        blockItemNodes.add(parseBlockItem());
+    }
+    return new BlockNode(blockItemNodes);
+}
+```
+
+So when `parseStmt` encounters `LBRACE`, it consumes it with `match("LBRACE")`, then calls `parseBlock()`, which immediately tries to consume another `LBRACE` with `match("LBRACE")`. This would fail because the current token is now the first token inside the block, not another `LBRACE`.
+
+This is the bug! The `parseStmt` method should not consume the `LBRACE` before calling `parseBlock()`, because `parseBlock()` expects to consume the `LBRACE` itself.
+
+Looking at the corrected logic, `parseStmt` should be:
+
+```java
+if (currentToken().type.equals("LBRACE")) {
+    BlockNode block = parseBlock();
+    return new BlockStmt(block);
+}
+```
+
+Without the `match("LBRACE")` call, because `parseBlock()` will handle consuming the `LBRACE`.
+
+This explains why the parsing goes wrong - after the first block statement, the parser is in an inconsistent state because it consumed an extra `LBRACE` token that wasn't there.
+
+<Parser.java>
+...
+    public StmtNode parseStmt() {
+        if (match("LBRACE")) {
+            // Block → '{' { BlockItem } '}'
+            BlockNode block = parseBlock();
+            return new BlockStmt(block);
+        } else if (match("IFTK")) {
+...

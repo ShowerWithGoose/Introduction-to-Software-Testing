@@ -1,0 +1,635 @@
+Based on the problem description and the test case, the program fails to detect syntax errors (missing semicolons) in the input. The expected output indicates three errors of type 'i' (missing semicolon) at lines 2, 9, and 13. The buggy output is empty, suggesting that the parser either crashes, enters an infinite loop, or simply fails to report the errors it encounters.
+
+The core issue lies in how the `Parser` handles error recovery and token consumption when a syntax error is detected. Specifically:
+
+1.  **`SemicnJudge` method**: When a semicolon is missing, it calls `addError('i')`. However, it does **not** consume the next token or advance the parser state. This means the current token (which caused the mismatch) remains as the "current" token.
+2.  **`Stmt` method**: In the `if` branch, after parsing the condition and the first statement, if there is no `else`, it returns. If the next token in the source is not a valid start for the next statement or block item, the parser might get stuck or misinterpret the flow. More critically, look at the `for` loop handling and general statement parsing.
+3.  **`Block` method**: The `while(!isMatch(LexType.RBRACE))` loop calls `BlockItem()`. If `BlockItem` encounters an error and doesn't advance the token stream correctly, the parser might loop infinitely or fail to reach the `RBRACE`.
+4.  **`CompUnit` method**: The lookahead logic `preRead(2)` might be problematic if the lexer's `preRead` implementation has side effects or if the token stream isn't managed correctly during error states.
+
+However, the most immediate cause for *no* output in `error.txt` despite errors existing is likely that the parser throws an exception (e.g., `IndexOutOfBoundsException` or `NullPointerException`) before it can write to the file, or it gets stuck in an infinite loop because it doesn't advance past the error point.
+
+Let's look at `SemicnJudge`:
+```java
+    public void SemicnJudge(TreeNode node) {
+        if (isMatch(LexType.SEMICN)) {
+            addLeaf(node);
+        }
+        else {
+            addError('i');
+        }
+    }
+```
+If `addError` is called, the token stream is NOT advanced. The next call to `isMatch` or `addLeaf` will see the same token. If the calling function (e.g., `VarDecl`) returns, the caller (e.g., `BlockItem` -> `Block`) continues. If the next expected token is not present, it might error again or loop.
+
+But there is a more subtle bug in `Lexer.analyze()` regarding comments and end-of-file handling which might cause the parser to miss tokens or crash, but the primary suspect for "Wrong Answer" with empty output is often an unhandled exception or infinite loop in the parser's error recovery.
+
+Let's look at `Parser.next()`:
+```java
+    public void next(){
+        int f = lexer.analyze();
+        if (f == -1) {
+            errorTable.add(lexer.getlineNUM() + " " + "a");
+        }
+        while (f == -2 && !lexer.isEnd()) {
+            f = lexer.analyze();
+        }
+        type = lexer.getLexType();
+        tokens.add(lexer.getToken());
+        curPos++;
+    }
+```
+If `lexer.analyze()` returns -1 (error 'a'), it adds to error table but *continues* to set `type` and add token. This seems okay for error 'a'.
+
+Let's look at `Stmt` again.
+In the `if` branch:
+```java
+        if (isMatch(LexType.IFTK)) {
+            addLeaf(stmt);
+            if (isMatch(LexType.LPARENT)) {
+                addLeaf(stmt);
+            }
+            stmt.addNode(Cond());
+            RparentJudge(stmt); // Checks for ')', adds error 'j' if missing, but DOES NOT advance if missing.
+            stmt.addNode(Stmt());
+            if (isMatch(LexType.ELSETK)) {
+                addLeaf(stmt);
+                stmt.addNode(Stmt());
+            }
+        }
+```
+If `RparentJudge` fails (missing ')'), it adds error 'j' but doesn't consume the token. Then `stmt.addNode(Stmt())` is called. `Stmt()` will try to parse the next statement starting from the token that should have been ')'. This might lead to cascading errors or incorrect parsing.
+
+However, the specific test case errors are:
+Line 2: `printf("Hello SysY!\n")` missing `;`.
+Line 9: `int a` missing `;`.
+Line 13: `return 0` missing `;`.
+
+Let's trace Line 2:
+`MainFuncDef` -> `Block` -> `BlockItem` -> `Stmt`.
+`Stmt` sees `PRINTFTK`.
+It executes the `printf` branch:
+```java
+        else if (isMatch(LexType.PRINTFTK)) {
+            addLeaf(stmt); // consumes printf
+            addLeaf(stmt); // consumes (
+            addLeaf(stmt); // consumes "Hello..."
+            while (isMatch(LexType.COMMA)) { ... }
+            RparentJudge(stmt); // Checks for )
+            SemicnJudge(stmt); // Checks for ;
+        }
+```
+If `SemicnJudge` finds no `;`, it calls `addError('i')`. It does NOT advance.
+The `Stmt` function finishes and returns `<Stmt>`.
+Control returns to `Block`.
+`Block` loop: `while(!isMatch(LexType.RBRACE))`.
+The current token is likely `if` (from line 4).
+`BlockItem` is called.
+`BlockItem` checks `if (isMatch(LexType.CONSTTK) || ...)` -> False.
+Else `stmt.addNode(Stmt())`.
+`Stmt` sees `IFTK`.
+Parses `if`.
+Inside `if`, `Cond` parses `1`.
+`RparentJudge` checks for `)`. It is present.
+`stmt.addNode(Stmt())`.
+The next token is `;` (line 7, inside the comment block? No, line 6 is `if (1)`, line 7 is empty, line 8 is comment, line 9 is `int a`).
+Wait, the input is:
+```
+    if (1)
+
+
+    /*********/
+    ;
+```
+After `if (1)`, the next token is `;` (from line 9? No, line 9 is `int a`).
+Let's re-read the input carefully.
+Line 1: `int main() {`
+Line 2: `    printf("Hello SysY!\n") // error 1` -> Missing `;`
+Line 3: (empty)
+Line 4: `    if (1)`
+Line 5: (empty)
+Line 6: (empty)
+Line 7: (empty)
+Line 8: `    /*********/`
+Line 9: `    ;` -> This `;` is likely parsed as an empty statement `Exp ';'` where Exp is empty? Or just `;`?
+Grammar: `Stmt → [Exp] ';'`.
+So `;` is a valid statement.
+Line 10: `    int a // error 2` -> Missing `;`
+Line 11: (empty)
+Line 12: `    for (;;) {}`
+Line 13: `    return 0 // error 3` -> Missing `;`
+Line 14: `}`
+
+Back to Line 2 error:
+`SemicnJudge` adds error 'i'. Current token is still whatever followed `"`? No, `addLeaf` consumed `"`. `RparentJudge` consumed `)`.
+So current token is the one AFTER `)`.
+In `printf("...")`, the tokens are `PRINTFTK`, `LPARENT`, `STRCON`, `RPARENT`.
+After `RparentJudge`, if `)` was present, it was consumed by `addLeaf` inside `RparentJudge`.
+So current token is the next one.
+If `SemicnJudge` fails, it adds error. Current token is NOT consumed.
+The next token is likely `IFTK` (from line 4).
+`Stmt` returns.
+`Block` loops. `isMatch(RBRACE)`? No, it's `IFTK`.
+`BlockItem` -> `Stmt`.
+`Stmt` sees `IFTK`. Parses `if`.
+`if (1)` -> `Cond` parses `1`. `RparentJudge` expects `)`.
+The token after `1` is `)`. It matches. Consumed.
+Next token?
+Input: `if (1) \n \n \n /*...*/ \n ;`
+Tokens: `IFTK`, `LPARENT`, `INTCON(1)`, `RPARENT`, `SEMICN` (from line 9).
+So `Stmt()` inside `if` is called.
+`Stmt` sees `SEMICN`.
+Branch: `else { if (isMatch(LexType.SEMICN)) { addLeaf(stmt); } ... }`
+It consumes `;`.
+Returns `<Stmt>`.
+`if` statement completes.
+`Block` loops.
+Next token: `INTTK` (from `int a` on line 10).
+`BlockItem` -> `Decl` -> `VarDecl`.
+`VarDecl` -> `BType` (consumes `int`) -> `VarDef`.
+`VarDef` -> `Ident` (consumes `a`).
+`VarDef` checks `[`? No.
+`VarDef` checks `=`? No.
+`VarDef` returns `<VarDef>`.
+`VarDecl` checks `,`? No.
+`VarDecl` calls `SemicnJudge`.
+Current token is likely `FORTK` (from line 12) or comment?
+Comments are skipped in Lexer.
+So next token is `FORTK`.
+`SemicnJudge` sees `FORTK`, not `SEMICN`.
+Adds error 'i'.
+Does NOT consume `FORTK`.
+`VarDecl` returns.
+`Block` loops.
+`isMatch(RBRACE)`? No, `FORTK`.
+`BlockItem` -> `Decl`?
+`BlockItem` checks `CONSTTK, INTTK, CHARTK, VOIDTK`.
+Current token is `FORTK`. None match.
+Else `stmt.addNode(Stmt())`.
+`Stmt` sees `FORTK`.
+Parses `for`.
+...
+`for (;;) {}` parses correctly.
+After `for`, next token is `RETURNTK`.
+`Block` loops.
+`BlockItem` -> `Stmt`.
+`Stmt` sees `RETURNTK`.
+Parses `return`.
+`return` branch:
+```java
+        else if (isMatch(LexType.RETURNTK)) {
+            addLeaf(stmt); // consumes return
+            if (isMatch(LexType.SEMICN)) {
+                addLeaf(stmt);
+            }
+            else if (isExp()){
+                stmt.addNode(Exp());
+                SemicnJudge(stmt);
+            }
+            else {
+                SemicnJudge(stmt);
+            }
+        }
+```
+`isExp()` checks for `LPARENT, IDENFR, INTCON...`.
+Next token is `INTCON(0)`. `isExp()` is true.
+`stmt.addNode(Exp())`.
+`Exp` -> `AddExp` -> ... -> `Number` -> consumes `0`.
+Returns from `Exp`.
+Back in `Stmt`: calls `SemicnJudge(stmt)`.
+Current token is `RBRACE` (from line 14).
+`SemicnJudge` sees `RBRACE`, not `SEMICN`.
+Adds error 'i'.
+Does NOT consume `RBRACE`.
+`Stmt` returns.
+`Block` loops.
+`isMatch(RBRACE)`? Yes!
+Consumes `RBRACE`.
+`Block` returns.
+`MainFuncDef` returns.
+`CompUnit` returns.
+`analyze()` prints errors.
+
+So the logic *seems* to find the errors. Why is the output empty?
+
+Check `addError`:
+```java
+    public void addError(Character c) {
+        errorTable.add(tokens.get(curPos - 2).getLineNum() + " " + c);
+    }
+```
+It uses `tokens.get(curPos - 2)`.
+`curPos` is incremented in `next()`.
+When `SemicnJudge` is called, `next()` has NOT been called for the missing semicolon (because it's missing).
+The last token consumed was the one before the expected semicolon.
+Example: `printf("...")`.
+Tokens consumed: `PRINTFTK`, `LPARENT`, `STRCON`, `RPARENT`.
+`curPos` points to index after `RPARENT`.
+`tokens.get(curPos - 1)` is `RPARENT`.
+`tokens.get(curPos - 2)` is `STRCON`.
+The error line number should correspond to the last non-terminal before the semicolon.
+For `printf`, the last token is `)`. Line number of `)` is correct.
+For `int a`, last token is `a`. Line number of `a` is correct.
+For `return 0`, last token is `0`. Line number of `0` is correct.
+
+So the line numbers should be correct.
+
+Why is `error.txt` empty?
+Maybe `System.setOut(errout)` fails or `errout` is not flushed/closed?
+In `analyze()`:
+```java
+        System.setOut(out);
+        for (String s : outputTable) {
+            System.out.println(s);
+        }
+
+        System.setOut(errout);
+        for (String s : errorTable) {
+            System.out.println(s);
+        }
+```
+It does not close `errout`. But `PrintStream` usually flushes on newline.
+However, if `outputTable` printing throws an exception, the code might stop.
+Or if `parser.txt` creation fails.
+
+Let's look at `Lexer.analyze()` again.
+Is it possible that `lexer.analyze()` throws an exception or returns unexpected values?
+In `Lexer`, `isEnd()` checks `curPos >= contents.length() - 1`.
+If `curPos` is at the last character, `isEnd` is true.
+`nextCharacter()` accesses `contents.charAt(curPos)`.
+If `curPos` equals `contents.length()`, `charAt` throws `StringIndexOutOfBoundsException`.
+
+In `Parser.next()`:
+```java
+    public void next(){
+        int f = lexer.analyze();
+        // ...
+        type = lexer.getLexType();
+        tokens.add(lexer.getToken());
+        curPos++;
+    }
+```
+If `lexer.analyze()` returns -2 (end of comment/EOF), the loop `while (f == -2 && !lexer.isEnd())` continues.
+If `lexer.isEnd()` becomes true, the loop exits.
+Then `type = lexer.getLexType()` uses the LAST valid token's type?
+And `tokens.add(lexer.getToken())` adds the LAST valid token AGAIN?
+This duplicates the last token in the `tokens` list.
+And `curPos++` increments parser's curPos.
+
+If the parser tries to parse beyond the valid tokens, it might crash.
+
+But the main issue is likely in `Block` or `Stmt` getting stuck or crashing.
+
+Actually, look at `CompUnit`:
+```java
+        while (!lexer.isEnd() && (isMatch(LexType.CONSTTK)
+                || ((isMatch(LexType.INTTK) || isMatch(LexType.CHARTK)) && !preRead(2).equals(LexType.LPARENT)))) {
+            root.addNode(Decl());
+        }
+```
+`preRead(2)` calls `lexer.preRead(2)`.
+`lexer.preRead`:
+```java
+    public LexType preRead(int i) {
+        int now = curPos;
+        int nowLine = lineNum;
+        for (int j = 0; j < i; j++) {
+            analyze();
+        }
+        curPos = now;
+        lineNum = nowLine;
+        return type;
+    }
+```
+It calls `analyze()` which advances `curPos` in the Lexer, then restores it.
+This is risky if `analyze()` has side effects other than `curPos` (like `lineNum` changes inside comments). It restores `lineNum` too.
+But `tokens` list in Parser is NOT affected by `preRead` because `preRead` doesn't add to `Parser.tokens`.
+However, `Lexer.token` is modified. `Parser.next()` uses `lexer.getToken()`.
+If `preRead` modifies `lexer.token`, and then `Parser.next()` is called, it uses the modified token?
+No, `Parser.next()` calls `lexer.analyze()` again, which creates a NEW token.
+
+There is a potential bug in `Lexer.preRead` restoring state.
+`curPos` is restored. `lineNum` is restored.
+But `lexer.token` object is the SAME object.
+`analyze()` clears `token` (`tokenClear()`) and builds it up.
+So `preRead` leaves `lexer.token` in the state of the last token read during preview.
+When `Parser.next()` is called subsequently, it calls `tokenClear()` and builds the correct token.
+So this should be fine.
+
+Let's look at the `Block` loop again.
+```java
+    public TreeNode Block() {
+        TreeNode block = new TreeNode(ParsType.Block,new ArrayList<>());
+        if (isMatch(LexType.LBRACE)) {
+            addLeaf(block);
+        }
+        while(!isMatch(LexType.RBRACE)) {
+            block.addNode(BlockItem());
+        }
+        addLeaf(block);
+        addOut("<Block>");
+        return block;
+    }
+```
+If `BlockItem` encounters an error and does NOT advance the token, and the token is not `RBRACE`, the loop runs forever.
+Does `BlockItem` always advance?
+`BlockItem` calls `Decl()` or `Stmt()`.
+`Decl()` calls `VarDecl()` or `ConstDecl()`.
+`VarDecl()` calls `SemicnJudge`. If error, does NOT advance.
+Returns.
+`BlockItem` returns.
+`Block` loops.
+Token is still the same (e.g., `FORTK`).
+`isMatch(RBRACE)` is false.
+`BlockItem` called again.
+`BlockItem` sees `FORTK`. Not a Decl.
+Calls `Stmt()`.
+`Stmt()` sees `FORTK`.
+Parses `for`.
+Advances tokens.
+So it doesn't loop infinitely here.
+
+What about `int a` error?
+`VarDecl` errors at `SemicnJudge`. Token is `FORTK`.
+Returns.
+`Block` loops.
+`BlockItem` sees `FORTK`.
+Calls `Stmt`.
+`Stmt` parses `for`.
+Advances.
+So no infinite loop.
+
+So why empty output?
+Check `Compiler.java`.
+```java
+        Parser parser = new Parser(lexer);
+        parser.analyze();
+```
+`Parser` constructor initializes `errorTable` and `outputTable`.
+`analyze()` calls `CompUnit()`.
+If `CompUnit()` throws an exception, `System.setOut` might not happen, or the print loops might not execute.
+
+Is it possible `CompUnit` crashes?
+`MainFuncDef()` is called at the end of `CompUnit`.
+If `MainFuncDef` fails to parse `int main() { ... }`, it might error out.
+
+Let's look at `MainFuncDef`:
+```java
+    public TreeNode MainFuncDef() {
+        TreeNode mainfuncdef = new TreeNode(ParsType.MainFuncDef,new ArrayList<>());
+        if (isMatch(LexType.INTTK)) {
+            addLeaf(mainfuncdef);
+        }
+        else error();
+        if (isMatch(LexType.MAINTK)) {
+            addLeaf(mainfuncdef);
+        }
+        else error();
+        if (isMatch(LexType.LPARENT)) {
+            addLeaf(mainfuncdef);
+        }
+        else error();
+        RparentJudge(mainfuncdef);
+        mainfuncdef.addNode(Block());
+        addOut("<MainFuncDef>");
+        return mainfuncdef;
+    }
+```
+If `isMatch` fails, it calls `error()` which prints to `System.out` (console), but doesn't throw.
+It continues.
+If `INTTK` is missing, it proceeds to check `MAINTK`.
+This is bad parsing logic, but shouldn't crash.
+
+However, notice `RparentJudge(mainfuncdef)`.
+If `(` was matched and consumed, `RparentJudge` checks for `)`.
+If `)` is missing, it adds error 'j'.
+Then `Block()` is called.
+If `)` is missing, the current token is `{`.
+`Block()` expects `{`.
+It matches `{`.
+So it might recover.
+
+The most likely reason for "Wrong Answer" with empty output is that the `error.txt` file is created but empty, or the errors are not being added to `errorTable`.
+
+Wait! Look at `addError` again.
+```java
+    public void addError(Character c) {
+        errorTable.add(tokens.get(curPos - 2).getLineNum() + " " + c);
+    }
+```
+If `curPos` is 0 or 1, `curPos - 2` is negative. `tokens.get(-1)` throws `IndexOutOfBoundsException`.
+At the start of parsing, `next()` is called once in `analyze()`.
+`curPos` becomes 1.
+`tokens` has 1 element (index 0).
+If an error occurs immediately, `curPos` is 1. `curPos - 2` is -1. Crash.
+
+In our test case:
+`int main() { ... }`
+Parsing starts.
+`CompUnit` skips Decls and FuncDefs.
+Calls `MainFuncDef`.
+`MainFuncDef` consumes `int`, `main`, `(`.
+`curPos` is 3.
+`RparentJudge` consumes `)`.
+`curPos` is 4.
+`Block` consumes `{`.
+`curPos` is 5.
+First `BlockItem` -> `Stmt` -> `printf`.
+Consumes `printf`, `(`, `"..."`, `)`.
+`curPos` is 9.
+`SemicnJudge` fails.
+`addError('i')`.
+`curPos` is 9. `curPos - 2` is 7.
+`tokens.get(7)` exists.
+So no crash here.
+
+What if the error is in `VarDecl` for `int a`?
+`curPos` is somewhere around 15.
+`curPos - 2` is safe.
+
+What if the error is in `return 0`?
+`curPos` is near end.
+Safe.
+
+So `IndexOutOfBounds` is unlikely for these specific errors.
+
+Let's look at `Lexer.analyze()` return value `-1`.
+```java
+        else if (character == '&') {
+            // ...
+                return -1;          // first error；
+            }
+        }
+```
+If `analyze` returns -1, `Parser.next()` adds error 'a' to `errorTable`.
+But it ALSO proceeds to:
+```java
+        type = lexer.getLexType();
+        tokens.add(lexer.getToken());
+        curPos++;
+```
+So it adds a token even on error.
+
+Is it possible that `error.txt` is not being written because `System.setOut(errout)` redirects `System.out`, but the `errorTable` is empty?
+If `errorTable` is empty, the loop `for (String s : errorTable)` does nothing.
+Why would `errorTable` be empty?
+Only if `addError` was never called, or `errorTable` was cleared.
+
+Did `SemicnJudge` actually get called?
+Yes, traced above.
+
+Did `addError` actually add to `errorTable`?
+Yes.
+
+Is it possible that `System.setOut(out)` redirects output to `parser.txt`, and then `System.setOut(errout)` redirects to `error.txt`, but the `println` statements for errors are somehow suppressed or the file is locked?
+
+Wait, look at `Compiler.java`.
+```java
+        FileInputStream input = new FileInputStream("testfile.txt");
+        System.setIn(input);
+```
+It sets `System.in`.
+`Parser` creates `PrintStream` for `error.txt` and `parser.txt`.
+These files are created in the current directory.
+
+If the program crashes BEFORE `analyze()` finishes, the files might be empty or incomplete.
+If `CompUnit` throws an exception, the `System.setOut` lines might not be reached?
+No, `System.setOut` is INSIDE `analyze()`, AFTER `CompUnit()`.
+```java
+    public void analyze() {
+        next();
+        CompUnit();
+        System.setOut(out); // <--- If CompUnit crashes, this is not reached.
+        // ...
+    }
+```
+If `CompUnit()` throws an exception, `analyze()` terminates abruptly.
+The `PrintStream` objects `out` and `errout` are created in the constructor.
+The files `parser.txt` and `error.txt` are created/opened in the constructor.
+If the program crashes, the files exist but might be empty because nothing was written to them yet (writing happens after `CompUnit`).
+AND `System.out` is still pointing to the console.
+So any errors printed to `System.out` (via `error()`) would appear on console, not in `error.txt`.
+But `addError` adds to `errorTable`, which is printed later.
+
+So if `CompUnit` crashes, `error.txt` is empty.
+
+Why would `CompUnit` crash?
+`MainFuncDef` -> `Block` -> `BlockItem` -> `Stmt` -> `printf`.
+`printf` parsing:
+```java
+        else if (isMatch(LexType.PRINTFTK)) {
+            addLeaf(stmt);
+            addLeaf(stmt);
+            addLeaf(stmt);
+            while (isMatch(LexType.COMMA)) {
+                addLeaf(stmt);
+                stmt.addNode(Exp());
+            }
+            RparentJudge(stmt);
+            SemicnJudge(stmt);
+        }
+```
+`addLeaf` calls `next()`.
+`next()` calls `lexer.analyze()`.
+If `lexer.analyze()` crashes, `CompUnit` crashes.
+
+Does `lexer.analyze()` crash on `printf("Hello SysY!\n")`?
+It parses `printf`.
+Then `(`.
+Then `"`.
+Inside `"` loop:
+```java
+        else if (character == '\"') {
+            do {
+                addToken();
+                nextCharacter();
+            }
+            while (character != '\"');
+            addToken();
+            type = LexType.STRCON;
+        }
+```
+The string is `"Hello SysY!\n"`.
+The `\n` inside the string is two characters: `\` and `n`.
+The lexer reads characters one by one.
+It stops when it finds `"`.
+This seems correct.
+
+However, look at `Lexer.analyze()` for `/` (comments).
+The input has `// error 1`.
+After `)`, the next character is space, then `/`.
+`analyze()` sees `/`.
+```java
+        else if (character == '/') {
+            addToken();
+            nextCharacter();
+            if (character != '/' && character != '*') {
+                outCharacter();
+                type = LexType.DIV;
+            }
+            else if (character == '/') {
+                do {
+                    addToken();
+                    nextCharacter();
+                } while (character != '\n');
+                lineNum++;
+                return -2;
+            }
+            // ...
+        }
+```
+It reads `//`.
+Enters `do-while` loop.
+Reads until `\n`.
+Increments `lineNum`.
+Returns -2.
+`Parser.next()` sees -2.
+Loops `while (f == -2 && !lexer.isEnd())`.
+Calls `analyze()` again.
+Next line is empty.
+`analyze()` skips whitespace/newlines.
+Returns -2?
+No, if it skips newlines, it increments `lineNum`.
+If it reaches end of file or next token, it returns 0 or -1.
+
+If `analyze()` returns -2, `next()` loops.
+If `lexer.isEnd()` is true, loop exits.
+Then `type = lexer.getLexType()`.
+What is `type` if `analyze()` returned -2?
+In `analyze()`, if it returns -2, `type` might be uninitialized or left from previous token?
+In `//` case, `type` is NOT set before `return -2`.
+So `type` retains its PREVIOUS value.
+`lexer.getLexType()` returns the OLD type.
+`lexer.getToken()` returns the OLD token?
+No, `tokenClear()` was called at the start of `analyze()`.
+So `token` is empty/reset.
+`tokens.add(lexer.getToken())` adds an EMPTY/INVALID token.
+`curPos++`.
+
+This corrupts the `tokens` list.
+Later, when `addError` accesses `tokens.get(curPos - 2)`, it might get an invalid token or crash if the token list is inconsistent.
+
+Specifically, if `analyze()` returns -2, it means "skip this, get next".
+But `Parser.next()` adds a token anyway.
+This adds a "garbage" token to the list.
+This shifts indices.
+`curPos` increments.
+The mapping between `curPos` and actual source tokens is broken.
+
+This is likely the cause. The parser's token list gets corrupted by comment skipping, leading to incorrect error reporting or crashes.
+
+<Frontend/Parser.java>
+...
+    public void next(){
+        int f = lexer.analyze();
+        if (f == -1) {
+            errorTable.add(lexer.getlineNUM() + " " + "a");
+        }
+        while (f == -2 && !lexer.isEnd()) {
+            f = lexer.analyze();
+        }
+        type = lexer.getLexType();
+        tokens.add(lexer.getToken());
+        curPos++;
+    }
+...

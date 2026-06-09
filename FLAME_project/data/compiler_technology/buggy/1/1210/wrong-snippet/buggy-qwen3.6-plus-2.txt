@@ -1,0 +1,755 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The task is to implement a syntax analyzer that outputs syntax component names for correct programs and error codes (line number + category) for incorrect programs.
+2.  **Test Case Input**:
+    ```c
+    void f(int a {} // error 1: Missing ')' in FuncDef parameters. Line 1.
+    
+    int main( { // error 2: Missing ')' in MainFuncDef. Line 3.
+        int a = 10;
+        f(a + 10; // error 3: Missing ')' in FuncRParams/UnaryExp. Line 5.
+        return 0;
+    }
+    ```
+    *Note: The input has empty lines. Line 1 is `void f(int a {}`. Line 2 is empty. Line 3 is `int main( {`. Line 4 is `    int a = 10;`. Line 5 is `    f(a + 10;`.*
+3.  **Expected Output**:
+    ```
+    1 j
+    3 j
+    5 j
+    ```
+    This indicates errors at lines 1, 3, and 5, all of type 'j' (missing right parenthesis).
+4.  **Buggy Output**:
+    ```
+    1 j
+    2 j
+    3 j
+    wa
+    ```
+    The program reports errors at lines 1, 2, and 3.
+    - Error at line 1 is correct.
+    - Error at line 2 is incorrect. There is no syntax error on line 2 (it's an empty line or part of the previous construct depending on parsing, but logically the next error is on line 3).
+    - Error at line 3 is reported, but expected is line 3 for the second error? Wait, the expected output says `3 j`. The buggy output says `2 j` and `3 j`.
+    - Let's re-examine the input lines carefully.
+      Line 1: `void f(int a {}`
+      Line 2: `` (empty)
+      Line 3: `int main( {`
+      Line 4: `    int a = 10;`
+      Line 5: `    f(a + 10;`
+      
+      The expected output is `1 j`, `3 j`, `5 j`.
+      The buggy output is `1 j`, `2 j`, `3 j`.
+      
+      It seems the parser is misidentifying the line numbers for the subsequent errors. Specifically, it reports an error at line 2 instead of line 3, and line 3 instead of line 5. Or perhaps it's detecting an error where there isn't one, or shifting indices.
+      
+      Let's look at `CompUnit.java`. It distinguishes between `Decl`, `MainFuncDef`, and `FuncDef`.
+      The logic `if (!tokens.get(p + 2).getCate().equals(Cate.LPARENT))` is used to detect `Decl`.
+      For `void f(int a {}`:
+      Token 0: `void` (VOIDTK)
+      Token 1: `f` (IDENFR)
+      Token 2: `(` (LPARENT)
+      The condition `!tokens.get(p + 2).getCate().equals(Cate.LPARENT)` is FALSE. So it goes to `else if` or `else`.
+      `tokens.get(p + 1).isMain()` checks if `f` is "main". It is not.
+      So it treats it as `FuncDef`.
+      
+      In `FuncDef.java`:
+      It parses `FuncType` (`void`), `Ident` (`f`), `(`.
+      Then it checks for `RPARENT` or `LBRACE` or `FuncFParams`.
+      Current token is `int` (BType). It goes to `else` (FuncFParams).
+      `FuncFParams` parses `int a`.
+      Back in `FuncDef`, it expects `RPARENT`. The next token is `{` (LBRACE).
+      It enters the `else` block of the `if (tokens.get(p).getCate().equals(Cate.RPARENT))` check? No, look at `FuncDef.java`:
+      
+      ```java
+      if (tokens.get(p).getCate().equals(Cate.RPARENT)) {
+          // ...
+      } else if (tokens.get(p).getCate().equals(Cate.LBRACE)) {
+          //error
+          ERROR error = new ERROR(tokens.get(p - 1).getLineNum(), 'j');
+          ERRORS.addError(error);
+      } else {
+          // FuncFParams
+      }
+      ```
+      Wait, the code structure in `FuncDef.java` provided is:
+      ```java
+      list.add(tokens.get(p)); // '('
+      p++;
+      if (tokens.get(p).getCate().equals(Cate.RPARENT)) {
+         // ...
+      } else if (tokens.get(p).getCate().equals(Cate.LBRACE)) {
+         // error j
+      } else {
+         // FuncFParams
+         // ...
+         if (tokens.get(p).getCate().equals(Cate.RPARENT)) {
+            // ...
+         } else {
+             ERROR error = new ERROR(tokens.get(p - 1).getLineNum(), 'j');
+             ERRORS.addError(error);
+         }
+      }
+      ```
+      For `void f(int a {}`:
+      After `FuncFParams` parses `int a`, `p` points to `{`.
+      The inner `if` checks for `RPARENT`. It fails.
+      The `else` creates an error with `tokens.get(p - 1).getLineNum()`.
+      `p` is at `{` (Line 1). `p-1` is `a` (Line 1). So Error 1 is `1 j`. This matches.
+      
+      Now, what happens next? `FuncDef.parser` returns `p`. It does NOT consume the `{`.
+      So `CompUnit.parser` continues with `p` pointing to `{` (Line 1).
+      The loop in `CompUnit` continues.
+      Next iteration:
+      `p` is at `{`.
+      Check `!tokens.get(p + 2).getCate().equals(Cate.LPARENT)`.
+      `tokens.get(p)` is `{`. `tokens.get(p+1)` is likely `int` (from next line?).
+      Actually, the tokens are:
+      0: void
+      1: f
+      2: (
+      3: int
+      4: a
+      5: {
+      6: int (from line 3)
+      7: main
+      8: (
+      9: {
+      ...
+      
+      At `p=5` (`{`):
+      `tokens.get(5)` is `{`.
+      `tokens.get(7)` is `main`.
+      `tokens.get(7+2)`? No, `p+2` is 7. `tokens.get(7)` is `main`. `main` is not `LPARENT`.
+      So `!...equals(LPARENT)` is TRUE.
+      It treats `{` as start of a `Decl`?
+      `Decl.parser` checks for `ConstDecl` or `VarDecl`.
+      `ConstDecl` expects `const`. Fails.
+      `VarDecl` expects `BType` (`int`, `char`, `void`).
+      `tokens.get(5)` is `{`. Not a BType.
+      `VarDecl` will likely crash or behave unexpectedly if it doesn't check.
+      Let's look at `VarDecl.java`:
+      ```java
+      public int parser(int p,ArrayList<Token> tokens) {
+          list.add(tokens.get(p)); // Adds '{'
+          p++;
+          VarDef varDef = new VarDef();
+          p = varDef.parser(p,tokens); // Parses from 'int' (line 3)
+          // ...
+      }
+      ```
+      `VarDecl` blindly consumes the token at `p`. It adds `{` to its list. Then increments `p`.
+      Then it calls `VarDef.parser(p, tokens)` where `p` is now at `int` (Line 3).
+      `VarDef` parses `int`? No, `VarDef` expects `Ident`.
+      `VarDecl` should have checked if it IS a VarDecl. But `Decl.java` calls `VarDecl.parser` directly if `ConstDecl` fails?
+      Look at `Decl.java`:
+      ```java
+      public int parser(int p, ArrayList<Token> tokens) {
+          if (new ConstDecl().isConstDecl(p, tokens)) {
+              // ...
+          } else {
+              VarDecl varDecl = new VarDecl();
+              p = varDecl.parser(p,tokens); // Calls parser directly without checking isVarDecl!
+              list.add(varDecl);
+          }
+          return p;
+      }
+      ```
+      This is a major bug. `Decl.parser` assumes if it's not a `ConstDecl`, it MUST be a `VarDecl`. It doesn't verify.
+      
+      So, at `p=5` (`{`), `Decl` calls `VarDecl.parser`.
+      `VarDecl` consumes `{` (Line 1). `p` becomes 6.
+      `VarDecl` calls `VarDef.parser(6, tokens)`.
+      Token 6 is `int` (Line 3).
+      `VarDef.parser`:
+      ```java
+      list.add(tokens.get(p)); // Adds 'int'
+      p++; // p=7 ('main')
+      if (tokens.get(p).getCate().equals(Cate.LBRACK)) { // 'main' is not '['
+      }
+      if (tokens.get(p).getCate().equals(Cate.ASSIGN)) { // 'main' is not '='
+      }
+      return p; // Returns 7.
+      ```
+      Back in `VarDecl`:
+      `p` is 7.
+      Checks for `,`. Token 7 is `main`. No.
+      Checks for `;`. Token 7 is `main`. No.
+      Enters `else`:
+      ```java
+      ERROR error = new ERROR(tokens.get(p - 1).getLineNum(),'i');
+      ```
+      `p-1` is 6 (`int`, Line 3).
+      So it reports Error `3 i`?
+      But the buggy output says `2 j`.
+      
+      Wait, let's look at the tokens again.
+      Line 1: `void f(int a {}`
+      Tokens: `void`, `f`, `(`, `int`, `a`, `{`, `}`
+      Line 2: empty
+      Line 3: `int main( {`
+      Tokens: `int`, `main`, `(`, `{`
+      
+      If `FuncDef` stopped at `{` (index 5), `p=5`.
+      `CompUnit` loop continues.
+      `p=5`. Token is `}`.
+      `tokens.get(5)` is `}`.
+      `tokens.get(7)`?
+      Index 5: `}` (Line 1)
+      Index 6: `int` (Line 3)
+      Index 7: `main` (Line 3)
+      Index 8: `(` (Line 3)
+      
+      Check `!tokens.get(p + 2).getCate().equals(Cate.LPARENT)`.
+      `p+2 = 7`. `tokens.get(7)` is `main`. `main` != `LPARENT`. Condition TRUE.
+      Calls `Decl.parser(5, tokens)`.
+      `Decl` calls `VarDecl.parser(5, tokens)`.
+      `VarDecl` consumes `}` (Line 1). `p` becomes 6.
+      `VarDecl` calls `VarDef.parser(6, tokens)`.
+      Token 6 is `int` (Line 3).
+      `VarDef` consumes `int`. `p` becomes 7.
+      `VarDef` checks `[` at 7 (`main`). No.
+      `VarDef` checks `=` at 7 (`main`). No.
+      Returns 7.
+      Back in `VarDecl`.
+      Checks `,` at 7 (`main`). No.
+      Checks `;` at 7 (`main`). No.
+      Error `i` at `tokens.get(6).getLineNum()` -> Line 3.
+      
+      This would produce `3 i`. The buggy output has `2 j`.
+      
+      Where does `2 j` come from?
+      Maybe my token indexing is slightly off due to newlines or something?
+      Or maybe `CompUnit` logic is different.
+      
+      Let's look at `MainFuncDef.java`.
+      If `CompUnit` identified `int main( {` correctly.
+      
+      Let's look at the Buggy Output again: `1 j`, `2 j`, `3 j`.
+      Expected: `1 j`, `3 j`, `5 j`.
+      
+      The line numbers in the buggy output are shifted up by 1 for the 2nd and 3rd errors?
+      Error 2: Expected `3 j`, Got `2 j`.
+      Error 3: Expected `5 j`, Got `3 j`.
+      
+      This suggests that the parser is consuming tokens incorrectly, causing subsequent errors to be attributed to earlier lines, or the line number tracking in tokens is wrong.
+      
+      However, there is a specific issue in `CompUnit.java` regarding how it identifies `MainFuncDef`.
+      ```java
+      } else if (tokens.get(p + 1).isMain()) {
+          //MainFuncDef
+          MainFuncDef mainFuncDef = new MainFuncDef();
+          p = mainFuncDef.parser(p,tokens);
+          mainFuncDefs.add(mainFuncDef);
+      }
+      ```
+      This check `tokens.get(p + 1).isMain()` relies on `p` being at the return type (`int`).
+      
+      If the previous `FuncDef` parser consumed `void f(int a` and stopped at `{`, `p` is at `{`.
+      The next iteration starts at `{`.
+      It mistakenly tries to parse `{` as a `Decl`.
+      
+      The core issue is that `FuncDef.parser` (and `MainFuncDef.parser`) do NOT consume the opening brace `{` of the block if an error occurs before it, or they leave the pointer in a bad state.
+      
+      In `FuncDef.java`:
+      ```java
+      Block block = new Block();
+      p = block.parser(p, tokens);
+      list.add(block);
+      return p;
+      ```
+      If an error occurred earlier (missing `)`), the code adds the error but DOES NOT skip to the matching `Block`. It proceeds to parse `Block` starting from the current token (which is `{`? No, if `)` is missing, we are at `{`).
+      
+      Let's trace `void f(int a {}` again.
+      `FuncDef`:
+      Parses `void`, `f`, `(`.
+      Parses `int a` via `FuncFParams`.
+      Checks `RPARENT`. Current is `{`.
+      Goes to `else` (since it's not `RPARENT` and not `LBRACE`? Wait.)
+      
+      Code in `FuncDef`:
+      ```java
+      if (tokens.get(p).getCate().equals(Cate.RPARENT)) {
+          // ...
+      } else if (tokens.get(p).getCate().equals(Cate.LBRACE)) {
+          //error j
+          ERROR error = new ERROR(tokens.get(p - 1).getLineNum(), 'j');
+          ERRORS.addError(error);
+      } else {
+          // FuncFParams
+          // ...
+          if (tokens.get(p).getCate().equals(Cate.RPARENT)) {
+             // ...
+          } else {
+             ERROR error = new ERROR(tokens.get(p - 1).getLineNum(), 'j');
+             ERRORS.addError(error);
+          }
+      }
+      ```
+      If `FuncFParams` was parsed, we are in the `else` block.
+      Inside `else`, after parsing `FuncFParams`, we check for `RPARENT`.
+      Current token is `{`.
+      It goes to `else` of that inner if.
+      Reports error `j` at `p-1` (`a`, Line 1).
+      Crucially, it does NOT increment `p`. `p` is still at `{`.
+      
+      Then:
+      ```java
+      Block block = new Block();
+      p = block.parser(p, tokens);
+      ```
+      `Block.parser` expects `{`.
+      It consumes `{`. `p++`.
+      Then it loops until `RBRACE`.
+      Inside `Block`, it parses `BlockItem`.
+      Next token is `}`.
+      `Block` loop condition: `while (!tokens.get(p).getCate().equals(Cate.RBRACE))`.
+      Token is `}`. Loop terminates.
+      `Block` consumes `}`. `p++`.
+      Returns `p`.
+      
+      So `FuncDef` consumes `void f(int a {}`.
+      `p` is now at the next token: `int` (Line 3).
+      
+      Next iteration in `CompUnit`:
+      `p` is at `int` (Line 3).
+      `tokens.get(p)` is `int`.
+      `tokens.get(p+1)` is `main`.
+      `tokens.get(p+2)` is `(`.
+      
+      Check `!tokens.get(p + 2).getCate().equals(Cate.LPARENT)`.
+      `tokens.get(8)` is `(`. Equals `LPARENT`.
+      Condition is FALSE.
+      
+      Goes to `else if (tokens.get(p + 1).isMain())`.
+      `tokens.get(7)` is `main`. `isMain()` returns true.
+      So it calls `MainFuncDef.parser(p, tokens)`.
+      
+      `MainFuncDef.parser(6, tokens)` (assuming `int` is index 6).
+      Consumes `int`. `p=7`.
+      Consumes `main`. `p=8`.
+      Consumes `(`. `p=9`.
+      Checks `RPARENT`.
+      Token 9 is `{` (Line 3).
+      `if (tokens.get(p).getCate().equals(Cate.RPARENT))` -> False.
+      `else`:
+      ```java
+      ERROR error = new ERROR(tokens.get(p-1).getLineNum(),'j');
+      ERRORS.addError(error);
+      ```
+      `p-1` is 8 (`(`, Line 3).
+      Reports `3 j`.
+      
+      Then:
+      ```java
+      Block block = new Block();
+      p = block.parser(p,tokens);
+      ```
+      `Block.parser` expects `{`.
+      Token 9 is `{`.
+      Consumes `{`. `p=10`.
+      Loop while not `RBRACE`.
+      Parses `BlockItem`s inside `main`.
+      `int a = 10;`
+      `f(a + 10;`
+      
+      Inside `Block`, it parses `Stmt`.
+      `f(a + 10;`
+      `Stmt` sees `f` (IDENFR).
+      Goes to the final `else` block in `Stmt`.
+      `tryParser` for `Exp`.
+      `Exp` -> `AddExp` -> ... -> `UnaryExp`.
+      `UnaryExp` sees `f` followed by `(`.
+      Parses `f`, `(`.
+      Then `FuncRParams`.
+      `FuncRParams` parses `a + 10`.
+      Returns.
+      Back in `UnaryExp`:
+      Checks `RPARENT`.
+      Current token is `;`.
+      `if (tokens.get(p).getCate().equals(Cate.RPARENT))` -> False.
+      `else`:
+      ```java
+      ERROR error = new ERROR(tokens.get(p-1).getLineNum(),'j');
+      ERRORS.addError(error);
+      ```
+      `p-1` is `10` (the last token of `10`, which is `INTCON`).
+      Line number of `10` is Line 5.
+      Reports `5 j`.
+      
+      So, if the logic above holds, the output SHOULD BE `1 j`, `3 j`, `5 j`.
+      
+      Why is the buggy output `1 j`, `2 j`, `3 j`?
+      
+      This implies that the line numbers stored in the tokens are wrong, OR the parser is stopping/consuming differently.
+      
+      Let's look at `Compiler.java` (Lexer).
+      It reads line by line.
+      `lineNum` increments on `\n`.
+      
+      Input:
+      Line 1: `void f(int a {}`
+      Line 2: ``
+      Line 3: `int main( {`
+      
+      If Line 2 is empty, `lineNum` becomes 2 when reading the newline of Line 1?
+      Standard behavior:
+      Read Line 1. `lineNum` = 1.
+      Process chars.
+      Encounter `\n`. `lineNum` becomes 2.
+      Read Line 2. `lineNum` = 2.
+      Process chars (none).
+      Encounter `\n`. `lineNum` becomes 3.
+      Read Line 3. `lineNum` = 3.
+      
+      So tokens from Line 1 have `lineNum` 1.
+      Tokens from Line 3 have `lineNum` 3.
+      
+      So why `2 j`?
+      
+      Is it possible that `FuncDef` did NOT consume the `}`?
+      If `FuncDef` failed to parse `Block` correctly?
+      
+      Or is it possible that `CompUnit` logic is flawed in a way that it skips `int`?
+      
+      Let's look at `CompUnit` again.
+      ```java
+      if (!tokens.get(p + 2).getCate().equals(Cate.LPARENT)) {
+          // Decl
+      } else if (tokens.get(p + 1).isMain()) {
+          // MainFuncDef
+      } else {
+          // FuncDef
+      }
+      ```
+      
+      What if `FuncDef` for `void f` consumed ONLY up to `a`?
+      If `FuncDef` didn't parse `Block`?
+      But `FuncDef` ALWAYS calls `Block.parser`.
+      
+      Wait, look at `FuncDef.java` again.
+      ```java
+      } else {
+          //error
+          ERROR error = new ERROR(tokens.get(p - 1).getLineNum(), 'j');
+          ERRORS.addError(error);
+      }
+      Block block = new Block();
+      p = block.parser(p, tokens);
+      ```
+      If the error was detected in the `else if (LBRACE)` branch:
+      ```java
+      } else if (tokens.get(p).getCate().equals(Cate.LBRACE)) {
+          //error
+          ERROR error = new ERROR(tokens.get(p - 1).getLineNum(), 'j');
+          ERRORS.addError(error);
+      }
+      ```
+      In this branch, it does NOT parse `FuncFParams`. It detects `{` immediately after `(`.
+      Then it falls through to `Block block = new Block();`.
+      It parses `Block`.
+      
+      In our case `void f(int a {}`, it went into the `else` (FuncFParams) branch.
+      
+      Is it possible that `FuncFParams` failed?
+      `FuncFParams` calls `FuncFParam`.
+      `FuncFParam` parses `int a`.
+      Returns.
+      `FuncFParams` checks for `,`. Next is `{`. No.
+      Returns.
+      
+      So `FuncDef` is at `{`.
+      
+      There is one subtle possibility: **The `Block` parser might be failing or behaving unexpectedly if the `FuncDef` error handling leaves `p` in a state where `Block` doesn't consume the `{`?**
+      No, `Block` explicitly checks for `{`.
+      
+      Let's look at the Buggy Output `2 j`.
+      Line 2 is empty.
+      How can an error be reported on Line 2?
+      Only if a token has `lineNum` 2.
+      Which token would have `lineNum` 2?
+      If the lexer assigns `lineNum` 2 to the first token of Line 3?
+      
+      In `Compiler.java`:
+      ```java
+      case '\n':
+          lineNum++;
+          break;
+      ```
+      This increments `lineNum` AFTER processing the newline character.
+      So tokens on Line 1 get `lineNum` 1.
+      When `\n` of Line 1 is processed, `lineNum` becomes 2.
+      Then Line 2 is processed. It is empty.
+      When `\n` of Line 2 is processed, `lineNum` becomes 3.
+      Then Line 3 is processed. Tokens get `lineNum` 3.
+      
+      So tokens on Line 3 have `lineNum` 3.
+      
+      Why `2 j`?
+      
+      Maybe the input file doesn't have an empty line?
+      "Test Case Input:
+      void f(int a {} // error 1
+      
+      int main( { // error 2"
+      
+      There is a blank line between them.
+      
+      If the blank line was NOT present, Line 3 would be Line 2.
+      But the problem statement shows a blank line.
+      
+      However, look at `CompUnit.java` logic again.
+      
+      What if `Decl` is parsed incorrectly?
+      
+      Let's look at `VarDecl.java` and `Decl.java` interaction again.
+      If `CompUnit` mistakenly identifies `int main...` as a `Decl`?
+      
+      If `FuncDef` for `void f` consumed `void f(int a` but FAILED to consume `{}`?
+      If `Block` parser threw an exception or didn't advance `p`?
+      
+      Actually, look at `Block.java`:
+      ```java
+      public int parser(int p,ArrayList<Token> tokens) {
+          list.add(tokens.get(p));
+          p++;
+          // ...
+      }
+      ```
+      If `p` is out of bounds?
+      
+      Let's assume the standard execution path I traced: `1 j`, `3 j`, `5 j`.
+      The buggy output is `1 j`, `2 j`, `3 j`.
+      
+      The difference is that the line numbers are 1 less than expected for the 2nd and 3rd errors?
+      Expected 3, Got 2.
+      Expected 5, Got 3? No, Expected 5, Got 3 is a difference of 2.
+      
+      Wait, `3 j` in buggy output corresponds to `5 j` in expected?
+      If the buggy program thinks `f(a+10;` is on Line 3?
+      
+      This implies that the parser thinks `int main...` is on Line 2?
+      
+      If the lexer assigned Line 2 to `int`?
+      This happens if the empty line is ignored or handled such that `lineNum` doesn't increment twice?
+      
+      Or, more likely, **`CompUnit` is skipping a token or misinterpreting the structure such that it enters a branch that reports an error on the wrong token.**
+      
+      Let's look at `CompUnit.java` closely.
+      
+      ```java
+      if (!tokens.get(p + 2).getCate().equals(Cate.LPARENT)) {
+          //Decl
+          Decl decl = new Decl();
+          p = decl.parser(p,tokens);
+          decls.add(decl);
+      } else if (tokens.get(p + 1).isMain()) {
+          //MainFuncDef
+          MainFuncDef mainFuncDef = new MainFuncDef();
+          p = mainFuncDef.parser(p,tokens);
+          mainFuncDefs.add(mainFuncDef);
+      } else{
+          //FuncDef
+          FuncDef funcDef = new FuncDef();
+          p = funcDef.parser(p,tokens);
+          funcDefs.add(funcDef);
+      }
+      ```
+      
+      If `FuncDef` for `void f` returns `p` pointing to `int` (Line 3).
+      Next iter: `p` at `int`.
+      `tokens.get(p+2)` is `(`.
+      Condition `!...equals(LPARENT)` is FALSE.
+      `tokens.get(p+1)` is `main`.
+      `isMain()` is TRUE.
+      Calls `MainFuncDef`.
+      
+      `MainFuncDef` reports `3 j`.
+      
+      So where does `2 j` come from?
+      
+      Is it possible that `FuncDef` reported TWO errors?
+      No, `1 j` is reported.
+      
+      Is it possible that `Decl` was parsed for `void f`?
+      If `CompUnit` thought `void f` was a `Decl`?
+      `tokens.get(p+2)` for `void` (0) is `(` (2).
+      `!...equals(LPARENT)` is FALSE.
+      So it's not `Decl`.
+      
+      What if `FuncDef` parser has a bug that causes it to report an error at line 2?
+      
+      Let's look at `FuncFParam.java`.
+      
+      Actually, there is a known issue in these types of assignments: **Synchronization**.
+      If an error occurs, the parser should synchronize to the next valid starting point.
+      The current code does NOT synchronize. It just continues.
+      
+      However, the specific discrepancy `2 j` vs `3 j` strongly suggests a line number calculation error or a token consumption error.
+      
+      Let's look at `ERRORS.java`.
+      It sorts errors.
+      
+      If the error reported as `2 j` is actually the error from `MainFuncDef` but with the wrong line number?
+      
+      In `MainFuncDef.java`:
+      ```java
+      ERROR error = new ERROR(tokens.get(p-1).getLineNum(),'j');
+      ```
+      If `p` is at `{` (Line 3), `p-1` is `(` (Line 3).
+      
+      Why would `(` have Line Number 2?
+      
+      Look at `Compiler.java` Lexer again.
+      
+      ```java
+      case '\n':
+          lineNum++;
+          break;
+      ```
+      
+      If the input file uses `\r\n`?
+      `Scanner.nextLine()` strips `\n`.
+      The code manually adds `\n` to `charList`.
+      ```java
+      charList.add('\n');
+      ```
+      
+      If the file is:
+      `void f(int a {}\n`
+      `\n`
+      `int main( {\n`
+      
+      Char list:
+      `v`...`}` `\n` (Line 1 -> 2)
+      `\n` (Line 2 -> 3)
+      `i`...
+      
+      Tokens from `int main` should be Line 3.
+      
+      Unless... `CompUnit` is NOT calling `MainFuncDef` for `int main`.
+      
+      What if `CompUnit` calls `FuncDef` for `int main`?
+      `tokens.get(p+1)` is `main`. `isMain()` is true.
+      So it calls `MainFuncDef`.
+      
+      What if `MainFuncDef` is buggy?
+      
+      Let's look at `MainFuncDef.java` again.
+      
+      ```java
+      public int parser(int p,ArrayList<Token> tokens) {
+          list.add(tokens.get(p)); // int
+          p++;
+          list.add(tokens.get(p)); // main
+          p++;
+          list.add(tokens.get(p)); // (
+          p++;
+          if (tokens.get(p).getCate().equals(Cate.RPARENT)) {
+              // ...
+          } else {
+              //error
+              ERROR error = new ERROR(tokens.get(p-1).getLineNum(),'j');
+              ERRORS.addError(error);
+          }
+          Block block = new Block();
+          p = block.parser(p,tokens);
+          list.add(block);
+          return p;
+      }
+      ```
+      
+      If `p` is at `(`, `p++` makes `p` point to `{`.
+      `tokens.get(p)` is `{`.
+      `else` branch.
+      `tokens.get(p-1)` is `(`.
+      
+      If `(` has line number 2, then error is `2 j`.
+      
+      Why would `(` have line number 2?
+      
+      If the empty line was NOT counted?
+      
+      If `Scanner` skipped the empty line?
+      `sc.hasNextLine()` returns true for empty lines.
+      `sc.nextLine()` returns "" for empty lines.
+      The loop runs.
+      `line.toCharArray()` is empty.
+      `charList.add('\n')`.
+      
+      So `lineNum` increments.
+      
+      Is it possible that `tokens.get(p-1)` is NOT `(`?
+      
+      If `MainFuncDef` was NOT called, but `FuncDef` was?
+      
+      If `FuncDef` was called for `int main`:
+      `FuncDef` parses `int` (FuncType), `main` (Ident), `(`.
+      Then checks `RPARENT`.
+      Same logic. `p-1` is `(`.
+      
+      So the question remains: Why is `(` on Line 2?
+      
+      Hypothesis: The lexer is assigning Line 2 to the tokens on the 3rd physical line because the empty line is not effectively incrementing the line counter in the way the parser expects, OR the test case input provided in the description has a blank line, but the actual test file passed to the program might not?
+      
+      No, I must assume the input is exactly as described.
+      
+      Alternative Hypothesis: **`CompUnit` is identifying `int` as a `Decl` (VarDecl).**
+      
+      If `CompUnit` logic:
+      `!tokens.get(p + 2).getCate().equals(Cate.LPARENT)`
+      
+      For `int main ( {`:
+      `p` at `int`.
+      `p+2` at `(`.
+      `(` IS `LPARENT`.
+      So `!...` is FALSE.
+      
+      So it goes to `else if`.
+      
+      What if `tokens.get(p+1).isMain()` returns FALSE?
+      `Token.isMain()` checks `item.equals("main")`.
+      
+      If `main` was tokenized as `IDENFR`?
+      In `Compiler.java`:
+      ```java
+      if (charList.get(i) == 'm' && charList.size() - i >= 4) {
+          if (charList.get(i + 1) == 'a' && charList.get(i + 2) == 'i'
+                  && charList.get(i + 3) == 'n') {
+              // ...
+              if (isTK) {
+                  token = new Token(string5.toString(), Cate.MAINTK,lineNum);
+              } else {
+                  token = new Token(string5.toString(), Cate.IDENFR,lineNum);
+              }
+          }
+      }
+      ```
+      It checks for following characters. If `main` is followed by `(`, `isTK` remains true.
+      So it is `MAINTK`.
+      
+      `Token.isMain()` checks `item.equals("main")`.
+      `MAINTK` item is "main".
+      So it returns true.
+      
+      So `MainFuncDef` is called.
+      
+      There is one other possibility. **`FuncDef` for `void f` did NOT consume the `}`.**
+      
+      If `FuncDef` stopped at `{`?
+      No, `Block` consumes `{` and `}`.
+      
+      Wait! Look at `Block.java`.
+      ```java
+      while (!tokens.get(p).getCate().equals(Cate.RBRACE)) {
+          //System.out.println(p); //28
+          blockItem = new BlockItem();
+          p = blockItem.parser(p,tokens);
+          list.add(blockItem);
+      }
+      list.add(tokens.get(p));
+      p++;
+      ```
+      
+      If `Block` is entered with `p` at `{`.
+      Consumes `{`.
+      Loop checks `tokens.get(p)` which is `}`

@@ -1,0 +1,880 @@
+Based on the problem description, the test case input, and the expected output, here is the analysis:
+
+**Summary:**
+The program fails to detect "Missing semicolon" errors (error code `i`) in three specific locations within the `testfile.txt`:
+1.  Line 2: `printf("Hello SysY!\n")` is missing a semicolon.
+2.  Line 9: `int a` is missing a semicolon.
+3.  Line 13: `return 0` is missing a semicolon.
+
+The expected output is:
+```
+2 i
+9 i
+13 i
+```
+The buggy output is empty, meaning the parser is not generating these error reports.
+
+**Error Location Analysis:**
+The logic for detecting missing semicolons is implemented in `frontend/Parser.java`. Specifically, in methods like `parseConstDecl`, `parseVarDecl`, `parseStmt`, etc., there are checks like:
+```java
+if (match(Token.Type.SEMICN)) {
+    // consume semicolon
+} else {
+    peekToken(-1).setErrorCode('i');
+}
+```
+The method `peekToken(-1)` is intended to retrieve the last successfully parsed token to report the error line number. Let's look at the implementation of `peekToken` and `advance` in `frontend/Parser.java`.
+
+In `advance()`:
+```java
+private void advance() {
+    currentTokenIndex++;
+    if (currentTokenIndex >= tokens.size()) {
+        currentTokenIndex = tokens.size() - 1;
+    }
+    currentToken = tokens.get(currentTokenIndex);
+}
+```
+When the end of the file is reached, `currentTokenIndex` stays at `tokens.size() - 1`.
+
+In `peekToken(int number)`:
+```java
+private Token peekToken(int number) {
+    if (currentTokenIndex + number >= tokens.size()) {
+        return tokens.get(tokens.size() - 1);
+    }
+    if (currentTokenIndex + number < 0) {
+        return tokens.get(0);
+    }
+    return tokens.get(currentTokenIndex + number);
+}
+```
+When `peekToken(-1)` is called:
+1.  If `currentTokenIndex` is 0, `currentTokenIndex + (-1)` is -1. The condition `currentTokenIndex + number < 0` is true, so it returns `tokens.get(0)`. This is incorrect if the error occurs later, but usually, we don't check for missing semicolons at the very first token.
+2.  More importantly, consider the case where we have parsed some tokens and are at the end of the file or near it.
+    *   Example: `return 0` (EOF).
+    *   Tokens: `RETURNTK`, `INTCON`, `EOF` (or just end of list).
+    *   Parser parses `return`, advances. Parses `0` (as Exp), advances.
+    *   Now `currentToken` is likely the last token or an EOF marker if present. If the lexer doesn't produce an explicit EOF token, `currentToken` is the last valid token (`INTCON`).
+    *   The parser checks `match(Token.Type.SEMICN)`. It fails.
+    *   It calls `peekToken(-1)`.
+    *   If `currentTokenIndex` points to the last token (e.g., index `N-1`), then `currentTokenIndex + (-1)` is `N-2`. This should return the token before the current one.
+    *   However, let's look at how `parseExp` and underlying functions work. They consume tokens.
+    *   In `parseStmt` for `return`:
+        ```java
+        case RETURNTK:
+            stmt.setType(8);
+            stmt.addToken(currentToken()); // 'return'
+            advance();
+            if (match(Token.Type.LPARENT) || ... ) {
+                stmt.addExp(parseExp()); // Exp
+            }
+            if (match(Token.Type.SEMICN)) {
+                stmt.addSemicn(currentToken()); // ';'
+                advance();
+            } else {
+                peekToken(-1).setErrorCode('i');
+            }
+            break;
+        ```
+    *   After `parseExp()` finishes parsing `0`, `currentToken` will be the token *after* `0`. If there is no semicolon, it might be `}` or EOF.
+    *   If it is `}`, `peekToken(-1)` should return `0` (the INTCON). The line number of `0` is 13. This seems correct.
+    *   Why is the output empty?
+
+Let's look at `Compiler.java` and `Parser.java`'s `print` method.
+```java
+public void print() throws Exception {
+    OutputStreamWriter writer1 = new OutputStreamWriter(new FileOutputStream("parser.txt"));
+    OutputStreamWriter writer2 = new OutputStreamWriter(new FileOutputStream("error.txt"));
+    writer1.write(compUnit.toString());
+    writer2.write(compUnit.error());
+    writer1.close();
+    writer2.close();
+}
+```
+It writes `compUnit.error()`. This recursively calls `error()` on all nodes.
+The `error()` methods in Node classes (e.g., `Stmt.java`) construct the error string by calling `token.error()` on stored tokens.
+```java
+// In Stmt.java, case 8 (return)
+case 8:
+    if (token != null) {
+        sb.append(token.error());
+    }
+    if (exp != null) {
+        sb.append(exp.error());
+    }
+    if (semicn != null) {
+        sb.append(semicn.error());
+    }
+    break;
+```
+Notice that `semicn` is **null** because the semicolon was missing. The code sets the error code on a token using `peekToken(-1).setErrorCode('i')`, but **it does not store this token in the `Stmt` node**.
+The `Stmt` node only outputs errors for tokens it holds (`token`, `exp`, `semicn`). Since `semicn` is null, and the error code was set on a token that is **not** part of the `Stmt`'s stored fields (specifically, it's likely the last token of the `Exp` or the `return` token itself, but wait...), let's trace carefully.
+
+In `parseStmt` for `return`:
+1. `token` is set to `return`.
+2. `exp` is parsed. Inside `parseExp`, tokens are consumed but the `Exp` node stores its internal structure. The `Exp` node's `error()` method calls `addExp.error()`.
+3. The missing semicolon error is set on `peekToken(-1)`. Who is `peekToken(-1)`?
+   - If `parseExp` consumed `0`, `currentToken` is now `}` (or next). `peekToken(-1)` is `0` (INTCON).
+   - `INTCON` is inside the `Exp` node (deeply nested in `AddExp` -> `MulExp` -> `UnaryExp` -> `PrimaryExp` -> `Number`).
+   - Does `Number.error()` output the error?
+     ```java
+     // Number.java
+     @Override
+     public String error() {
+         if (intConst == null) {
+             return "";
+         }
+         return intConst.error();
+     }
+     ```
+     Yes, `intConst.error()` will return the formatted error string if `errorCode` is set.
+   - So, if `peekToken(-1)` correctly identifies the last token of the expression, the error should be propagated up through `Exp` -> `Stmt`.
+
+Let's re-evaluate `peekToken(-1)` behavior at the end of input.
+If the input ends with `return 0`, and there is no newline or trailing token.
+Lexer produces tokens. Last token is `0` (INTCON).
+Parser:
+- `return` consumed.
+- `parseExp` consumes `0`. `advance()` is called inside `parseNumber` or similar.
+- After consuming `0`, `currentTokenIndex` increments. If `0` was the last token, `advance()` sets `currentTokenIndex` to `size - 1` (clamped). So `currentToken` remains `0`.
+- Back in `parseStmt`, `match(SEMICN)` checks `currentToken` which is `0`. False.
+- `peekToken(-1)` is called. `currentTokenIndex` is index of `0`. `index - 1` is index of `return`.
+- So `peekToken(-1)` returns the `return` token.
+- `return` token gets `errorCode = 'i'`.
+- The `return` token is stored in `stmt.token`.
+- `stmt.error()` calls `token.error()`.
+- `token.error()` returns `"13 i\n"`.
+- This should work for `return 0`.
+
+What about `printf("Hello SysY!\n")`?
+- `parseStmt` case `PRINTFTK`.
+- Consumes `printf`, `(`, `StringConst`.
+- Checks `)`. Matches. Consumes `)`.
+- Checks `SEMICN`. Current token is `}` (next block item or end of block).
+- `match(SEMICN)` is false.
+- `peekToken(-1)` returns `)`.
+- `)` is stored in `stmt.rParent`.
+- `stmt.error()` case 11:
+  ```java
+  if (rParent != null) {
+      sb.append(rParent.error());
+  }
+  ```
+- So `)` gets error code `i`. `rParent.error()` outputs it.
+- This should also work.
+
+What about `int a`?
+- `parseBlockItem` sees `INTTK`. Calls `parseDecl`.
+- `parseDecl` calls `parseVarDecl`.
+- `parseVarDecl`:
+  - Parses `BType` (`int`).
+  - Parses `VarDef` (`a`).
+    - `parseVarDef`: consumes `a`. No `[`. No `=`. Returns.
+  - Back in `parseVarDecl`.
+  - Checks `SEMICN`. Current token is `}` (next in block) or `for`?
+  - Input:
+    ```
+    int a // error 2
+
+    for (;;) {}
+    ```
+  - After `a`, next token is `for` (FORTK).
+  - `match(SEMICN)` is false.
+  - `peekToken(-1)` returns `a` (IDENFR).
+  - `a` is inside `VarDef`. `VarDef` stores `ident`.
+  - `VarDecl` stores `varDefList`.
+  - `VarDecl.error()`:
+    ```java
+    sb.append(bType.error());
+    sb.append(varDefList.get(0).error());
+    ...
+    sb.append(semicn.error()); // semicn is null
+    ```
+  - `varDefList.get(0).error()` calls `VarDef.error()`.
+  - `VarDef.error()` calls `ident.error()`.
+  - `ident` has error code `i`.
+  - So `VarDef.error()` returns `"9 i\n"`.
+  - `VarDecl.error()` returns `"9 i\n"`.
+  - `Decl.error()` returns `"9 i\n"`.
+  - `BlockItem.error()` returns `"9 i\n"`.
+  - This should also work.
+
+So why is the output empty?
+
+Let's look at `Lexer.java` again.
+```java
+while (tokens.get(tokens.size() - 1) == null) {
+    tokens.remove(tokens.size() - 1);
+}
+```
+This removes trailing nulls.
+
+Is it possible that `compUnit.error()` is not being called or written correctly?
+In `Compiler.java`:
+```java
+parser.print();
+```
+In `Parser.print()`:
+```java
+writer2.write(compUnit.error());
+```
+
+Wait, look at `Token.error()` implementation in `Token.java`:
+```java
+@Override
+public String error() {
+    if (errorCode == 0) {
+        return "";
+    }
+    return String.format("%d %c\n", ln, errorCode);
+}
+```
+
+And `Node.error()` implementations.
+
+Is it possible that the errors are being detected but overwritten?
+Or perhaps `peekToken(-1)` is returning the wrong token or failing?
+
+Let's look at `peekToken` again.
+```java
+private Token peekToken(int number) {
+    if (currentTokenIndex + number >= tokens.size()) {
+        return tokens.get(tokens.size() - 1);
+    }
+    if (currentTokenIndex + number < 0) {
+        return tokens.get(0);
+    }
+    return tokens.get(currentTokenIndex + number);
+}
+```
+
+Consider the `printf` case again.
+Tokens: `PRINTFTK`, `LPARENT`, `STRCON`, `RPARENT`, `RBRACE`...
+1. `parseStmt` matches `PRINTFTK`.
+2. `advance()` -> `LPARENT`.
+3. `addLParent`. `advance()` -> `STRCON`.
+4. `addStringConst`. `advance()` -> `RPARENT`.
+5. `match(RPARENT)` is true. `addRParent`. `advance()` -> `RBRACE` (assuming `}` follows immediately or after whitespace).
+6. `match(SEMICN)` checks `RBRACE`. False.
+7. `peekToken(-1)`. `currentTokenIndex` is index of `RBRACE`. `index - 1` is index of `RPARENT`.
+8. `RPARENT` gets `errorCode = 'i'`.
+9. `RPARENT` is stored in `stmt.rParent`.
+10. `stmt.error()` includes `rParent.error()`.
+
+This logic seems sound.
+
+However, there is a subtle issue in `parseStmt` for `IDENFR`.
+```java
+case IDENFR:
+    Exp tmpExp = parseExp();
+    if (!match(Token.Type.ASSIGN)) {
+        stmt.setType(2);
+        stmt.addExp(tmpExp); // Exp
+        if (match(Token.Type.SEMICN)) {
+            stmt.addSemicn(currentToken()); // ';'
+            advance();
+        } else {
+            peekToken(-1).setErrorCode('i');
+        }
+        break;
+    }
+    // ... assignment logic
+```
+If we have `a = b`, it goes to assignment.
+If we have `a;`, `parseExp` parses `a`. `match(ASSIGN)` is false (it's `SEMICN`).
+Enters `if (!match(ASSIGN))`.
+`match(SEMICN)` is true. Consumes it. No error.
+
+What if we have `a` (missing semicolon)?
+`parseExp` parses `a`. `currentToken` becomes next token (e.g., `}`).
+`match(ASSIGN)` is false.
+Enters `if`.
+`match(SEMICN)` is false.
+`peekToken(-1)` sets error on `a`.
+`a` is inside `tmpExp`.
+`stmt.addExp(tmpExp)`.
+`stmt.error()` calls `exp.error()`.
+`exp.error()` calls `addExp.error()` ... -> `ident.error()`.
+This should work.
+
+Is there a problem with how `CompUnit` aggregates errors?
+```java
+@Override
+public String error() {
+    StringBuilder sb = new StringBuilder();
+    for (Decl decl : declList) {
+        sb.append(decl.error());
+    }
+    for (FuncDef funcDef : funDefList) {
+        sb.append(funcDef.error());
+    }
+    if (mainFuncDef != null) {
+        sb.append(mainFuncDef.error());
+    }
+    return sb.toString();
+}
+```
+It iterates through declarations and function definitions.
+
+The test input is:
+```c
+int main() {
+    printf("Hello SysY!\n") // error 1
+
+    if (1)
+
+
+    /*********/
+    ;
+    int a // error 2
+
+    for (;;) {}
+
+    return 0 // error 3
+}
+```
+
+1. `int main() { ... }` is `MainFuncDef`.
+2. Inside `main`, `Block` contains `BlockItems`.
+3. `printf(...)` is a `Stmt` inside a `BlockItem`.
+4. `if (1) ;` is a `Stmt` inside a `BlockItem`. Note: `if (1)` followed by empty lines and comment and `;`.
+   - `if (1)` parses `Cond`. Then `parseStmt()` for the body.
+   - The body is `;`.
+   - `parseStmt` sees `SEMICN`. Case `default`: `stmt.setType(2)`, `assert match(SEMICN)`, `addSemicn`, `advance`.
+   - This is an empty statement. Correct.
+5. `int a` is a `Decl` inside a `BlockItem`.
+6. `for (;;) {}` is a `Stmt` inside a `BlockItem`.
+7. `return 0` is a `Stmt` inside a `BlockItem`.
+
+All these are inside `mainFuncDef.block`.
+`MainFuncDef.error()` calls `block.error()`.
+`Block.error()`:
+```java
+@Override
+public String error() {
+    StringBuilder sb = new StringBuilder();
+    if (lBrace != null) {
+        sb.append(lBrace.error());
+    }
+    for (BlockItem blockItem : blockItemList) {
+        sb.append(blockItem.error());
+    }
+    if (rBrace != null) {
+        sb.append(rBrace.error());
+    }
+    return sb.toString();
+}
+```
+It iterates `blockItemList`.
+
+So the structure supports error propagation.
+
+Why is the output empty?
+
+Let's look closely at `Lexer.handleSymbol`.
+```java
+private Token handleSymbol() {
+    StringBuilder sb = new StringBuilder();
+    String tmp = String.format("%c%c", currentChar, peekNextChar());
+    if (!Character.isWhitespace(currentChar) && !Character.isLetter(currentChar) && !Character.isDigit(currentChar)) {
+        sb.append(currentChar);
+        advance();
+    }
+    if (tmp.equals("!=") || tmp.equals("&&") || tmp.equals("||") || tmp.equals("==") || tmp.equals(">=") || tmp.equals("<=")) {
+        sb.append(currentChar);
+        advance();
+    }
+    try {
+        return new Token.SymbolToken(sb.toString());
+    } catch (RuntimeException e) {
+        System.err.println(e.getMessage());
+        return null;
+    }
+}
+```
+If `handleSymbol` returns `null`, the token list contains `null`.
+In `Lexer` constructor:
+```java
+while (tokens.get(tokens.size() - 1) == null) {
+    tokens.remove(tokens.size() - 1);
+}
+```
+This only removes trailing nulls. If a `null` is in the middle, it stays.
+In `Parser` constructor:
+```java
+this.currentToken = tokens.get(0);
+```
+If `tokens.get(0)` is null, crash. But first token is `int`.
+
+If `handleSymbol` returns `null` for some reason, `tokens` list has `null`.
+When `Parser` runs `currentToken.getType()`, if `currentToken` is `null`, it crashes.
+But the program didn't crash, it produced wrong answer (empty output).
+
+Let's look at `Token.SymbolToken` constructor again.
+```java
+default:
+    if (value.charAt(0) == '"' && value.charAt(value.length() - 1) == '"') {
+        this.type = Type.STRCON;
+    } else if (value.charAt(0) == '\'' && value.charAt(value.length() - 1) == '\'') {
+        this.type = Type.CHRCON;
+    } else {
+        this.type = Type.ERROR;
+        this.errorCode = 'u'; // unknown
+    }
+```
+If an unknown symbol is found, it gets error `u`.
+
+Is it possible that the errors are detected but `compUnit.error()` returns empty string?
+
+Let's check `peekToken(-1)` logic again.
+If `currentTokenIndex` is 0, `peekToken(-1)` returns `tokens.get(0)`.
+If the first thing in the program is an error, it might report line 1.
+
+But here errors are deep inside.
+
+Wait! Look at `parseStmt` for `PRINTF`.
+```java
+case PRINTFTK:
+    stmt.setType(11);
+    stmt.addToken(currentToken()); // 'printf'
+    advance();
+    stmt.addLParent(currentToken()); // '('
+    advance();
+    stmt.addStringConst(currentToken()); // StringConst
+    advance();
+    while (match(Token.Type.COMMA)) {
+        stmt.addCommaList(currentToken()); // ','
+        advance();
+        stmt.addExpList(parseExp()); // Exp
+    }
+    if (match(Token.Type.RPARENT)) {
+        stmt.addRParent(currentToken()); // ')'
+        advance();
+    } else {
+        peekToken(-1).setErrorCode('j');
+    }
+    if (match(Token.Type.SEMICN)) {
+        stmt.addSemicn(currentToken()); // ';'
+        advance();
+    } else {
+        peekToken(-1).setErrorCode('i');
+    }
+    break;
+```
+In the test case: `printf("Hello SysY!\n")`.
+1. `printf` consumed.
+2. `(` consumed.
+3. `"Hello..."` consumed.
+4. `while(match(COMMA))`: Next token is `)`. Not comma. Loop skipped.
+5. `match(RPARENT)`: Next token is `)`. True.
+6. `addRParent` (stores `)`). `advance()`.
+7. Now `currentToken` is the token AFTER `)`. In the source:
+   ```
+   printf("Hello SysY!\n") // error 1
+
+   if (1)
+   ```
+   After `)`, there is a comment `// error 1`. Lexer skips comments.
+   Next token is `if` (IFTK).
+8. `match(SEMICN)`: Checks `IFTK`. False.
+9. `peekToken(-1)`: `currentTokenIndex` is index of `IFTK`. `index - 1` is index of `)`.
+10. `)` gets `errorCode = 'i'`.
+11. `)` is stored in `stmt.rParent`.
+12. `stmt.error()` appends `rParent.error()`.
+
+This SHOULD work.
+
+Is it possible that `BlockItem` or `Block` is not iterating correctly?
+Or `MainFuncDef`?
+
+Let's look at `parseBlock`.
+```java
+private Block parseBlock() {
+    Block block = new Block();
+    block.addLBrace(currentToken()); // '{'
+    advance();
+    while (!match(Token.Type.RBRACE)) {
+        block.addBlockItem(parseBlockItem()); // BlockItem
+    }
+    block.addRBrace(currentToken()); // '}'
+    advance();
+    return block;
+}
+```
+It parses items until `}`.
+
+There is one suspicious thing in `parseCompUnit`.
+```java
+while (peekToken(1).getType() != Token.Type.MAINTK) {
+    compUnit.addFuncDef(parseFuncDef()); // {FuncDef}
+}
+compUnit.addMainFuncDef(parseMainFuncDef()); // MainFuncDef
+```
+If there are no function definitions before main, `peekToken(1)` checks if the *next* token is `main`.
+At start, `currentToken` is `int` (of `int main`). `peekToken(1)` is `main`.
+`main.getType()` is `MAINTK`.
+Loop condition `!= MAINTK` is false. Loop doesn't run.
+`parseMainFuncDef` is called.
+
+Inside `parseMainFuncDef`:
+```java
+mainFuncDef.addInt(currentToken()); // 'int'
+advance();
+mainFuncDef.addMain(currentToken()); // 'main'
+advance();
+mainFuncDef.addLParent(currentToken()); // '('
+advance();
+if (match(Token.Type.RPARENT)) {
+    mainFuncDef.addRParent(currentToken()); // ')'
+    advance();
+} else {
+    peekToken(-1).setErrorCode('j');
+}
+mainFuncDef.addBlock(parseBlock()); // Block
+```
+This parses `int main() { ... }`.
+
+Everything seems structurally correct.
+
+Let's look at the `error()` method of `Stmt` again.
+```java
+@Override
+public String error() {
+    StringBuilder sb = new StringBuilder();
+    switch (type) {
+        // ...
+        case 11: // printf
+            if (token != null) {
+                sb.append(token.error());
+            }
+            if (lParent != null) {
+                sb.append(lParent.error());
+            }
+            if (stringConst != null) {
+                sb.append(stringConst.error());
+            }
+            for (int i = 0; i < commaList.size(); i++) {
+                sb.append(commaList.get(i).error());
+                sb.append(expList.get(i).error());
+            }
+            if (rParent != null) {
+                sb.append(rParent.error());
+            }
+            if (semicn != null) {
+                sb.append(semicn.error());
+            }
+            break;
+        // ...
+    }
+    sb.append("<Stmt>\n"); // This is toString, not error!
+    return sb.toString();
+}
+```
+Wait, I copied `toString` logic in my head? No, looking at `Stmt.java` provided:
+```java
+    @Override
+    public String error() {
+        StringBuilder sb = new StringBuilder();
+        switch (type) {
+            case 1:
+                // ...
+            case 11:
+                if (token != null) {
+                    sb.append(token.error());
+                }
+                if (lParent != null) {
+                    sb.append(lParent.error());
+                }
+                if (stringConst != null) {
+                    sb.append(stringConst.error());
+                }
+                for (int i = 0; i < commaList.size(); i++) {
+                    sb.append(commaList.get(i).error());
+                    sb.append(expList.get(i).error());
+                }
+                if (rParent != null) {
+                    sb.append(rParent.error());
+                }
+                if (semicn != null) {
+                    sb.append(semicn.error());
+                }
+                break;
+            default:
+                break;
+        }
+        return sb.toString();
+    }
+```
+It does NOT append `<Stmt>\n`. That's in `toString`.
+
+So `rParent.error()` IS called.
+
+Is it possible that `peekToken(-1)` is NOT setting the error code on the token that is stored in the node?
+
+In `printf` case:
+`rParent` is `)`.
+`peekToken(-1)` returns `)`.
+`setErrorCode('i')` is called on `)`.
+`rParent` IS `)`.
+So `rParent.error()` should return `"2 i\n"`.
+
+Why would it fail?
+
+One possibility: **The `Token` objects are immutable or copied?**
+No, they are objects. `setErrorCode` modifies the field.
+
+Another possibility: **Multiple errors on same token?**
+No, just one.
+
+Let's look at `Lexer.nowLine`.
+It is static.
+`Token` captures `ln` in constructor.
+`IdentToken(String value) { this.ln = Lexer.nowLine; ... }`
+
+If `nowLine` is updated incorrectly, line numbers might be wrong. But output is empty, not wrong lines.
+
+Is it possible that `compUnit.error()` is throwing an exception or returning empty string because of a null pointer?
+If `blockItemList` is empty? No, it has items.
+
+Let's look at `parseBlockItem`.
+```java
+private BlockItem parseBlockItem() {
+    BlockItem blockItem = new BlockItem();
+    if (match(Token.Type.CONSTTK) ||
+            match(Token.Type.INTTK) ||
+            match(Token.Type.CHARTK)) {
+        blockItem.setType(1);
+        blockItem.addDecl(parseDecl()); // Decl
+    } else {
+        blockItem.setType(2);
+        blockItem.addStmt(parseStmt()); // Stmt
+    }
+    return blockItem;
+}
+```
+
+If `parseDecl` or `parseStmt` throws an exception, the program would crash. It didn't.
+
+There is one critical flaw in `peekToken` when `currentTokenIndex` is 0.
+But here indices are large.
+
+Let's look at `advance()` again.
+```java
+private void advance() {
+    currentTokenIndex++;
+    if (currentTokenIndex >= tokens.size()) {
+        currentTokenIndex = tokens.size() - 1;
+    }
+    currentToken = tokens.get(currentTokenIndex);
+}
+```
+If we are at the last token, `advance()` keeps us at the last token.
+
+In `printf` case:
+Tokens: `...`, `)`, `if`, `...`
+After consuming `)`, `currentToken` is `if`.
+`peekToken(-1)` is `)`.
+Correct.
+
+In `return 0` case:
+Tokens: `return`, `0`, `}`
+After consuming `0`, `currentToken` is `}`.
+`peekToken(-1)` is `0`.
+`0` is inside `Exp`.
+`Exp` is stored in `stmt.exp`.
+`stmt.error()` calls `exp.error()`.
+`exp.error()` calls `addExp.error()` ... `number.error()` ... `intConst.error()`.
+`intConst` is `0`.
+`0` has error code `i`.
+So `intConst.error()` returns `"13 i\n"`.
+
+This implies the code SHOULD work.
+
+Why is the output empty?
+
+Check `Compiler.java`.
+```java
+public class Compiler {
+    public static void main(String[] args) throws Exception {
+        String text = new String(Files.readAllBytes(Paths.get("testfile.txt")));
+        Lexer lexer = new Lexer(text);
+//        lexer.print();
+        Parser parser = new Parser(lexer);
+        parser.print();
+    }
+}
+```
+It calls `parser.print()`.
+
+Check `Parser.print()`.
+```java
+public void print() throws Exception {
+    OutputStreamWriter writer1 = new OutputStreamWriter(new FileOutputStream("parser.txt"));
+    OutputStreamWriter writer2 = new OutputStreamWriter(new FileOutputStream("error.txt"));
+    writer1.write(compUnit.toString());
+    writer2.write(compUnit.error());
+    writer1.close();
+    writer2.close();
+}
+```
+
+Is it possible that `compUnit` is null? No, initialized in constructor.
+
+Is it possible that `compUnit.error()` returns empty string?
+
+Let's look at `Decl.error()`.
+```java
+@Override
+public String error() {
+    return switch (type) {
+        case 1 -> constDecl.error();
+        case 2 -> varDecl.error();
+        default -> "";
+    };
+}
+```
+If `type` is 0, returns "".
+In `parseDecl`:
+```java
+if (match(Token.Type.CONSTTK)) {
+    decl.setType(1);
+    // ...
+} else {
+    decl.setType(2);
+    // ...
+}
+```
+Type is set.
+
+In `BlockItem.error()`:
+```java
+@Override
+public String error() {
+    return switch (type) {
+        case 1 -> decl.error();
+        case 2 -> stmt.error();
+        default -> "";
+    };
+}
+```
+Type is set in `parseBlockItem`.
+
+I suspect the issue might be in **how the error code is set on the token**.
+`peekToken(-1).setErrorCode('i')`.
+
+If `peekToken(-1)` returns a token that is **not** the one stored in the AST node, the error will be lost.
+
+In `printf` case:
+Stored: `rParent` (which is `)`).
+`peekToken(-1)` returns `)`.
+Same object?
+`tokens` list contains the token objects.
+`addRParent(currentToken())` stores the reference from `tokens`.
+`peekToken` returns reference from `tokens`.
+Yes, same object.
+
+In `return 0` case:
+Stored: `exp` containing `Number` containing `intConst` (which is `0`).
+`peekToken(-1)` returns `0`.
+Same object?
+Yes.
+
+In `int a` case:
+Stored: `decl` containing `varDecl` containing `varDef` containing `ident` (which is `a`).
+`peekToken(-1)` returns `a`.
+Same object?
+Yes.
+
+There is one subtle case: **What if `peekToken(-1)` returns `null`?**
+`tokens` list shouldn't contain nulls in the middle unless `handleSymbol` failed.
+If `handleSymbol` returns null, `tokens` has null.
+If `peekToken` accesses a null index, it returns null.
+`null.setErrorCode('i')` -> NullPointerException.
+Program would crash. It didn't.
+
+I will bet on the `peekToken` implementation having an off-by-one error or boundary issue that causes it to return the wrong token or fail silently in a way I'm missing, OR the `error()` propagation is broken for specific nodes.
+
+Actually, look at `parseVarDef`.
+```java
+private VarDef parseVarDef() {
+    VarDef varDef = new VarDef();
+    varDef.addIdent(currentToken()); // Ident
+    advance();
+    if (match(Token.Type.LBRACK)) {
+        // ...
+    }
+    varDef.setType(1);
+    if (match(Token.Type.ASSIGN)) {
+        varDef.setType(2);
+        varDef.addAssign(currentToken()); // '='
+        advance();
+        varDef.addInitVal(parseInitVal()); // InitVal
+    }
+    return varDef;
+}
+```
+For `int a`, `parseVarDef` consumes `a`. `currentToken` becomes next (e.g., `for` or `}`).
+Returns `varDef`.
+Back in `parseVarDecl`.
+```java
+if (match(Token.Type.SEMICN)) {
+    // ...
+} else {
+    peekToken(-1).setErrorCode('i');
+}
+```
+`peekToken(-1)` is `a`.
+`a` is in `varDef.ident`.
+`varDef.error()` calls `ident.error()`.
+This works.
+
+I will highlight the `peekToken` method and the error setting logic in `Parser.java` as the likely location, specifically because if `peekToken` behaves unexpectedly at boundaries or if the token returned isn't the one linked in the AST, errors are lost. Given the symptoms, the error detection logic relies entirely on `peekToken(-1)` modifying the correct token object that is later queried by `error()`.
+
+<frontend/Parser.java>
+...
+    private Token peekToken(int number) {
+        if (currentTokenIndex + number >= tokens.size()) {
+            return tokens.get(tokens.size() - 1);
+        }
+        if (currentTokenIndex + number < 0) {
+            return tokens.get(0);
+        }
+        return tokens.get(currentTokenIndex + number);
+    }
+...
+    private ConstDecl parseConstDecl() {
+...
+        if (match(Token.Type.SEMICN)) {
+            constDecl.addSemicn(currentToken()); // ';'
+            advance();
+        } else {
+            peekToken(-1).setErrorCode('i');
+        }
+        return constDecl;
+    }
+
+    private VarDecl parseVarDecl() {
+...
+        if (match(Token.Type.SEMICN)) {
+            varDecl.addSemicn(currentToken()); // ';'
+            advance();
+        } else {
+            peekToken(-1).setErrorCode('i');
+        }
+        return varDecl;
+    }
+...
+    private Stmt parseStmt() {
+        Stmt stmt = new Stmt();
+        switch (currentToken().getType()) {
+            case IDENFR:
+...
+                if (!match(Token.Type.ASSIGN)) {
+                    stmt.setType(2);
+                    stmt.addExp(tmpExp); // Exp
+                    if (match(Token.Type.SEMICN)) {
+                        stmt.addSemicn(currentToken()); // ';'
+                        advance();
+                    } else {
+                        peekToken(-1).setErrorCode('i');

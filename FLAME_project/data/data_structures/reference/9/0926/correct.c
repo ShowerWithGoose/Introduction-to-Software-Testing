@@ -1,0 +1,91 @@
+#include<stdio.h>
+#include<math.h>
+#include<stdlib.h>
+#include<string.h>
+#include<ctype.h>
+//变量循环的初始化很关键，scanf的&
+int n,i,j;
+int x1[105],x2[105],yx1[105],yx2[105];
+int num,q1,q2,w1,w2,nn,f1,f2,f3;
+int main()
+{
+scanf("%d",&n);
+for(i=0;i<n;i++){
+	scanf("%d%d%d%d",&x1[i],&yx1[i],&x2[i],&yx2[i]);
+}
+for(i=0;i<n;i++){
+	q1=x1[i];
+	q2=yx1[i];
+	w1=x2[i];
+	w2=yx2[i];
+	for(j=0;j<n;j++){
+		if(j!=i){
+			if((w1==x1[j])&&(w2==yx1[j])){
+				w1=x2[j];
+				w2=yx2[j];
+				num++;
+			}
+			if((q1==x2[j])&&(q2==yx2[j])){
+				q1=x1[j];
+				q2=yx1[j];
+				num++;
+			}
+		}
+	}
+	for(j=0;j<n;j++){
+		if(j!=i){
+			if((w1==x1[j])&&(w2==yx1[j])){
+				w1=x2[j];
+				w2=yx2[j];
+				num++;
+			}
+			if((q1==x2[j])&&(q2==yx2[j])){
+				q1=x1[j];
+				q2=yx1[j];
+				num++;
+			}
+		}
+	}
+	for(j=0;j<n;j++){
+		if(j!=i){
+			if((w1==x1[j])&&(w2==yx1[j])){
+				w1=x2[j];
+				w2=yx2[j];
+				num++;
+			}
+			if((q1==x2[j])&&(q2==yx2[j])){
+				q1=x1[j];
+				q2=yx1[j];
+				num++;
+			}
+		}
+	}
+	for(j=0;j<n;j++){
+		if(j!=i){
+			if((w1==x1[j])&&(w2==yx1[j])){
+				w1=x2[j];
+				w2=yx2[j];
+				num++;
+			}
+			if((q1==x2[j])&&(q2==yx2[j])){
+				q1=x1[j];
+				q2=yx1[j];
+				num++;
+			}
+		}
+	}
+	if(num>nn){
+		nn=num;
+		f1=q1;
+		f2=q2;
+	}
+	num=0;
+}
+printf("%d %d %d",nn+1,f1,f2);
+f1=0;
+f2=0;
+nn=0;
+  return 0;
+}
+
+

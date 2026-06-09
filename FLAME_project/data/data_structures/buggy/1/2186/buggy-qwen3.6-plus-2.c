@@ -1,0 +1,38 @@
+#include <stdio.h>
+
+void f(int *a, int *b, int n, int index) {
+
+    int i = 0;
+    if (index == n) {
+        for (int i = 0; i < n; i++) {
+
+            printf("%d", a[i]); // @@ The output format is incorrect. Integers should be separated by a space, but here they are printed consecutively without spaces. It should be printf("%d ", a[i]); or similar logic to handle spacing correctly.
+        }
+        printf("\n");
+        return;
+    }
+    for (int i = 1; i <= n; i++) {
+
+        if (b[i] == 0) {
+
+            a[index] = i;
+
+            b[i] = 1;
+
+            f(a, b, n, index + 1);
+            b[i] = 0;
+
+        }
+    }
+
+}
+
+int main() {
+    int n;
+    int a[100] = {0};
+    int b[100] = {0};
+    scanf("%d", &n);
+    f(a, b, n, 0);
+    return 0;
+
+}

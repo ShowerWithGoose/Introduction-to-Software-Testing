@@ -1,0 +1,185 @@
+The error lies in the `expect` method of the `ASTNode` class. When a syntax error (missing semicolon, right parenthesis, or right bracket) is detected, the code adds the error to a local `errors` list but **does not advance the token index**. This causes the parser to get stuck on the same unexpected token, leading to infinite loops or repeated error reporting for the same location as different non-terminals attempt to parse and fail on the same token.
+
+Additionally, the `addError` mechanism in `ASTNode` relies on `addErrors()` being called in `toString()`. However, if the parser gets stuck or throws an exception before reaching `toString()`, or if the error collection logic in `CompUnit` or other nodes doesn't properly propagate these local errors to the global `ErrorCollector` in a way that prevents duplicates or handles the "stuck" state, we get multiple errors.
+
+Looking closely at the `Buggy Output`:
+```
+1 j
+1 j
+3 j
+3 j
+5 j
+5 j
+```
+And `Expected Output`:
+```
+1 j
+3 j
+5 j
+```
+
+The errors are duplicated. This suggests that for each error location, two different parts of the parser are detecting the missing `)` and reporting it.
+
+Let's trace Error 1: `void f(int a {}`
+1. `FuncDefNode.parse()` calls `expect(TokenType.RParenthesis, ")")` after parsing params. It fails because next token is `{`. It adds error `1 j`. **Crucially, it does NOT advance.**
+2. The parser then tries to parse `Block`. `BlockNode.parse()` expects `{`. It sees `{`, advances.
+3. Inside `Block`, it parses `BlockItem`.
+4. Eventually, the parser might backtrack or another component might try to parse something else? No, recursive descent doesn't backtrack easily.
+
+Wait, let's look at `FuncDefNode`:
+```java
+        expect(TokenType.RParenthesis, ")");
+
+        // parse function body
+        body = new BlockNode(tokens, depth + 1);
+        body.parse();
+```
+If `expect` fails, it adds an error but returns. The token stream is still at `{`.
+`BlockNode` expects `{`. It sees `{`, consumes it.
+Then it parses block items.
+The function definition ends.
+
+Why is there a second `1 j`?
+Perhaps `MainFuncDefNode` or `CompUnit` is also trying to parse?
+In `CompUnit.parse()`:
+```java
+        // Main func
+        this.mainFuncDefNode = new MainFuncDefNode(tokens, depth + 1);
+        mainFuncDefNode.parse();
+```
+After `FuncDefNode` finishes (even with error), the parser moves to `MainFuncDefNode`.
+`MainFuncDefNode` expects `int`. The next token is `int` (from `int main...`). So it proceeds.
+It expects `main`. Sees `main`.
+It expects `(`. Sees `(`.
+It expects `)`. Sees `{` (from `int main( {`).
+So `MainFuncDefNode` reports `3 j` (line 3).
+
+Where does the duplicate come from?
+Let's look at `StmtNode` or `ExpNode` inside the functions?
+
+Actually, look at `UnaryExpNode`:
+```java
+            expect(TokenType.RParenthesis, ")");
+```
+And `PrimaryExpNode`:
+```java
+            expect(TokenType.RParenthesis, ")");
+```
+
+In `void f(int a {}`:
+`FuncDefNode` fails to find `)`. Reports error. Token is `{`.
+`BlockNode` consumes `{`.
+Inside block, it's empty? No, `}` follows immediately.
+`BlockNode` sees `}`, consumes it.
+`FuncDefNode` returns.
+
+Next is `int main( {`.
+`MainFuncDefNode` parses `int`, `main`, `(`.
+Expects `)`. Sees `{`. Reports error `3 j`. Token is `{`.
+`BlockNode` consumes `{`.
+Parses `int a = 10;`.
+Parses `f(a + 10;`.
+`StmtNode` sees `f`. Calls `ExpStmt` or `LValAssignStmt`?
+`StmtNode` logic:
+```java
+            case Identifier -> {
+                int index = tokens.getIndex();
+                if (!token.isTypeOf(TokenType.Semicolon)) {
+                    // Field is not empty
+                    // Since Exp consists of LVal, so first parse Exp
+                    ExpNode exp = new ExpNode(tokens, depth + 1);
+                    exp.parse();
+```
+`ExpNode` -> `AddExpNode` -> ... -> `UnaryExpNode`.
+`UnaryExpNode` sees `f`, then `(`. It identifies as `FuncCall`.
+```java
+            type = Type.FuncCall;
+            identifier = new Ident(token.getContent());
+            tokens.advance(); // consumes f
+            expect(TokenType.LParenthesis, "("); // consumes (
+            if (isExpr(tokens.get().getType())) { // sees a
+                funcCallParams = new FuncCallParamsNode(tokens, depth + 1);
+                funcCallParams.parse();
+            }
+            expect(TokenType.RParenthesis, ")");
+```
+`FuncCallParamsNode` parses `a`. Then `+`. `+` is not `,`. So it returns.
+Back in `UnaryExpNode`, it expects `)`.
+Current token is `+` (from `a + 10`).
+So `UnaryExpNode` reports error `5 j` (Line 5, `a` is line 5? No, `f(a+10;` is line 5. `a` is likely col 2. `prev()` is `a`. Line 5).
+It adds error `5 j`. **Does not advance.**
+Token is still `+`.
+
+Then `UnaryExpNode` returns.
+`ExpNode` returns.
+Back in `StmtNode`:
+```java
+                    if (tokens.get().isTypeOf(TokenType.AssignOperator)) {
+                        // LVal assign statement
+                        tokens.setIndex(index);
+                        stmt = new LValAssignStmt(tokens, depth + 1);
+                        stmt.parse();
+                    } else {
+                        // not null exp statement
+                        tokens.setIndex(index);
+                        stmt = new ExpStmt(tokens, depth + 1);
+                        stmt.parse();
+                    }
+```
+The token is `+`. Not `=`.
+So it goes to `else`:
+```java
+                        tokens.setIndex(index); // Resets to 'f'!
+                        stmt = new ExpStmt(tokens, depth + 1);
+                        stmt.parse();
+```
+`ExpStmt` checks `isExpr`. `f` is identifier. Yes.
+Creates `ExpNode`.
+`ExpNode` parses `f` again.
+`UnaryExpNode` sees `f`, `(`. FuncCall.
+Consumes `f`, `(`.
+Parses params `a`.
+Expects `)`. Sees `+`.
+Reports error `5 j` **AGAIN**.
+
+This explains the duplication! The `StmtNode` tries to parse an `Exp` to decide if it's an assignment or expression statement. If it's not an assignment, it **resets the index** and parses it again as an `ExpStmt`. The first parse attempt generates an error (and leaves the token stream in a bad state or just records the error), and the second parse attempt generates the same error again.
+
+The fix should be to ensure that errors are not duplicated when backtracking/resetting index, OR to not parse the full expression just to check for `=`. However, checking for `=` requires parsing the LVal.
+
+A simpler fix for the specific duplication issue caused by `expect` not advancing is that `expect` *should* probably advance or handle the error such that subsequent parses don't re-report it if they are just retries. But the root cause is the retry logic in `StmtNode` combined with `expect` adding errors to a list that isn't cleared or checked for duplicates globally before output.
+
+However, the most direct "bug" in the provided code structure that leads to *incorrect* behavior (duplicates) is that `ASTNode.expect` adds to `this.errors`, and `addErrors()` pushes them to the global collector. When `StmtNode` resets the index and reparses, new AST nodes are created. These new nodes have their own `errors` lists. They encounter the same syntax error, add it to their local list, and then `toString()` pushes it to the global collector again.
+
+To fix this, one approach is to make `expect` advance past the error (panic mode) or to ensure that the global `ErrorCollector` handles duplicates (though line+type might be valid duplicates in some cases, here it's clearly unwanted).
+
+But looking at the prompt, I need to identify the location. The primary logical error causing the *duplication* is in `StmtNode.java` where it resets the index and reparses, causing side effects (error recording) to happen twice. The secondary error is in `ASTNode.java` where `expect` does not advance, allowing the second parse to fail at the exact same spot.
+
+Usually, in recursive descent parsers with error recovery, if you reset the index, you should ideally suppress errors from the "probe" parse, or use a different mechanism.
+
+Let's look at `StmtNode.java`:
+
+<frontend/ast/StmtNode.java>
+...
+            case Identifier -> {
+                int index = tokens.getIndex();
+                if (!token.isTypeOf(TokenType.Semicolon)) {
+                    // Field is not empty
+                    // Since Exp consists of LVal, so first parse Exp
+                    ExpNode exp = new ExpNode(tokens, depth + 1);
+                    exp.parse();
+                    if (tokens.get().isTypeOf(TokenType.AssignOperator)) {
+                        // LVal assign statement
+                        tokens.setIndex(index);
+                        stmt = new LValAssignStmt(tokens, depth + 1);
+                        stmt.parse();
+                    } else {
+                        // not null exp statement
+                        tokens.setIndex(index);
+                        stmt = new ExpStmt(tokens, depth + 1);
+                        stmt.parse();
+                    }
+                } else {
+                    stmt = new ExpStmt(tokens, depth + 1);
+                }
+            }
+...

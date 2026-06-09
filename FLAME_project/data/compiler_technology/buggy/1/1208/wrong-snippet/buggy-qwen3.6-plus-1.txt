@@ -1,0 +1,126 @@
+Based on the comparison between the buggy output and the expected output, the error occurs during the parsing of function call arguments (`FuncRParams`).
+
+In the test case `printf("%d,%d,%d",5,func_p(),9);`, when parsing the argument `func_p()`:
+1. The parser enters `parseUnaryExp`.
+2. It identifies `IDENFR func_p` followed by `LPARENT (`.
+3. It consumes `func_p` and `(`.
+4. It calls `parseFuncRParams()`. Since there are no parameters inside `func_p()`, `parseFuncRParams` should ideally handle an empty list or return immediately if the next token is `)`. However, looking at `parseFuncRParams`:
+   ```java
+   public Node parseFuncRParams() {
+       Node funcRParams = new Node(SyntaxType.FuncRParams, curToken);
+       funcRParams.addChildNode(parseExp()); // This expects an Exp immediately
+       ...
+   }
+   ```
+   The grammar for `FuncRParams` is `Exp { ',' Exp }`. But in the context of `UnaryExp -> Ident '(' [FuncRParams] ')'`, the `FuncRParams` is optional. The current implementation of `parseUnaryExp` calls `parseFuncRParams()` unconditionally if it sees `Ident '('`.
+   
+   Let's look closer at `parseUnaryExp`:
+   ```java
+   } else if (curToken.getType() == LexType.IDENFR) {
+       if (look(0).getType() == LexType.LPARENT) { // Actually look(0) is current token, likely meant look(1) or just check next
+           unaryExp.addChildNode(createEndNode()); // ident
+           unaryExp.addChildNode(createEndNode()); // '('
+           unaryExp.addChildNode(parseFuncRParams()); // <--- Problem here
+           if (curToken.getType() == LexType.RPARENT) {
+               unaryExp.addChildNode(createEndNode()); // ')'
+           } else {
+               errors.put(look(-2).getLineno(), 'j');
+           }
+       } else {
+           unaryExp.addChildNode(parseLVal("Primary"));
+       }
+   }
+   ```
+   
+   The issue is that `parseFuncRParams` assumes there is at least one `Exp`. If the parentheses are empty `()`, `parseFuncRParams` will try to parse an `Exp` starting with `)`, which is incorrect.
+   
+   However, looking at the Buggy Output:
+   ```
+   IDENFR func_p
+   LPARENT (
+   <UnaryExp>  <-- This suggests parseFuncRParams returned something or parsed incorrectly
+   <MulExp>
+   <AddExp>
+   <Exp>
+   <FuncRParams>
+   RPARENT )
+   ```
+   
+   Wait, the expected output is:
+   ```
+   IDENFR func_p
+   LPARENT (
+   RPARENT )
+   <UnaryExp>
+   ...
+   ```
+   
+   In the buggy output, `RPARENT )` appears *after* `<FuncRParams>`. In the expected output, `RPARENT )` appears *immediately after* `LPARENT (`. This implies that for `func_p()`, the parser should recognize that there are no parameters, consume the `)`, and then wrap up the `UnaryExp`.
+   
+   The current code calls `parseFuncRParams()` unconditionally. `parseFuncRParams` tries to parse an `Exp`. If the next token is `)`, `parseExp` (via `parseAddExp` etc.) might fail or produce an empty/incorrect node structure, but crucially, it doesn't consume the `)`. The `)` is consumed by the `createEndNode()` in `parseUnaryExp` *after* `parseFuncRParams` returns.
+   
+   The real issue is that `parseFuncRParams` is called even when there are no parameters. The grammar says `[FuncRParams]`. So `parseUnaryExp` should check if the next token is `)` before calling `parseFuncRParams`. If it is `)`, it should skip calling `parseFuncRParams`.
+   
+   Let's verify `parseFuncRParams` behavior. If it encounters `)`, `parseExp` will likely error out or behave unexpectedly depending on implementation. But looking at the buggy output, it seems `parseFuncRParams` did produce output (`<UnaryExp>...<FuncRParams>`). This suggests it might have parsed an empty expression or failed gracefully but still printed nodes.
+   
+   Actually, looking at `parseFuncRParams`:
+   ```java
+   public Node parseFuncRParams() {
+       Node funcRParams = new Node(SyntaxType.FuncRParams, curToken);
+       funcRParams.addChildNode(parseExp()); // Tries to parse Exp
+       while (curToken.getType() == LexType.COMMA) {
+           ...
+       }
+       return funcRParams;
+   }
+   ```
+   If `curToken` is `)`, `parseExp` is called. `parseExp` calls `parseAddExp`. `parseAddExp` calls `parseMulExp`. `parseMulExp` calls `parseUnaryExp`. `parseUnaryExp` sees `)`. It falls into the `else` block (error) or does nothing?
+   
+   In `parseUnaryExp`:
+   ```java
+   } else {
+       // error
+   }
+   return unaryExp;
+   ```
+   It returns an empty `UnaryExp` node? If so, the hierarchy builds up empty nodes.
+   
+   The fix should be in `parseUnaryExp`. It should only call `parseFuncRParams` if the next token is NOT `)`.
+   
+   Code snippet location: `frontend/Parser.java`, method `parseUnaryExp`.
+
+<frontend/Parser.java>
+...
+    public Node parseUnaryExp() {
+        Node unaryExp = new Node(SyntaxType.UnaryExp, curToken);
+        if (curToken.getType() == LexType.LPARENT) {
+            unaryExp.addChildNode(parsePExp());
+        } else if (curToken.getType() == LexType.INTCON) {
+            unaryExp.addChildNode(parseNumber());
+        } else if (curToken.getType() == LexType.CHRCON) {
+            unaryExp.addChildNode(parseCharacter());
+        } else if (curToken.getType() == LexType.IDENFR) {
+            if (look(0).getType() == LexType.LPARENT) {
+                unaryExp.addChildNode(createEndNode()); // ident
+                unaryExp.addChildNode(createEndNode()); // '('
+                if (curToken.getType() != LexType.RPARENT) {
+                    unaryExp.addChildNode(parseFuncRParams());
+                }
+                if (curToken.getType() == LexType.RPARENT) {
+                    unaryExp.addChildNode(createEndNode()); // ')'
+                } else {
+                    errors.put(look(-2).getLineno(), 'j');
+                }
+            } else {
+                unaryExp.addChildNode(parseLVal("Primary"));
+            }
+        } else if (curToken.getType() == LexType.PLUS || curToken.getType() == LexType.MINU ||
+        curToken.getType() == LexType.NOT) {
+            unaryExp.addChildNode(parseUnaryOp());
+            unaryExp.addChildNode(parseUnaryExp());
+        } else {
+            // error
+        }
+        return unaryExp;
+    }
+...

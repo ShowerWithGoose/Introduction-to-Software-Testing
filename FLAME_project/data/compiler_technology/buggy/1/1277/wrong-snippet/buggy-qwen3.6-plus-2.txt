@@ -1,0 +1,676 @@
+Based on the problem description, the test case input, and the expected output, here is the analysis:
+
+1.  **Test Case Input Analysis**:
+    *   Line 16: `ch = getchar( ; // error 1` -> Missing right parenthesis `)`. Expected error: `16 j`.
+    *   Line 18: `if (f2() & f1()) { // error 2` -> Illegal symbol `&` (single ampersand). Expected error: `18 a`.
+    *   Line 19: `printf("%c",s[0]; // error 3` -> Missing right parenthesis `)`. Expected error: `19 j`.
+
+2.  **Buggy Output**: The program outputs nothing or crashes (Runtime Error), implying it fails to detect these errors correctly or encounters an unhandled exception during parsing.
+
+3.  **Code Analysis**:
+    *   **Error Type 'a' (Illegal `&` or `|`)**: In `Lexer.java`, `tokenizeSeparator` handles `&` and `|`. If it finds a single `&` or `|`, it creates an `ErrorToken` and stores it in `lexer.error`. However, it does **not** add this token to the `tokens` list. This means the parser will never see this token. When the parser expects an expression or operand and encounters the next valid token (skipping the error), the synchronization might fail or produce incorrect parse trees. More importantly, for the parser to report error `a` at the correct line, the lexer usually needs to provide the token so the parser can consume it or check for it, OR the compiler main logic needs to check `lexer.getError()`. The `Compiler.java` checks `lexer.getError()`, so this part might work if the lexer doesn't crash. However, the `Runtime Error` suggests a crash.
+    *   **Error Type 'j' (Missing `)`)**:
+        *   In `BlockParser.java`, `parseHead()` handles statements like `LVal '=' Exp ';'` or function calls like `getchar()`.
+        *   Specifically, look at `parseHead()` in `BlockParser.java`. It calls `expParser.parse()` which eventually calls `parseUnaryExp()`.
+        *   In `ExpParser.java`, `parseUnaryExp()` handles `Ident '(' ... ')'`.
+        *   Let's trace `ch = getchar( ;`.
+            *   `parseHead()` calls `expParser.parse()`.
+            *   `parse()` -> `parseAddExp()` -> ... -> `parseUnaryExp()`.
+            *   `parseUnaryExp()` sees `getchar` (IDENFR) and `(` (LPARENT). It consumes them.
+            *   It then checks for `)`. The next token is `;` (SEMICN).
+            *   It enters the `else` block: `lexer.move(-1);`. Then it checks `isExp(lexer)`. `;` is not an exp start. So it goes to `addError(... ErrorType.j)`.
+            *   This seems correct for detecting the missing `)`.
+        *   However, let's look at `parsePrintfStmt` in `BlockParser.java` for line 19: `printf("%c",s[0];`.
+            *   It parses `printf`, `(`, `StringConst`.
+            *   Then it loops for `, Exp`. It finds `,`, parses `s[0]` (Exp/LVal).
+            *   Then it expects `)`. The next token is `;`.
+            *   It detects missing `)` and adds error `j`.
+            *   Then it expects `;`. It finds `;`.
+            *   This also seems correct.
+
+    *   **The Runtime Error Source**:
+        Look at `Lexer.java`, `tokenizeSeparator`.
+        ```java
+        if (c == '&') {
+            if (next == '&') {
+                tokens.add(new Token(TokenType.AND, "&&", curLine));
+            } else {
+                error = new ErrorToken(TokenType.AND, "&&", curLine);
+                processor.backward();
+            }
+        }
+        ```
+        When `&` is encountered alone, `error` is set. But `processor.backward()` is called. The loop in `tokenize()` continues. The next iteration will re-read the character after `&`? No, `processor.backward()` moves back one char. The `skip()` function is called at the start of the loop.
+        
+        The critical issue is likely in how `CompileUnitParser` or `BlockParser` handles the stream when errors are present but tokens are missing.
+        
+        Actually, look closely at `ExpParser.java`, `parseUnaryExp()`:
+        ```java
+        Token t1 = lexer.getAndNext();
+        Token t2 = lexer.getAndNext();
+        if (t1.getType() == TokenType.IDENFR && t2.getType() == TokenType.LPARENT) {
+             // ...
+             Token t = lexer.getAndNext();
+             if (t.getType() == TokenType.RPARENT) {
+                 // ...
+             } else {
+                 lexer.move(-1);
+                 // TODO
+                 if (isExp(lexer)) {
+                     children.add(parseFuncRParams());
+                     t = lexer.getAndNext();
+                     if (t.getType() == TokenType.RPARENT) {
+                         children.add(new SynLeaf(t));
+                     } else {
+                         lexer.move(-1);
+                         addError(new ErrorSyntax(children.get(0).getLine(), ErrorType.j));
+                     }
+                 } else {
+                     addError(new ErrorSyntax(children.get(0).getLine(), ErrorType.j));
+                 }
+             }
+        }
+        ```
+        
+        Now look at `BlockParser.java`, `parseHead()`.
+        ```java
+        public ArrayList<SynNode> parseHead() {
+            ArrayList<SynNode> children = new ArrayList<>();
+            ExpParser expParser = new ExpParser(lexer);
+            SynNode root = expParser.parse(); // Parses LVal = ... or Exp
+            updateError(expParser.getErrorList());
+            root = analyseExpLVal(root);
+            if (root.getType() != SynType.EMPTY) {
+                children.add(root);
+            }
+            if (root.getType() == SynType.LVal) {
+                children.add(new SynLeaf(lexer.getAndNext())); // =
+                Token t = lexer.getAndNext();
+                if (t.getType() == TokenType.GETCHARTK || t.getType() == TokenType.GETINTTK) {
+                    children.add(new SynLeaf(t));
+                    children.add(new SynLeaf(lexer.getAndNext())); // (
+                    t = lexer.getAndNext();
+                    if (t.getType() == TokenType.RPARENT) { // )
+                        children.add(new SynLeaf(t));
+                    } else {
+                        lexer.move(-1);
+                        addError(new ErrorSyntax(children.get(1).getLine(), ErrorType.j));
+                    }
+                    t = lexer.getAndNext();
+                    if (t.getType() == TokenType.SEMICN) {
+                        children.add(new SynLeaf(t));
+                    } else {
+                        lexer.move(-1);
+                        addError(new ErrorSyntax(children.get(1).getLine(), ErrorType.i));
+                    }
+                } else { // Exp; // i
+                   // ...
+                }
+            } else { // Exp(done) ; // i
+                Token t = lexer.getAndNext();
+                if (t.getType() == TokenType.SEMICN) {
+                    children.add(new SynLeaf(t));
+                } else {
+                    lexer.move(-2); // <--- POTENTIAL ISSUE
+                    addError(new ErrorSyntax(lexer.get().getLine(), ErrorType.i));
+                    lexer.move(1);
+                }
+            }
+            return children;
+        }
+        ```
+
+        The `Runtime Error` often comes from `IndexOutOfBoundsException` in `Lexer` or `Processor` when `move` or `get` is called incorrectly, or `NullPointerException`.
+        
+        Let's look at `Lexer.java` `tokenizeSeparator` again.
+        When `&` is found alone:
+        1. `error` is set.
+        2. `processor.backward()` is called.
+        3. The method returns.
+        4. The `tokenize` loop continues. `skip()` is called.
+        5. `skip()` advances past whitespace.
+        6. The next char is processed.
+        
+        The problem with `&` alone is that it is **not added to the token list**.
+        In `testfile.txt`: `if (f2() & f1())`.
+        Tokens generated: `if`, `(`, `f2`, `(`, `)`, `f1`, `(`, `)`, `)`.
+        The `&` is skipped (only error recorded).
+        Parser `parseCond` -> `parseLOrExp` -> `parseLAndExp` -> `parseEqExp` ...
+        `parseLAndExp` expects `&&`. It sees `f1` (after `f2()`). It won't match `&&`.
+        So `f2()` is parsed as an expression. Then `f1()` is parsed?
+        The grammar for `Cond` is `LOrExp`. `LOrExp` -> `LAndExp` -> `EqExp` -> `RelExp` -> `AddExp` -> `MulExp` -> `UnaryExp`.
+        `UnaryExp` can be `PrimaryExp`. `PrimaryExp` can be `LVal` or `Ident '(' ... ')'`.
+        So `f2()` is parsed as a `UnaryExp` (function call).
+        Then `parseMulExp` returns. `parseAddExp` returns.
+        Back in `parseLAndExp`: it checks for `&&`. The next token is `f1` (IDENFR). It is not `&&`. So it breaks.
+        Back in `parseLOrExp`: it checks for `||`. Next token is `f1`. Not `||`. Breaks.
+        So `Cond` successfully parses `f2()`.
+        Then `parseIfStmt` in `BlockParser` expects `)`.
+        The current token is `f1`.
+        `parseIfStmt`:
+        ```java
+        Token t = lexer.getAndNext(); // Gets 'f1'
+        if (t.getType() == TokenType.RPARENT) {
+             // ...
+        } else {
+             lexer.move(-1);
+             addError(new ErrorSyntax(children.get(0).getLine(), ErrorType.j)); // Reports missing ) at line of 'if'
+        }
+        ```
+        This reports error `j` at line 18. But expected is `a` at line 18.
+        The error `a` should be reported by the Lexer/Compiler main.
+        
+        Why Runtime Error?
+        If `lexer.getError()` is not null, `Compiler.java` writes errors.
+        
+        Let's look at `parseHead` again.
+        `ch = getchar( ;`
+        `parseHead` calls `expParser.parse()`.
+        `parse()` -> `parseAddExp` -> ... -> `parseUnaryExp`.
+        `getchar` is IDENFR. Next is `(`.
+        `parseUnaryExp` consumes `getchar`, `(`.
+        Next is `;`.
+        `t` is `;`. Not `)`.
+        `lexer.move(-1)`.
+        `isExp(lexer)` checks `;`. Returns false.
+        Adds error `j`.
+        Returns `UnaryExp` node.
+        
+        Back in `parseHead`:
+        `root` is `UnaryExp` (which contains `getchar(`).
+        `analyseExpLVal(root)`:
+        Checks if it's an LVal. It's a UnaryExp (FuncCall). Returns `root` (UnaryExp).
+        `root.getType()` is `UnaryExp` (not EMPTY, not LVal).
+        Goes to `else { // Exp(done) ; // i`
+        `Token t = lexer.getAndNext();` -> Gets `;`.
+        `if (t.getType() == TokenType.SEMICN)` -> True.
+        Adds `;` to children.
+        Returns.
+        
+        This path seems fine for error detection (adds `j`).
+        
+        What about `printf("%c",s[0];`?
+        `parsePrintfStmt`:
+        Parses `printf`, `(`, `"%c"`.
+        Loop: gets `,`. Parses `s[0]` (Exp).
+        Loop: gets `;`. Not `,`. Breaks. `lexer.move(-1)`.
+        Expects `)`. Gets `;`.
+        Adds error `j`.
+        Expects `;`. Gets `;`.
+        Adds `;`.
+        Returns.
+        
+        This also seems fine.
+        
+        So why Runtime Error?
+        
+        Check `Lexer.java` `tokenizeDigit` or `tokenizeAlphabet`.
+        
+        Check `Processor.java`.
+        
+        Check `CompileUnitParser.java`.
+        
+        One common cause of Runtime Error in these assignments is `IndexOutOfBounds` in `Lexer.get()` or `move()`.
+        
+        In `Lexer.java`:
+        ```java
+        public void move(int n) {
+            curIdx += n;
+        }
+        public Token get() {
+            return tokens.get(curIdx);
+        }
+        ```
+        If `curIdx` goes out of bounds, `get()` throws exception.
+        
+        In `BlockParser.parseHead()`:
+        ```java
+        } else { // Exp(done) ; // i
+            Token t = lexer.getAndNext();
+            if (t.getType() == TokenType.SEMICN) {
+                children.add(new SynLeaf(t));
+            } else {
+                lexer.move(-2); // <--- Moves back 2
+                addError(new ErrorSyntax(lexer.get().getLine(), ErrorType.i)); // <--- Gets token
+                lexer.move(1);
+            }
+        }
+        ```
+        If `getAndNext()` consumed the last token, `curIdx` is at `tokens.size()`.
+        `move(-2)` makes it `tokens.size() - 2`.
+        `get()` accesses `tokens.get(tokens.size() - 2)`. This is valid if size >= 2.
+        
+        However, look at `parseIfStmt` in `BlockParser`:
+        ```java
+        Token t = lexer.getAndNext();
+        if (t.getType() == TokenType.RPARENT) {
+            children.add(new SynLeaf(t));
+        } else {
+            lexer.move(-1);
+            addError(new ErrorSyntax(children.get(0).getLine(), ErrorType.j));
+        }
+        children.add(parseStmt()); // <--- Recursive call
+        ```
+        If `)` is missing, it reports error, moves back, then calls `parseStmt()`.
+        `parseStmt()` will try to parse the token that was supposed to be `)` (e.g., `f1` or `{`) as a statement.
+        
+        The specific Runtime Error might be in `Lexer.tokenizeSeparator` when handling `&` or `|` if `processor.hasNext()` behaves unexpectedly or `backward()` goes below 0.
+        
+        But there is a more subtle bug in `BlockParser.parseHead()` regarding `analyseExpLVal`.
+        
+        Actually, the most likely culprit for a **Runtime Error** specifically, rather than just wrong output, is an infinite recursion or stack overflow, or an index out of bounds.
+        
+        Let's look at `ExpParser.parseUnaryExp()` again.
+        ```java
+        Token t1 = lexer.getAndNext();
+        Token t2 = lexer.getAndNext();
+        if (t1.getType() == TokenType.IDENFR && t2.getType() == TokenType.LPARENT) {
+             // ...
+             if (isExp(lexer)) {
+                 children.add(parseFuncRParams());
+                 // ...
+             } else {
+                 addError(...);
+             }
+        } else if (t1.getType() == TokenType.PLUS || ...) {
+             lexer.move(-2);
+             children.add(parseUnaryOp());
+             children.add(parseUnaryExp()); // <--- Recursive
+        } else {
+             lexer.move(-2);
+             children.add(parsePrimaryExp());
+        }
+        ```
+        
+        If `t1` is `+` and `t2` is NOT a valid unary exp start?
+        `parseUnaryOp()` consumes `+`.
+        `parseUnaryExp()` is called.
+        
+        If `t1` is `IDENFR` and `t2` is NOT `(`.
+        `lexer.move(-2)`.
+        `parsePrimaryExp()` is called.
+        `parsePrimaryExp()` calls `lexer.getAndNext()` -> gets `IDENFR`.
+        
+        This looks okay.
+        
+        Let's look at `Lexer.java` `tokenizeSeparator` again.
+        
+        ```java
+        if (c == '&') {
+            if (next == '&') {
+                tokens.add(new Token(TokenType.AND, "&&", curLine));
+            } else {
+                error = new ErrorToken(TokenType.AND, "&&", curLine);
+                processor.backward();
+            }
+        }
+        ```
+        
+        If `&` is the last character in the file?
+        `processor.hasNext()` is false.
+        `next` becomes `\0` (from `else` block: `processor.forward(); next = '\0';`).
+        Wait, the code structure is:
+        ```java
+        char next;
+        if (processor.hasNext()) {
+            processor.forward();
+            next = processor.getChar();
+        } else {
+            processor.forward(); // <--- Advances even if no next?
+            next = '\0';
+        }
+        ```
+        If `hasNext()` is false, `forward()` is called. `curChar` increments.
+        Then `getChar()` might throw exception if `curChar` >= `fileLines.length()`.
+        
+        In `Processor.java`:
+        ```java
+        public char getChar() {
+            return fileLines.charAt(curChar);
+        }
+        ```
+        If `curChar` equals `fileLines.length()`, `charAt` throws `StringIndexOutOfBoundsException`.
+        
+        This happens if the file ends with a single `&`, `|`, `!`, `<`, `>`, `=`.
+        In the test case, line 18 is `if (f2() & f1())`. The `&` is not at the end of the file.
+        
+        However, look at the test case input again.
+        `const char Ch='c', s[20] = "hello world";`
+        ...
+        `return 0;`
+        `}`
+        
+        Is there a trailing newline? Usually yes.
+        
+        Let's check `skip()` in `Lexer`.
+        ```java
+        private int skip() {
+            char c = processor.getChar(); // <--- Can throw if curChar is at end
+            if (c == '\n') {
+                curLine++;
+            }
+            while(Character.isWhitespace(c) && processor.hasNext()) {
+                processor.forward();
+                c = processor.getChar();
+                if (c == '\n') {
+                    curLine++;
+                }
+            }
+            if (!processor.hasNext() && Character.isWhitespace(processor.getChar())) { // <--- Can throw
+                return 1;
+            } else {
+                return 0;
+            }
+        }
+        ```
+        
+        In `tokenize()`:
+        ```java
+        while(processor.hasNext()) {
+            processor.forward();
+            char c;
+            if (skip() == 1) {
+                break;
+            } else {
+                c = processor.getChar();
+            }
+            // ...
+        }
+        ```
+        
+        `processor.hasNext()` checks `(curChar + 1) < fileLines.length()`.
+        So inside the loop, `curChar` is at most `length - 2`.
+        `processor.forward()` makes `curChar` at most `length - 1`.
+        `skip()` calls `processor.getChar()`. `charAt(length - 1)` is valid.
+        
+        Inside `skip()`:
+        `while(... && processor.hasNext())`.
+        If `hasNext()` becomes false, loop ends.
+        Then `if (!processor.hasNext() && Character.isWhitespace(processor.getChar()))`.
+        `getChar()` is called. `curChar` is `length - 1`. Valid.
+        
+        So `skip()` seems safe.
+        
+        What about `tokenizeSeparator`?
+        ```java
+        char next;
+        if (processor.hasNext()) {
+            processor.forward();
+            next = processor.getChar();
+        } else {
+            processor.forward(); // <--- curChar becomes length
+            next = '\0';
+        }
+        ```
+        If `processor.hasNext()` is false, `curChar` is `length - 1` (from previous steps).
+        `forward()` makes `curChar` = `length`.
+        Then later, if we call `getChar()`, it crashes.
+        
+        Does `getChar()` get called after this?
+        The code falls through to the `if (c == '!') ...` blocks.
+        It does NOT call `getChar()` immediately after setting `next`.
+        However, at the end of `tokenizeSeparator`, it returns.
+        The loop in `tokenize()` continues.
+        Next iteration: `processor.hasNext()`?
+        `curChar` is `length`. `hasNext()` checks `(length + 1) < length` -> False.
+        Loop terminates.
+        
+        So `tokenizeSeparator` itself doesn't crash, but it leaves `curChar` in an invalid state (equal to length) if it was the last char. But since the loop terminates, it might be okay.
+        
+        HOWEVER, look at `processor.backward()` in `tokenizeSeparator`.
+        If `c == '&'` and `next != '&'`:
+        `error = ...`
+        `processor.backward()`.
+        `curChar` decreases by 1.
+        
+        If `c` was the second to last char, and `next` was the last char.
+        `forward()` made `curChar` point to last char.
+        `backward()` makes `curChar` point to second to last char.
+        Loop continues. `hasNext()` is true (points to last char).
+        `forward()` points to last char.
+        `skip()`? No, `skip()` is called at start of loop.
+        
+        Wait, `tokenize()` structure:
+        ```java
+        while(processor.hasNext()) {
+            processor.forward();
+            char c;
+            if (skip() == 1) { break; }
+            else { c = processor.getChar(); }
+            
+            if (digit) ...
+            else if (alpha) ...
+            else if (quote) ...
+            else { tokenizeSeparator(c); }
+        }
+        ```
+        
+        If `tokenizeSeparator` calls `processor.forward()` to look ahead, and then `processor.backward()`, the net change is 0.
+        BUT, if it calls `processor.forward()` in the `else` branch (no next), it does NOT call `backward()`.
+        
+        If the file ends with `&`:
+        1. Loop condition `hasNext()` true.
+        2. `forward()`. `c` is `&`.
+        3. `skip()` returns 0.
+        4. `tokenizeSeparator('&')`.
+        5. `hasNext()` is false (assuming `&` is last non-whitespace, or just last char).
+        6. Enters `else`: `forward()`. `curChar` is now `length`.
+        7. `next = '\0'`.
+        8. Sets error.
+        9. Returns.
+        10. Loop continues.
+        11. `processor.hasNext()`? `curChar` is `length`. `(length+1) < length` is False.
+        12. Loop ends.
+        
+        This seems safe from crash.
+        
+        So where is the Runtime Error?
+        
+        Let's look at `BlockParser.parseHead()` again.
+        
+        ```java
+        } else { // Exp(done) ; // i
+            Token t = lexer.getAndNext();
+            if (t.getType() == TokenType.SEMICN) {
+                children.add(new SynLeaf(t));
+            } else {
+                lexer.move(-2);
+                addError(new ErrorSyntax(lexer.get().getLine(), ErrorType.i));
+                lexer.move(1);
+            }
+        }
+        ```
+        
+        If `getAndNext()` retrieves the **last token** in the list.
+        `curIdx` becomes `tokens.size()`.
+        `move(-2)` makes `curIdx` = `tokens.size() - 2`.
+        `lexer.get()` accesses `tokens.get(tokens.size() - 2)`.
+        
+        If there is only 1 token left?
+        `curIdx` was `size - 1`. `getAndNext()` makes it `size`.
+        `move(-2)` makes it `size - 2`.
+        If `size` is 1, `size - 2` is -1. `get(-1)` throws Exception.
+        
+        Can `parseHead` be called when only 1 token is left?
+        `parseHead` is called from `parseStmt`.
+        `parseStmt` is called from `parseBlockItem`.
+        `parseBlockItem` is called from `BlockParser.parse()`.
+        
+        If the program is `int main() { return 0 }` (missing semicolon).
+        Tokens: `int`, `main`, `(`, `)`, `{`, `return`, `0`, `}`.
+        
+        Parse `return 0`.
+        `parseReturnStmt`.
+        `children.add(return)`.
+        `t = getAndNext()` -> `0`.
+        Not `;`.
+        `move(-1)`.
+        `isExp` -> true.
+        `parseExp`.
+        `t = getAndNext()` -> `}`.
+        Not `;`.
+        `move(-1)`.
+        `addError(i)`.
+        
+        This doesn't trigger the `else` block in `parseHead`.
+        
+        Consider `a = b` (missing semicolon).
+        `parseHead`.
+        `expParser.parse()` parses `a`.
+        `analyseExpLVal` returns `LVal` `a`.
+        `root.getType() == LVal`.
+        `children.add(LVal)`.
+        `children.add(getAndNext())` -> `=`.
+        `t = getAndNext()` -> `b`.
+        Not `getchar`/`getint`.
+        `else { // Exp;`
+        `lexer.move(-1)`.
+        `expParser2.parse()` parses `b`.
+        `t = getAndNext()`.
+        If `b` is the last token. `t` is null? No, `getAndNext` throws if empty.
+        
+        `Lexer.getAndNext()`:
+        ```java
+        public Token getAndNext() {
+            Token res = tokens.get(curIdx);
+            curIdx++;
+            return res;
+        }
+        ```
+        If `curIdx` == `tokens.size()`, `tokens.get` throws `IndexOutOfBoundsException`.
+        
+        So, if `parseHead` expects a semicolon but reaches EOF, `getAndNext()` will crash.
+        
+        In the test case:
+        Line 16: `ch = getchar( ;`
+        Tokens: `ch`, `=`, `getchar`, `(`, `;`, ...
+        
+        Line 19: `printf("%c",s[0];`
+        Tokens: `printf`, `(`, `"%c"`, `,`, `s`, `[`, `0`, `;`, ...
+        
+        These lines have semicolons.
+        
+        However, line 18: `if (f2() & f1()) {`
+        The `&` is removed by lexer.
+        Tokens around there: `if`, `(`, `f2`, `(`, `)`, `f1`, `(`, `)`, `)`, `{`.
+        
+        Parser `parseIfStmt`:
+        Consumes `if`, `(`.
+        `parseCond`.
+        `parseLOrExp`... parses `f2()`.
+        Expects `)`.
+        Next token is `f1`.
+        `t = getAndNext()` -> `f1`.
+        Not `)`.
+        `move(-1)`.
+        Add Error `j`.
+        `parseStmt()`.
+        Next token is `f1`.
+        `parseStmt` sees `f1`.
+        `parseHead`.
+        `expParser.parse()` parses `f1`.
+        `analyseExpLVal`? `f1` is `UnaryExp` (FuncCall `f1()`? No, just `f1` IDENFR).
+        Wait, `f1` is followed by `(`.
+        `parseUnaryExp` sees `f1`, `(`.
+        Parses `f1()`.
+        Returns `UnaryExp`.
+        
+        Back in `parseHead`.
+        `root` is `UnaryExp`.
+        Not `LVal`.
+        Goes to `else { // Exp(done) ; // i`.
+        `t = lexer.getAndNext()`.
+        Current token is `)` (the one closing `if`).
+        `t` is `)`.
+        Not `;`.
+        `lexer.move(-2)`.
+        `lexer.get()`.
+        `lexer.move(1)`.
+        
+        This doesn't crash.
+        
+        I suspect the Runtime Error is due to `Lexer` throwing an exception when `getAndNext()` is called on an empty stream, which might happen if the parser logic is flawed and consumes too many tokens or fails to stop.
+        
+        Given the constraints, the most likely error location causing a crash or incorrect behavior in this specific context (handling `&` and missing `)`) is in the `Lexer`'s handling of single `&`/`|` (not adding to token stream) causing the parser to misalign, OR the `BlockParser`'s error recovery logic.
+        
+        However, the prompt asks to identify the location of the errors. The "Runtime Error" suggests a crash.
+        
+        The code snippet below highlights the `Lexer`'s `tokenizeSeparator` where `&` and `|` are handled incorrectly (not adding to token list, potentially causing parser desync) and the `BlockParser`'s `parseHead` where `getAndNext` might crash if not careful.
+
+<fronted/lexer/Lexer.java>
+...
+        if (c == '&') {
+            if (next == '&') {
+                tokens.add(new Token(TokenType.AND, "&&", curLine));
+            } else {
+                error = new ErrorToken(TokenType.AND, "&&", curLine);
+                processor.backward();
+            }
+        }
+        if (c == '|') {
+            if (next == '|') {
+                tokens.add(new Token(TokenType.OR, "||", curLine));
+            } else {
+                error = new ErrorToken(TokenType.OR, "||", curLine);
+                processor.backward();
+            }
+        }
+...
+
+<fronted/parser/parse/BlockParser.java>
+...
+    public ArrayList<SynNode> parseHead() {
+        ArrayList<SynNode> children = new ArrayList<>();
+        ExpParser expParser = new ExpParser(lexer);
+        SynNode root = expParser.parse();
+        updateError(expParser.getErrorList());
+        root = analyseExpLVal(root);
+        if (root.getType() != SynType.EMPTY) {
+            children.add(root);
+        }
+        if (root.getType() == SynType.LVal) {
+            children.add(new SynLeaf(lexer.getAndNext())); // =
+            Token t = lexer.getAndNext();
+            if (t.getType() == TokenType.GETCHARTK || t.getType() == TokenType.GETINTTK) {
+                children.add(new SynLeaf(t));
+                children.add(new SynLeaf(lexer.getAndNext())); // (
+                t = lexer.getAndNext();
+                if (t.getType() == TokenType.RPARENT) { // )
+                    children.add(new SynLeaf(t));
+                } else {
+                    lexer.move(-1);
+                    addError(new ErrorSyntax(children.get(1).getLine(), ErrorType.j));
+                }
+                t = lexer.getAndNext();
+                if (t.getType() == TokenType.SEMICN) {
+                    children.add(new SynLeaf(t));
+                } else {
+                    lexer.move(-1);
+                    addError(new ErrorSyntax(children.get(1).getLine(), ErrorType.i));
+                }
+            } else { // Exp; // i
+                lexer.move(-1);
+                ExpParser expParser2 = new ExpParser(lexer);
+                children.add(expParser2.parse());
+                updateError(expParser2.getErrorList());
+                t = lexer.getAndNext();
+                if (t.getType() == TokenType.SEMICN) {
+                    children.add(new SynLeaf(t));
+                } else {
+                    lexer.move(-1);
+                    addError(new ErrorSyntax(children.get(1).getLine(), ErrorType.i));
+                }
+            }
+        } else { // Exp(done) ; // i
+            Token t = lexer.getAndNext();
+            if (t.getType() == TokenType.SEMICN) {
+                children.add(new SynLeaf(t));
+            } else {
+                lexer.move(-2);
+                addError(new ErrorSyntax(lexer.get().getLine(), ErrorType.i));
+                lexer.move(1);
+            }
+        }
+        return children;
+    }
+...

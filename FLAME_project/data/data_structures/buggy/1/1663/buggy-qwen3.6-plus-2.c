@@ -1,0 +1,35 @@
+#include<stdio.h>
+
+int n;
+int a[101];
+int b[101];
+
+void qpl(int step)
+{
+    int i;
+    if(step==n+1)
+    {
+        for(i=1;i<=n;++i)
+        {
+            printf("%d",a[i]); // @@ The output format requires integers to be separated by a space, but this line prints them consecutively without spaces. It should be printf("%d ", a[i]); or handle spacing carefully.
+        }
+        printf("\n");
+        return;
+    }
+    for(i=1;i<=n;++i)
+    {
+        if(b[i]==0)
+        {
+            a[step]=i;
+            b[i]=1;
+            qpl(step+1);
+            b[i]=0;
+        }
+    }
+}
+int main()
+{
+    scanf("%d",&n);
+    qpl(1);
+    return 0;
+}

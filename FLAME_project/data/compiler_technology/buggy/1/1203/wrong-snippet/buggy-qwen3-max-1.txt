@@ -1,0 +1,921 @@
+Looking at the test case input and comparing the buggy output with the expected output, I can see the issue is in the `parseLVal` method in the Parser.java file.
+
+The problem occurs when parsing the line `x[i]=i;`. In the buggy output, it shows:
+```
+IDENFR ]
+<LVal>
+```
+
+But in the expected output, it should show:
+```
+IDENFR x
+LBRACK [
+IDENFR i
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACK ]
+<LVal>
+```
+
+The issue is that in the `parseLVal` method, when it encounters an identifier followed by a left bracket `[`, it should parse the array access correctly. However, looking at the buggy output, it appears that the parser is incorrectly treating `]` as an identifier (`IDENFR`) instead of properly parsing the LVal structure.
+
+Looking more carefully at the code, I can see that in the `parseStmt` method, there's a logic issue in how it handles the lookahead for LVal parsing. The problem is in this section:
+
+```java
+} else if (getCur().getType() == Token.Type.IDENFR) {
+    peek = cur;
+    LVal lVal = (LVal)parseLVal();
+    //特殊设计: 解析到Ident '(' [FuncRParams] ')'返回空指针
+    if (lVal == null) {
+        cur = peek;
+        stmt.addChildNode(parseExpStmt());
+    } else { //cur now points to '='
+        if (doPeek(cur+1).getType() == Token.Type.GETINTTK) {
+            cur = peek;
+            stmt.addChildNode(parseGetIntStmt());
+        } else if (doPeek(cur+1).getType() == Token.Type.GETCHARTK) {
+            cur = peek;
+            stmt.addChildNode(parseGetCharStmt());
+        } else {
+            cur = peek;
+            stmt.addChildNode(parseAssignStmt());
+        }
+    }
+}
+```
+
+The issue is that after calling `parseLVal()`, if it returns a non-null value, the code resets `cur = peek` and then calls `parseAssignStmt()`, which calls `parseLVal()` again. However, during the first call to `parseLVal()`, the parser has already consumed tokens and advanced the cursor, but when it resets `cur = peek`, it loses the context of what was parsed.
+
+But looking even more closely at the actual output difference, I notice that in the buggy output, it shows `IDENFR ]` which suggests that the `]` token is being treated as an identifier. This indicates that the lexical analysis might be correct, but the parsing logic in `parseLVal` is not properly handling the array subscript expression.
+
+Actually, looking at the expected vs buggy output more carefully, the real issue is that in the buggy output, after parsing the `continue;` statement, the next token should be `IDENFR x` but instead it shows `IDENFR ]`. This suggests that the parser's current position is wrong - it's pointing to the `]` token instead of the `x` token.
+
+The root cause is in the `parseLVal` method. When `parseLVal` is called and encounters `[`, it parses the expression inside, but if there's an error or incomplete parsing, the cursor position gets messed up.
+
+Looking at the `parseLVal` method:
+
+```java
+public Node parseLVal() {
+    //可能出现k型错误
+    LVal lVal = new LVal();
+    lVal.setStartLine(getCur().getLineNo());
+    //Ident
+    lVal.addChildNode(new LeafNode(Token.Type.IDENFR,
+            getCur().getValue(), getCur().getLineNo(), '\0'));
+    cur++;
+    //特殊：解析到Ident '(' [FuncRParams] ')'返回空指针，用于stmt解析时区分不同分支
+    if (getCur().getType() == Token.Type.LPARENT) {
+        return null;
+    }
+    //['['Exp']']
+    if (getCur().getType() == Token.Type.LBRACK) {
+        lVal.addChildNode(new LeafNode(Token.Type.LBRACK,
+                "[", getCur().getLineNo(), '\0'));
+        cur++;
+        lVal.addChildNode(parseExp());
+        if (getCur().getType() != Token.Type.RBRACK) {
+            lVal.addChildNode(new LeafNode(Token.Type.RBRACK,
+                    "]", doPeek(cur-1).getLineNo(), 'k'));
+            hasError = true;
+            errorList.add(doPeek(cur-1).getLineNo()+" "+'k');
+        } else {
+            lVal.addChildNode(new LeafNode(Token.Type.RBRACK,
+                    "]", getCur().getLineNo(), '\0'));
+            cur++;
+        }
+    }
+    lVal.setEndLine(doPeek(cur-1).getLineNo());
+    return lVal;
+}
+```
+
+The issue is that when there's no error (i.e., when `getCur().getType() == Token.Type.RBRACK`), it consumes the `RBRACK` token by doing `cur++`. But in the buggy case, it seems like the `RBRACK` is not being consumed properly, causing the parser to be at the wrong position.
+
+However, looking at the test input, the line is `x[i]=i;` which should parse correctly. The real issue might be elsewhere.
+
+Wait, let me look at the exact difference again. In the buggy output, after the `continue;` statement, it shows:
+
+```
+IDENFR ]
+<LVal>
+```
+
+But it should show:
+
+```
+IDENFR x
+LBRACK [
+IDENFR i
+...
+RBRACK ]
+<LVal>
+```
+
+This suggests that the parser is not starting from the correct token. The `]` should not be treated as an identifier at all.
+
+Actually, looking more carefully at the token sequence, I think the issue is in the `parseStmt` method's logic for determining which statement type to parse. The problem is that after parsing the previous statement (the `continue;`), the parser should be positioned at the `x` token, but instead it's positioned at the `]` token.
+
+This suggests that there's a bug in how the previous statements are being parsed, causing the cursor to be in the wrong position.
+
+Looking at the `parseRecStmt` method (which parses the for loop), I notice this section:
+
+```java
+//[ForStmt]')'
+if (getCur().getType() == Token.Type.RPARENT) {
+    recStmt.addChildNode(new LeafNode(Token.Type.RPARENT,
+            ")", getCur().getLineNo(), '\0'));
+    cur++;
+} else {
+    recStmt.addChildNode(parseForStmt());
+    recStmt.addChildNode(new LeafNode(Token.Type.RPARENT,
+            ")", getCur().getLineNo(), '\0'));
+    cur++;
+}
+```
+
+In the test input, the for loop is: `for(;i<=10;)` - note that there's no third ForStmt (it's empty before the closing parenthesis). So the parser should take the first branch and consume the `RPARENT`. But if there's an issue with this logic, it could cause the cursor to be mispositioned.
+
+However, looking at the output, the for loop parsing seems to complete correctly, as we see the closing `RPARENT )` in both outputs.
+
+Let me reconsider. The key insight is in the buggy output showing `IDENFR ]`. This means that the lexer is correctly identifying `]` as `RBRACK`, but somewhere in the parser, this token is being treated as if it were an `IDENFR`.
+
+Looking at the `parseLVal` method again, I see that when it returns `null` (indicating a function call), the calling code in `parseStmt` resets `cur = peek` and then tries other parsing options. But if the `parseLVal` method has already consumed some tokens and then returns `null`, the reset might not be working correctly.
+
+Wait, no - the `parseLVal` method only returns `null` when it sees `LPARENT` after an identifier, which would indicate a function call. In our case, we have `x[i]`, so it should not return `null`.
+
+Actually, I think I found the real issue. Looking at the test input:
+
+```c
+int x[10],i=0;
+
+int main()
+{
+    for(;i<=10;)
+{if(i==2)
+{
+i=4;
+continue;
+}
+ x[i]=i;
+i = i + 1;
+if(i==5)
+break;}
+
+    return 0;
+}
+```
+
+The problematic line is ` x[i]=i;` (note the leading space). But that shouldn't matter.
+
+Looking at the buggy output again, I notice that after parsing the `continue;` statement, the next thing parsed is shown as `IDENFR ]`, but it should be `IDENFR x`. This suggests that the parser's current token is `]` instead of `x`.
+
+This can only happen if the previous parsing consumed too many tokens or didn't consume enough tokens, leaving the cursor in the wrong position.
+
+Looking at the `parseStmt` method for the `continue` statement:
+
+```java
+} else if (getCur().getType() == Token.Type.CONTINUETK) {
+    stmt.addChildNode(new LeafNode(Token.Type.CONTINUETK,
+            "continue", getCur().getLineNo(), '\0'));
+    cur++;
+    if (getCur().getType() == Token.Type.SEMICN) {
+        stmt.addChildNode(new LeafNode(Token.Type.SEMICN,
+                ";", getCur().getLineNo(), '\0'));
+        cur++;
+    } else {
+        stmt.addChildNode(new LeafNode(Token.Type.SEMICN,
+                ";", doPeek(cur-1).getLineNo(), 'i'));
+        hasError = true;
+        errorList.add(doPeek(cur-1).getLineNo()+" "+'i');
+    }
+}
+```
+
+This looks correct - it should consume `continue` and then `;`, leaving the cursor at the next token, which should be `x`.
+
+But in the buggy output, after `CONTINUETK continue` and `SEMICN ;`, we see `<Stmt>` and then `RBRACE }`, `<Block>`, `<Stmt>`, `<Stmt>`, and then `IDENFR ]`.
+
+Wait, I think I see the issue now. Looking at the structure:
+
+The `continue;` is inside a block: `{i=4; continue;}`. After the `continue;`, there's a closing brace `}`, which should be parsed as part of the block.
+
+In the buggy output, after `CONTINUETK continue`, `SEMICN ;`, `<Stmt>`, we see `RBRACE }`, `<Block>`, `<Stmt>`, `<Stmt>`, and then the problematic `IDENFR ]`.
+
+This suggests that after parsing the inner block `{i=4; continue;}`, the parser should be positioned at the `x[i]=i;` statement. But instead, it's positioned at `]`.
+
+The issue must be in how the `parseBlock` method works. Let me look at it:
+
+```java
+public Node parseBlock() {
+    Block block = new Block();
+    block.setStartLine(getCur().getLineNo());
+    //'{'
+    block.addChildNode(new LeafNode(Token.Type.LBRACE,
+            "{", getCur().getLineNo(), '\0'));
+    cur++;
+    //{ConstDecl | VarDecl | Stmt} '}'
+    if (getCur().getType() == Token.Type.RBRACE) {
+        block.addChildNode(new LeafNode(Token.Type.RBRACE,
+                "}", getCur().getLineNo(), '\0'));
+        cur++;
+    } else {
+        //{ConstDecl | VarDecl | Stmt}
+        boolean endFlag = false;
+        while (!endFlag) {
+            Token.Type temTp = getCur().getType();
+            if (temTp == Token.Type.CONSTTK) {
+                block.addChildNode(parseConstDecl());
+            } else if (temTp == Token.Type.INTTK || temTp == Token.Type.CHARTK) {
+                block.addChildNode(parseVarDecl());
+            } else if (temTp == Token.Type.IFTK || temTp == Token.Type.FORTK
+            || temTp == Token.Type.BREAKTK || temTp == Token.Type.CONTINUETK
+            || temTp == Token.Type.RETURNTK || temTp == Token.Type.PRINTFTK
+            || temTp == Token.Type.LBRACE || temTp == Token.Type.IDENFR
+            || temTp == Token.Type.PLUS || temTp == Token.Type.MINU
+                    || temTp == Token.Type.INTCON || temTp == Token.Type.CHRCON
+            ||temTp == Token.Type.LPARENT || temTp == Token.Type.SEMICN) {
+                //FIRST(Stmt)
+                block.addChildNode(parseStmt());
+            } else {
+                endFlag = true;
+            }
+        }
+        //'}'
+        block.addChildNode(new LeafNode(Token.Type.RBRACE,
+                "}", getCur().getLineNo(), '\0'));
+        cur++;
+    }
+    block.setEndLine(doPeek(cur-1).getLineNo());
+    return block;
+}
+```
+
+The issue is in the `else` branch. After parsing all the statements in the block, it assumes that the next token is `RBRACE` and consumes it without checking. But what if the next token is not `RBRACE`? It should check first.
+
+However, in our case, the inner block `{i=4; continue;}` should end with `RBRACE`, so this should work.
+
+I'm still not seeing the exact issue. Let me look at the difference one more time.
+
+In the expected output, after the inner block closes, we have:
+```
+RBRACE }
+<Block>
+<Stmt>
+<Stmt>
+IDENFR x
+LBRACK [
+...
+```
+
+In the buggy output, we have:
+```
+RBRACE }
+<Block>
+<Stmt>
+<Stmt>
+IDENFR ]
+<LVal>
+...
+```
+
+This means that instead of `x`, the parser is seeing `]` as the next identifier. This suggests that the token stream is being corrupted or the parser's cursor is jumping to the wrong position.
+
+Wait! I think I found it. Look at the `parseLVal` method again. When it parses an array access like `x[i]`, it should consume the `RBRACK` token. But what if there's a nested structure or the parsing of the expression inside the brackets affects the cursor position?
+
+Actually, let's trace through what should happen for `x[i]=i;`:
+
+1. `parseStmt` sees `IDENFR x`
+2. It calls `parseLVal()` 
+3. `parseLVal` creates LVal node, adds `x` as IDENFR, increments cur
+4. Sees `LBRACK [`, adds it, increments cur  
+5. Calls `parseExp()` to parse `i`
+6. `parseExp()` calls `parseAddExp()`, which calls `parseMulExp()`, which calls `parseUnaryExp()`, which calls `parsePrimaryExp()`, which calls `parseLVal()` again for `i`
+7. The inner `parseLVal()` for `i` just adds `i` as IDENFR and returns (no brackets)
+8. Back to outer `parseLVal()`, it should now see `RBRACK ]`
+9. It adds `RBRACK ]` and increments cur
+10. Returns the LVal node
+
+This should work correctly. 
+
+But in the buggy output, it seems like step 9 is not happening - the `RBRACK` is not being consumed, so when the next statement is parsed, it starts from `RBRACK` instead of the next token after `RBRACK`.
+
+Looking at the `parseLVal` method, I see the issue! In the case where there IS a matching `RBRACK`, it does:
+
+```java
+} else {
+    lVal.addChildNode(new LeafNode(Token.Type.RBRACK,
+            "]", getCur().getLineNo(), '\0'));
+    cur++;
+}
+```
+
+This is correct - it consumes the `RBRACK`.
+
+But what if there's an error in parsing the expression inside the brackets? That could leave the cursor in a bad state.
+
+However, in our test case, the expression is just `i`, which should parse fine.
+
+Let me look at the actual buggy output more carefully. The buggy output shows:
+
+```
+IDENFR ]
+<LVal>
+ASSIGN =
+...
+```
+
+This suggests that the parser is trying to parse `]` as an LVal, which means it thinks `]` is an identifier. But `]` should be `RBRACK`, not `IDENFR`.
+
+Wait a minute! This is the key insight. In the buggy output, it says `IDENFR ]`, which means the lexer is categorizing `]` as an identifier, but that's impossible because `]` is a reserved symbol that should be lexed as `RBRACK`.
+
+Unless... the issue is not in the parser at all, but in how the output is being generated.
+
+Looking at the `printNode` method:
+
+```java
+public void printNode(Node node, String toFile) throws IOException {
+    if (node.getType() == Node.SyntaxType.LeafType) {
+        Files.write(Paths.get(toFile), ((LeafNode) node).toString().getBytes(),
+                StandardOpenOption.APPEND, StandardOpenOption.CREATE);
+    } else {
+        ArrayList<Node> children = node.getChildren();
+        for (Node child : children) {
+            printNode(child, toFile);
+        }
+        if (node.getType() != Node.SyntaxType.Private) {
+            Files.write(Paths.get(toFile), ("<" + node.getType().name() + ">" + "\n").getBytes(),
+                    StandardOpenOption.APPEND, StandardOpenOption.CREATE);
+        }
+    }
+}
+```
+
+And the `LeafNode.toString()` method:
+
+```java
+@Override
+public String toString() {
+    return (leafType.name() +" " + value + "\n");
+}
+```
+
+So if we see `IDENFR ]` in the output, it means there's a `LeafNode` with `leafType = IDENFR` and `value = "]"`.
+
+This should never happen because the lexer should never produce an `IDENFR` token with value `"]"`.
+
+But wait, looking back at the test input, is it possible that there's a typo or encoding issue? No, the test input clearly shows `x[i]=i;`.
+
+I think the real issue is in the `parseLVal` method's handling of the array subscript. Let me look at it once more.
+
+Actually, I notice something suspicious. In the buggy output, after the `continue;` statement, we have:
+
+```
+RBRACE }
+<Block>
+<Stmt>
+<Stmt>
+IDENFR ]
+<LVal>
+```
+
+The two `<Stmt>` entries suggest that there are two statement nodes being created. One for the inner block, and one for something else.
+
+But the key insight is this: in the buggy output, it shows `IDENFR ]`, but in the expected output, the corresponding part shows the full LVal parsing for `x[i]`.
+
+This suggests that the parser is not parsing `x[i]` as an LVal at all, but is instead trying to parse `]` as a standalone identifier.
+
+How could this happen? Only if the parser's current token is `]` instead of `x`.
+
+This means that during the parsing of the previous constructs, the cursor got advanced too far.
+
+Looking at the for loop parsing in `parseRecStmt`:
+
+```java
+//[ForStmt]')'
+if (getCur().getType() == Token.Type.RPARENT) {
+    recStmt.addChildNode(new LeafNode(Token.Type.RPARENT,
+            ")", getCur().getLineNo(), '\0'));
+    cur++;
+} else {
+    recStmt.addChildNode(parseForStmt());
+    recStmt.addChildNode(new LeafNode(Token.Type.RPARENT,
+            ")", getCur().getLineNo(), '\0'));
+    cur++;
+}
+```
+
+In our test input, the for loop is `for(;i<=10;)`, so after parsing the condition `i<=10;`, the next token should be `RPARENT )`.
+
+But what if the parser doesn't correctly identify that the next token is `RPARENT`? Then it would go into the `else` branch and try to parse a `ForStmt`, which would start parsing from whatever token is next.
+
+If the next token after `;` is `RBRACE }` (from the end of the for loop body), then trying to parse a `ForStmt` would fail, and the cursor position would be messed up.
+
+But in our case, the for loop body is:
+```c
+{if(i==2)
+{
+i=4;
+continue;
+}
+ x[i]=i;
+i = i + 1;
+if(i==5)
+break;}
+```
+
+So after the condition `i<=10;`, the next token should indeed be `RPARENT )`.
+
+I'm going in circles. Let me try a different approach.
+
+Looking at the exact point of divergence:
+
+Expected:
+```
+IDENFR x
+LBRACK [
+IDENFR i
+<LVal>
+...
+RBRACK ]
+<LVal>
+```
+
+Buggy:
+```
+IDENFR ]
+<LVal>
+```
+
+This suggests that instead of parsing `x[i]` as an LVal, the parser is parsing `]` as an LVal.
+
+The only way this can happen is if the parser's current token is `]` when it should be `x`.
+
+This means that somewhere before this point, the parser consumed the `x[` part but didn't properly handle it, leaving the cursor at `]`.
+
+Looking at the grammar, `x[i]=i;` should be parsed as an AssignStmt: `LVal '=' Exp ';'`.
+
+The `LVal` is `x[i]`.
+
+So the issue must be in the `parseLVal` method not properly consuming the entire LVal, or in the `parseStmt` method not properly invoking `parseLVal`.
+
+Wait! I think I see it now. In the `parseStmt` method, there's this logic:
+
+```java
+} else if (getCur().getType() == Token.Type.IDENFR) {
+    peek = cur;
+    LVal lVal = (LVal)parseLVal();
+    //特殊设计: 解析到Ident '(' [FuncRParams] ')'返回空指针
+    if (lVal == null) {
+        cur = peek;
+        stmt.addChildNode(parseExpStmt());
+    } else { //cur now points to '='
+        if (doPeek(cur+1).getType() == Token.Type.GETINTTK) {
+            cur = peek;
+            stmt.addChildNode(parseGetIntStmt());
+        } else if (doPeek(cur+1).getType() == Token.Type.GETCHARTK) {
+            cur = peek;
+            stmt.addChildNode(parseGetCharStmt());
+        } else {
+            cur = peek;
+            stmt.addChildNode(parseAssignStmt());
+        }
+    }
+}
+```
+
+The problem is that after calling `parseLVal()`, if it returns a non-null value, the code sets `cur = peek` (resetting to the original position) and then calls `parseAssignStmt()`, which will call `parseLVal()` again.
+
+But during the first call to `parseLVal()`, if it successfully parses `x[i]`, it will have advanced `cur` past the `]` token. Then when we reset `cur = peek`, we go back to the `x` token, and then `parseAssignStmt()` calls `parseLVal()` again, which should work correctly.
+
+However, there's a subtle bug here. The comment says "//cur now points to '='" but that's only true if the LVal parsing stopped at the `=` token. But `parseLVal()` doesn't consume the `=` token - it only parses the LVal part.
+
+So after `parseLVal()` returns, `cur` should be pointing to the `=` token.
+
+But in the code, after getting the non-null `lVal`, it does `cur = peek`, which resets to the original `x` token, and then calls `parseAssignStmt()`.
+
+This should be fine, because `parseAssignStmt()` will call `parseLVal()` again from the `x` token.
+
+So why is the buggy output showing `IDENFR ]`?
+
+I think the issue might be that the first call to `parseLVal()` is somehow consuming tokens incorrectly, and when we reset `cur = peek`, the internal state of the parser is inconsistent.
+
+But that doesn't make sense because `cur` is the only state.
+
+Wait, let's simulate what happens:
+
+1. Initial state: `cur` points to `x` (IDENFR)
+2. `peek = cur` (so `peek` also points to `x`)
+3. Call `parseLVal()`:
+   - Consumes `x` (cur advances to `[`)
+   - Consumes `[` (cur advances to `i`)
+   - Parses `i` as Exp (cur advances to `]`)
+   - Consumes `]` (cur advances to `=`)
+   - Returns LVal node
+4. Now `cur` points to `=`, and `peek` points to `x`
+5. Since `lVal` is not null, we check `doPeek(cur+1)` which is `doPeek(position of = + 1)` = `i`
+6. `i` is not GETINTTK or GETCHARTK, so we do `cur = peek` (reset to `x`)
+7. Call `parseAssignStmt()`:
+   - Calls `parseLVal()` again from `x`
+   - This should work the same as step 3
+
+This should produce the correct output.
+
+But in the buggy output, it seems like step 3 is not consuming the `]` token, so when we get to step 7, the `parseLVal()` in `parseAssignStmt()` starts from `x`, parses `x[`, parses `i`, but then sees `]` and for some reason treats it as an identifier.
+
+I'm still not seeing it.
+
+Let me look at the `parseLVal` method one more time, very carefully:
+
+```java
+public Node parseLVal() {
+    //可能出现k型错误
+    LVal lVal = new LVal();
+    lVal.setStartLine(getCur().getLineNo());
+    //Ident
+    lVal.addChildNode(new LeafNode(Token.Type.IDENFR,
+            getCur().getValue(), getCur().getLineNo(), '\0'));
+    cur++;
+    //特殊：解析到Ident '(' [FuncRParams] ')'返回空指针，用于stmt解析时区分不同分支
+    if (getCur().getType() == Token.Type.LPARENT) {
+        return null;
+    }
+    //['['Exp']']
+    if (getCur().getType() == Token.Type.LBRACK) {
+        lVal.addChildNode(new LeafNode(Token.Type.LBRACK,
+                "[", getCur().getLineNo(), '\0'));
+        cur++;
+        lVal.addChildNode(parseExp());
+        if (getCur().getType() != Token.Type.RBRACK) {
+            lVal.addChildNode(new LeafNode(Token.Type.RBRACK,
+                    "]", doPeek(cur-1).getLineNo(), 'k'));
+            hasError = true;
+            errorList.add(doPeek(cur-1).getLineNo()+" "+'k');
+        } else {
+            lVal.addChildNode(new LeafNode(Token.Type.RBRACK,
+                    "]", getCur().getLineNo(), '\0'));
+            cur++;
+        }
+    }
+    lVal.setEndLine(doPeek(cur-1).getLineNo());
+    return lVal;
+}
+```
+
+Ah! I see the issue now!
+
+In the case where `getCur().getType() != Token.Type.RBRACK`, it adds a `RBRACK` leaf node with error code 'k', but it does NOT increment `cur`. This means that if there's a missing `]` error, the cursor stays at whatever token caused the mismatch.
+
+But in our test case, there is a `]`, so it should take the `else` branch and increment `cur`.
+
+However, what if the `parseExp()` call inside `parseLVal()` consumes more tokens than it should? For example, if `parseExp()` for `i` somehow consumes the `]` token, then when we check `getCur().getType()`, it would be whatever comes after `]`, not `]` itself.
+
+But `parseExp()` for `i` should only consume the `i` token, leaving `cur` at `]`.
+
+Let's trace `parseExp()` for `i`:
+
+- `parseExp()` calls `parseAddExp()`
+- `parseAddExp()` calls `parseMulExp()`
+- `parseMulExp()` calls `parseUnaryExp()`
+- `parseUnaryExp()` sees `IDENFR i`, and since the next token is not `LPARENT`, it calls `parsePrimaryExp()`
+- `parsePrimaryExp()` calls `parseLVal()` for `i`
+- `parseLVal()` for `i`:
+  - Adds `i` as IDENFR
+  - Increments cur (now points to `]`)
+  - Next token is `]`, not `LPARENT`, so continues
+  - Next token is `]`, not `LBRACK`, so returns LVal
+- Back to `parsePrimaryExp()`, which returns
+- Back up the chain, all return
+- So `parseExp()` consumes only the `i` token, leaving `cur` at `]`
+
+This should be correct.
+
+I'm really stuck. Let me try to think differently.
+
+What if the issue is not in `parseLVal` but in how the output is structured? Looking at the expected output, after the inner block, we have:
+
+```
+RBRACE }
+<Block>
+<Stmt>
+<Stmt>
+IDENFR x
+...
+```
+
+The two `<Stmt>` suggest that there are two statement nodes: one for the if statement, and one for the block containing the if statement.
+
+In the buggy output, it's the same until the `IDENFR ]` part.
+
+Maybe the issue is that the parser is somehow skipping the `x[` tokens entirely and starting from `]`.
+
+This could happen if there's a bug in the token list or in the cursor management.
+
+Wait! I think I found it. Look at the `parseRecStmt` method again:
+
+```java
+//[ForStmt]')'
+if (getCur().getType() == Token.Type.RPARENT) {
+    recStmt.addChildNode(new LeafNode(Token.Type.RPARENT,
+            ")", getCur().getLineNo(), '\0'));
+    cur++;
+} else {
+    recStmt.addChildNode(parseForStmt());
+    recStmt.addChildNode(new LeafNode(Token.Type.RPARENT,
+            ")", getCur().getLineNo(), '\0'));
+    cur++;
+}
+```
+
+In our test input, the for loop is `for(;i<=10;)`, so after parsing the second semicolon, the next token should be `RPARENT )`.
+
+But what if the parser doesn't see `RPARENT` there? What if it sees something else?
+
+Looking at the for loop structure:
+`for(;i<=10;)`
+
+After parsing:
+- `FORTK for`
+- `LPARENT (`
+- `SEMICN ;` (first empty ForStmt)
+- `Cond` (i<=10)
+- `SEMICN ;` (second semicolon)
+
+Now the next token should be `RPARENT )`.
+
+But in the buggy output, we see that the for loop parsing completes correctly, as we see `RPARENT )` in the output.
+
+So that's not it.
+
+Let me look at the actual difference in the output files one more time.
+
+Expected has:
+```
+IDENFR x
+LBRACK [
+IDENFR i
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACK ]
+<LVal>
+```
+
+Buggy has:
+```
+IDENFR ]
+<LVal>
+```
+
+This means that in the buggy version, the parser is creating an LVal node with a single child that is an IDENFR with value "]".
+
+The only way this can happen is if `parseLVal()` is called when the current token is `]`, and `]` is somehow being treated as an IDENFR.
+
+But the lexer should never produce an IDENFR token for "]".
+
+Unless... there's a bug in the lexer.
+
+Looking at the lexer's character handling:
+
+```java
+} else if (ch == ']') {
+    tokenList.add((new Token()).setToken(Token.Type.RBRACK, "]", getCurLine()));
+}
+```
+
+This should correctly produce RBRACK for "]".
+
+So the token list should have RBRACK, not IDENFR.
+
+This means that somewhere in the parser, a RBRACK token is being incorrectly treated as an IDENFR.
+
+Looking at the `parseLVal` method, the only place it creates an IDENFR leaf node is at the beginning:
+
+```java
+//Ident
+lVal.addChildNode(new LeafNode(Token.Type.IDENFR,
+        getCur().getValue(), getCur().getLineNo(), '\0'));
+```
+
+This assumes that the current token is an identifier, which it should be when `parseLVal` is called.
+
+But if `parseLVal` is called when the current token is RBRACK, then it would create an IDENFR leaf node with value "]", which is exactly what we see in the buggy output.
+
+So the question is: why is `parseLVal` being called when the current token is RBRACK?
+
+This can only happen if the parser's control flow is incorrect.
+
+Looking back at the `parseStmt` method:
+
+```java
+} else if (getCur().getType() == Token.Type.IDENFR) {
+    peek = cur;
+    LVal lVal = (LVal)parseLVal();
+    //...
+}
+```
+
+This only calls `parseLVal` if the current token is IDENFR.
+
+So for `parseLVal` to be called with RBRACK, the current token must be IDENFR, but somehow the value is "]".
+
+This suggests that the token list itself is corrupted.
+
+But that seems unlikely.
+
+Another possibility: maybe the issue is in the `doPeek` method or cursor management.
+
+Looking at the `doPeek` method:
+
+```java
+private Token doPeek(int p) {
+    if (p >= limit) {
+        return null;
+    }
+    return tokenList.get(p);
+}
+```
+
+This seems correct.
+
+I'm running out of ideas. Let me try to focus on the most likely culprit.
+
+Given that the only difference is that `x[i]` is not being parsed correctly, and instead `]` is being treated as an identifier, the most likely place for the bug is in the `parseLVal` method's handling of the array subscript.
+
+Looking at the `parseLVal` method again, I notice that when it parses the expression inside the brackets, it calls `parseExp()`, which could potentially consume more tokens than expected if there's a bug in the expression parsing.
+
+But in our case, the expression is just `i`, which is simple.
+
+Wait! What if the issue is that the `parseExp()` call is failing or returning early, leaving the cursor in a bad state?
+
+For example, if `parseExp()` for `i` somehow doesn't consume the `i` token, then when we check for `RBRACK`, we'd be looking at `i` instead of `]`, so we'd go into the error branch and add a fake `RBRACK` token, but not advance the cursor.
+
+Then, when the `parseLVal` returns, the cursor would still be at `i`, not at `=`.
+
+But in the buggy output, we see `IDENFR ]`, not `IDENFR i`.
+
+So that's not it.
+
+I think I need to consider that the bug might be in the `parseStmt` method's logic for resetting the cursor.
+
+Let's look at this part again:
+
+```java
+} else if (getCur().getType() == Token.Type.IDENFR) {
+    peek = cur;
+    LVal lVal = (LVal)parseLVal();
+    //特殊设计: 解析到Ident '(' [FuncRParams] ')'返回空指针
+    if (lVal == null) {
+        cur = peek;
+        stmt.addChildNode(parseExpStmt());
+    } else { //cur now points to '='
+        if (doPeek(cur+1).getType() == Token.Type.GETINTTK) {
+            cur = peek;
+            stmt.addChildNode(parseGetIntStmt());
+        } else if (doPeek(cur+1).getType() == Token.Type.GETCHARTK) {
+            cur = peek;
+            stmt.addChildNode(parseGetCharStmt());
+        } else {
+            cur = peek;
+            stmt.addChildNode(parseAssignStmt());
+        }
+    }
+}
+```
+
+The comment says "//cur now points to '='" but what if it doesn't? What if `parseLVal()` leaves `cur` at a different position?
+
+In the case of `x[i]`, after `parseLVal()` returns, `cur` should be at `=`, so `doPeek(cur+1)` should be the token after `=`, which is `i`.
+
+But what if `parseLVal()` has a bug and doesn't consume the `]` token, so `cur` is still at `]`?
+
+Then `doPeek(cur+1)` would be `=`, not `i`.
+
+And `=` is not GETINTTK or GETCHARTK, so it would go to the else branch, reset `cur = peek` (to `x`), and call `parseAssignStmt()`.
+
+That should still work.
+
+I'm really stuck.
+
+Let me try to think about what would cause `]` to be treated as an IDENFR.
+
+The only way is if the parser calls `parseLVal()` when the current token is `]`, and the current token's type is IDENFR.
+
+But the lexer should make `]` have type RBRACK.
+
+Unless there's a bug in the lexer where under certain conditions, `]` is lexed as IDENFR.
+
+Looking at the lexer's handling of `]`:
+
+```java
+} else if (ch == ']') {
+    tokenList.add((new Token()).setToken(Token.Type.RBRACK, "]", getCurLine()));
+}
+```
+
+This seems correct.
+
+But what if there's a character encoding issue or the input has a different character that looks like `]` but isn't?
+
+That seems unlikely for a test case.
+
+Another possibility: maybe the issue is in the `parseLVal` method when it's called recursively.
+
+When parsing `x[i]`, the outer `parseLVal` calls `parseExp()`, which eventually calls `parseLVal` for `i`.
+
+What if there's a bug in the recursive call that affects the outer call?
+
+But that doesn't make sense because each call has its own local variables.
+
+I think I need to consider that the bug might be in the `parseBlock` method's loop condition.
+
+Looking at the `parseBlock` method:
+
+```java
+boolean endFlag = false;
+while (!endFlag) {
+    Token.Type temTp = getCur().getType();
+    if (temTp == Token.Type.CONSTTK) {
+        block.addChildNode(parseConstDecl());
+    } else if (temTp == Token.Type.INTTK || temTp == Token.Type.CHARTK) {
+        block.addChildNode(parseVarDecl());
+    } else if (temTp == Token.Type.IFTK || temTp == Token.Type.FORTK
+    || temTp == Token.Type.BREAKTK || temTp == Token.Type.CONTINUETK
+    || temTp == Token.Type.RETURNTK || temTp == Token.Type.PRINTFTK
+    || temTp == Token.Type.LBRACE || temTp == Token.Type.IDENFR
+    || temTp == Token.Type.PLUS || temTp == Token.Type.MINU
+            || temTp == Token.Type.INTCON || temTp == Token.Type.CHRCON
+    ||temTp == Token.Type.LPARENT || temTp == Token.Type.SEMICN) {
+        //FIRST(Stmt)
+        block.addChildNode(parseStmt());
+    } else {
+        endFlag = true;
+    }
+}
+```
+
+The loop continues as long as the current token is in the FIRST set of Stmt or is a declaration.
+
+When it encounters a token not in those sets, it breaks out of the loop and then consumes the RBRACE.
+
+In our case, after parsing all the statements in the for loop body, the next token should be RBRACE.
+
+But what if the parser, due to a bug in statement parsing, leaves the cursor at a token that is in the FIRST set of Stmt, causing it to try to parse another statement when it shouldn't?
+
+For example, if after parsing `break;`, the cursor is left at `]` (somehow), and if `]` were in the FIRST set of Stmt, it would try to parse it as a statement.
+
+But `]` is not in the FIRST set of Stmt listed in the condition.
+
+The FIRST set includes: IFTK, FORTK, BREAKTK, CONTINUETK, RETURNTK, PRINTFTK, LBRACE, IDENFR, PLUS, MINU, INTCON, CHRCON, LPARENT, SEMICN.
+
+RBRACK is not in this set, so the loop should exit.
+
+Then it would consume the RBRACE.
+
+So that should work.
+
+I'm out of ideas. Given the time I've spent, I think the most likely location of the bug is in the `parseLVal` method, specifically in how it handles the array subscript parsing.
+
+Let me output the `parseLVal` method as the likely location of the error.
+
+<frontend/Parser.java>
+...
+    public Node parseLVal() {
+        //可能出现k型错误
+        LVal lVal = new LVal();
+        lVal.setStartLine(getCur().getLineNo());
+        //Ident
+        lVal.addChildNode(new LeafNode(Token.Type.IDENFR,
+                getCur().getValue(), getCur().getLineNo(), '\0'));
+        cur++;
+        //特殊：解析到Ident '(' [FuncRParams] ')'返回空指针，用于stmt解析时区分不同分支
+        if (getCur().getType() == Token.Type.LPARENT) {
+            return null;
+        }
+        //['['Exp']']
+        if (getCur().getType() == Token.Type.LBRACK) {
+            lVal.addChildNode(new LeafNode(Token.Type.LBRACK,
+                    "[", getCur().getLineNo(), '\0'));
+            cur++;
+            lVal.addChildNode(parseExp());
+            if (getCur().getType() != Token.Type.RBRACK) {
+                lVal.addChildNode(new LeafNode(Token.Type.RBRACK,
+                        "]", doPeek(cur-1).getLineNo(), 'k'));
+                hasError = true;
+                errorList.add(doPeek(cur-1).getLineNo()+" "+'k');
+            } else {
+                lVal.addChildNode(new LeafNode(Token.Type.RBRACK,
+                        "]", getCur().getLineNo(), '\0'));
+                cur++;
+            }
+        }
+        lVal.setEndLine(doPeek(cur-1).getLineNo());
+        return lVal;
+    }
+...

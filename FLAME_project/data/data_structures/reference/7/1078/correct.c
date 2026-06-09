@@ -1,0 +1,65 @@
+#include<stdio.h>
+#include<string.h>
+#include<math.h>
+int main()
+{
+	int a,b[50],c[300],d[300],e[300],y[20],z[20],i,j,k,h,f=0;
+	scanf("%d\n",&a);
+	for(i=0;i<a;i++)
+	{
+		scanf("%d ",&b[i]);
+	}
+	for(i=0;i<300;i++)
+	{
+		c[i]=-11;
+		d[i]=-11;
+	}
+	for(i=0;i<a;i++)
+	{
+		f=0;
+		while(c[f]!=-11)
+		{
+			if(b[i]<c[f])
+			{
+				f=2*f+1;
+			}
+			else
+			{
+				f=2*f+2;
+			}
+		}
+		c[f]=b[i];
+		d[i]=f;
+	}
+	f=0;
+	for(i=0;i<a;i++)
+	{
+		if(c[d[i]*2+1]==-11&&c[d[i]*2+2]==-11)
+		{
+			y[f]=c[d[i]];
+			z[f]=d[i];
+			f++;
+		}
+	}
+	for(i=0;i<f;i++)
+	{
+		z[i]=log(z[i]+1)/log(2)+1;
+	}
+	for(i=0;i<f-1;i++)
+	{
+		for(j=0;j<f-1-i;j++)
+		{
+			if(y[j]>y[j+1])
+			{
+				k=y[j];h=z[j];
+				y[j]=y[j+1];z[j]=z[j+1];
+				y[j+1]=k;z[j+1]=h;
+			}
+		}
+	}
+	for(i=0;i<f;i++)
+	{
+		printf("%d %d\n",y[i],z[i]);
+	}
+}
+

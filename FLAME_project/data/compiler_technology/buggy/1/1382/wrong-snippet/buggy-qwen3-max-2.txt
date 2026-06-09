@@ -1,0 +1,634 @@
+Looking at the difference between the buggy output and expected output, I can see that in the `editdistDP` function, there are incorrect LVal productions being generated. Specifically, in the buggy output, I see:
+
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+
+But in the expected output, it should be:
+
+```
+IDENFR Dp
+LBRACK [
+...
+<LVal>
+ASSIGN =
+IDENFR j
+...
+```
+
+The issue is that the parser is not correctly recognizing the full LVal (which should include the identifier `Dp`) and is instead starting with just `LBRACK [`. This suggests that the `lValParser()` method in the Parser class is not properly handling array access expressions.
+
+Looking at the `lValParser()` method in the Parser.java file, I can see the problem. When parsing an LVal with array brackets, it only captures the identifier and the expression inside the brackets, but it's not properly structured to handle the case where we have an identifier followed by brackets.
+
+However, looking more carefully at the actual issue in the output, I notice that in the buggy output, there are lines like:
+- `LBRACK [` appearing as a standalone token without the preceding identifier
+- `LPARENT (` appearing as if it's part of an LVal when it should be part of a function call
+
+The real issue appears to be in the `stmtParser()` method, specifically in the IDENFR case where it uses `switchFake(true)` to peek ahead and determine if it's an assignment or just an expression. The fake mode logic seems to be interfering with the proper token consumption.
+
+Looking at the specific problematic section in the `editdistDP` function where the error occurs:
+
+In the buggy output:
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+
+This suggests that when parsing `Dp[cal(0,j)] = j;`, the parser is incorrectly treating `[` as the start of an LVal rather than recognizing that `Dp` is the identifier part of the LVal.
+
+The issue is in the `lValParser()` method. Let me examine it:
+
+```java
+private LVal lValParser() {
+    Token pos1 = tokenIterator.getNext();
+    if (fakeMode) step++;
+    Token ident = pos1;
+    if (tokenIterator.getNext().getLexType().equals(LexType.LBRACK)) {
+        if (fakeMode) step++;
+        Exp exp = expParser();
+        if (! tokenIterator.getNext().getLexType().equals(LexType.RBRACK)) {
+            if (fakeMode) {
+                step--;
+                tokenIterator.getPrevious();
+            }
+            if (! fakeMode) addErrorK(tokenIterator.getPrevious().getLineNum());//K  error
+        }
+        if (fakeMode) step++;
+        return new LVal(ident, exp);
+    }
+    else {
+        tokenIterator.getPrevious();
+        return new LVal(ident);
+    }
+}
+```
+
+The problem is that this method assumes the first token is always the identifier, but in the buggy cases, it seems like the parser is calling `lValParser()` when the current token is already `[` instead of the identifier.
+
+Looking at the `stmtParser()` method in the IDENFR case:
+
+```java
+case IDENFR: {
+    tokenIterator.getPrevious();
+    switchFake(true);
+    lValParser();
+    if (tokenIterator.getNext().getLexType().equals(LexType.ASSIGN)) {
+        tokenIterator.getBack(step + 1);
+        switchFake(false);
+        LVal lVal = lValParser();
+        // ... rest of assignment handling
+    }
+    // ... rest of method
+}
+```
+
+The issue is that after the fake parsing with `lValParser()`, when it does `tokenIterator.getBack(step + 1)`, it may not be resetting to the correct position. The `step` variable tracks how many tokens were consumed during fake mode, but the logic for backing up might be incorrect.
+
+However, looking more closely at the actual output discrepancy, I notice that in the buggy output, there are sequences like:
+
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+```
+
+This suggests that the parser is encountering a `[` token and trying to parse it as an LVal, which shouldn't happen. An LVal must start with an identifier.
+
+The real issue appears to be in the array assignment statements like `Dp[cal(0,j)] = j;`. In the buggy output, instead of properly parsing this as:
+- `IDENFR Dp`
+- `LBRACK [`
+- ... (function call expression)
+- `RBRACK ]`
+- `<LVal>`
+- `ASSIGN =`
+- ... (right side expression)
+
+It's parsing it as:
+- `LBRACK [` (as if this is the start)
+- `<LVal>` 
+- etc.
+
+This indicates that the token iterator position is wrong when parsing these statements.
+
+Looking at the `stmtParser()` method again, specifically this part:
+
+```java
+case IDENFR: {
+    tokenIterator.getPrevious();
+    switchFake(true);
+    lValParser();
+    if (tokenIterator.getNext().getLexType().equals(LexType.ASSIGN)) {
+        tokenIterator.getBack(step + 1);
+        switchFake(false);
+        LVal lVal = lValParser();
+        tokenIterator.getNext();
+        pos1 = tokenIterator.getNext();
+        // ... handle assignment
+    }
+}
+```
+
+The problem is likely in the `tokenIterator.getBack(step + 1)` call. After fake parsing, `step` contains the number of tokens consumed during fake mode, but when backing up, it should back up by exactly the right amount to get back to the original position before fake parsing started.
+
+But looking at the actual bug more carefully, I think the issue is elsewhere. Let me check the `primaryExpParser()` method:
+
+```java
+private PrimaryExp primaryExpParser() {
+    Token pos1 = tokenIterator.getNext();
+    if (fakeMode) step++;
+    if (pos1.getLexType().equals(LexType.INTCON)) {
+        Number number = new Number(pos1);
+        return new PrimaryExp(number);
+    }
+    else if (pos1.getLexType().equals(LexType.CHRCON)) {
+        Character character = new Character(pos1);
+        return new PrimaryExp(character);
+    }
+    else if (pos1.getLexType().equals(LexType.IDENFR)) {
+        tokenIterator.getPrevious();
+        if (fakeMode) step--;
+        LVal lVal  = lValParser();
+        return new PrimaryExp(lVal);
+    }
+    else {
+        Exp exp = expParser();
+        if (! tokenIterator.getNext().getLexType().equals(LexType.RPARENT)) {
+            if (fakeMode) {
+                step--;
+                tokenIterator.getPrevious();
+            }
+            if (! fakeMode) addErrorJ(tokenIterator.getPrevious().getLineNum());//j  error
+        }
+        PrimaryExpExp primaryExpExp = new PrimaryExpExp(exp);
+        if (fakeMode) step++;
+        return new PrimaryExp(primaryExpExp);
+    }
+}
+```
+
+Wait, I see the issue now! In the buggy output, I'm seeing lines like:
+
+```
+LPARENT (
+INTCON 0
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RPARENT )
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+SEMICN ;
+<Stmt>
+```
+
+This suggests that the parser is treating `(0)` as a PrimaryExp (which is correct for parenthesized expressions), but then it's being used in a context where it shouldn't be.
+
+Looking at the specific problematic code in the source:
+```c
+Dp[cal(0,j)] = j;
+```
+
+In the buggy output, this is being parsed incorrectly. The issue is that in the `stmtParser()`, when it encounters an IDENFR, it does fake parsing to determine if it's an assignment. But the fake parsing logic is flawed.
+
+However, looking at the exact difference between expected and buggy output, I notice that in the buggy output, there are missing identifier tokens. For example, in the assignment `Dp[cal(0,j)] = j;`, the `IDENFR Dp` token is missing from the output, and instead it starts with `LBRACK [`.
+
+This strongly suggests that the `lValParser()` method is being called when the current token is `[` instead of `Dp`.
+
+Looking back at the `stmtParser()` method, the issue is in this section:
+
+```java
+case IDENFR: {
+    tokenIterator.getPrevious();
+    switchFake(true);
+    lValParser();
+    if (tokenIterator.getNext().getLexType().equals(LexType.ASSIGN)) {
+        tokenIterator.getBack(step + 1);
+        switchFake(false);
+        LVal lVal = lValParser();
+        // ...
+    }
+}
+```
+
+The problem is that `tokenIterator.getPrevious()` moves back one token, but if we're already at the IDENFR token, moving back might put us in the wrong position.
+
+Actually, let me trace through this more carefully. When the parser encounters the token stream for `Dp[cal(0,j)] = j;`, the tokens are:
+1. `IDENFR Dp`
+2. `LBRACK [`
+3. `IDENFR cal`
+4. `LPARENT (`
+5. `INTCON 0`
+6. etc.
+
+When `stmtParser()` is called, it gets the first token with `tokenIterator.getNext()`, which is `IDENFR Dp`. Then it does `tokenIterator.getPrevious()` to move back, so now the next token to be read is again `IDENFR Dp`.
+
+Then it calls `lValParser()` in fake mode. The `lValParser()` reads `IDENFR Dp`, then sees `LBRACK [`, then parses the expression `cal(0,j)`, consuming several tokens. The `step` variable tracks how many tokens were consumed.
+
+Then it checks if the next token is `ASSIGN`, which it is. So it does `tokenIterator.getBack(step + 1)` to reset to the original position.
+
+But here's the bug: `step + 1` might not be the correct number of tokens to back up. The `step` variable counts tokens consumed during fake parsing, but the initial `tokenIterator.getPrevious()` also affects the position.
+
+However, looking at the actual output more carefully, I think the real issue is in the `Block` class's `toPrint()` method. Let me check that:
+
+```java
+public String toPrint() {
+    StringBuilder stringBuilder = new StringBuilder();
+    stringBuilder.append("LBRACE" + " {" +  "\n");
+    for (BlockItem blockItem : blockItems) {
+        stringBuilder.append(blockItem.toPrint());
+    }
+    stringBuilder.append("RBRACE" + " }" +  "\n");
+    stringBuilder.append("<Block>\n");
+    return stringBuilder.toString();
+}
+```
+
+This looks correct.
+
+Wait, I think I found the actual issue. Looking at the buggy output again, I see:
+
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+```
+
+But in the expected output, it should be:
+
+```
+IDENFR Dp
+LBRACK [
+...
+<LVal>
+ASSIGN =
+IDENFR j
+```
+
+The problem is that the `LVal.toPrint()` method is not including the identifier token in its output when there's an array access. Let me check the `LVal.toPrint()` method:
+
+```java
+public String toPrint() {
+    StringBuilder stringBuilder = new StringBuilder();
+    stringBuilder.append(ident.toPrint());
+    if (exp != null) {
+        stringBuilder.append("LBRACK" + " [" + "\n");
+        stringBuilder.append(exp.toPrint());
+        stringBuilder.append("RBRACK" + " ]" + "\n");
+    }
+    stringBuilder.append("<LVal>\n");
+    return stringBuilder.toString();
+}
+```
+
+This looks correct - it should output the identifier first, then the brackets if present.
+
+So why is the buggy output missing the `IDENFR Dp` token?
+
+Looking more carefully at the buggy output, I notice that the `IDENFR Dp` token actually does appear earlier in the output, in the variable declaration:
+
+```
+INTTK int
+IDENFR Dp
+LBRACK [
+...
+<VarDecl>
+```
+
+But in the assignment statements inside the function, it's missing.
+
+Ah! Now I see the pattern. In the buggy output, for the assignment statements like `Dp[cal(0,j)] = j;`, the parser is not recognizing this as an LVal assignment, but rather as some other kind of statement.
+
+Looking at the `stmtParser()` method again, the issue might be in the fake parsing logic. When it does the fake parse to determine if it's an assignment, it might be consuming tokens incorrectly.
+
+But actually, looking at the very beginning of the buggy output for the first for loop in `editdistDP`:
+
+Buggy:
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+
+Expected:
+```
+IDENFR Dp
+LBRACK [
+...
+<LVal>
+ASSIGN =
+IDENFR j
+...
+```
+
+The key difference is that in the buggy version, instead of `IDENFR Dp` followed by `LBRACK [`, it's just `LBRACK [` directly. And instead of assigning `IDENFR j`, it's assigning `(0)`.
+
+This suggests that the parser is completely misparsing the statement `Dp[cal(0,j)] = j;` as something like `[0] = (0);`.
+
+This points to a fundamental issue in the `stmtParser()` method's handling of IDENFR tokens.
+
+Looking at the `stmtParser()` method, when it encounters an IDENFR, it does:
+
+1. `tokenIterator.getPrevious()` - moves back one token
+2. `switchFake(true)` - enables fake mode  
+3. `lValParser()` - parses as LVal in fake mode
+4. Checks if next token is ASSIGN
+5. If yes, backs up with `tokenIterator.getBack(step + 1)`
+6. Parses LVal again for real
+
+The problem is likely in step 5. The `step + 1` calculation is incorrect.
+
+Let me trace through what should happen:
+
+- Initial position: about to read `IDENFR Dp`
+- `tokenIterator.getNext()` in switch statement reads `IDENFR Dp`
+- `tokenIterator.getPrevious()` moves back, so next token is `IDENFR Dp`
+- Fake mode enabled, `step = 0`
+- `lValParser()` reads `IDENFR Dp` (step becomes 1), then `LBRACK [` (step becomes 2), then parses the entire expression `cal(0,j)` which consumes many tokens, then reads `RBRACK ]` (step increments), then the next token would be `ASSIGN =`
+- So `step` might be something like 8 or 9
+- Then `tokenIterator.getNext()` reads `ASSIGN =` 
+- Since it's ASSIGN, it does `tokenIterator.getBack(step + 1)` = `tokenIterator.getBack(10)`
+- This should put us back to right before `IDENFR Dp`
+
+But if the backup is incorrect, we might end up at the wrong position.
+
+However, looking at the actual bug manifestation, I think the issue is simpler. In the buggy output, I'm seeing `LBRACK [` as the first token of the statement, which means that when the real `lValParser()` is called, the current token is `LBRACK [` instead of `IDENFR Dp`.
+
+This suggests that the `tokenIterator.getBack(step + 1)` is backing up too far or not far enough.
+
+But actually, looking at the `TokenIterator.getBack()` method:
+
+```java
+public void getBack(int n) {
+    for (int i = 0; i < n; i++) {
+        getPrevious();
+    }
+}
+
+public Token getPrevious() {
+    if (iterator.hasPrevious()) {
+        iterator.previous();
+    }
+    if (iterator.hasPrevious()) {
+        iterator.previous();
+    }
+    return getNext();
+}
+```
+
+The `getPrevious()` method is implemented incorrectly! It calls `iterator.previous()` twice, which moves back two positions, then `getNext()` which moves forward one position. So effectively, `getPrevious()` moves back by one position total.
+
+But `getBack(n)` calls `getPrevious()` n times, so it moves back by n positions.
+
+However, the issue might be in how `step` is calculated.
+
+Looking at the `lValParser()` method again:
+
+```java
+private LVal lValParser() {
+    Token pos1 = tokenIterator.getNext();
+    if (fakeMode) step++;
+    Token ident = pos1;
+    if (tokenIterator.getNext().getLexType().equals(LexType.LBRACK)) {
+        if (fakeMode) step++;
+        Exp exp = expParser();
+        if (! tokenIterator.getNext().getLexType().equals(LexType.RBRACK)) {
+            if (fakeMode) {
+                step--;
+                tokenIterator.getPrevious();
+            }
+            if (! fakeMode) addErrorK(tokenIterator.getPrevious().getLineNum());//K  error
+        }
+        if (fakeMode) step++;
+        return new LVal(ident, exp);
+    }
+    else {
+        tokenIterator.getPrevious();
+        return new LVal(ident);
+    }
+}
+```
+
+When parsing `Dp[cal(0,j)]`, the tokens consumed are:
+1. `IDENFR Dp` - step++ (step=1)
+2. `LBRACK [` - step++ (step=2)  
+3. Then `expParser()` is called, which will consume `cal(0,j)` - this involves many tokens
+4. `RBRACK ]` - step++ (step=final value)
+
+The problem is that `expParser()` and all the expression parsers also increment `step` when in fake mode, so `step` should accurately count all tokens consumed.
+
+But there's another issue. In the `stmtParser()`, after the fake parse determines it's an assignment, it does:
+
+```java
+tokenIterator.getBack(step + 1);
+switchFake(false);
+LVal lVal = lValParser();
+```
+
+The `+ 1` might be wrong. Let's think about it:
+
+- Before fake parsing, we had just read the IDENFR token in the switch statement
+- We did `tokenIterator.getPrevious()` to move back
+- So we're positioned right before the IDENFR token
+- During fake parsing, we consumed `step` tokens (including the IDENFR)
+- To get back to the position right before the IDENFR token, we need to back up by `step` tokens, not `step + 1`
+
+So the bug is likely that it should be `tokenIterator.getBack(step)` instead of `tokenIterator.getBack(step + 1)`.
+
+Let me verify this theory. If we back up by `step + 1` instead of `step`, we'd end up one token before where we should be. So when we then call `lValParser()` for real, it would read the token before `IDENFR Dp`, which might be `RBRACE }` or something else, and then the next token would be `IDENFR Dp`, but the parser logic might get confused.
+
+Actually, looking at the token sequence more carefully:
+
+If the backup is off by one, and we end up positioned at the token before `IDENFR Dp`, then when `lValParser()` calls `tokenIterator.getNext()`, it would get `IDENFR Dp` (correct). So that doesn't explain why we're seeing `LBRACK [` as the first token.
+
+Wait, maybe the issue is different. Let me look at the actual problematic code in the test input:
+
+In the `editdistDP` function, there's this code:
+```c
+for (j = 0;j <= len2;j = j + 1) {
+    Dp[cal(0,j)] = j;
+}
+```
+
+In the buggy output, this is being parsed as:
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+
+This suggests that the parser is interpreting this as `[cal(0,j)] = j;` instead of `Dp[cal(0,j)] = j;`.
+
+This means that the `IDENFR Dp` token is being skipped entirely.
+
+Looking back at the `stmtParser()` method, I notice that after the fake parsing determines it's an assignment, it calls:
+
+```java
+LVal lVal = lValParser();
+tokenIterator.getNext(); // This should read the ASSIGN token
+pos1 = tokenIterator.getNext(); // This should read the first token of the right-hand side
+```
+
+But if the `lValParser()` is not reading the `IDENFR Dp` token, then `tokenIterator.getNext()` would read `LBRACK [` instead.
+
+The only way this could happen is if the token iterator position is wrong when `lValParser()` is called.
+
+Given all this analysis, I believe the bug is in the `stmtParser()` method in the IDENFR case, specifically in the backup logic. The `step + 1` should probably be just `step`.
+
+But looking at the code again, I see another possibility. In the `lValParser()` method, when it's not in fake mode and encounters an array access, it reads the `RBRACK` token but doesn't do anything with it in terms of output. However, that shouldn't cause the identifier to be missing.
+
+Actually, let me check if there's an issue with the `TokenIterator.getPrevious()` method implementation:
+
+```java
+public Token getPrevious() {
+    if (iterator.hasPrevious()) {
+        iterator.previous();
+    }
+    if (iterator.hasPrevious()) {
+        iterator.previous();
+    }
+    return getNext();
+}
+```
+
+This method is supposed to move back by one position, but it actually:
+1. Moves back one position with `iterator.previous()`
+2. Moves back another position with `iterator.previous()`  
+3. Then `getNext()` moves forward one position
+
+So net effect: moves back by 1 position (from original position: -1 -1 +1 = -1).
+
+That seems correct.
+
+But the real issue might be in how the fake mode affects the parsing. Let me look at the `unaryExpParser()` method, which also uses fake mode:
+
+```java
+private UnaryExp unaryExpParser() {
+    Token pos1 = tokenIterator.getNext();
+    Token pos2 = tokenIterator.getNext();
+    if (pos2.getLexType().equals(LexType.END)) {
+        if (fakeMode)  step -= 1;
+    }
+    if (fakeMode)  step += 2;
+    if (pos1.getLexType().equals(LexType.IDENFR)
+            && pos2.getLexType().equals(LexType.LPARENT)) {
+        tokenIterator.getBack(2);
+        if (fakeMode) step -= 2;
+        FuncCall funcCall = funcCallParser();
+        return new UnaryExp(funcCall);
+    }
+    else {
+        tokenIterator.getPrevious();
+        if (fakeMode) step--;
+        // ... rest of method
+    }
+}
+```
+
+This also has complex fake mode logic.
+
+However, given the time and the specific nature of the bug (missing identifier tokens in LVal assignments), I believe the most likely location of the error is in the `stmtParser()` method's IDENFR case, specifically the backup logic with `step + 1`.
+
+But looking at the expected vs buggy output one more time, I notice something else. In the buggy output, for the statement `Dp[cal(0,j)] = j;`, it shows:
+
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+
+But `LPARENT (` followed by `INTCON 0` suggests that it's parsing `(0)` as the right-hand side, when it should be `j`.
+
+This indicates that the entire parsing is shifted by several tokens.
+
+Given all this, I think the error is in the `stmtParser()` method in the IDENFR case. The specific line is:
+
+```java
+tokenIterator.getBack(step + 1);
+```
+
+It should probably be:
+
+```java
+tokenIterator.getBack(step);
+```
+
+But since I need to output the exact code snippet where the error is located, I'll provide the relevant section from Parser.java.
+
+<frontend/Parser.java>
+...
+            case IDENFR: {
+                tokenIterator.getPrevious();
+                switchFake(true);
+                lValParser();
+                if (tokenIterator.getNext().getLexType().equals(LexType.ASSIGN)) {
+                    tokenIterator.getBack(step + 1);
+                    switchFake(false);
+                    LVal lVal = lValParser();
+                    tokenIterator.getNext();
+                    pos1 = tokenIterator.getNext();
+                    if (pos1.getLexType().equals(LexType.GETINTTK)) {
+                        tokenIterator.getNext();
+                        if (! tokenIterator.getNext().getLexType().equals(LexType.RPARENT)) {
+                            addErrorJ(tokenIterator.getPrevious().getLineNum());//j  error
+                        }
+                        if (! tokenIterator.getNext().getLexType().equals(LexType.SEMICN)) {
+                            addErrorI(tokenIterator.getPrevious().getLineNum());//i  error
+                        }
+                        return new Stmt(new getIntStmt(lVal));
+                    }
+                    else if (pos1.getLexType().equals(LexType.GETCHARTK)) {
+                        tokenIterator.getNext();
+                        if (! tokenIterator.getNext().getLexType().equals(LexType.RPARENT)) {
+                            addErrorJ(tokenIterator.getPrevious().getLineNum());//j  error
+                        }
+                        if (! tokenIterator.getNext().getLexType().equals(LexType.SEMICN)) {
+                            addErrorI(tokenIterator.getPrevious().getLineNum());//i  error
+                        }
+                        return new Stmt(new getCharStmt(lVal));
+                    }
+                    else {
+                        tokenIterator.getPrevious();
+                        Exp exp = expParser();
+                        if (! tokenIterator.getNext().getLexType().equals(LexType.SEMICN)) {
+                            addErrorI(tokenIterator.getPrevious().getLineNum());//i  error
+                        }
+                        return new Stmt(new AssignStmt(lVal,  exp));
+                    }
+                }
+                else {
+                    tokenIterator.getBack(step + 1);
+                    switchFake(false);
+                    Exp exp = expParser();
+                    if (! tokenIterator.getNext().getLexType().equals(LexType.SEMICN)) {
+                        addErrorI(tokenIterator.getPrevious().getLineNum());//i  error
+                    }
+                    return new Stmt(new ExpStmt(exp));
+                }
+            }
+...

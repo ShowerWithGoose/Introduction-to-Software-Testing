@@ -1,0 +1,178 @@
+Based on the problem description and the provided code, the issue is that the program produces **no output file** (`parser.txt` is empty or not created correctly) for a valid input.
+
+Looking at `Compiler.java`:
+```java
+Parser parser = new Parser(lexer);
+parser.parseCompUnit().visit();
+```
+
+The `Parser` constructor calls `nextToken()` to initialize the current token. `parseCompUnit()` parses the structure. Finally, `visit()` is called on the root `CompUnit` node.
+
+Let's look at `CompUnit.java`:
+```java
+public void visit(){
+  if(!decls.isEmpty()) for(Decl decl:decls) decl.visit();
+  if(!funcDefs.isEmpty())for (FuncDef funcDef:funcDefs)funcDef.visit();
+  MainFunctionDef.visit();
+  myWriter.writeNonTerminal("CompUnit");
+  myWriter.close();
+  System.out.println("CompUnit is written");
+}
+```
+
+This looks correct for writing the output. However, let's look at how tokens are written. The requirement states: "Output the information of each word line by line in the order recognized by lexical analysis." AND "Before completing the analysis of any syntax components... output the name of the current syntax component".
+
+In `token.java`:
+```java
+public void visit() {
+    myWriter.writeTerminal(this);
+}
+```
+
+In `myWriter.java`, the writer is initialized to `parser.txt`.
+
+The critical observation is in `Lexer.java`. The `Lexer` constructor reads all tokens into a list. But `Parser` uses an index to traverse this list.
+
+Let's look closely at `Parser.java`'s `parseCompUnit`:
+```java
+public CompUnit parseCompUnit() {
+    CompUnit compUnit = new CompUnit();
+    // 循环解析 Decl 部分
+    while (token.getType() == tokenType.CONSTTK || ((token.getType() == tokenType.INTTK || token.getType() == tokenType.CHARTK) && index2Token(2).getType() != tokenType.LPARENT)) {
+        compUnit.decls.add(parseDecl());
+
+    }// 循环解析 FuncDef 部分
+    //int ident ()
+    while (token.getType() == tokenType.VOIDTK || token.getType() == tokenType.CHARTK || (token.getType() == tokenType.INTTK && index2Token(1).getType() != tokenType.MAINTK)) {
+        compUnit.funcDefs.add(parseFuncDef());
+    }
+    // 解析主函数定义 MainFuncDef
+    compUnit.MainFunctionDef = parseMainFuncDef();
+    return compUnit;
+}
+```
+
+The logic for distinguishing `Decl` (specifically `VarDecl`) from `FuncDef` relies on lookahead.
+`index2Token(2)` gets the token at `index + 1`.
+`index2Token(1)` gets the token at `index`. Wait.
+
+```java
+private token index2Token(int offset) {
+    return lexer.getTokens().get(index + offset - 1);
+}
+```
+If `offset` is 1, it returns `lexer.getTokens().get(index)`. This is the **current** token.
+If `offset` is 2, it returns `lexer.getTokens().get(index + 1)`. This is the **next** token.
+
+In `parseCompUnit`:
+1. `while (token.getType() == tokenType.CONSTTK || ((token.getType() == tokenType.INTTK || token.getType() == tokenType.CHARTK) && index2Token(2).getType() != tokenType.LPARENT))`
+   - If current is `int`, check if next token (`index2Token(2)`) is NOT `(`.
+   - If next token is `main` (as in `int main()`), `main` is `MAINTK`, not `LPARENT`. So this condition is TRUE. It tries to parse `int main()` as a `Decl` (VarDecl).
+   - `parseDecl` calls `parseVarDecl`.
+   - `parseVarDecl` expects `BType VarDef ... ;`.
+   - `parseVarDef` matches `int` (consumed by BType? No, `parseBType` consumes `int`). Then it expects an `Ident`. The next token is `main` (`MAINTK`). `parseVarDef` calls `match()` for ident. `MAINTK` is not `IDENFR`.
+   - Actually, `parseBType` consumes `INTTK`. Current token becomes `MAINTK`.
+   - `parseVarDef` expects `Ident`. `token.getType()` is `MAINTK`. It will likely fail or throw an exception or produce incorrect parsing.
+   - Crucially, if it fails to parse correctly, it might not reach the `visit()` stage properly, or exceptions might be swallowed/not handled, resulting in no output.
+
+However, the specific bug causing "No output file" usually implies an exception occurred before `myWriter.close()` or the file was never written to.
+
+Let's look at `index2Token` usage in `parseCompUnit` again.
+For `int main() { ... }`:
+- Current token: `INTTK`.
+- `index2Token(2)` is `MAINTK`.
+- `MAINTK != LPARENT`. Condition is true.
+- Enters `parseDecl`.
+- `parseVarDecl`.
+- `parseBType` consumes `INTTK`.
+- `parseVarDef`.
+- `varDef.ident = match()`. Expects `IDENFR`. Gets `MAINTK`.
+- `match()` returns `MAINTK` token.
+- Next token is `LPARENT`.
+- `if (token.getType() == tokenType.LBRACK)` -> False.
+- `if (token.getType() == tokenType.ASSIGN)` -> False.
+- Returns `VarDef`.
+- Back in `parseVarDecl`. `while (token.getType() == COMMA)` -> False.
+- `if (token.getType() != SEMICN)` -> True (it is `LPARENT`).
+- `errorManager.handleError(...)`. Error 'i' (missing semicolon) is recorded.
+- `semicn` remains null.
+- Returns `VarDecl`.
+- Back in `parseCompUnit`. Loop continues?
+- Current token is `LPARENT`.
+- `CONSTTK`? No. `INTTK`? No. `CHARTK`? No.
+- Exits Decl loop.
+- Enters FuncDef loop.
+- `token.getType()` is `LPARENT`.
+- `VOIDTK`? No. `CHARTK`? No. `INTTK`? No.
+- Exits FuncDef loop.
+- Calls `parseMainFuncDef()`.
+- `mainFuncDef.intToken = match()`. Expects `INTTK`. Current is `LPARENT`.
+- Crash or error.
+
+The fundamental logic error is in `parseCompUnit`'s lookahead for distinguishing `VarDecl` from `FuncDef`. It should check if the identifier is followed by `(`.
+Specifically: `int main` -> `int` is BType. `main` is Ident. `(` follows. This is a FuncDef (or MainFuncDef).
+The condition `index2Token(2).getType() != tokenType.LPARENT` checks the token *after* the current one.
+Current: `int`. Next: `main`. Next+1: `(`.
+`index2Token(2)` returns `main` (`MAINTK`).
+`MAINTK != LPARENT` is true. So it treats `int main...` as a declaration. This is wrong.
+
+It should look further ahead or check if the second token is an identifier followed by `(`.
+Actually, standard logic:
+If `int` is followed by `ident` and then `(`, it's a function.
+If `int` is followed by `ident` and then `=`, `,`, or `;`, it's a variable.
+
+The code uses `index2Token(2)` which is the token at `index+1`.
+If input is `int a = 0;`:
+1. `int` (index 0). `index2Token(2)` is `a` (IDENFR). `IDENFR != LPARENT`. True. Parses as Decl. Correct.
+
+If input is `int main()`:
+1. `int` (index 0). `index2Token(2)` is `main` (MAINTK). `MAINTK != LPARENT`. True. Parses as Decl. Incorrect.
+
+The fix should involve checking if the token after the identifier is `LPARENT`.
+Or simply, `parseCompUnit` should not try to parse `MainFuncDef` as a `Decl` or `FuncDef`.
+The loop for `FuncDef` excludes `MAINTK`: `(token.getType() == tokenType.INTTK && index2Token(1).getType() != tokenType.MAINTK)`.
+Here `index2Token(1)` is current token (`INTTK`). Wait.
+`index2Token(1)` returns `lexer.getTokens().get(index)`.
+So if current is `INTTK`, `index2Token(1)` is `INTTK`. `INTTK != MAINTK` is True.
+So `int main` enters the `FuncDef` loop?
+Let's re-read the condition:
+`while (token.getType() == tokenType.VOIDTK || token.getType() == tokenType.CHARTK || (token.getType() == tokenType.INTTK && index2Token(1).getType() != tokenType.MAINTK))`
+
+If current token is `INTTK` (from `int main`):
+1. `token.getType() == INTTK` is True.
+2. `index2Token(1).getType()` is `INTTK`.
+3. `INTTK != MAINTK` is True.
+4. So the whole condition is True.
+5. It enters `parseFuncDef`.
+
+Wait, earlier I said it enters `Decl` loop first.
+`while (token.getType() == tokenType.CONSTTK || ((token.getType() == tokenType.INTTK || token.getType() == tokenType.CHARTK) && index2Token(2).getType() != tokenType.LPARENT))`
+
+If current is `INTTK`:
+1. `token.getType() == INTTK` is True.
+2. `index2Token(2).getType()` is `MAINTK`.
+3. `MAINTK != LPARENT` is True.
+4. So it enters `Decl` loop.
+
+So `int main` is caught by the `Decl` loop incorrectly because the lookahead `index2Token(2)` only sees `main`, not `(`.
+
+The error location is in `Parser.java` in `parseCompUnit`.
+
+<frontend/Parser.java>
+...
+    public CompUnit parseCompUnit() {
+        CompUnit compUnit = new CompUnit();
+        // 循环解析 Decl 部分
+        while (token.getType() == tokenType.CONSTTK || ((token.getType() == tokenType.INTTK || token.getType() == tokenType.CHARTK) && index2Token(2).getType() != tokenType.LPARENT)) {
+            compUnit.decls.add(parseDecl());
+
+        }// 循环解析 FuncDef 部分
+        //int ident ()
+        while (token.getType() == tokenType.VOIDTK || token.getType() == tokenType.CHARTK || (token.getType() == tokenType.INTTK && index2Token(1).getType() != tokenType.MAINTK)) {
+            compUnit.funcDefs.add(parseFuncDef());
+        }
+        // 解析主函数定义 MainFuncDef
+        compUnit.MainFunctionDef = parseMainFuncDef();
+        return compUnit;
+    }
+...

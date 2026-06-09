@@ -1,0 +1,63 @@
+The error lies in the `Parser.java` file, specifically in how error line numbers are determined and reported.
+
+1.  **Line Number Tracking for Errors**: The problem states that for missing semicolons (`i`), missing right parentheses (`j`), and missing right square brackets (`k`), the error line number corresponds to the line where the **last non-terminal before the missing symbol** is located.
+2.  **Current Implementation**: The methods `checkRightParen`, `checkRightRacket`, and `checkSemicolon` in `Parser.java` use `last.getLineNum()` to report errors.
+    *   `last` is updated in `getToken()` to be the token *before* `now`.
+    *   When `checkRightParen` is called, `now` is expected to be `)`. If it's not, `last` is the token immediately preceding the expected `)`.
+    *   However, the "last non-terminal" might span multiple tokens. For example, in `ch = getchar( ;`, the `getchar` call is a `UnaryExp`. The parser consumes `getchar` (IDENFR), then `(` (LPARENT). Inside `parseUnaryExp`, it calls `parseFuncRParams` or checks for empty params. If `)` is missing, `last` would be `(`. The error should likely be associated with the construct that *expected* the closing parenthesis.
+    *   More critically, look at the test case:
+        *   Line 16: `ch = getchar( ; // error 1` -> Expected `)` after `(`. The token before `)` is `(`. `last` is `(`. Line 16. Correct? Wait, the expected output says `16 j`. The buggy output says `16 j`. This one matches.
+        *   Line 18: `if (f2() & f1()) { // error 2` -> `&` is invalid. The lexer detects `&` followed by space (not `&`). In `Lexer.java`, `getsym` sees `&`, reads next char ` ` (space), retracts, adds `&` as token with type `AND` (which is wrong, it should be an error `a`), and returns -1.
+            *   Let's check `Lexer.java`:
+                ```java
+                } else if (this.Char == '&') {
+                    getChar();
+                    if (this.Char == '&') {
+                        catToken();
+                        symbol = TokenType.AND;
+                    } else {
+                        retract();
+                        catToken('&');
+                        symbol = TokenType.AND; // <--- BUG HERE
+                        return -1;
+                    }
+                }
+                ```
+            *   The lexer correctly returns -1 and adds an error. But it sets `symbol = TokenType.AND`. This token is added to the token list.
+            *   The error is added via `lexer.addError(lineNum, ErrorType.a)`. `lineNum` is current line.
+            *   The test case input has `if (f2() & f1())`.
+            *   `f2()` is parsed. Then `&` is encountered.
+            *   The lexer creates a token for `&` on line 18. It adds error `a` at line 18.
+            *   The parser continues. It sees `AND` token. `parseLAndExp` expects `&&` (TokenType.AND). It finds `AND`. It consumes it. Then it parses `f1()`.
+            *   So the parser doesn't crash here. The error is recorded by the lexer.
+            *   Why is the order wrong?
+            *   Buggy Output: `18 a`, `16 j`, `19 j`.
+            *   Expected Output: `16 j`, `18 a`, `19 j`.
+            *   The errors are collected in `lexer.errorList`.
+            *   In `Compiler.java`, `lexer.lexicalAnalysis()` is called first, then `parser.syntaxAnalysis()`.
+            *   `lexicalAnalysis` populates `errorList`.
+            *   `syntaxAnalysis` runs. During parsing, `checkRightParen` etc. call `lexer.addError`.
+            *   So `errorList` contains errors from both lexing and parsing.
+            *   The `errorOutput` method in `Lexer.java` writes them out.
+            *   The issue is that `errorList` is an `ArrayList<Map.Entry<Integer, ErrorType>>`. It preserves insertion order.
+            *   Lexical errors are added during `lexicalAnalysis`. Parsing errors are added during `syntaxAnalysis`.
+            *   Therefore, all lexical errors (like `18 a`) are added *before* any parsing errors (like `16 j` and `19 j`).
+            *   This results in `18 a` appearing before `16 j` in the list, even though 16 < 18.
+            *   The expected output requires errors to be sorted by line number.
+            *   The `errorOutput` method simply iterates through the list. It does not sort.
+
+3.  **Conclusion**: The `errorOutput` method in `Lexer.java` needs to sort the `errorList` by line number before writing to the file. Alternatively, the `Parser` should not add errors to the lexer's list directly if sorting is required globally, but since both use the same list, sorting at the end is the easiest fix.
+
+<frontend/Lexer.java>
+...
+    public void errorOutput() {
+        try (BufferedWriter err = new BufferedWriter(new FileWriter("error.txt"))) {
+            for (Map.Entry<Integer, ErrorType> entry : errorList) {
+                err.write(entry.getKey().toString() + " " + entry.getValue().toString());
+                err.newLine();
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+...

@@ -1,0 +1,240 @@
+Based on the problem description and test case, the program should output syntax component names like `<Stmt>`, `<VarDecl>`, etc., but the buggy output shows "No output file". This indicates that the AST dumping functionality is not working correctly.
+
+Looking at the expected output, we can see that syntax components are being printed in the correct order with proper nesting. The issue appears to be in the `DumpAST.dump()` method, which is responsible for writing the output to `parser.txt`.
+
+Examining the `DumpAST.java` file, I notice that in the `dump(CompUnit compUnit)` method, the code writes `<CompUnit>` at the end after closing the BufferedWriter, which is incorrect. The `<CompUnit>` should be written as part of the recursive dumping process, not after closing the file.
+
+However, looking more carefully at the expected output, I see that `<CompUnit>` appears at the very end, which suggests the current approach might be intentional. 
+
+The real issue is in the recursive `dump(ArrayList<Object> nodes)` method. When it encounters an ASTNode or ASTNodeWithOption, it recursively dumps the children first, then writes the component name. But according to the problem description, the syntax component name should be output **before** completing the analysis of the component (i.e., before its children are fully processed).
+
+Actually, looking at the expected output more carefully, the pattern shows that terminal tokens are output first, then the non-terminal component names are output after their constituents. For example:
+```
+INTTK int
+IDENFR a
+ASSIGN =
+INTCON 0
+<Number>
+<PrimaryExp>
+...
+<VarDef>
+SEMICN ;
+<VarDecl>
+```
+
+This suggests the current post-order traversal is correct. 
+
+The actual bug is in the `DumpAST.dump(CompUnit compUnit)` method. It calls `dump(compUnit.explore())` which processes all the content, but then it writes `<CompUnit>` and immediately closes the file. However, looking at the expected output, `<CompUnit>` should be the last line, but the file should contain all the previous content.
+
+Wait, looking at the implementation again:
+
+```java
+public static void dump(CompUnit compUnit) throws IOException {
+    out = new BufferedWriter(new FileWriter(Config.dumpASTFileName));
+    dump(compUnit.explore());
+    out.write("<CompUnit>");
+    out.close();
+}
+```
+
+The issue is that `out.write("<CompUnit>");` doesn't include a newline character, and it's written after all the other content. But in the expected output, `<CompUnit>` is on its own line at the very end.
+
+However, looking at the recursive `dump` method, every write operation includes `+ "\n"`, so each token and component is on its own line. But the final `<CompUnit>` write doesn't have a newline, which might cause issues.
+
+But the bigger issue is that the test case shows "No output file", which suggests that no file is being created at all. This could be because an exception is being thrown during parsing, causing the program to exit early.
+
+Looking at the `Compiler.java` file, in the `frontend` method:
+
+```java
+// Stage2 语法分析
+// 创建CompUnit(AST) -> 错误处理 -> [输出CompUnit(AST)]
+CompUnit compUnit = new CompUnit(tokenStream);
+// TODO 下一行为参与语法分析评测时的特地设置
+errorHandle(errorTable);
+if (Config.dumpAST) {
+    DumpAST.dump(compUnit);
+}
+```
+
+The `errorHandle(errorTable)` is called immediately after creating the `CompUnit`, and if there are any errors in the error table, it will dump the error file and exit with code 1, preventing the AST from being dumped.
+
+So the issue might be that the parser is incorrectly detecting errors in the valid test case, causing it to output to `error.txt` instead of `parser.txt`.
+
+Looking at the test input:
+```c
+int main() {
+    printf("21373119");
+    int a = 0;
+    {
+        int a = 1;
+        printf("%d",a); // 输出 1
+    }
+    return 0;
+}
+```
+
+This is a valid program. But let's check the `CompUnit` constructor in `CompUnit.java`:
+
+```java
+public CompUnit(TokenStream stream) {
+    decls = new ArrayList<>();
+    funcDefs = new ArrayList<>();
+    // ConstDecl → 'const' BType ConstDef { ',' ConstDef } ';'
+    //                ConstDef → $Ident$ [ '[' ConstExp ']' ] '=' ConstInitVal
+    // VarDecl → BType VarDef { $','$ VarDef } $';'$ // 该分号也有可能因为i类错误缺失，但是如果缺失后变为'('那就无法确定是否定义函数
+    //        VarDef → Ident [ $'['$ ConstExp ']' ] [ $'='$ InitVal ]
+    // FuncDef → FuncType Ident $'('$ [FuncFParams] ')' Block
+    // MainFuncDef → 'int' 'main' $'('$ ')' Block
+    while (stream.getNext(2).type() != TokenType.LPARENT) {
+        decls.add(Decl.parse(stream));
+    }
+    // FuncDef → FuncType $Ident$ '(' [FuncFParams] ')' Block
+    // MainFuncDef → 'int' $'main'$ '(' ')' Block
+    while (stream.getNext(1).type() != TokenType.MAINTK) {
+        funcDefs.add(new FuncDef(stream));
+    }
+    mainFuncDef = new MainFuncDef(stream);
+    if (stream.getNow().type() != TokenType.EOF) {
+        if (Config.parserThrowable) {
+            throw new RuntimeException("When CompUnit() end, didn't reach the end of the file.");
+        }
+    }
+}
+```
+
+The logic for parsing declarations and function definitions seems flawed. The condition `while (stream.getNext(2).type() != TokenType.LPARENT)` is trying to look ahead to determine if the next tokens form a function definition (which would have `Ident '('`), but this logic is incorrect.
+
+For the test case, the first token is `INTTK` (for "int"), then `MAINTK` (for "main"), then `LPARENT`. So `stream.getNext(2)` when at the beginning would be `LPARENT`, so the while loop condition `stream.getNext(2).type() != TokenType.LPARENT` would be false, and it wouldn't parse any declarations.
+
+Then it moves to the function definitions loop: `while (stream.getNext(1).type() != TokenType.MAINTK)`. At this point, `stream.getNow()` is `INTTK`, so `stream.getNext(1)` is `MAINTK`, so the condition is false, and it doesn't parse any function definitions either.
+
+Then it tries to parse `MainFuncDef`, which expects `INTTK MAINTK LPARENT RPARENT Block`, which matches the input.
+
+However, after parsing the main function, there might be an EOF check issue.
+
+But the real problem is likely in the `BlockItem.parse()` method or somewhere in the statement parsing that's causing an error to be recorded.
+
+Looking at the `Stmt.parse()` method, particularly the default case:
+
+```java
+default -> {
+    // Stmt → LVal '=' Exp ';'
+    //      | Exp ';'
+    //      | LVal '=' 'getint' '(' ')' ';'
+    //      | LVal '=' 'getchar' '(' ')' ';'
+    int checkpointID = stream.checkpoint("StmtTry");
+    Exp tryExp = new Exp(stream);
+    if (stream.isNow(TokenType.ASSIGN)) {
+        if (stream.isNext(1, TokenType.GETINTTK)) {
+            stream.restore(checkpointID);
+            yield new Stmt(new Stmt_LValGetint(stream));
+        } else if (stream.isNext(1, TokenType.GETCHARTK)) {
+            stream.restore(checkpointID);
+            yield new Stmt(new Stmt_LValGetchar(stream));
+        } else {
+            stream.restore(checkpointID);
+            yield new Stmt(new Stmt_LValAssign(stream));
+        }
+    } else {
+        yield new Stmt(new Stmt_Exp(tryExp, stream));
+    }
+};
+```
+
+The issue is that `new Exp(stream)` might throw an exception if the current token cannot start an expression. In the test case, we have statements like `printf("21373119");` which starts with `PRINTFTK`, not something that can start an `Exp`.
+
+So when `Stmt.parse()` encounters `PRINTFTK`, it goes to the default case, tries to create `new Exp(stream)`, but `Exp` constructor calls `AddExp`, which expects tokens that can start a `MulExp`, which expects tokens that can start a `UnaryExp`.
+
+Looking at `UnaryExp.parse()`:
+
+```java
+static UnaryExp parse(TokenStream stream) {
+    if (stream.isNow(TokenType.PLUS, TokenType.MINU, TokenType.NOT)) {
+        return new UnaryExp(new UnaryExp_UnaryOp(stream));
+    } else if (stream.isNow(TokenType.IDENFR) && stream.isNext(1, TokenType.LPARENT)) {
+        return new UnaryExp(new UnaryExp_IndetFuncCall(stream));
+    } else if (stream.isNow(TokenType.LPARENT, TokenType.IDENFR, TokenType.INTCON, TokenType.CHRCON)) {
+        return new UnaryExp(new UnaryExp_PrimaryExp(stream));
+    } else {
+        if (Config.parserThrowable) {
+            throw new RuntimeException("When UnaryExp.parse(), unexpected token: " + stream.getNow());
+        } else {
+            return null;
+        }
+    }
+}
+```
+
+Since `PRINTFTK` is not in any of those categories, it would throw a `RuntimeException` if `parserThrowable` is true.
+
+In `global/Config.java`, `parserThrowable` is set to `true` by default.
+
+So when `Stmt.parse()` tries to create `new Exp(stream)` with `PRINTFTK` as the current token, it throws an exception, which is caught in the `Stmt.parse()` method:
+
+```java
+int checkpointID = stream.checkpoint("StmtTry");
+Exp tryExp = new Exp(stream);
+```
+
+But this exception is not caught! The try-catch block is only around the attempt to parse `FuncRParams` in `UnaryExp_IndetFuncCall` and around the `Exp` parsing in `Stmt_Return`, but not here.
+
+So the `RuntimeException` from `UnaryExp.parse()` propagates up and crashes the program, which is why there's "No output file".
+
+The fix should be to wrap the `new Exp(stream)` in a try-catch block in `Stmt.parse()`.
+
+<frontend/parser/statement/Stmt.java>
+...
+    static Stmt parse(TokenStream stream) {
+        return switch (stream.getNow().type()) {
+            case SEMICN -> new Stmt(new Stmt_Semicn(stream));
+            case LBRACE -> new Stmt(new Stmt_Block(stream));
+            case IFTK -> new Stmt(new Stmt_If(stream));
+            case FORTK -> new Stmt(new Stmt_For(stream));
+            case BREAKTK -> new Stmt(new Stmt_Break(stream));
+            case CONTINUETK -> new Stmt(new Stmt_Continue(stream));
+            case RETURNTK -> new Stmt(new Stmt_Return(stream));
+            case PRINTFTK -> new Stmt(new Stmt_Printf(stream));
+            default -> {
+                // Stmt → LVal '=' Exp ';'
+                //      | Exp ';'
+                //      | LVal '=' 'getint' '(' ')' ';'
+                //      | LVal '=' 'getchar' '(' ')' ';'
+                int checkpointID = stream.checkpoint("StmtTry");
+                Exp tryExp;
+                try {
+                    tryExp = new Exp(stream);
+                } catch (RuntimeException e) {
+                    // If Exp parsing fails, this is not an Exp statement
+                    // Check if it's a LVal assignment or function call
+                    if (stream.isNow(TokenType.IDENFR)) {
+                        if (stream.isNext(1, TokenType.ASSIGN)) {
+                            if (stream.isNext(2, TokenType.GETINTTK)) {
+                                yield new Stmt(new Stmt_LValGetint(stream));
+                            } else if (stream.isNext(2, TokenType.GETCHARTK)) {
+                                yield new Stmt(new Stmt_LValGetchar(stream));
+                            } else {
+                                yield new Stmt(new Stmt_LValAssign(stream));
+                            }
+                        }
+                    }
+                    // If none of the above, rethrow the exception
+                    throw e;
+                }
+                if (stream.isNow(TokenType.ASSIGN)) {
+                    if (stream.isNext(1, TokenType.GETINTTK)) {
+                        stream.restore(checkpointID);
+                        yield new Stmt(new Stmt_LValGetint(stream));
+                    } else if (stream.isNext(1, TokenType.GETCHARTK)) {
+                        stream.restore(checkpointID);
+                        yield new Stmt(new Stmt_LValGetchar(stream));
+                    } else {
+                        stream.restore(checkpointID);
+                        yield new Stmt(new Stmt_LValAssign(stream));
+                    }
+                } else {
+                    yield new Stmt(new Stmt_Exp(tryExp, stream));
+                }
+            }
+        };
+    }
+...

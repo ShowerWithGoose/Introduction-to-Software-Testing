@@ -1,0 +1,164 @@
+Based on the comparison between the buggy output and the expected output, the error is an extra `RPARENT )` token appearing immediately after the function definition's parameter list closing parenthesis and before the opening brace of the function body.
+
+In the `parseFuncDef` method in `Parser.java`, the code explicitly consumes the right parenthesis `)` and logs it. However, looking at the `parseMainFuncDef` method, it follows a similar pattern but does not produce this error. The issue likely stems from how `parseFuncDef` handles the transition or potentially a double consumption/logging if `assertToken` or `checkToken` interacts unexpectedly with the logging mechanism, but more specifically, comparing the two methods:
+
+`parseFuncDef`:
+```java
+funcDefNode.addChild(assertToken(TokenType.RPARENT, parseSupporter.getLineNum()));
+parseSupporter.addComponent("RPARENT" + " " + parseSupporter.getCurrentToken().getContent());
+funcDefNode.addChild(parseBlock());
+```
+
+`parseMainFuncDef`:
+```java
+mainFuncDefNode.addChild(assertToken(TokenType.RPARENT, parseSupporter.getLineNum()));
+// Note: MainFuncDef does NOT have an explicit addComponent for RPARENT here in the provided code? 
+// Let's re-read carefully.
+```
+
+Wait, looking at `parseMainFuncDef` in the provided source:
+```java
+    private MainFuncDefNode parseMainFuncDef() throws Exception {
+        MainFuncDefNode mainFuncDefNode = new MainFuncDefNode();
+
+        mainFuncDefNode.addChild(parseSupporter.checkToken(TokenType.INTTK));
+        parseSupporter.addComponent(TokenType.INTTK + " " + parseSupporter.getCurrentToken().getContent());
+        mainFuncDefNode.addChild(parseSupporter.checkToken(TokenType.MAINTK));
+        parseSupporter.addComponent(TokenType.MAINTK + " " + parseSupporter.getCurrentToken().getContent());
+        mainFuncDefNode.addChild(parseSupporter.checkToken(TokenType.LPARENT));
+        parseSupporter.addComponent(TokenType.LPARENT + " " + parseSupporter.getCurrentToken().getContent());
+        mainFuncDefNode.addChild(assertToken(TokenType.RPARENT, parseSupporter.getLineNum()));
+        // MISSING: parseSupporter.addComponent("RPARENT" ...); 
+        mainFuncDefNode.addChild(parseBlock());
+        parseSupporter.addParseLog("MainFuncDef");
+        return mainFuncDefNode;
+    }
+```
+
+And `parseFuncDef`:
+```java
+    private FuncDefNode parseFuncDef() throws Exception {
+        FuncDefNode funcDefNode = new FuncDefNode();
+
+        funcDefNode.addChild(parseFuncType());
+        funcDefNode.addChild(parseSupporter.checkToken(TokenType.IDENFR));
+        parseSupporter.addComponent("IDENFR" + " " + parseSupporter.getCurrentToken().getContent());
+        funcDefNode.addChild(parseSupporter.checkToken(TokenType.LPARENT));
+        parseSupporter.addComponent("LPARENT" + " " + parseSupporter.getCurrentToken().getContent());
+
+        if (parseSupporter.isFuncParaFirst()) {
+            funcDefNode.addChild(parseFuncPara());
+        }
+
+        funcDefNode.addChild(assertToken(TokenType.RPARENT, parseSupporter.getLineNum()));
+        parseSupporter.addComponent("RPARENT" + " " + parseSupporter.getCurrentToken().getContent()); // This line exists
+        funcDefNode.addChild(parseBlock());
+        parseSupporter.addParseLog("FuncDef");
+        return funcDefNode;
+    }
+```
+
+The Buggy Output shows:
+```
+RPARENT )
+RPARENT )  <-- Extra one? No, wait.
+LBRACE {
+```
+
+Let's look at the Buggy Output again:
+```
+IDENFR func_p
+LPARENT (
+RPARENT )   <-- From parseFuncDef assertToken/addComponent
+RPARENT )   <-- Where does this come from?
+LBRACE {
+```
+
+If `assertToken` calls `checkToken`, which advances the index. Then `addComponent` uses `getCurrentToken()` which is `lookAhead(-1)`, i.e., the token just consumed. So that prints one `RPARENT )`.
+
+Where does the second `RPARENT )` come from?
+
+Let's look at `parseBlock`.
+```java
+    private BlockNode parseBlock() throws Exception {
+        BlockNode blockNode = new BlockNode();
+        blockNode.addChild(parseSupporter.checkToken(TokenType.LBRACE));
+        parseSupporter.addComponent("LBRACE" + " " + parseSupporter.getCurrentToken().getContent());
+        // ...
+    }
+```
+It expects `LBRACE`.
+
+Let's look at `parseFuncPara` (called `parseFuncFParams` in grammar but `parseFuncPara` in code).
+```java
+    private FuncFParamsNode parseFuncPara() throws Exception {
+        FuncFParamsNode funcFParamsNode = new FuncFParamsNode();
+        funcFParamsNode.addChild(parseFuncFParam());
+        while (parseSupporter.isComma()) {
+             // ...
+        }
+        parseSupporter.addParseLog("FuncFParams");
+        return funcFParamsNode;
+    }
+```
+This doesn't consume `)`.
+
+Is it possible that `parseFuncFParam` or something inside consumes it? No.
+
+Let's look closely at `assertToken`.
+```java
+    public CSTNode assertToken(TokenType type, int lineNum) throws RuntimeException {
+        try {
+            CSTNode node = parseSupporter.checkToken(type);
+            if (type == TokenType.SEMICN) {
+                parseSupporter.addComponent("SEMICN" + " " + parseSupporter.getCurrentToken().getContent());
+            } else if (type == TokenType.RBRACK) {
+                parseSupporter.addComponent("RBRACK" + " " + parseSupporter.getCurrentToken().getContent());
+            } else if (type == TokenType.RPARENT) {
+                parseSupporter.addComponent("RPARENT" + " " + parseSupporter.getCurrentToken().getContent());
+            }
+            return node;
+        } catch (RuntimeException e) {
+            return handleTokenException(type, lineNum, e);
+        }
+    }
+```
+
+So `assertToken(RPARENT)` calls `checkToken(RPARENT)`, which advances. Then it checks `if (type == TokenType.RPARENT)` and calls `addComponent("RPARENT" ...)`.
+
+Then in `parseFuncDef`:
+```java
+        funcDefNode.addChild(assertToken(TokenType.RPARENT, parseSupporter.getLineNum()));
+        parseSupporter.addComponent("RPARENT" + " " + parseSupporter.getCurrentToken().getContent());
+```
+It calls `assertToken`, which ALREADY adds the component "RPARENT )".
+Then it MANUALLY adds another component "RPARENT )".
+
+This results in two "RPARENT )" lines in the output.
+
+In `parseMainFuncDef`, it calls `assertToken(RPARENT)` which adds one "RPARENT )", but it does NOT have the subsequent manual `addComponent` line. That's why `main` is correct but `func_p` is wrong.
+
+The error is the redundant `parseSupporter.addComponent` call in `parseFuncDef` after `assertToken` has already handled the logging for `RPARENT`.
+
+<frontend/parser/Parser.java>
+...
+    private FuncDefNode parseFuncDef() throws Exception {
+        FuncDefNode funcDefNode = new FuncDefNode();
+
+        funcDefNode.addChild(parseFuncType());
+        funcDefNode.addChild(parseSupporter.checkToken(TokenType.IDENFR));
+        parseSupporter.addComponent("IDENFR" + " " + parseSupporter.getCurrentToken().getContent());
+        funcDefNode.addChild(parseSupporter.checkToken(TokenType.LPARENT));
+        parseSupporter.addComponent("LPARENT" + " " + parseSupporter.getCurrentToken().getContent());
+
+        if (parseSupporter.isFuncParaFirst()) {
+            funcDefNode.addChild(parseFuncPara());
+        }
+
+        funcDefNode.addChild(assertToken(TokenType.RPARENT, parseSupporter.getLineNum()));
+        parseSupporter.addComponent("RPARENT" + " " + parseSupporter.getCurrentToken().getContent());
+        funcDefNode.addChild(parseBlock());
+        parseSupporter.addParseLog("FuncDef");
+        return funcDefNode;
+    }
+...

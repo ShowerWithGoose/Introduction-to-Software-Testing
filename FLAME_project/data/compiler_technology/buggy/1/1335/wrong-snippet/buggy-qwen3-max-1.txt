@@ -1,0 +1,205 @@
+Based on the problem description, test case input, expected output, and actual buggy behavior (no output file generated), the issue appears to be in the **AST node construction and traversal logic**, specifically related to **which syntax components are marked for output**.
+
+According to the problem:
+> Before completing the analysis of any syntax components in the grammar (**except for `<BlockItem>`, `<Decl>`, `<BType>`**), output the name of the current syntax component...
+
+However, looking at the `ASTNode` construction in the parser, many nodes that **should not be printed** (like `<Decl>`, `<BType>`) are being created with `isRoot=true` or are otherwise included in the post-order traversal output.
+
+But more critically: **the expected output includes `<Stmt>`, `<VarDecl>`, `<Block>`, etc., but NOT `<Decl>` or `<BType>`** — yet in the parser code, these are being added as non-terminal nodes and will be printed by `postOrderPrint`.
+
+However, the **real root cause** of **no output file** is likely that **an error is being incorrectly reported**, causing the program to write to `error.txt` instead of `parser.txt`.
+
+Looking at the test input:
+```c
+int main() {
+    printf("21373119");
+    int a = 0;
+    {
+        int a = 1;
+        printf("%d",a); // 输出 1
+    }
+    return 0;
+}
+```
+
+This is a **valid program**, so no errors should be reported.
+
+But in `Lexer.java`, there's a critical bug in comment handling:
+
+### Key Observation:
+The test input contains a **line comment**: `// 输出 1`
+
+In `Lexer.java`, the lexer handles line comments with:
+```java
+if (currentChar == '/' && curPos< curLine.length() && curLine.charAt(curPos) == '/') {
+    break; // 退出当前行的处理
+}
+```
+
+However, **before this check**, there's multi-line comment logic that sets a `flag = 1` when `/*` is seen. But **`flag` is never reset per line** — it's a class-level variable that persists across lines.
+
+So if any prior line had `/*`, `flag=1` remains set. In our test case, there is **no `/*`**, so `flag=0` initially.
+
+But wait — look at this part in `tokenize()`:
+
+```java
+int flag = 0;
+for (Map.Entry<Integer, String> entry : allLines.entrySet()) {
+    curLine = entry.getValue();
+    curPos = 0;
+    lineNum = entry.getKey();
+
+    while (curPos < curLine.length()) {
+        ...
+        if (currentChar == '/'&& curPos< curLine.length() && curLine.charAt(curPos) == '*' ) {
+            flag = 1;
+            ...
+        }
+        if (flag == 1) {
+            ...
+        }
+        if (currentChar == '/' && curPos< curLine.length() && curLine.charAt(curPos) == '/') {
+            break;
+        }
+        ...
+    }
+}
+```
+
+This looks okay — `flag` is **local to `tokenize()`**, so it resets per file, not per line. That’s fine.
+
+But now look at the **actual bug**: in the test input, the line:
+```c
+printf("%d",a); // 输出 1
+```
+
+When the lexer sees `/` followed by `/`, it does `break`, which exits the `while (curPos < curLine.length())` loop — so the rest of the line (including the `;`) **is not tokenized**!
+
+Wait — no: the `;` appears **before** the `//`, so it should be tokenized.
+
+Let’s simulate:
+- Line: `printf("%d",a); // 输出 1`
+- Tokens before `//`: `printf`, `(`, `"%d"`, `,`, `a`, `)`, `;` → all should be processed.
+- Then space, then `/`, peek next is `/` → `break` → exit while loop.
+
+So `;` **is** tokenized. So why no output?
+
+Now look at the **expected output**: it includes `<Stmt>` for the `printf` call inside the block.
+
+But in the **buggy output**: "No output file"
+
+That means either:
+1. The parser encountered an error and wrote to `error.txt`, OR
+2. The AST was built but `postOrderPrint` output nothing.
+
+From the provided code, in `Compiler.java`:
+```java
+if (!lexer.isHasError() && !parser.hasError()) {
+    postOrderPrint(parser.getCompUnitNode(), parserWriter);
+} else {
+    // write errors
+}
+```
+
+So if **any error** is recorded, it writes to `error.txt`.
+
+Now, look at `Lexer.java` again — at the **end of the operator handling**:
+
+```java
+else if((currentChar == '&' && peekChar() != '&') ) {
+    tokens.add(new Token("&&", Type.AND, lineNum));
+    this.hasError = true;
+    ErrorInformation error = new ErrorInformation(lineNum,'a');
+    this.errorInformation.add(error);
+} else if ( (currentChar == '|' && peekChar() != '|')) {
+    tokens.add(new Token("||", Type.OR, lineNum));
+    this.hasError = true;
+    ErrorInformation error = new ErrorInformation(lineNum,'a');
+    this.errorInformation.add(error);
+}
+```
+
+This is **wrong**: if it sees a single `&`, it **adds a token `"&&"`** (which is incorrect!) and reports error 'a'.
+
+But in our test input, there is **no `&` or `|`**, so this shouldn't trigger.
+
+Then why no output?
+
+Now look at the **Parser's `parseMain()`**:
+
+```java
+private ASTNode parseMain() {
+    ASTNode main = new ASTNode(SynComponent.MainFuncDef,true,null,false);
+    main.addChild(new ASTNode(null, false, currentToken, true));
+    consume();//int
+    main.addChild(new ASTNode(null, false, currentToken, true));
+    consume();//main
+    main.addChild(new ASTNode(null, false, currentToken, true));
+    consume();//(
+    if (currentToken.getType() == Type.RPARENT) {
+        main.addChild(new ASTNode(null, false, currentToken, true));
+        consume(); // Expecting ')'
+    } else {
+        hasError = true;
+        errors.add(new ErrorInformation(beforeLine(),'j'));
+    }
+    ...
+}
+```
+
+In the test input: `int main() { ... }`
+
+Tokens: `INTTK`, `MAINTK`, `LPARENT`, `RPARENT`, ...
+
+So after consuming `(`, `currentToken` is `RPARENT` → condition passes.
+
+So no error.
+
+Now consider: **what if the lexer missed the `}` or `;`?**
+
+But expected output shows all tokens.
+
+Now, the **real smoking gun**: in the `Compiler.java`, the input file path is hardcoded:
+
+```java
+BufferedReader reader = new BufferedReader(new FileReader("C:\\Users\\86136\\Desktop\\hw2_Lexer\\hw2_Lexer\\testfile.txt"));
+```
+
+But the problem says: input is in `testfile.txt` (relative path).
+
+However, the assignment says: "The test program is provided in **testfile.txt**."
+
+But in the code, it's reading from an **absolute Windows path**.
+
+If the test environment runs in a different directory (e.g., Linux or different user), **`FileNotFoundError`** occurs.
+
+Look at the exception handler:
+
+```java
+} catch (FileNotFoundException e) {
+    System.err.println("File not found: " + e.getMessage());
+}
+```
+
+It **prints to stderr but does not create any output files**.
+
+And the observed behavior: **"No output file"**
+
+✅ This matches!
+
+But wait — the problem says: "Test Case Input: ..." and we're to assume the file exists.
+
+However, in the **provided code**, the path is **hardcoded to a specific Windows user directory**.
+
+In a grading environment, `testfile.txt` will be in the **current working directory**, not in `C:\\Users\\86136\\...`.
+
+So the program fails to open the file, catches `FileNotFoundException`, prints an error, and **exits without creating `parser.txt` or `error.txt`**.
+
+Thus, **no output file** is produced.
+
+### Therefore, the error is in `Compiler.java` — the hardcoded file path.
+
+<Compiler.java>
+...
+            BufferedReader reader = new BufferedReader(new FileReader("C:\\Users\\86136\\Desktop\\hw2_Lexer\\hw2_Lexer\\testfile.txt"));
+...

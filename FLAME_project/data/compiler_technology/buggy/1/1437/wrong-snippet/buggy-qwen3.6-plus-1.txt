@@ -1,0 +1,489 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The task is to implement a syntax analyzer that outputs syntax components for correct programs and error codes/line numbers for incorrect programs. Specifically, it needs to handle errors `j` (missing right parenthesis) and `e` (parameter type mismatch in function call).
+2.  **Test Case Input**: The input contains three specific errors:
+    *   Line 13: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);` -> Missing `)` at the end. Expected error `13 j`.
+    *   Line 15: `if (3 > 0 {` -> Missing `)` after `0`. Expected error `15 j`.
+    *   Line 20: `i = (((((f(str)))));` -> This is an assignment statement `LVal '=' Exp ';'`. The expression `Exp` contains a function call `f(str)`. `f` expects a `char[]`, but `str` is passed. In the context of the provided code structure, `f(str)` inside an expression is parsed as a `UnaryExp` -> `Ident '(' ... ')'`. The semantic analyzer checks parameter types. However, looking at the expected output, there is **no** error `e` reported for line 20. Wait, let's re-read the expected output.
+    *   **Expected Output**: `13 j`, `15 j`, `20 j`.
+    *   **Buggy Output**: `13 j`, `15 j`, `16 e`, `20 j`, `22 e`.
+    
+    Let's re-examine the input code around line 20 and 22.
+    Line 20: `i = (((((f(str))))); // error 3`
+    Line 22: `g(i + 1, arr);`
+    
+    The expected output says `20 j`. This implies that the parser considers line 20 to have a missing right parenthesis `j`.
+    Let's look at line 20 again: `i = (((((f(str)))));`
+    Count parens:
+    `(` (1)
+    `(` (2)
+    `(` (3)
+    `(` (4)
+    `(` (5)
+    `f(str)` -> `f` `(` `str` `)`
+    `)` (6)
+    `)` (7)
+    `)` (8)
+    `)` (9)
+    `)` (10)
+    `;`
+    
+    Wait, `f(str)` consumes one `(` and one `)`.
+    So we have 5 opening parens before `f`.
+    `f(str)` has 1 open, 1 close.
+    Then 5 closing parens.
+    Total opens: 6. Total closes: 6.
+    The statement is `i = ... ;`.
+    Why would line 20 be error `j`?
+    
+    Let's look at the Buggy Output vs Expected Output again.
+    Expected: `13 j`, `15 j`, `20 j`.
+    Buggy: `13 j`, `15 j`, `16 e`, `20 j`, `22 e`.
+    
+    The buggy output reports extra errors `16 e` and `22 e`.
+    Line 16: `g((((f(str)))), arr);`
+    Line 22: `g(i + 1, arr);`
+    
+    Function `g` is defined as `int g(int i, int arr[])`.
+    Call `g(..., arr)`: `arr` is `int[3]`. Parameter is `int[]`. This should be valid.
+    Call `g(..., arr)` on line 16: `arr` is `int[3]`. Parameter is `int[]`. This should be valid.
+    
+    Why does the semantic analyzer report error `e` (parameter type mismatch)?
+    In `SemanticAnalyzer.java`, `visitUnaryExp` handles function calls.
+    It checks if `paramsType.get(i)` matches `argsType.get(i)`.
+    For `g(int i, int arr[])`, `argsType` will be `[Int, IntArray]`.
+    
+    On line 22: `g(i + 1, arr)`.
+    Param 1: `i + 1`. `getTypeInExp` returns "0" (scalar/int). Matches `Int`.
+    Param 2: `arr`. `getTypeInExp` calls `getTypeInLVal`. `lVal` is `arr`. `lBrackToken` is null. Returns `arr`'s name.
+    `getSymbol("arr")` returns the symbol for `arr`.
+    `arr` is declared as `int arr[3];` in `main`.
+    In `visitVarDef`, `int arr[3]` creates a symbol with type `IntArray`.
+    So `paramsType` becomes `[Int, IntArray]`.
+    `argsType` is `[Int, IntArray]`.
+    They match. So why error `e`?
+    
+    Let's look at `visitFuncFParam` in `SemanticAnalyzer`.
+    `FuncFParam -> BType Ident ['[' ']']`.
+    For `int arr[]`, `lBrackToken` is not null.
+    Type is `IntArray`.
+    
+    Let's look at `visitVarDef` for `int arr[3]`.
+    `varDef.getConstExp()` is not null.
+    Type is `IntArray`.
+    
+    So types should match.
+    
+    However, look at the error `16 e` in buggy output.
+    Line 16: `g((((f(str)))), arr);`
+    `f(str)` returns `int` (since `f` is `int f(...)`).
+    So param 1 is `int`. Matches `int i`.
+    Param 2 is `arr`. Matches `int arr[]`.
+    
+    Why is `e` reported?
+    
+    Let's look at `getTypeInUnaryExp` in `SemanticAnalyzer`.
+    ```java
+    private String getTypeInUnaryExp(UnaryExp unaryExp) {
+        /* ident() 返回的不是数组 */
+        if (unaryExp.getIdent() != null) {
+            return "0";
+        } else if (unaryExp.getPrimaryExp() != null) {
+            return getTypeInPrimaryExp(unaryExp.getPrimaryExp());
+        } else {
+            return getTypeInUnaryExp(unaryExp.getUnaryExp());
+        }
+    }
+    ```
+    If `unaryExp.getIdent() != null`, it means it's a function call `Ident(...)`.
+    The code returns `"0"`. This implies that the result of a function call is always treated as a scalar (non-array), which is correct for `int` or `char` return types.
+    
+    Now look at `visitUnaryExp` where error `e` is generated.
+    ```java
+    List<SymbolType> paramsType = new ArrayList<>();
+    for (Exp exp: unaryExp.getFuncRParams().getExp()) {
+        String name = getTypeInExp(exp);
+        if (name.equals("0")) {
+            paramsType.add(SymbolType.Int);
+        } else {
+            Symbol param = getSymbol(name);
+            if (param != null) {
+                paramsType.add(param.getType());
+            } else {
+                return;
+            }
+        }
+    }
+    ```
+    If `getTypeInExp` returns a name (e.g., "arr"), it looks up the symbol.
+    If `arr` is an array, `param.getType()` is `IntArray`.
+    
+    Is it possible that `getSymbol` is failing or returning the wrong thing?
+    Or is the issue in how `FuncFParam` types are stored?
+    
+    Actually, let's look at the **Expected Output** again.
+    Expected: `13 j`, `15 j`, `20 j`.
+    
+    Why `20 j`?
+    Line 20: `i = (((((f(str)))));`
+    If the parser fails to parse this correctly, it might trigger a missing paren error.
+    
+    But the main discrepancy is the extra errors `16 e` and `22 e` in the buggy output.
+    The expected output does **not** have these errors.
+    This means the program *should not* report type mismatch errors for lines 16 and 22.
+    
+    Why does the current code report them?
+    
+    Let's trace `g(i+1, arr)` on line 22.
+    `visitStmt` -> `visitExp` -> ... -> `visitUnaryExp` for `g(...)`.
+    `funcSym` for `g`. Args: `i` (Int), `arr` (IntArray).
+    Params:
+    1. `i+1`. `getTypeInExp` -> `getTypeInAddExp`. `operater` not empty. Returns "0". `paramsType.add(Int)`. Correct.
+    2. `arr`. `getTypeInExp` -> `getTypeInAddExp` -> `getTypeInMulExp` -> `getTypeInUnaryExp`.
+       `unaryExp` for `arr` is a `PrimaryExp` containing `LVal`.
+       `getTypeInPrimaryExp` -> `getTypeInLVal`.
+       `lVal` is `arr`. `lBrackToken` is null.
+       Returns `lVal.getIdent().getContent()` which is "arr".
+       Back in `visitUnaryExp`: `name` is "arr".
+       `getSymbol("arr")`.
+       `arr` was declared in `main` block.
+       `curSymTab` is currently inside `main` block's scope?
+       `visitMainFuncDef` creates a symbol table for `main`.
+       `visitBlock` iterates items.
+       When visiting the statement `i = ...`, we are inside `main`'s symbol table.
+       `getSymbol` searches up from `curSymTab`.
+       It should find `arr`.
+       `param.getType()` is `IntArray`.
+       `argsType.get(1)` is `IntArray`.
+       Match.
+       
+    So why error `e`?
+    
+    Let's look closely at `visitFuncFParam`.
+    ```java
+    if (funcFParam.getlBrackToken() != null) {
+        if (funcFParam.getBType().getType().getContent().equals("int")) {
+            type = SymbolType.IntArray;
+        } else {
+            type = SymbolType.CharArray;
+        }
+        varSym = new VarSym(funcFParam.getIdent().getContent(), type, curScope, null, false, true);
+    }
+    ```
+    
+    And `visitVarDef` for `int arr[3]`.
+    ```java
+    if (varDef.getConstExp() != null) {
+        // ...
+        if (bType.getType().getContent().equals("int")) {
+            type = SymbolType.IntArray;
+        }
+        // ...
+        curSymTab.addSymbol(new VarSym(varDef.getIdent().getContent(), type, curScope, null, false, true));
+    }
+    ```
+    
+    Both are `IntArray`.
+    
+    Is it possible that `getSymbol` is finding a different `arr`? No, only one `arr`.
+    
+    Wait, look at `ErrorType.e` description in `SemanticAnalyzer`:
+    ```java
+    if (argsType.get(i) == SymbolType.Int || argsType.get(i) == SymbolType.Char) {
+        if (paramsType.get(i) == SymbolType.IntArray || ...) {
+             ErrorList.getInstance().addError(... ErrorType.e);
+        }
+    } else if (argsType.get(i) == SymbolType.IntArray) {
+        if (paramsType.get(i) != SymbolType.IntArray && paramsType.get(i) != SymbolType.ConstIntArray) {
+             ErrorList.getInstance().addError(... ErrorType.e);
+        }
+    }
+    ```
+    
+    If `paramsType.get(i)` is `IntArray` and `argsType.get(i)` is `IntArray`, it passes.
+    
+    Is it possible that `getTypeInExp` is returning something else?
+    
+    Let's look at `getTypeInLVal`:
+    ```java
+    private String getTypeInLVal(LVal lVal) {
+        if (lVal.getlBrackToken() != null) {
+            return "0";
+        } else {
+            return lVal.getIdent().getContent();
+        }
+    }
+    ```
+    
+    If `lVal` is `arr`, it returns "arr".
+    
+    There is a subtle bug in `visitUnaryExp` in `SemanticAnalyzer`.
+    
+    ```java
+    FuncSym funcSym = (FuncSym) getSymbol(unaryExp.getIdent().getContent());
+    if (funcSym == null) {
+        throw new RuntimeException("FuncSym is not found: " + unaryExp.getIdent().getContent());
+    }
+    ```
+    
+    If `getSymbol` returns a `VarSym` instead of `FuncSym` (e.g. if a variable shadows a function, though not allowed here), it would crash. But here `g` is a function.
+    
+    Let's look at the **Parser** logic for `Stmt`.
+    
+    The buggy output has `20 j`.
+    Line 20: `i = (((((f(str)))));`
+    
+    If the parser correctly parses this, there is no error `j`.
+    The fact that Expected Output has `20 j` suggests that the **reference solution** considers this an error, OR the test case description implies that line 20 *is* erroneous in a way that triggers `j`.
+    
+    Wait, look at the input again:
+    `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7); // error 1` -> Line 13. Missing `)`.
+    `if (3 > 0 { // error 2` -> Line 15. Missing `)`.
+    `i = (((((f(str))))); // error 3` -> Line 20.
+    
+    Why is line 20 an error `j`?
+    Count parens again.
+    `i = (` (1)
+    `(` (2)
+    `(` (3)
+    `(` (4)
+    `(` (5)
+    `f(str)` -> `f` `(` (6) `str` `)` (7)
+    `)` (8)
+    `)` (9)
+    `)` (10)
+    `)` (11)
+    `)` (12)
+    `;`
+    
+    Opens: 1 (after =) + 4 (before f) + 1 (in f) = 6.
+    Closes: 1 (in f) + 5 (after f) = 6.
+    
+    It seems balanced.
+    
+    However, look at the Buggy Output: `20 j`.
+    The Buggy Output MATCHES the Expected Output for line 20!
+    Expected: `13 j`, `15 j`, `20 j`.
+    Buggy: `13 j`, `15 j`, `16 e`, `20 j`, `22 e`.
+    
+    So the Parser IS reporting `20 j`. This means the Parser is likely correct (or consistently incorrect in a way that matches expectations) regarding line 20.
+    
+    The problem is the **extra** errors `16 e` and `22 e`.
+    
+    Why are `16 e` and `22 e` being reported?
+    
+    Let's look at `visitFuncFParam` again.
+    
+    ```java
+    private void visitFuncFParam(FuncFParam funcFParam, FuncSym funcSym) {
+        /* FuncFParam → BType Ident ['[' ']'] // b */
+        if (curSymTab.isExist(funcFParam.getIdent().getContent())) {
+            ErrorList.getInstance().addError(new Error(funcFParam.getIdent().getLine(), ErrorType.b));
+            return;
+        }
+        SymbolType type;
+        VarSym varSym;
+        if (funcFParam.getlBrackToken() != null) {
+            if (funcFParam.getBType().getType().getContent().equals("int")) {
+                type = SymbolType.IntArray;
+            } else {
+                type = SymbolType.CharArray;
+            }
+            varSym = new VarSym(funcFParam.getIdent().getContent(), type, curScope, null, false, true);
+        } else {
+            if (funcFParam.getBType().getType().getContent().equals("int")) {
+                type = SymbolType.Int;
+            } else {
+                type = SymbolType.Char;
+            }
+            varSym = new VarSym(funcFParam.getIdent().getContent(), type, curScope, null, false, false);
+        }
+        curSymTab.addSymbol(varSym);
+        funcSym.addArg(varSym);
+    }
+    ```
+    
+    And `visitUnaryExp` in `SemanticAnalyzer`:
+    
+    ```java
+    List<SymbolType> argsType = new ArrayList<>();
+    for (Symbol arg: funcSym.getArgs().values()) {
+        argsType.add(arg.getType());
+    }
+    ```
+    
+    The order of arguments in `funcSym.getArgs().values()` depends on the iteration order of the `HashMap` in `FuncSym`.
+    
+    ```java
+    public class FuncSym extends Symbol {
+        private Map<String, Symbol> args = new HashMap<>();
+        // ...
+    }
+    ```
+    
+    **`HashMap` does not guarantee insertion order!**
+    
+    In `visitFuncFParams`:
+    ```java
+    for (FuncFParam funcFParam: funcFParams.getFuncFParam()) {
+        visitFuncFParam(funcFParam, funcSym);
+    }
+    ```
+    This iterates in source order.
+    `funcSym.addArg(varSym)` puts them in the HashMap.
+    
+    Later, in `visitUnaryExp`:
+    ```java
+    for (Symbol arg: funcSym.getArgs().values()) {
+        argsType.add(arg.getType());
+    }
+    ```
+    This iterates over `HashMap.values()`. The order is **undefined**.
+    
+    If the order of `argsType` does not match the order of `paramsType` (which is derived from `unaryExp.getFuncRParams().getExp()` in source order), then the type checking will compare wrong parameters.
+    
+    For `g(int i, int arr[])`:
+    Source order: `i` (Int), `arr` (IntArray).
+    If HashMap iterates as `arr`, `i`:
+    `argsType` = `[IntArray, Int]`.
+    
+    Call `g(i+1, arr)`:
+    Params source order: `i+1` (Int), `arr` (IntArray).
+    `paramsType` = `[Int, IntArray]`.
+    
+    Comparison:
+    i=0: `argsType[0]` (IntArray) vs `paramsType[0]` (Int).
+    `argsType[0]` is `IntArray`.
+    Code:
+    ```java
+    else if (argsType.get(i) == SymbolType.IntArray) {
+        if (paramsType.get(i) != SymbolType.IntArray && paramsType.get(i) != SymbolType.ConstIntArray) {
+             ErrorList.getInstance().addError(... ErrorType.e);
+        }
+    }
+    ```
+    `paramsType[0]` is `Int`. `Int != IntArray`.
+    **Error `e` is added.**
+    
+    i=1: `argsType[1]` (Int) vs `paramsType[1]` (IntArray).
+    `argsType[1]` is `Int`.
+    Code:
+    ```java
+    if (argsType.get(i) == SymbolType.Int || argsType.get(i) == SymbolType.Char) {
+        if (paramsType.get(i) == SymbolType.IntArray || ...) {
+             ErrorList.getInstance().addError(... ErrorType.e);
+        }
+    }
+    ```
+    `paramsType[1]` is `IntArray`.
+    **Error `e` is added.**
+    
+    So, two errors `e` are reported for one function call if the order is swapped.
+    
+    This explains `16 e` and `22 e`.
+    
+    **Fix**: Use a `LinkedHashMap` in `FuncSym` to preserve insertion order, or use a `List` for arguments.
+
+<frontend/SemanticAnalyzer.java>
+...
+    private void visitUnaryExp(UnaryExp unaryExp) {
+        /* UnaryExp → PrimaryExp
+        * | Ident '(' [FuncRParams] ')' // c d e
+        * | UnaryOp UnaryExp */
+        if (unaryExp.getPrimaryExp() != null) {
+            visitPrimaryExp(unaryExp.getPrimaryExp());
+        } else if (unaryExp.getUnaryExp() != null) {
+            visitUnaryExp(unaryExp.getUnaryExp());
+        } else {
+            if (!containsSymbol(unaryExp.getIdent().getContent())) {
+                ErrorList.getInstance().addError(new Error(unaryExp.getIdent().getLine(), ErrorType.c));
+                return;
+            }
+            FuncSym funcSym = (FuncSym) getSymbol(unaryExp.getIdent().getContent());
+            if (funcSym == null) {
+                throw new RuntimeException("FuncSym is not found: " + unaryExp.getIdent().getContent());
+            }
+            if (unaryExp.getFuncRParams() == null) {
+                if (!funcSym.getArgs().isEmpty()) {
+                    ErrorList.getInstance().addError(new Error(unaryExp.getIdent().getLine(), ErrorType.d));
+                }
+            } else {
+                int paramNum = unaryExp.getFuncRParams().getExp().size();
+                int argNum = funcSym.getArgs().size();
+                if (paramNum != argNum) {
+                    ErrorList.getInstance().addError(new Error(unaryExp.getIdent().getLine(), ErrorType.d));
+                    return;
+                }
+                visitFuncRParams(unaryExp.getFuncRParams());
+
+                List<SymbolType> argsType = new ArrayList<>();
+                for (Symbol arg: funcSym.getArgs().values()) {
+                    argsType.add(arg.getType());
+                }
+                List<SymbolType> paramsType = new ArrayList<>();
+                for (Exp exp: unaryExp.getFuncRParams().getExp()) {
+                    String name = getTypeInExp(exp);
+                    if (name.equals("0")) {
+                        paramsType.add(SymbolType.Int);
+                    } else {
+                        Symbol param = getSymbol(name);
+                        if (param != null) {
+                            paramsType.add(param.getType());
+                        } else {
+                            return;
+                        }
+                    }
+                }
+                for (int i = 0; i < argsType.size(); i++) {
+                    if (argsType.get(i) == SymbolType.Int || argsType.get(i) == SymbolType.Char) {
+                        if (paramsType.get(i) == SymbolType.IntArray ||
+                                paramsType.get(i) == SymbolType.CharArray ||
+                                paramsType.get(i) == SymbolType.ConstIntArray ||
+                                paramsType.get(i) == SymbolType.ConstCharArray) {
+                            ErrorList.getInstance().addError(new Error(unaryExp.getIdent().getLine(), ErrorType.e));
+                            return;
+                        }
+                    } else if (argsType.get(i) == SymbolType.IntArray) {
+                        if (paramsType.get(i) != SymbolType.IntArray && paramsType.get(i) != SymbolType.ConstIntArray) {
+                            ErrorList.getInstance().addError(new Error(unaryExp.getIdent().getLine(), ErrorType.e));
+                            return;
+                        }
+                    } else if (argsType.get(i) == SymbolType.CharArray) {
+                        if (paramsType.get(i) != SymbolType.CharArray && paramsType.get(i) != SymbolType.ConstCharArray) {
+                            ErrorList.getInstance().addError(new Error(unaryExp.getIdent().getLine(), ErrorType.e));
+                            return;
+                        }
+                    } else {
+                        throw new RuntimeException("Unexcepted arg type: " + argsType.get(i));
+                    }
+                }
+            }
+        }
+    }
+...
+
+<symbol/FuncSym.java>
+package symbol;
+
+import java.util.HashMap;
+import java.util.Map;
+
+public class FuncSym extends Symbol {
+    private Map<String, Symbol> args = new HashMap<>();
+
+    public FuncSym(String name, SymbolType type, int scope) {
+        super(name, type, scope);
+    }
+
+    public Map<String, Symbol> getArgs() {
+        return args;
+    }
+
+    public boolean isExist(String name) {
+        return args.containsKey(name);
+    }
+
+    public void addArg(Symbol arg) {
+        args.put(arg.getName(), arg);
+    }
+}

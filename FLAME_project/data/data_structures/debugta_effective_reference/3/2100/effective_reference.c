@@ -1,0 +1,97 @@
+#include<stdio.h>
+#include<string.h>
+int isnumber(char c)
+{
+	return c>='0'&&c<='9';
+}
+char s1[105],ans[105];
+int main()
+{
+	int i,j,k;
+	gets(s1);
+	if(s1[1]=='.'&&s1[0]=='0')
+	{
+		for(i=2;;i++)
+		{
+			if(s1[i]>='1'&&s1[i]<='9')break;
+		}
+		j=i;//记录第一个非零数字出现的位置
+		ans[0]=s1[j];//把第一个非零数组存入 
+		if(s1[j+1]=='\0')
+		{
+			ans[1]='e';
+			ans[2]='-';
+			if(j-1<=9)
+			{
+				ans[3]=j-1+'0';
+				ans[4]='\0';
+			}
+			else 
+			{
+				ans[3]=(j-1)/10+'0';
+				ans[4]=(j-1)%10+'0';
+				ans[5]='\0';
+			}
+		 } 
+		 else
+		 {
+		 	ans[1]='.';
+		 	for(i=j+1,k=2;s1[i]!='\0';i++)
+		 	{
+		 		ans[k++]=s1[i];
+			 }
+			 ans[k++]='e';
+			 ans[k++]='-';
+			 if(j-1<=9)
+			 {
+			 	ans[k++]=j-1+'0';
+			 	ans[k]='\0';
+			 }
+			else 
+			{
+				ans[k++]=(j-1)/10+'0';
+				ans[k++]=(j-1)%10+'0';
+				ans[k]='\0';
+			}
+		 }
+	}
+	else if(s1[0]!='0'&&s1[1]=='.')
+	{
+		for(k=0,i=0;s1[i]!='\0';i++,k++)
+		{
+			ans[k]=s1[i];
+		}
+		ans[k++]='e';
+		ans[k++]='0';
+		ans[k]='\0';
+	}
+	else
+	{
+		ans[0]=s1[0];
+		ans[1]='.';
+		for(i=0;s1[i]!='\0';i++)
+		{
+			if(s1[i]=='.')break;
+		}
+		j=i;//记录小数点的位置
+		for(k=2,i=1;s1[i]!='\0';i++)
+		{
+			if(s1[i]!='.')ans[k++]=s1[i];
+		 } 
+		 ans[k++]='e';
+		 if(j-1<=9)
+		{
+			ans[k++]=j-1+'0';
+			ans[k]='\0';
+		}
+			else 
+			{
+				ans[k++]=(j-1)/10+'0';
+				ans[k++]=(j-1)%10+'0';
+				ans[k]='\0';
+			}
+	}
+	puts(ans);
+	return 0;
+}
+

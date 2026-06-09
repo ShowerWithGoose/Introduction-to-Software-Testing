@@ -1,0 +1,518 @@
+Looking at the test case input and expected output, I can see that there are three missing right parenthesis errors (error type 'j') on lines 13, 15, and 20.
+
+Let me analyze the problematic lines in the input:
+
+1. Line 13: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);` - Missing closing parenthesis
+2. Line 15: `if (3 > 0 {` - Missing closing parenthesis after condition
+3. Line 20: `i = (((((f(str)))));` - Missing closing parenthesis
+
+The issue is in the `PrimaryExp()` method in the Parser.java file. When parsing an expression inside parentheses like `( Exp )`, the parser should check for the closing parenthesis and report an error if it's missing.
+
+Looking at the `PrimaryExp()` method:
+
+```java
+private static AstNode PrimaryExp() {
+    AstNode node = new AstNode(AstType.PrimaryExp, now.line);
+    if (now.type == singleType('(')) {
+        pushToken(node, now); // (
+        node.add(Exp());
+        pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+    } else if (now.type == TokenType.IDENFR) {
+        node.add(LVal());
+    } else if (now.type == TokenType.INTCON) {
+        node.add(Number());
+    } else if (now.type == TokenType.CHRCON) {
+        node.add(Character());
+    }
+    return node;
+}
+```
+
+This looks correct. However, looking more carefully at the test case, the issue might be in how the error line number is being tracked. The `node.lstLine` should reflect the line of the last token processed before expecting the closing parenthesis.
+
+But actually, looking at the Stmt() method for the if statement:
+
+```java
+if (now.type == TokenType.IFTK) {
+    pushToken(node, now); // if
+    pushToken(node, now); // (
+    node.add(Cond());
+    pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+    node.add(Stmt());
+    ...
+}
+```
+
+And in the MainFuncDef():
+
+```java
+private static AstNode MainFuncDef() {
+    AstNode node = new AstNode(AstType.MainFuncDef, now.line);
+    pushToken(node, now); // int
+    pushToken(node, now); // main
+    pushToken(node, now); // (
+    pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+    node.add(Block());
+    return node;
+}
+```
+
+The problem appears to be that when there's a missing closing parenthesis in nested expressions like `(1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7)`, the error should be detected in the `PrimaryExp()` method, but the line number tracking might not be working correctly.
+
+However, looking more closely at the actual issue: the test case shows that all three errors should be reported as type 'j' (missing right parenthesis), but the program isn't reporting them at all (empty output vs expected "13 j", "15 j", "20 j").
+
+The real issue is likely in the `pushToken` method that takes an error parameter. Let me check that:
+
+```java
+private static void pushToken(AstNode node, Token token, TokenType type, ErrInfo errInfo) {
+    if (token.type == type) {
+        pushToken(node, token);
+    } else {
+        ErrHandler.addError(errInfo);
+    }
+}
+```
+
+This method doesn't advance the token index when there's an error! This means that when a closing parenthesis is missing, the parser adds an error but doesn't consume any token, which could cause the parser to get stuck or not continue properly.
+
+But wait, looking at the test input again:
+- Line 13: The expression has unbalanced parentheses - 3 opening but only 2 closing
+- Line 15: `if (3 > 0 {` - missing closing parenthesis after condition  
+- Line 20: `i = (((((f(str)))));` - 6 opening but only 5 closing
+
+The parser should detect these missing closing parentheses in:
+1. `PrimaryExp()` for the arithmetic expression (line 13)
+2. `Stmt()` in the if-statement handling (line 15) 
+3. `PrimaryExp()` for the nested function call expression (line 20)
+
+However, I notice that in the `UnaryExp()` method, there's also a closing parenthesis check:
+
+```java
+} else if (peek(1).type == singleType('(')) {
+    pushToken(node, now); // Ident
+    pushToken(node, now); // (
+    if (expFirst()) { // not sure ???
+        node.add(FuncRParams());
+    }
+    pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+}
+```
+
+But the main issue seems to be that the parser might not be reaching these error checks because of how the grammar is structured.
+
+Looking at line 15 specifically: `if (3 > 0 {`
+The parser should parse this as:
+- `if` keyword
+- `(` token  
+- `Cond()` which parses `3 > 0`
+- Then expect `)` but finds `{` instead
+
+This should trigger the error in the `Stmt()` method's if-block.
+
+Similarly, line 13: The expression `(1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7)` should be parsed by `PrimaryExp()` which expects a closing `)` after parsing the `Exp()`.
+
+The issue might be that the parser is not properly handling the case where the expected token is missing, and the error handling isn't working as expected.
+
+But looking at the actual code structure, I think the problem is in the `PrimaryExp()` method. When it encounters an opening parenthesis `(`, it parses the expression inside, but if the closing parenthesis is missing, it should report error 'j'. However, the current implementation should do exactly that.
+
+Wait, let me look at the test case more carefully. The expected output shows errors on lines 13, 15, and 20, but the buggy output is empty. This suggests that the errors are not being detected at all.
+
+Looking at the `pushToken` method again:
+
+```java
+private static void pushToken(AstNode node, Token token, TokenType type, ErrInfo errInfo) {
+    if (token.type == type) {
+        pushToken(node, token);
+    } else {
+        ErrHandler.addError(errInfo);
+    }
+}
+```
+
+The problem is that this method doesn't call `next()` when there's an error! So when a closing parenthesis is expected but not found, the parser adds an error but stays on the same token, which could cause infinite loops or prevent further parsing.
+
+However, in this specific case, since we're expecting a `)` but finding something else (like `;` or `{`), the parser should add the error and continue. But without advancing the token, subsequent parsing might fail.
+
+But actually, looking at the grammar and the specific test cases, I think the real issue is in the `PrimaryExp()` method. Let me trace through line 13:
+
+`int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);`
+
+When parsing the expression after `=`, it goes to `Exp()` -> `AddExp()` -> `MulExp()` -> `UnaryExp()` -> `PrimaryExp()`.
+
+In `PrimaryExp()`, it sees `(`, consumes it, then calls `Exp()` to parse everything inside. The inner `Exp()` will parse `1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7` completely, and then `PrimaryExp()` expects a `)` but finds `;` instead.
+
+So it should call `pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));` which should add error 'j'.
+
+The same logic applies to the other cases.
+
+Given that the output is completely empty (no errors reported), I suspect the issue might be that `ErrHandler.hasErr()` is returning false, or the errors are not being added properly.
+
+But looking at the `Compiler.main()` method:
+
+```java
+IO.printTokens(tokens);
+AstNode root = Parser.parse(tokens);
+if (Config.taskType == Config.TaskType.PARSER && !ErrHandler.hasErr()) {
+    IO.printAst(root);
+}
+
+if (ErrHandler.hasErr()) {
+    ErrHandler.printErrs();
+}
+```
+
+The issue might be that `ErrHandler.hasErr()` is not detecting the errors, or the errors are being added but not printed.
+
+However, the most likely culprit is in the error handling within the parser methods themselves. Looking at the `Stmt()` method, there's a complex lookahead mechanism for handling LVal vs Exp that uses `ErrHandler.close()` and `ErrHandler.open()`. This could be interfering with error detection.
+
+Specifically, in the `Stmt()` method:
+
+```java
+} else if (now.type == TokenType.IDENFR && peek(1).type != singleType('(')) {
+    // Exp begins with Ident in two cases:  Exp -> LVal, Ident '(' [FuncRParams] ')'
+    // so if it is not the second case, we can always parse a LVal
+    int lstIndex = index;
+    ErrHandler.close();
+    LVal(); // parse a LVal
+    ErrHandler.open();
+    Token nextToken = now;
+    index = lstIndex;
+    now = tokens.get(index);
+    if (nextToken.type == singleType('=')) {
+        // it is actually LVal, aad it into node
+        node.add(LVal()); // rerun to make ErrHandler work
+        pushToken(node, now); // =
+        if (now.type == TokenType.GETINTTK || now.type == TokenType.GETCHARTK) {
+            pushToken(node, now); // getInt / getChar
+            pushToken(node, now); // (
+            pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+            pushToken(node, now, singleType(';'), new ErrInfo(ErrType.i, node.lstLine));
+        } else {
+            node.add(Exp());
+            pushToken(node, now, singleType(';'), new ErrInfo(ErrType.i, node.lstLine));
+        }
+    } else {
+        // it is not LVal but Exp, go back and parse Exp
+        // one LVal can be parsed at most two times so it is still O(n)
+        node.add(Exp());
+        pushToken(node, now, singleType(';'), new ErrInfo(ErrType.i, node.lstLine));
+    }
+}
+```
+
+The problem is that when `ErrHandler.close()` is called, any errors detected during the speculative `LVal()` parsing are discarded. But if the `LVal()` parsing itself encounters a missing parenthesis error, that error would be suppressed.
+
+However, in our test cases:
+- Line 13: This is a simple assignment `int i = (...);` which should be handled by the `VarDef()` method in `VarDecl()`, not by the complex LVal/Exp logic in `Stmt()`.
+- Line 15: This is an if statement, handled directly in `Stmt()`.
+- Line 20: This is an assignment statement `i = ...;` which would go through the LVal/Exp logic in `Stmt()`.
+
+For line 13, the error should be detected in `VarDef()` -> `InitVal()` -> `Exp()` -> `AddExp()` -> ... -> `PrimaryExp()`.
+
+For line 20, it would go through the LVal/Exp logic, and during the speculative parsing, errors might be suppressed.
+
+But the main issue I'm seeing is that the `PrimaryExp()` method should be detecting the missing closing parenthesis, but it's not happening.
+
+Looking more carefully at the `PrimaryExp()` method, I notice that it only handles the case where `now.type == singleType('(')`. But what if there are other tokens? The method doesn't have a default case or error handling for unexpected tokens.
+
+However, that shouldn't be the issue here since we do have opening parentheses.
+
+After careful analysis, I believe the issue is in the `pushToken` method that doesn't advance the token stream when an error occurs. This can cause the parser to get stuck or not continue parsing, but in this case, since we have multiple errors, it should still detect them.
+
+Actually, looking at the expected behavior: the parser should report errors and continue parsing to find more errors. But if the `pushToken` method doesn't advance on error, then after the first error, the parser might be stuck on the same token.
+
+But in the test case, we need to report 3 errors, so the parser must continue.
+
+Let me reconsider. The real issue might be simpler. Looking at line 13:
+
+`int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);`
+
+This is inside a variable declaration, so it's parsed by `VarDef()` -> `InitVal()` -> `Exp()`.
+
+The `Exp()` calls `AddExp()`, which eventually calls `PrimaryExp()` for the outermost `(`.
+
+`PrimaryExp()` consumes `(`, calls `Exp()` for the inner content, which successfully parses `1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7`, and then `PrimaryExp()` expects `)` but finds `;`.
+
+So it should call `pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));`
+
+The `node.lstLine` at this point should be the line number of the last token in the expression, which is `7` on line 13.
+
+This should work correctly.
+
+Similarly for line 20: `i = (((((f(str)))));`
+
+This goes through `Stmt()` -> complex LVal/Exp logic -> eventually `PrimaryExp()` for each level of parentheses.
+
+The innermost is `f(str)` which is fine, but then there are 5 closing parentheses for 6 opening ones, so the outermost `PrimaryExp()` should detect the missing `)`.
+
+For line 15: `if (3 > 0 {`
+
+This is handled in `Stmt()` -> if branch, which calls `Cond()` to parse `3 > 0`, then expects `)` but finds `{`, so it should report error 'j'.
+
+All of these should work with the current code.
+
+But the output is empty, which suggests that either:
+1. Errors are not being added to `ErrHandler`
+2. `ErrHandler.hasErr()` is returning false
+3. The errors are being cleared somewhere
+
+Looking at the `Compiler.main()` method again:
+
+```java
+IO.printTokens(tokens);
+AstNode root = Parser.parse(tokens);
+if (Config.taskType == Config.TaskType.PARSER && !ErrHandler.hasErr()) {
+    IO.printAst(root);
+}
+
+if (ErrHandler.hasErr()) {
+    ErrHandler.printErrs();
+}
+```
+
+Wait! There's a call to `IO.printTokens(tokens);` before parsing. This sets the output file to `lexer.txt`. Then `Parser.parse(tokens)` runs, and if there are no errors, it prints the AST to `parser.txt`. If there are errors, it prints errors to `error.txt`.
+
+But the issue might be that `ErrHandler` is not being reset between runs, but that shouldn't matter for a single run.
+
+Actually, I think I found the issue. In the `Compiler.main()` method:
+
+```java
+if (Config.taskType == Config.TaskType.LEXER && !ErrHandler.hasErr()) {
+    IO.printTokens(tokens);
+}
+IO.printTokens(tokens);  // <-- This line is suspicious!
+```
+
+The second `IO.printTokens(tokens);` call will overwrite the output file setting. But more importantly, looking at the `IO.printTokens` method:
+
+```java
+public static void printTokens(ArrayList<Token> tokens) {
+    setOut(Config.lexerOutputFile);
+    for(Token token : tokens) {
+        writeln(token.toString());
+    }
+}
+```
+
+This sets the output to `lexer.txt`. Then later, when printing AST or errors, it should set the output to the appropriate file.
+
+But the real issue might be elsewhere.
+
+After careful analysis, I believe the problem is in the `PrimaryExp()` method. Let me look at it again:
+
+```java
+private static AstNode PrimaryExp() {
+    AstNode node = new AstNode(AstType.PrimaryExp, now.line);
+    if (now.type == singleType('(')) {
+        pushToken(node, now); // (
+        node.add(Exp());
+        pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+    } else if (now.type == TokenType.IDENFR) {
+        node.add(LVal());
+    } else if (now.type == TokenType.INTCON) {
+        node.add(Number());
+    } else if (now.type == TokenType.CHRCON) {
+        node.add(Character());
+    }
+    return node;
+}
+```
+
+What happens if `now.type` is none of these? For example, if we have an unexpected token, the method returns an empty node. But in our case, we do have `(`, so that's not the issue.
+
+I think the actual bug is in the error reporting line number. The `node.lstLine` might not be correctly updated to reflect the line where the error should be reported.
+
+According to the problem description:
+- For error 'j' (missing right parenthesis), "the error line number corresponds to the line where the last non-terminal before the right parenthesis is located."
+
+In the case of `PrimaryExp()`, after parsing `Exp()`, the `node.lstLine` should be the line of the last token in the `Exp()`, which is correct.
+
+But let's look at the `pushToken` method again:
+
+```java
+private static void pushToken(AstNode node, Token token, TokenType type, ErrInfo errInfo) {
+    if (token.type == type) {
+        pushToken(node, token);
+    } else {
+        ErrHandler.addError(errInfo);
+    }
+}
+```
+
+The issue is that when the expected token is not found, the method adds the error but does NOT consume any token. This means the parser remains on the current token, which could be a problem for continued parsing.
+
+However, for error reporting purposes, this should still work - the error gets added, and when the parser eventually tries to consume that token in another context, it might fail again.
+
+But in practice, for the given test cases, this should still result in the errors being reported.
+
+Given the time and the evidence, I believe the most likely location of the error is in the `PrimaryExp()` method, specifically in how it handles the missing closing parenthesis. However, the code looks correct.
+
+Wait! I just noticed something critical. In the test case line 13:
+
+`int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);`
+
+This is actually inside a **variable declaration**, not a statement. So it's parsed by `VarDef()` -> `InitVal()` -> `Exp()`.
+
+But looking at the `InitVal()` method:
+
+```java
+private static AstNode InitVal() {
+    AstNode node = new AstNode(AstType.InitVal, now.line);
+    if (now.type == singleType('{')) {
+        pushToken(node, now);
+        if (now.type != singleType('}')) {
+            node.add(Exp());
+            while (now.type == singleType(',')) {
+                pushToken(node, now);
+                node.add(Exp());
+            }
+        }
+        pushToken(node, now);
+    } else if (now.type == TokenType.STRCON) {
+        pushToken(node, now);
+    } else {
+        node.add(Exp());
+    }
+    return node;
+}
+```
+
+The `InitVal()` method calls `Exp()`, which should handle the parentheses correctly.
+
+But here's the key insight: the `Exp()` method calls `AddExp()`, which builds an AST using the `form()` method. The `form()` method creates intermediate nodes, but the line number tracking should still work.
+
+After extensive analysis, I think the issue might be more subtle. Let me look at the `UnaryExp()` method:
+
+```java
+private static AstNode UnaryExp() {
+    AstNode node = new AstNode(AstType.UnaryExp, now.line);
+    if (now.type == singleType('+') || now.type == singleType('-')
+            || now.type == singleType('!')) {
+        node.add(UnaryOp());
+        node.add(UnaryExp());
+    } else if (peek(1).type == singleType('(')) {
+        pushToken(node, now); // Ident
+        pushToken(node, now); // (
+        if (expFirst()) { // not sure ???
+            node.add(FuncRParams());
+        }
+        pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+    } else {
+        node.add(PrimaryExp());
+    }
+    return node;
+}
+```
+
+Ah! Here's a potential issue. The condition `else if (peek(1).type == singleType('('))` is checking if the next token is `(`, which would indicate a function call. But what if we have a parenthesized expression like `(1 + 2)`? In that case, `now.type` would be `(`, not an identifier, so it would go to the `else` branch and call `PrimaryExp()`.
+
+That seems correct.
+
+But for line 20: `i = (((((f(str)))));`
+
+This starts with `i` (IDENFR), then `=`, then `(`. So when parsing the RHS expression, `now.type` is `(`, so it goes to `PrimaryExp()`.
+
+`PrimaryExp()` sees `(`, consumes it, then calls `Exp()` on the rest: `((((f(str)))));`
+
+The `Exp()` will eventually lead to another `PrimaryExp()` for the next `(`, and so on.
+
+The innermost will be `f(str)`, which is parsed by `UnaryExp()` as a function call.
+
+Then we have 5 closing parentheses, but we need 6, so the outermost `PrimaryExp()` should detect the missing `)`.
+
+This should work.
+
+Given all this analysis, I think the most likely issue is in the error handling mechanism itself. But since I need to provide a specific code snippet, and the errors are all related to missing closing parentheses, the common location is the `pushToken` calls that check for `singleType(')')`.
+
+However, looking at the three locations where missing `)` errors should be detected:
+
+1. `PrimaryExp()` - for parenthesized expressions
+2. `Stmt()` - for if/for/printf statements  
+3. `FuncDef()` and `MainFuncDef()` - for function definitions
+4. `UnaryExp()` - for function calls
+
+For the given test cases:
+- Line 13: `PrimaryExp()`
+- Line 15: `Stmt()` (if statement)
+- Line 20: `PrimaryExp()` (nested parentheses)
+
+So the issue is likely in the `PrimaryExp()` method and the `Stmt()` method's if-handling.
+
+But the code looks correct. 
+
+Wait! I just realized something important. In the `Stmt()` method, for the if statement:
+
+```java
+pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+```
+
+The `node.lstLine` at this point is the line of the last token in the `Cond()`, which is correct.
+
+But what if the `Cond()` parsing didn't update the `lstLine` properly?
+
+Looking at the `Cond()` method:
+
+```java
+private static AstNode Cond() {
+    AstNode node = new AstNode(AstType.Cond, now.line);
+    node.add(LOrExp());
+    return node;
+}
+```
+
+And `LOrExp()` uses the `form()` method which should properly update line numbers.
+
+I think I need to focus on the most likely culprit. Given that all three errors are type 'j' (missing right parenthesis), and they're not being reported at all, the issue is probably in the error reporting mechanism.
+
+But looking back at the `Compiler.main()` method, I notice:
+
+```java
+IO.printTokens(tokens);
+AstNode root = Parser.parse(tokens);
+if (Config.taskType == Config.TaskType.PARSER && !ErrHandler.hasErr()) {
+    IO.printAst(root);
+}
+
+if (ErrHandler.hasErr()) {
+    ErrHandler.printErrs();
+}
+```
+
+The call to `IO.printTokens(tokens);` happens unconditionally, which sets the output file to `lexer.txt`. Then, if there are no errors, it prints the AST to `parser.txt`. If there are errors, it prints errors to `error.txt`.
+
+This should work correctly.
+
+After careful consideration, I believe the issue is in the `pushToken` method that doesn't advance the token stream on error. This can cause the parser to not continue properly, but more importantly, it might cause the parser to miss subsequent errors.
+
+However, for the purpose of this exercise, I need to identify the specific code location. Given that all three errors are missing closing parentheses, and they should be detected in `PrimaryExp()` and `Stmt()`, but the most fundamental location is `PrimaryExp()`.
+
+But looking at the test case again, line 13 is in a variable initialization, which goes through `InitVal()` -> `Exp()` -> `PrimaryExp()`.
+
+Line 20 is in a statement assignment, which goes through `Stmt()` -> `Exp()` -> `PrimaryExp()`.
+
+Line 15 is in an if statement condition, which goes through `Stmt()` directly.
+
+So the common thread is that the error detection code is there, but it's not working.
+
+I think the actual bug is in the `pushToken` method implementation. It should advance the token even when there's an error, or at least handle the error differently.
+
+But since I have to choose a specific code snippet, and the problem is that missing closing parentheses are not being reported, I'll go with the `PrimaryExp()` method as the most likely location, since two out of three errors involve parenthesized expressions.
+
+<astGen/Parser.java>
+...
+    private static AstNode PrimaryExp() {
+        AstNode node = new AstNode(AstType.PrimaryExp, now.line);
+        if (now.type == singleType('(')) {
+            pushToken(node, now); // (
+            node.add(Exp());
+            pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+        } else if (now.type == TokenType.IDENFR) {
+            node.add(LVal());
+        } else if (now.type == TokenType.INTCON) {
+            node.add(Number());
+        } else if (now.type == TokenType.CHRCON) {
+            node.add(Character());
+        }
+        return node;
+    }
+...

@@ -1,0 +1,245 @@
+**Summary of the Problem:**
+The program is a lexical analyzer. It failed a test case where the input source code contains a single `&` character on line 25 (`if ('a' <= str[i] & str[i] <= 'z')`). The expected output is an error report `25 a` (indicating error type 'a' at line 25). However, the program output `10 a`. This indicates that the lexer is incorrectly reporting the line number of the error. It seems to be detecting the error at line 10 instead of line 25.
+
+Looking at the code, the `Lexer` class maintains a `line` variable. The `getToken` method checks for errors like standalone `&` or `|`. When such an error is found, it adds an `Error` object with the current `line` number.
+
+The issue likely stems from how the `line` number is updated or how the error is detected.
+In `Lexer.java`, inside `getToken`, there is a block handling delimiters. At the end of this block:
+```java
+            } else if (myMatch("&") != null || myMatch("\\|") != null)  {
+                errors.add(new Error(line, "a"));
+            }
+```
+This code adds an error if it matches a single `&` or `|`. However, `myMatch` checks if the pattern matches *starting at the current position `pos`*. If it matches, it returns the string, but the code here doesn't consume the token (it doesn't return a Token object, nor does it advance `pos` explicitly in this branch, although the main loop in `lex()` advances `pos` by 1 if `getToken` returns null).
+
+Wait, let's look at the flow in `lex()`:
+```java
+        while (pos < sourceCode.length()) {
+            Token token = getToken();
+            if (token != null) {
+                pos += token.getContent().length();
+                line += token.getContent().split("\n").length - 1;
+                // ... add to tokens
+            } else {  // 这儿关于出错的情况，我只考虑了“&”和“|”这两种（毕竟评测说了就这两种错误）
+                pos++;
+            }
+        }
+```
+If `getToken` finds an error (standalone `&` or `|`), it adds the error to the list but returns `null` (implicitly, as there is no return statement in that `else if` block). Consequently, the `lex()` loop executes the `else` branch, incrementing `pos` by 1. It does *not* update the `line` number in the `else` branch.
+
+The `line` number is only updated when a valid `Token` is returned and processed in the `if (token != null)` block.
+However, the `line` variable is also updated inside `getToken`? No, `line` is a member variable. It is initialized to 1. It is updated in `lex()` based on the content of the returned token.
+
+Let's trace what happens before line 25.
+Line 10 in the input is:
+`void _strcat(char str1[],char str2[]) {`
+There are no `&` or `|` here.
+
+Why would it report line 10?
+Let's look at the `myMatch` function and how tokens are consumed.
+If `getToken` returns a token, `pos` and `line` are updated in `lex()`.
+If `getToken` returns `null` (error case or unrecognized char), `pos` increments by 1, but `line` is NOT updated.
+
+This is a critical bug. If an error occurs, or if any character is skipped via the `else` branch in `lex()`, the `line` counter stops updating correctly for subsequent characters if newlines are skipped this way. But wait, standard characters like `&` don't contain newlines. So skipping one char doesn't change the line.
+
+However, consider if there was a newline character skipped? No, `\s+` matches whitespace including newlines and returns a `Blank` token. So newlines should be consumed as `Blank` tokens, triggering the line update logic in `lex()`.
+
+Let's re-examine the error detection logic in `getToken`:
+```java
+            } else if (myMatch("&") != null || myMatch("\\|") != null)  {
+                errors.add(new Error(line, "a"));
+            }
+```
+If `myMatch("&")` succeeds, it means the current character is `&`. It adds the error. It does NOT return a token. So `getToken` returns `null`.
+Back in `lex()`, `pos` increments by 1. `line` remains unchanged.
+
+Is it possible that the `line` variable is incorrect *before* reaching line 25?
+Or is the error detected earlier?
+The input has `_strlen` calls.
+Line 10: `void _strcat(char str1[],char str2[]) {`
+Line 25: `if ('a' <= str[i] & str[i] <= 'z')`
+
+If the output is `10 a`, it means when the error was added, `line` was 10.
+This implies the lexer thought it was on line 10 when it encountered the `&` on line 25.
+This suggests that the `line` variable was not updated correctly between line 10 and line 25.
+
+Why would `line` not update?
+`line` updates only when a token is returned.
+Tokens include `Blank` which matches `\s+`.
+Does `\s+` match newlines? Yes.
+So, normally, every newline is part of a `Blank` token (or preceding/following whitespace), causing `line` to increment.
+
+However, look at the order of matching in `getToken`.
+1. Comments
+2. Keywords
+3. Ident
+4. String
+5. Char
+6. Int
+7. Blank (`\s+`)
+8. Delimiters
+
+If there is a newline, it should be caught by `Blank`.
+Unless... the `Blank` token matching fails or is skipped?
+No, `myMatch("\\s+")` should work.
+
+Let's look closely at the `myMatch` implementation:
+```java
+    private String myMatch(String regex) {
+        Pattern pattern = Pattern.compile(regex);
+        Matcher matcher = pattern.matcher(sourceCode);
+        // 从 index 处开始匹配，然后检验是否匹配
+        if (matcher.find(pos) && matcher.start() == pos) {
+            return matcher.group();
+        } else {
+            return null;
+        }
+    }
+```
+This looks correct for matching at the current position.
+
+Is there any case where a newline is NOT consumed as a `Blank` token?
+What if the newline is inside a string or char constant?
+`StringCon` and `CharCon` handle their own endings. They return tokens. The `lex()` loop updates `line` based on the token content.
+`StringCon.getString` finds the closing quote. It doesn't count newlines internally for the `line` update in `lex()`.
+Wait!
+In `lex()`:
+```java
+                line += token.getContent().split("\n").length - 1;
+```
+If a String token spans multiple lines (which is usually illegal in C-like languages but depends on grammar), the line count would update. But typically strings are single line.
+
+Let's look at `CharCon`.
+```java
+    public static int getChar(String sourceCode, int pos) {
+        if (sourceCode.charAt(pos + 1) == '\\') {
+            return pos + 4;
+        } else {
+            return pos + 3;
+        }
+    }
+```
+This assumes fixed length. `'a'` is 3 chars. `'\n'` is 4 chars.
+
+Let's look at the specific error line 25:
+`if ('a' <= str[i] & str[i] <= 'z')`
+
+Before this line, we have lines 11-24.
+Line 11: `int i,len1 = _strlen(str1),len2 = _strlen(str2);`
+Line 12: `for (i = 0;i < len2 + 1;i = i + 1) {`
+...
+Line 24: `}`
+
+If the `line` variable is stuck at 10, it means no tokens containing newlines were processed between line 10 and 25? That's impossible. There are many newlines.
+
+Alternative hypothesis:
+The error is NOT at line 25 in the lexer's view, but detected earlier?
+No, the only `&` is at line 25. The previous `&` might be in `&&`?
+Line 10 has no `&`.
+Line 11-24 have no `&` or `|`.
+
+Let's check if there is a bug in how `line` is updated.
+```java
+                line += token.getContent().split("\n").length - 1;
+```
+If `token.getContent()` is `" \n"`, split gives `[" ", ""]`? No, `" \n".split("\n")` results in `[" "]` if trailing empty strings are discarded?
+Java's `String.split` discards trailing empty strings by default.
+`" \n".split("\n")` -> `[" "]`. Length 1. `1 - 1 = 0`. Line does NOT increment.
+`"\n".split("\n")` -> `[]`. Length 0. `0 - 1 = -1`. Line decrements?
+`" \n ".split("\n")` -> `[" ", " "]`. Length 2. `2 - 1 = 1`. Line increments.
+
+This is a very common bug with `split`.
+If a line ends with `\n`, and the token is just `\n` (or whitespace ending in `\n`), `split("\n")` might not count the newline correctly if it's at the end of the string.
+
+Example:
+Token content: `"\n"`
+`"\n".split("\n")` returns an empty array `[]` in Java?
+Actually:
+```java
+System.out.println("\n".split("\n").length); // Prints 0
+```
+So `line += 0 - 1` => `line -= 1`.
+
+Token content: `" \n"`
+`" \n".split("\n")` returns `[" "]`. Length 1.
+`line += 1 - 1` => `line += 0`.
+
+Token content: `"\n "`
+`"\n ".split("\n")` returns `["", " "]`. Length 2.
+`line += 2 - 1` => `line += 1`.
+
+So, if a `Blank` token consists of spaces followed by a newline (e.g., `"    \n"`), `split("\n")` produces `["    "]`. Length 1. Update is 0. The newline is effectively ignored for line counting!
+If a `Blank` token is just a newline `"\n"`, update is -1.
+If a `Blank` token is `"\n    "`, update is 1.
+
+In typical code, indentation follows newlines. So `\n` is often followed by spaces/tabs.
+If the source is:
+`...\n    int...`
+The lexer might match `\n    ` as a single `Blank` token?
+Regex `\s+` is greedy. It will match `\n    ` as one token.
+Content: `"\n    "`
+Split: `["", "    "]`. Length 2. Update: +1. Correct.
+
+But what if the newline is at the END of the file? Or before EOF?
+Or what if there is a blank line?
+`\n\n`
+Matched as one token `\n\n`.
+Split: `["", "", ""]`? No, trailing empties discarded. `["", ""]`. Length 2. Update +1.
+But there are TWO newlines. So line should increase by 2.
+`"\n\n".split("\n")` -> `["", ""]`. Length 2. `2-1=1`. Only increases by 1. Error!
+
+So, using `split("\n").length - 1` is fundamentally flawed for counting newlines because it misses trailing empty strings which represent consecutive newlines or newlines at the end.
+
+Correct way:
+Count occurrences of `\n` in the string.
+```java
+int count = 0;
+for (char c : token.getContent().toCharArray()) {
+    if (c == '\n') count++;
+}
+line += count;
+```
+
+Because of this bug, the `line` number drifts. It likely undercounts the number of newlines.
+In the test case, there are many lines. If each blank line or specific whitespace pattern causes an undercount, the internal `line` variable will be smaller than the actual line number.
+The output `10 a` instead of `25 a` suggests a significant drift (15 lines missing).
+
+Let's verify the drift.
+Lines 1-9 are processed.
+Line 10: `void _strcat...`
+If the drift accumulates to 15 lines by the time we reach line 25, then when the error is detected at actual line 25, the internal `line` variable is 10.
+
+This confirms the location of the error is in the line counting logic in `Compiler.java` (inside the `lex()` loop processing).
+
+<Compiler.java>
+...
+        Lexer lexer = new Lexer(sourceCode.toString(), errors);
+        ArrayList<Token> tokens = lexer.lex();
+//        System.out.println(lexer.showLexerResult());
+
+        if (errors.isEmpty()) {
+...
+</Compiler.java>
+
+The error is actually in `frontend/Lexer.java` inside the `lex()` method where `line` is updated.
+
+<frontend/Lexer.java>
+...
+    public ArrayList<Token> lex() {
+        while (pos < sourceCode.length()) {
+            Token token = getToken();
+            if (token != null) {
+                pos += token.getContent().length();
+                line += token.getContent().split("\n").length - 1;
+                if (token.getType() != TokenType.BLANK &&
+                        token.getType() != TokenType.LINECOMMENT &&
+                        token.getType() != TokenType.BLOCKCOMMENT) {
+                    tokens.add(token);
+                }
+            } else {  // 这儿关于出错的情况，我只考虑了“&”和“|”这两种（毕竟评测说了就这两种错误）
+                pos++;
+            }
+        }
+        return tokens;
+    }
+...

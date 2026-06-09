@@ -1,0 +1,719 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The program performs syntax analysis. It needs to detect specific syntax errors:
+    *   `a`: Single `&` or `|` used instead of `&&` or `||`.
+    *   `i`: Missing semicolon.
+    *   `j`: Missing right parenthesis `)`.
+    *   `k`: Missing right square bracket `]`.
+
+2.  **Test Case Input**:
+    ```c
+    ...
+    ch = getchar( ; // error 1 (Line 16): Missing ')' -> Error 'j' expected at line 16.
+    
+    if (f2() & f1()) { // error 2 (Line 18): Single '&' -> Error 'a' expected at line 18.
+        printf("%c",s[0]; // error 3 (Line 19): Missing ')' -> Error 'j' expected at line 19.
+    }
+    ...
+    ```
+
+3.  **Expected Output**:
+    ```
+    16 j
+    18 a
+    19 j
+    ```
+
+4.  **Buggy Output**:
+    ```
+    16 j
+    16 j
+    19 j
+    ```
+
+5.  **Error Identification**:
+    *   The output `16 j` appears twice, and `18 a` is missing. This indicates that the error `a` (single `&`) on line 18 is not being detected or reported correctly. Instead, another `j` error is reported for line 16.
+    *   Looking at `Lexical.java`, when a single `&` is encountered, it adds error `a` and creates a token `AND` ("&&"). Similarly for `|`. This part seems correct for generating the error during lexical analysis.
+    *   However, the `Syntactic.java` parses expressions. The grammar for `LAndExp` uses `Token.Type.AND`. If the lexer converts `&` to `AND` (with error `a`), the parser will see `AND` and treat it as a valid logical AND operator in `parseLAndExp`.
+    *   The issue is likely in how the errors are collected or printed. `ErrorInfo.printError()` sorts errors by line number.
+    *   Let's look closely at `Lexical.java` again.
+        ```java
+        } else if (curChar == '&') {
+            getChar();
+            if (curChar == '&') {
+                words.add(new Token(Token.Type.AND, "&&", line));
+                getChar();
+            } else {
+                errorInfo.addError('a',line);
+                words.add(new Token(Token.Type.AND, "&&", line)); // Creates an AND token
+            }
+        }
+        ```
+        This generates error `a` at the correct line.
+    *   Now look at `Syntactic.java`. The parser expects `&&` for `LAndExp`. Since the lexer produced an `AND` token, the parser consumes it successfully in `parseLAndExp`.
+    *   Why is `16 j` repeated?
+        In `Syntactic.java`, `parseStmt` handles `getchar`.
+        ```java
+        } else if (now().getType() == Token.Type.GETCHARTK) {
+            Token getCharTk = now();
+            move();
+            Token lparent = now();
+            move();
+            Token rparent;
+            if (now().getType() != Token.Type.RPARENT) {
+                rparent = new Token(Token.Type.RPARENT, ")", getPre().getLine());
+                errorInfo.addError('j', getPre().getLine()); // Adds error j at line 16
+            } else {
+                rparent = now();
+                move();
+            }
+            // ...
+        }
+        ```
+        This correctly adds error `j` for line 16.
+        
+    *   Why is there a second `16 j` and no `18 a`?
+        The `Lexical.java` adds error `a` to `errorInfo`.
+        The `Syntactic.java` adds error `j` to `errorInfo`.
+        
+        Wait, look at `Compiler.java`.
+        ```java
+        Lexical lexical = new Lexical(content, words, errorInfo);
+        lexical.lexical_analysis();
+        lexical.lexical_print(); // <--- THIS IS THE PROBLEM
+        Syntactic syntactic = new Syntactic(words, errorInfo);
+        syntactic.syntax_print();
+        ```
+        
+        Let's check `lexical_print()`:
+        ```java
+        public void lexical_print() {
+            if (!errorInfo.isEmpty()) {
+                String filePath = "lexer.txt";
+                // ... writes to lexer.txt ...
+            } else {
+                String filePath = "error.txt";
+                // ... writes empty/flushes ...
+            }
+        }
+        ```
+        This method writes to `lexer.txt` if there are errors, but does **not** write to `error.txt`. It also doesn't clear the errors.
+        
+        Then `syntactic.syntax_print()`:
+        ```java
+        public void syntax_print() {
+            CompUnit compUnit = parseCompUnit();
+            if (!errorInfo.isEmpty()) {
+                errorInfo.printError(); // <--- Writes all accumulated errors to error.txt
+            } else {
+                // ... writes parser.txt ...
+            }
+        }
+        ```
+        
+        So `errorInfo` contains both lexical errors (`a`) and syntax errors (`j`).
+        `errorInfo.printError()` sorts them and writes them.
+        
+        The expected output is:
+        `16 j`
+        `18 a`
+        `19 j`
+        
+        The buggy output is:
+        `16 j`
+        `16 j`
+        `19 j`
+        
+        This implies that the error `a` at line 18 is either not added, or overwritten, or the line number is wrong. And there is an extra `16 j`.
+        
+        Let's re-examine `Lexical.java` handling of `&`.
+        ```java
+            } else if (curChar == '&') {
+                getChar();
+                if (curChar == '&') {
+                    words.add(new Token(Token.Type.AND, "&&", line));
+                    getChar();
+                } else {
+                    errorInfo.addError('a',line);
+                    words.add(new Token(Token.Type.AND, "&&", line));
+                }
+            }
+        ```
+        If the input is `& `, `curChar` is `&`. `getChar()` advances to ` `. `curChar` is ` ` (space). It is not `&`. So it goes to `else`. Adds error `a` at `line`. Adds `AND` token.
+        
+        Is it possible that the `line` variable in `Lexical.java` is incorrect?
+        The input line 18 is `    if (f2() & f1()) { // error 2`.
+        
+        Let's look at the duplicate `16 j`.
+        In `Syntactic.java`, `parseStmt` for `getchar`:
+        ```java
+                Token rparent;
+                if (now().getType() != Token.Type.RPARENT) {
+                    rparent = new Token(Token.Type.RPARENT, ")", getPre().getLine());
+                    errorInfo.addError('j', getPre().getLine());
+                } else {
+                    rparent = now();
+                    move();
+                }
+                Token semicn;
+                if (now().getType() != Token.Type.SEMICN) {
+                    semicn = new Token(Token.Type.SEMICN, ";", getPre().getLine());
+                    errorInfo.addError('i', getPre().getLine());
+                } else {
+                    semicn = now();
+                    move();
+                }
+        ```
+        For `ch = getchar( ;`, the tokens are `IDENFR ch`, `ASSIGN =`, `GETCHARTK getchar`, `LPARENT (`, `SEMICN ;`.
+        Inside `parseStmt`:
+        1. `lval` parsed (`ch`).
+        2. `assign` parsed (`=`).
+        3. Matches `GETCHARTK`.
+        4. `getCharTk` = `getchar`. `move()`.
+        5. `lparent` = `(`. `move()`.
+        6. `now()` is `;` (SEMICN).
+        7. `now().getType() != RPARENT` is true.
+        8. Adds error `j` at `getPre().getLine()`. `getPre()` is `(`. Line 16. Correct.
+        9. `rparent` created.
+        10. Checks for `semicn`. `now()` is `;`. Matches. `move()`.
+        
+        So only one `j` error should be added here.
+        
+        Where does the second `16 j` come from?
+        And why is `18 a` missing?
+        
+        Let's look at `parseCond` and `parseLOrExp`.
+        Line 18: `if (f2() & f1())`.
+        Tokens: `IFTK if`, `LPARENT (`, `IDENFR f2`, `LPARENT (`, `RPARENT )`, `AND &` (from lexer), `IDENFR f1`, `LPARENT (`, `RPARENT )`, `RPARENT )`, `LBRACE {`.
+        
+        `parseStmt` sees `IFTK`.
+        `move()`.
+        `lparent` = `(`. `move()`.
+        `parseCond()`.
+        `parseCond` calls `parseLOrExp()`.
+        `parseLOrExp` calls `parseLAndExp()`.
+        `parseLAndExp` calls `parseEqExp()`.
+        ... eventually parses `f2()`.
+        Returns to `parseLAndExp`.
+        `while (now().getType() == Token.Type.AND)`
+        The token generated by lexer for `&` is `AND`. So this condition is TRUE.
+        `move()`.
+        `parseLAndExp` recursively called? No, `eqExps.add(parseEqExp())`.
+        It parses `f1()`.
+        Returns.
+        So the parser successfully consumes the `&` as an `AND` operator. No syntax error is generated in `Syntactic.java` for this.
+        
+        So the error `a` MUST come from `Lexical.java`.
+        
+        If `Lexical.java` adds `a` at line 18, and `Syntactic.java` adds `j` at line 16 and `j` at line 19.
+        The list in `errorInfo` should be:
+        1. `a`, 18
+        2. `j`, 16
+        3. `j`, 19
+        
+        `printError` sorts them:
+        1. `j`, 16
+        2. `a`, 18
+        3. `j`, 19
+        
+        This matches the expected output.
+        
+        So why is the buggy output `16 j`, `16 j`, `19 j`?
+        This implies:
+        1. Error `a` at 18 is NOT in the list.
+        2. Error `j` at 16 IS in the list TWICE.
+        
+        How can `j` at 16 be added twice?
+        Maybe `parseStmt` is called twice? Or `parseCond` triggers something?
+        
+        Let's look at `parseUnaryExp`.
+        ```java
+        } else if (now().getType() == Token.Type.IDENFR) {
+            if (getNext(1).getType() == Token.Type.LPARENT) {
+                // Function call
+                ...
+            } else {
+                return new UnaryExp1(parsePrimaryExp());
+            }
+        }
+        ```
+        
+        Is it possible that the Lexer is failing to advance correctly for `&`?
+        
+        Let's look at `Lexical.java` again.
+        ```java
+            } else if (curChar == '&') {
+                getChar();
+                if (curChar == '&') {
+                    words.add(new Token(Token.Type.AND, "&&", line));
+                    getChar();
+                } else {
+                    errorInfo.addError('a',line);
+                    words.add(new Token(Token.Type.AND, "&&", line));
+                }
+            }
+        ```
+        If `curChar` is `&`, `getChar()` moves to next char. If next char is NOT `&`, it adds error `a`.
+        Crucially, it does **NOT** call `getChar()` again in the `else` block.
+        The main loop `lexical_analysis` ends with checking `curChar`.
+        At the start of the loop:
+        ```java
+        while (curCharIndex < content.length()) {
+            if (curChar != content.charAt(curCharIndex)) {
+                curCharIndex++;
+            }
+            // ...
+            getCharNbc(); // Skips whitespace
+            // ... processes token ...
+        }
+        ```
+        
+        Wait, look at the start of the loop:
+        ```java
+            if (curChar != content.charAt(curCharIndex)) {
+                curCharIndex++;
+            }
+        ```
+        This logic is weird. `curChar` is supposed to be `content.charAt(curCharIndex)`.
+        If `unGetCh()` was called, `curCharIndex` is decremented, but `curChar` still holds the old value.
+        So `curChar != content.charAt(curCharIndex)` becomes true, and `curCharIndex++` restores it.
+        
+        In the `&` case:
+        1. `curChar` is `&`.
+        2. `getChar()` increments `curCharIndex`. `curChar` becomes next char (e.g., space).
+        3. Enters `else`. Adds error. Adds Token.
+        4. Loop continues.
+        5. Start of loop: `curChar` (space) == `content.charAt(curCharIndex)` (space). Condition false.
+        6. `getCharNbc()` skips space.
+        
+        This seems fine. The error `a` should be added.
+        
+        Why is it missing?
+        
+        Let's look at `Compiler.java` again.
+        ```java
+            Lexical lexical = new Lexical(content, words, errorInfo);
+            lexical.lexical_analysis();
+            lexical.lexical_print();
+            Syntactic syntactic = new Syntactic(words, errorInfo);
+            syntactic.syntax_print();
+        ```
+        
+        Is it possible that `lexical_print` clears the errors?
+        ```java
+    public void lexical_print()
+    {
+        if (!errorInfo.isEmpty()) {
+            String filePath = "lexer.txt";
+            try (BufferedWriter writer = new BufferedWriter(new FileWriter(filePath, true))) {
+                for (Token word : words) {
+                    writer.write(word + "\n");
+                }
+                writer.flush();
+            } catch (IOException e) {
+                e.printStackTrace();
+                System.out.println("写入文件时发生错误。");
+            }
+        } else {
+            String filePath = "error.txt";
+            try (BufferedWriter writer = new BufferedWriter(new FileWriter(filePath, true))) {
+                //writer.write(errorLine + " " + errorText);
+                writer.flush();
+            } catch (IOException e) {
+                e.printStackTrace();
+                System.out.println("写入文件时发生错误。");
+            }
+        }
+    }
+        ```
+        No, it doesn't clear `errorInfo`.
+        
+        Let's look at `Syntactic.java` `parseDecls`.
+        ```java
+    public ArrayList<Decl> parseDecls() {
+        ArrayList<Decl> decls = new ArrayList<>();
+        while (notEnd()) {
+            if (getNext(2).getType() != Token.Type.LPARENT) {
+                decls.add(parseDecl());
+            } else {
+                break;
+            }
+        }
+        return decls;
+    }
+        ```
+        This lookahead `getNext(2)` might throw `IndexOutOfBoundsException` if not careful, but assuming it works.
+        
+        Let's look at the duplicate `16 j`.
+        In `parseStmt`, inside `if (now().getType() == Token.Type.GETCHARTK)`:
+        ```java
+                Token rparent;
+                if (now().getType() != Token.Type.RPARENT) {
+                    rparent = new Token(Token.Type.RPARENT, ")", getPre().getLine());
+                    errorInfo.addError('j', getPre().getLine());
+                } else {
+                    rparent = now();
+                    move();
+                }
+        ```
+        
+        Is it possible that `parseCond` or something else also reports an error for line 16?
+        
+        Actually, look at `parseMainFuncDef`.
+        ```java
+    public MainFuncDef parseMainFuncDef() {
+        Token intTk = now();
+        move();
+        Token mainTk = now();
+        move();
+        Token lparent = now();
+        move();
+        Token rparent;
+        if (now().getType() != Token.Type.RPARENT) {
+            rparent = new Token(Token.Type.RPARENT, ")", getPre().getLine());
+            errorInfo.addError('j', getPre().getLine());
+        } else {
+            rparent = now();
+            move();
+        }
+        Block block = parseBlock();
+        return new MainFuncDef(intTk, mainTk, lparent, rparent, block);
+    }
+        ```
+        
+        And `parseFuncDef`.
+        
+        The error `16 j` corresponds to `ch = getchar( ;`.
+        
+        If the output is `16 j`, `16 j`, `19 j`, it means two `j` errors were recorded for line 16.
+        
+        Could it be that `parseStmt` is entered, detects missing `)`, adds error.
+        Then, because the token stream is not advanced past the error correctly, it tries to parse again?
+        
+        In `parseStmt` for `getchar`:
+        If `)` is missing, `rparent` is synthesized. `move()` is NOT called for `)`.
+        The current token `now()` is still `;`.
+        Then it checks for `;`.
+        `if (now().getType() != Token.Type.SEMICN)` -> False, it IS `;`.
+        `semicn = now(); move();`
+        Returns `Stmt9`.
+        
+        So `cur` advances past `;`.
+        
+        Next statement in block: `if (f2() & f1())`.
+        
+        So where does the second `16 j` come from?
+        
+        Maybe the first `16 j` is from `getchar`.
+        
+        What if `parseCond` fails?
+        `if (f2() & f1())`.
+        `parseCond` -> `parseLOrExp`.
+        
+        If the lexer DID NOT generate error `a`, but generated something else?
+        No, we saw the code.
+        
+        Wait! Look at `Lexical.java` handling of `&` again.
+        ```java
+            } else if (curChar == '&') {
+                getChar();
+                if (curChar == '&') {
+                    words.add(new Token(Token.Type.AND, "&&", line));
+                    getChar();
+                } else {
+                    errorInfo.addError('a',line);
+                    words.add(new Token(Token.Type.AND, "&&", line));
+                }
+            }
+        ```
+        
+        If the input is `&`, `curChar` becomes ` ` (space).
+        Error `a` added. Token `AND` added.
+        
+        Is it possible that `errorInfo.addError` is called twice for line 16?
+        
+        Let's look at `parseStmt` for `LVal = Exp ;`.
+        `ch = getchar( ;`
+        1. `isLval()` checks if `ch` is LVal. Yes.
+        2. `parseLVal()` parses `ch`.
+        3. `assign` = `=`. `move()`.
+        4. `now()` is `getchar`.
+        5. Matches `GETCHARTK`.
+        6. Enters `else if (now().getType() == Token.Type.GETCHARTK)`.
+        7. `getCharTk` = `getchar`. `move()`.
+        8. `lparent` = `(`. `move()`.
+        9. `now()` is `;`.
+        10. `now() != RPARENT`. True.
+        11. `errorInfo.addError('j', 16)`.
+        12. `rparent` synthesized.
+        13. `now()` is `;`.
+        14. `now() == SEMICN`. True.
+        15. `semicn` = `;`. `move()`.
+        16. Returns.
+        
+        Only one `j` added here.
+        
+        Is there another place where `j` is added for line 16?
+        
+        What about `parseExp`?
+        `getchar(` is treated as a function call in some contexts?
+        No, it's handled specifically in `Stmt`.
+        
+        However, look at `parseUnaryExp`.
+        If `getchar` was parsed as a `UnaryExp` (function call), it would also check for `)`.
+        
+        But `parseStmt` consumes `getchar` before `parseExp` is called.
+        `Stmt` rule: `LVal '=' 'getchar''('')'';'`
+        
+        So `parseExp` is NOT called for `getchar(...)`.
+        
+        Let's look at the `18 a` missing.
+        If `Lexical.java` adds `a`, it should be there.
+        
+        Unless... `lexical_print` writes to `lexer.txt` and `syntax_print` writes to `error.txt`.
+        The problem asks for output in `error.txt`.
+        
+        If `lexical_print` is called, and `errorInfo` is NOT empty, it writes to `lexer.txt`.
+        Then `syntax_print` is called. It parses. If errors exist, it calls `errorInfo.printError()`.
+        
+        This should work.
+        
+        Is it possible that `Syntactic.java` constructor or parsing resets `errorInfo`? No.
+        
+        Let's look at the Buggy Output again:
+        `16 j`
+        `16 j`
+        `19 j`
+        
+        This looks like the error `a` at 18 was replaced by a `j` at 16.
+        
+        Hypothesis: The Lexer is NOT adding error `a`.
+        Why?
+        
+        Check `Lexical.java` logic for `&`.
+        ```java
+            } else if (curChar == '&') {
+                getChar();
+                if (curChar == '&') {
+                    words.add(new Token(Token.Type.AND, "&&", line));
+                    getChar();
+                } else {
+                    errorInfo.addError('a',line);
+                    words.add(new Token(Token.Type.AND, "&&", line));
+                }
+            }
+        ```
+        
+        If `curChar` is `&`, `getChar()` is called.
+        If the file ends with `&`? No, there is ` f1()`.
+        
+        What if `curChar` is NOT `&`?
+        
+        Wait, look at `getCharNbc`.
+        ```java
+    private void getCharNbc() {
+        while (Character.isWhitespace(curChar) && curCharIndex < content.length()) {
+            if (curChar == '\n') {
+                line++;
+            }
+            getChar();
+        }
+    }
+        ```
+        
+        If `&` is preceded by space, `getCharNbc` skips space. `curChar` becomes `&`.
+        
+        There is a subtle bug in `Lexical.java` loop control:
+        ```java
+        while (curCharIndex < content.length()) {
+            if (curChar != content.charAt(curCharIndex)) {
+                curCharIndex++;
+            }
+            //System.out.println(curChar);
+            builder.setLength(0);
+            getCharNbc();
+            // ...
+        }
+        ```
+        
+        If `unGetCh()` is used, `curCharIndex` is decremented.
+        Next iteration: `curChar` (old) != `content.charAt(curCharIndex)` (new/old).
+        `curCharIndex++`.
+        This restores `curCharIndex` to where it was before `unGetCh`.
+        But `curChar` is NOT updated to `content.charAt(curCharIndex)` after `curCharIndex++`.
+        
+        Example:
+        1. `curChar` is `=`, `curCharIndex` is 10.
+        2. `getChar()` -> `curCharIndex` 11, `curChar` is ` `.
+        3. `unGetCh()` -> `curCharIndex` 10. `curChar` is still ` `.
+        4. Loop end.
+        5. Loop start. `curChar` (` `) != `content.charAt(10)` (`=`). True.
+        6. `curCharIndex++` -> 11.
+        7. `getCharNbc()`. `curChar` is ` `. Whitespace. `getChar()` -> `curCharIndex` 12, `curChar` next char.
+        
+        This logic seems to handle `unGetCh` correctly by skipping the mismatched index.
+        
+        However, for `&`:
+        1. `curChar` is `&`.
+        2. `getChar()` -> `curChar` is ` `.
+        3. `else` block. No `unGetCh`.
+        4. Loop continues.
+        5. `curChar` (` `) == `content.charAt(curCharIndex)` (` `). False.
+        6. `getCharNbc()` skips ` `.
+        
+        So `&` is processed once. Error `a` added.
+        
+        Why is it missing in output?
+        
+        Maybe `ErrorInfo.sort()` is buggy?
+        ```java
+    public void sort() {
+        for (int i = 0; i < errorText.size() - 1; i++) {
+            for (int j = 0; j < errorText.size() - 1 - i; j++) {
+                if (errorLine.get(j) > errorLine.get(j + 1)) {
+                    int tempLine = errorLine.get(j);
+                    char tempText = errorText.get(j);
+                    errorLine.set(j, errorLine.get(j + 1));
+                    errorText.set(j, errorText.get(j + 1));
+                }
+            }
+        }
+    }
+        ```
+        Bubble sort. Looks correct.
+        
+        Let's look at `Syntactic.java` `parseCond`.
+        ```java
+    public Cond parseCond() {
+        return new Cond(parseLOrExp());
+    }
+        ```
+        
+        If `parseLOrExp` fails to match `&` as `AND`, it might return early?
+        No, `parseLAndExp` loops on `AND`.
+        
+        Is it possible that `Token.Type.AND` is not matched?
+        In `Lexical.java`, `words.add(new Token(Token.Type.AND, "&&", line));`.
+        In `Syntactic.java`, `while (now().getType() == Token.Type.AND)`.
+        
+        They match.
+        
+        There is one possibility: **The `errorInfo` object passed to `Syntactic` is different?**
+        No, same object.
+        
+        Let's look at the duplicate `16 j`.
+        
+        In `parseStmt`, `if (now().getType() == Token.Type.IDENFR && isLval())`.
+        `isLval()` scans ahead.
+        
+        If `isLval()` causes side effects? No, it uses `curTmp`.
+        
+        Wait, look at `parseStmt` again.
+        
+        ```java
+        if (now().getType() == Token.Type.IDENFR && isLval()) {
+            LVal lval = parseLVal();
+            Token assign = now();
+            move();
+            if (now().getType() == Token.Type.GETINTTK) {
+               // ...
+            } else if (now().getType() == Token.Type.GETCHARTK) {
+               // ...
+            } else {
+               // parseExp
+            }
+        }
+        ```
+        
+        For `ch = getchar( ;`, it enters `GETCHARTK` block.
+        
+        What if `parseCond` for `if (f2() & f1())` triggers an error?
+        
+        If `&` is NOT converted to `AND` by lexer?
+        If lexer treats `&` as something else?
+        
+        If lexer fails to add error `a`, then `&` might be skipped or treated as invalid?
+        
+        Actually, look at `Lexical.java` again.
+        
+        ```java
+            } else if (curChar == '&') {
+                getChar();
+                if (curChar == '&') {
+                    words.add(new Token(Token.Type.AND, "&&", line));
+                    getChar();
+                } else {
+                    errorInfo.addError('a',line);
+                    words.add(new Token(Token.Type.AND, "&&", line));
+                }
+            }
+        ```
+        
+        If `curChar` is `&`, `getChar()` makes `curChar` the next character.
+        If the next character is `&`, it consumes it.
+        If not, it adds error.
+        
+        This logic is correct for detecting `&`.
+        
+        The only explanation for `16 j` appearing twice and `18 a` missing is if **the error `a` is never added**, and **error `j` is added twice**.
+        
+        How can `j` be added twice for line 16?
+        
+        Maybe `parseStmt` is called recursively or something?
+        
+        Or maybe `parseUnaryExp` is called on `getchar`?
+        
+        In `parseStmt`, `getchar` is consumed.
+        
+        But wait! `parseCond` calls `parseLOrExp`.
+        
+        If the lexer DID produce `AND` for `&`, `parseLAndExp` consumes it.
+        
+        If the lexer DID NOT produce `AND`?
+        
+        If `curChar` handling is broken such that `&` is skipped?
+        
+        Let's assume the bug is in `Lexical.java` where `errorInfo.addError('a', line)` is NOT executed.
+        
+        Why?
+        
+        Maybe `curChar` is not `&`?
+        
+        If `getCharNbc` skips `&`? No.
+        
+        I will bet on the `Lexical.java` file having the issue with error reporting or token generation for `&` and `|`, OR `Syntactic.java` having a duplicate error report for `j`.
+        
+        Given the output `16 j` twice, let's look at `parseStmt` for `getchar` and `getint`.
+        
+        Both have identical structure.
+        
+        Is it possible that `parseExp` is ALSO called?
+        
+        No.
+        
+        I will highlight the `Lexical.java` section for `&` and `|` as the likely source of the missing `a` error, and potentially `Syntactic.java` for the duplicate `j` if the parser backtracks or retries (which it shouldn't).
+        
+        However, usually, these bugs are in the Lexer not advancing or reporting correctly.
+        
+        <lexicalanalysis/Lexical.java>
+...
+            } else if (curChar == '&') {
+                getChar();
+                if (curChar == '&') {
+                    words.add(new Token(Token.Type.AND, "&&", line));
+                    getChar();
+                } else {
+                    errorInfo.addError('a',line);
+                    words.add(new Token(Token.Type.AND, "&&", line));
+                }
+            } else if (curChar == '|') {
+                getChar();
+                if (curChar == '|') {
+                    words.add(new Token(Token.Type.OR, "||", line));
+                    getChar();
+                } else {
+                    errorInfo.addError('a',line);
+                    words.add(new Token(Token.Type.OR, "||", line));
+                }
+            } else if (curChar == '+') {
+...

@@ -1,0 +1,177 @@
+Based on the analysis of the problem description, test case, and source code:
+
+1.  **Problem Analysis**: The test case `void f(int a {}` contains a syntax error where the right parenthesis `)` is missing before the left brace `{`. This corresponds to error type `j` (Missing right parenthesis ')'). The expected output indicates this error should be reported on line 1. Similarly, `int main( {` misses `)` on line 3, and `f(a + 10;` misses `)` on line 5.
+
+2.  **Code Analysis**:
+    *   The `FuncDefParser.java` handles the parsing of function definitions like `void f(...)`.
+    *   In `parseFuncDef()`, it reads `FuncType`, `Ident`, `(`, and then attempts to read the next token into `rparent`.
+    *   If `rparent` is not `)`, it checks if it is `{`. If so, it reports error `j`.
+    *   **Crucial Logic Flaw**: When reporting the error, it calls `ErrorHandler.getInstance().reportError(this.reader.getPreviousToken().getLine(), "j")`.
+    *   Let's trace `getPreviousToken()` in `TokenListReader.java`:
+        ```java
+        public Token getPreviousToken() {
+            Token toReturn = null;
+            int currentIndex = this.iterator.nextIndex();
+            if (currentIndex > 1) {
+                this.iterator.previous(); 
+                toReturn = this.iterator.previous(); 
+            }
+            // ... restore position
+            return toReturn;
+        }
+        ```
+    *   In `FuncDefParser`:
+        1.  `lparent = this.reader.getnextToken();` (Reads `(`). `preToken` is `(`. Iterator is after `(`.
+        2.  `rparent = this.reader.getnextToken();` (Reads `int` or `{` depending on lookahead, but here it reads the token after `(` which is `int` in `void f(int a {}`). Wait, the input is `void f(int a {}`.
+            *   Tokens: `void`, `f`, `(`, `int`, `a`, `{`, `}`.
+            *   `funcType` consumes `void`.
+            *   `ident` consumes `f`.
+            *   `lparent` consumes `(`.
+            *   `rparent` consumes `int`.
+            *   Check: `int` != `)`.
+            *   Check: `int` != `{`.
+            *   Else branch: `this.reader.backward(1);` (Iterator moves back before `int`).
+            *   `FuncFParamsParser` is called. It parses `int a`.
+            *   Inside `FuncFParamsParser`, it parses `int` (BType), `a` (Ident). Then it looks for `[` or `,` or `)`. It reads next token which is `{`.
+            *   It returns.
+            *   Back in `FuncDefParser`: `this.rparent = this.reader.getnextToken();` reads `{`.
+            *   `BlockParser` is called.
+            *   The error `j` (missing `)`) was *not* caught in the initial check because the token after `(` was `int`, not `{`. The missing `)` is detected implicitly when the parameter list parsing finishes and encounters `{` instead of `)`, or potentially inside `FuncFParamsParser` if it checked for `)`.
+            *   However, looking at `FuncFParamsParser.parseFuncFParams()`:
+                ```java
+                Token token = this.reader.getnextToken();
+                while(token.getType().equals(TokenType.COMMA)) { ... }
+                this.reader.backward(1);
+                ```
+                It doesn't explicitly check for `)`. It just stops on non-comma.
+            *   So back in `FuncDefParser`, after parsing params, it reads `rparent` which is `{`.
+            *   The code structure in `FuncDefParser` has an `if (!this.rparent.getType().equals(TokenType.RPARENT))` block at the beginning. But that only checks the *immediate* next token.
+            *   The actual logic flow for `void f(int a {}`:
+                1. `lparent` = `(`.
+                2. `rparent` (temp) = `int`.
+                3. `int` != `)`. `int` != `{`.
+                4. `backward(1)`.
+                5. Parse `FuncFParams`. Parses `int a`. Next token is `{`. `backward(1)` inside parser? No, `FuncFParamsParser` reads `int`, `a`, then `{`. Loop condition fails. `backward(1)` puts iterator before `{`.
+                6. Back in `FuncDefParser`: `this.rparent = this.reader.getnextToken()` reads `{`.
+                7. `BlockParser` parses `{}`.
+                8. The function definition ends. The missing `)` error is **never reported** because the code assumed that if the token after `(` isn't `)` or `{`, it must be parameters, and it didn't verify the closing `)` after parameters properly or report the error if the token following parameters is `{` instead of `)`.
+    
+    *   Actually, let's look closer at `FuncDefParser`:
+        ```java
+        this.rparent = this.reader.getnextToken();
+        if (!this.rparent.getType().equals(TokenType.RPARENT)) {
+            if(this.rparent.getType().equals(TokenType.LBRACE)) {
+                 // Error j reported here. Line of previous token.
+            } else {
+                 // Parse params
+                 this.rparent = this.reader.getnextToken(); // This reads the token AFTER params
+                 // If this token is NOT ), it should be an error, but it's not checked!
+                 BlockParser...
+            }
+        }
+        ```
+        In the `else` branch (params present), after parsing params, it reads `this.rparent`. If the input is `void f(int a {}`, after parsing `int a`, the next token is `{`. So `this.rparent` becomes `{`. The code proceeds to `BlockParser`. It **fails to check** if `this.rparent` is `)`. It assumes it is. Thus, no error is reported for the missing `)`.
+
+    *   To fix this, we need to add a check in the `else` branch of `FuncDefParser` to verify if `this.rparent` is `)`. If not, report error `j`.
+
+    *   Similarly, `MainFuncDefParser` has:
+        ```java
+        this.rparent = this.reader.getnextToken();
+        if(!this.rparent.getType().equals(TokenType.RPARENT)) {
+             ErrorHandler...
+             this.reader.backward(1);
+        }
+        ```
+        For `int main( {`, `rparent` is `{`. Error `j` is reported. `getPreviousToken()` returns `(`. Line 3. Correct.
+
+    *   For `f(a + 10;` inside `main`:
+        This is a statement. `StmtParser` -> `decide` -> `StmtLvalExpParser`? Or `UnaryExp`?
+        `f` is `IDENFR`. `decide` looks ahead.
+        Tokens: `f`, `(`, `a`, `+`, `10`, `;`.
+        `decide` sees `ASSIGN`? No. `GETINT`? No. `GETCHAR`? No.
+        So it goes to `StmtExpParser`.
+        `StmtExpParser` calls `ExpParser`.
+        `ExpParser` -> `AddExp` -> ... -> `UnaryExp`.
+        `UnaryExpParser`: `first`=`f`, `second`=`(`. Matches `IDENFR` + `LPARENT`.
+        Calls `UnaryExpIdentParser`.
+        `UnaryExpIdentParser`:
+        ```java
+        this.ident = parser.parseIdent(); // f
+        this.lparent = this.reader.getnextToken(); // (
+        this.rparent = this.reader.getnextToken(); // a
+        if(!this.rparent.getType().equals(TokenType.RPARENT)) {
+             this.reader.backward(1);
+             FuncRParamsParser... // Parses a + 10
+             if(this.params == null) { ... }
+             this.rparent = this.reader.getnextToken(); // Reads ;
+             // Checks if rparent is )? NO.
+             unaryExpIdent = new UnaryExpIdent(..., this.rparent);
+        }
+        ```
+        After parsing params `a + 10`, the next token is `;`. `this.rparent` becomes `;`.
+        The code does **not** check if `this.rparent` is `)`. It just accepts it.
+        Then control returns to `StmtExpParser`.
+        `StmtExpParser`:
+        ```java
+        this.exp = expParser.parseExp(); // Consumes f(a+10
+        this.semicn = this.reader.getnextToken(); // Reads next token. But wait.
+        ```
+        In `UnaryExpIdentParser`, `this.rparent` consumed `;`.
+        So when `StmtExpParser` calls `this.semicn = this.reader.getnextToken()`, it reads the token *after* `;`. If there is one.
+        Regardless, the missing `)` error was not reported in `UnaryExpIdentParser`.
+
+    *   Therefore, the errors are in:
+        1.  `FuncDefParser.java`: Missing check for `)` after parsing parameters.
+        2.  `UnaryExpIdentParser.java`: Missing check for `)` after parsing function arguments.
+
+    *   Let's check `PrimaryExpExpParser.java` as well (for `(Exp)`):
+        ```java
+        this.rparent = this.reader.getnextToken();
+        if(!this.rparent.getType().equals(TokenType.RPARENT)) {
+             ErrorHandler...
+             this.reader.backward(1);
+        }
+        ```
+        This one *does* check.
+
+    *   So the likely locations are `FuncDefParser.java` and `UnaryExpIdentParser.java`.
+
+<frontend/Parser/FuncDefParser.java>
+...
+        else{
+            this.reader.backward(1);
+            FuncFParamsParser funcFParamsParser = new FuncFParamsParser(this.reader);
+            this.funcFParams = funcFParamsParser.parseFuncFParams();
+
+            this.rparent = this.reader.getnextToken();
+            // Error: Missing check for RPARENT here. If rparent is not ), it's error j.
+            if (!this.rparent.getType().equals(TokenType.RPARENT)) {
+                ErrorHandler.getInstance().reportError(this.reader.getPreviousToken().getLine(),"j");
+                this.reader.backward(1);
+            }
+            BlockParser blockParser = new BlockParser(this.reader);
+            this.block = blockParser.parseBlock();
+            return new FuncDef(this.funcType, this.ident, this.lparent,
+                    this.funcFParams, this.rparent, this.block);
+        }
+...
+
+<frontend/Parser/Exp/UnaryExpIdentParser.java>
+...
+            this.reader.backward(1);
+            FuncRParamsParser funcRParamsParser = new FuncRParamsParser(this.reader);
+            this.params = funcRParamsParser.parseFuncRParams();
+            if(this.params == null)
+            {
+                // error!
+                ErrorHandler.getInstance().reportError(this.reader.getPreviousToken().getLine(),"j");
+                this.reader.backward(1);
+            }
+            this.rparent = this.reader.getnextToken();
+            // Error: Missing check for RPARENT here. If rparent is not ), it's error j.
+            if (!this.rparent.getType().equals(TokenType.RPARENT)) {
+                ErrorHandler.getInstance().reportError(this.reader.getPreviousToken().getLine(),"j");
+                this.reader.backward(1);
+            }
+            unaryExpIdent = new UnaryExpIdent(this.ident, this.lparent, this.params, this.rparent);
+...

@@ -1,0 +1,125 @@
+<Compiler.java>
+...
+        try (OutputStream outputStream = new FileOutputStream(outputFileName)) {
+            try (OutputStream errStream = new FileOutputStream(errorFileName)) {
+                if (errorTable.isEmpty()) { @@ The check for errors is performed immediately after Lexer construction, but the Lexer constructor calls analyse() which populates the errorTable. However, the logic here is flawed because it checks errorTable.isEmpty() to decide whether to write tokens or errors. If there are NO errors, it writes tokens. If there ARE errors, it writes errors. This part seems logically correct for the "one error" constraint, BUT the problem states "Buggy Output: No output file". This suggests that neither file is being written to, or an exception is occurring before writing. Let's look closer. Actually, the issue is likely that `lexer.getTokens().toString()` or `errorTable.toString()` might return empty strings if not handled correctly, or more likely, the `Lexer` constructor throws an exception or fails to populate tokens properly if an error occurs? No, the lexer continues. 
+                
+                Wait, looking at the provided buggy output "No output file", it implies the program crashed or produced no files. 
+                
+                Let's re-read the code carefully.
+                In `Compiler.java`:
+                `Lexer lexer = new Lexer(inputStream, errorTable);`
+                Inside `Lexer` constructor: `analyse();` is called.
+                
+                If `analyse()` encounters an IO exception, it propagates up. The `main` method declares `throws Exception`. So if an exception occurs, the program terminates without creating/writing the files (or creates empty ones if the try-with-resources block exits early due to exception before write).
+                
+                However, the most common reason for "No output file" or empty output in these assignments when the logic seems okay is often related to how the output is generated or if the program crashes.
+                
+                Let's look at `Lexer.java` -> `unread()`.
+                ```java
+                private void unread() throws IOException { // unread and update curChar
+                    stream.unread(curChar); // unread
+                    stream.unread(curChar);
+                    curChar = (char) stream.read(); // update
+                }
+                ```
+                This `unread` method is suspicious. It unreads `curChar` twice? And then reads one char? This logic is very strange and likely incorrect for a standard pushback buffer usage, usually you unread once to put back the character you just read if it doesn't belong to the current token. But this method is not called in the main `getToken` flow directly, except potentially indirectly? No, `getToken` uses `read()`. `skipComment` uses `read()`. `getType1Token` uses `read()`. `getType2Token` uses `read()`. `getType3Token` uses `read()`. `getIntToken` uses `read()`. `getCharToken` uses `read()`. `getStringToken` uses `read()`. `getWordToken` uses `read()`.
+                
+                Where is `unread()` called?
+                It is called in `skipComment()`:
+                ```java
+                if (curChar != '/') {
+                    return false;
+                }
+                read();
+                if (curChar == '/') { ... }
+                if (curChar == '*') { ... }
+                unread(); // <--- Called here if it's just a '/' followed by something else
+                return false;
+                ```
+                
+                If the input contains a `/` that is not a comment (e.g., division operator), `skipComment` reads the next char. If it's not `/` or `*`, it calls `unread()`.
+                
+                Let's trace `unread()`:
+                Suppose `curChar` is `/`. `read()` makes `curChar` be the next char, say ` ` (space).
+                It's not `/` or `*`. So `unread()` is called.
+                Inside `unread()`:
+                `stream.unread(curChar);` -> pushes ` ` back.
+                `stream.unread(curChar);` -> pushes ` ` back AGAIN.
+                `curChar = (char) stream.read();` -> reads ` ` again.
+                
+                So now `curChar` is ` ` (space).
+                Back in `skipComment`, it returns `false`.
+                Back in `analyse`, `skipWhiteSpace()` is called. It sees ` ` (space), skips it.
+                Then `getToken()` is called.
+                
+                This seems to work for `/` followed by space.
+                
+                What if `/` is followed by `a`?
+                `curChar` = `/`. `read()` -> `curChar` = `a`.
+                Not comment. `unread()`.
+                Push `a`, Push `a`. Read `a`. `curChar` = `a`.
+                Returns false.
+                `skipWhiteSpace` does nothing.
+                `getToken` sees `a`. Returns identifier.
+                But the `/` was consumed by `skipComment`'s initial `read()` and then effectively lost?
+                No, `skipComment` started with `curChar` = `/`. It called `read()`. So `/` was consumed from the stream.
+                Then it determined it wasn't a comment.
+                It called `unread()` which only put back the *second* character (`a`).
+                The `/` is GONE. It was never put back.
+                
+                So if we have `int a = 1 / 2;`, the lexer will see:
+                1. `int`, `a`, `=`, `1`.
+                2. Space skipped.
+                3. `curChar` is `/`. `skipComment` is called.
+                4. `read()` -> `curChar` is ` ` (space).
+                5. Not comment. `unread()` puts back space twice, reads space. `curChar` is ` `.
+                6. `skipComment` returns false.
+                7. `skipWhiteSpace` skips space.
+                8. `getToken` sees `2`.
+                
+                The `/` token is missing!
+                
+                This explains why the output might be wrong or incomplete. But does it explain "No output file"?
+                If the program crashes, yes. If it just produces wrong output, no.
+                
+                However, there is a critical bug in `unread()`.
+                `PushbackInputStream.unread(int b)` pushes back a single byte.
+                Calling it twice with the same char pushes two bytes.
+                Then `read()` reads one.
+                The net effect is that one byte is pushed back permanently into the buffer? No, the buffer size is limited. If you keep doing this, you might overflow the pushback buffer? Default size is 1. If you unread twice, you need a larger buffer.
+                `new PushbackInputStream(new FileInputStream(inputFileName));` uses default buffer size of 1.
+                `stream.unread(curChar);` -> Buffer has 1 char.
+                `stream.unread(curChar);` -> **Throws IOException: Push back buffer is full** if the buffer size is 1 and it's already full? Or does it expand?
+                According to Java docs: `PushbackInputStream` constructor with just InputStream arg creates a buffer of size 1.
+                `unread(int b)`: "Pushes back a byte... If the pushback buffer is full, an IOException is thrown."
+                
+                So, the second `stream.unread(curChar);` inside `unread()` will throw an `IOException` because the buffer size is 1 and we just filled it with the first `unread`.
+                
+                This exception propagates to `main`, causing the program to terminate abruptly.
+                Since the `try-with-resources` blocks are in `main`, if an exception is thrown *before* entering the try block (which it is, `Lexer` construction happens before), the files are created (by `FileOutputStream` constructor) but might remain empty or not be flushed/closed properly if the crash happens immediately?
+                Actually, `new FileOutputStream` creates/truncates the file immediately.
+                If the exception happens at `Lexer lexer = new Lexer(...)`, the code never enters the `try` block where `write` happens.
+                The `outputStream` and `errStream` variables are not even initialized yet in the scope of the try-with-resources if the exception happens before.
+                Wait, the declaration is inside the try:
+                `try (OutputStream outputStream = new FileOutputStream(outputFileName)) {`
+                
+                If `Lexer` construction throws, we never enter this try block.
+                So `lexer.txt` and `error.txt` are NOT created by this code.
+                
+                Are they created elsewhere? No.
+                So "No output file" means the files don't exist.
+                
+                This confirms the error is in `Lexer.java` in the `unread` method causing an IOException due to buffer overflow, which crashes the program before file creation/writing.
+
+                The fix would be to only unread once, or increase buffer size, or redesign `unread`.
+                Given the constraint to identify the error location:
+
+<frontend/lexer/Lexer.java>
+...
+    private void unread() throws IOException { // unread and update curChar
+        stream.unread(curChar); // unread
+        stream.unread(curChar); // @@ This line causes an IOException because the default PushbackInputStream buffer size is 1, and pushing back a second byte exceeds the capacity, crashing the program before output files are written.
+        curChar = (char) stream.read(); // update
+    }
+...

@@ -1,0 +1,214 @@
+Based on the problem description and the provided code, the issue is that the program produces **no output file** (`parser.txt` is empty or not created correctly, or `error.txt` is empty when it shouldn't be, but here the expected output is a valid parse tree). The test case input is a valid C-like program. The "Buggy Output" states "No output file", which usually implies an exception occurred during execution preventing the file from being written, or the logic for determining success/failure is flawed.
+
+Looking at `Compiler.java`:
+1. It reads `testfile.txt`.
+2. It tokenizes.
+3. It parses.
+4. It checks `if (!lexer.isHasError() && !parser.hasError())`.
+5. If true, it calls `postOrderPrint`.
+6. If false, it writes errors.
+
+The `Lexer` has a significant bug in handling comments and potentially multi-line logic, but for the specific input:
+```c
+int main() {
+    printf("21373119");
+    int a = 0;
+    {
+        int a = 1;
+        printf("%d",a); // 输出 1
+    }
+    return 0;
+}
+```
+The lexer seems to handle single-line comments (`//`) by breaking the line loop. However, there is a logic error in `Lexer.tokenize()` regarding how it processes lines and the `flag` variable for multi-line comments. Specifically, `flag` is initialized to 0 outside the loop over lines, but if a multi-line comment starts and doesn't end on the same line, `flag` becomes 1. On the next line, if `flag` is 1, it looks for `*/`. If not found, it `break`s the inner `while` loop (processing characters of that line), but then continues to the **next entry** in `allLines`. This part might be okay for simple cases, but let's look closer at `Parser.java`.
+
+In `Parser.java`, the `parseCompUnit` method:
+```java
+private void parseCompUnit() {
+    while (currentToken != null) {
+        if(currentToken.getType() == Type.INTTK && checkNext().getType() == Type.MAINTK){
+            ASTNode main = parseMain();
+            compUnitNode.addChild(main);
+        }else if (judge.isFuncDef(currentToken,checkNext(),checkNext2())) {
+            ASTNode funcDefNode = parseFuncDef();
+            compUnitNode.addChild(funcDefNode);
+        } else if (judge.isDecl(currentToken)) {
+            ASTNode declNode = parseDecl();
+            compUnitNode.addChild(declNode);
+        }
+    }
+}
+```
+If none of the conditions are met, the loop runs infinitely because `currentToken` is never consumed/advanced. However, for a valid program ending with `MainFuncDef`, this should terminate.
+
+Let's look at `ASTNode.postOrderPrint`.
+```java
+public static void postOrderPrint(ASTNode node, BufferedWriter writer) throws IOException {
+    if (node == null) return;
+    // ... recursion ...
+    String output = toPrint(node);
+    if (!output.isEmpty()) {
+        System.out.println(output);
+        writer.write(output); 
+        writer.newLine(); 
+    }
+}
+```
+This looks correct for writing to the file.
+
+However, there is a critical issue in `Compiler.java` regarding the file paths.
+```java
+BufferedReader reader = new BufferedReader(new FileReader("C:\\Users\\86136\\Desktop\\hw2_Lexer\\hw2_Lexer\\testfile.txt"));
+```
+The input file path is hardcoded to an absolute path on the developer's machine. If the grading system runs this code on a different machine or in a different directory structure where this file does not exist, a `FileNotFoundException` will be thrown.
+The catch block handles it:
+```java
+} catch (FileNotFoundException e) {
+    System.err.println("File not found: " + e.getMessage());
+} catch (IOException e) {
+    System.err.println("IO Error: " + e.getMessage());
+}
+```
+If an exception is thrown, the `parserWriter` and `errorWriter` might not be flushed or closed properly, or simply nothing is written to them if the exception happens before parsing. But more importantly, if the file is not found, the program exits without generating the required output files in the current working directory (or generates empty ones if they were created before the exception, but `FileWriter` creates the file immediately).
+
+Wait, `new FileWriter(parserOutputFileName)` creates the file. If `FileReader` throws an exception, the `try` block jumps to `catch`. The writers are closed in the `finally`? No, there is no `finally`. They are closed at the end of the `try` block. If an exception occurs at `new FileReader(...)`, the code jumps to `catch`, skipping the closing of writers. However, `FileWriter` buffers output. If `writer.close()` is not called, the buffer might not be flushed to disk, resulting in an empty file or missing file content.
+
+But usually, "No output file" in these online judge contexts often means the program crashed or produced no output to stdout/stderr that matched expectations, or the output files were empty.
+
+Let's look at another potential crash point. In `Parser.java`, `checkNext()` returns `null` if there is no next token.
+```java
+private Token checkNext() {
+    int currentIndex = tokens.indexOf(currentToken);
+    Token nextToken;
+    if(currentIndex + 1 >= tokens.size()) {
+        nextToken = null;
+    } else {
+        nextToken = tokens.get(currentIndex + 1);
+    }
+    return nextToken;
+}
+```
+In `parseCompUnit`:
+```java
+if(currentToken.getType() == Type.INTTK && checkNext().getType() == Type.MAINTK){
+```
+If `checkNext()` returns `null`, calling `.getType()` on it will throw a `NullPointerException`. This would crash the parser before any output is generated (or before the output stream is flushed/closed properly if the crash happens inside the try block).
+
+For the input `int main() ...`, the first token is `int`. `checkNext()` is `main`. This is safe.
+
+However, consider the end of the file. After parsing `MainFuncDef`, `currentToken` should be `null` if all tokens are consumed.
+In `parseMain`:
+```java
+main.addChild(parseBlock());
+return main;
+```
+`parseBlock` consumes `{ ... }`. If the block is parsed correctly, `currentToken` advances.
+If `parseBlock` finishes, `currentToken` is the token after `}`. In the example, `}` is the last token. So `currentToken` becomes `null`.
+Then `parseCompUnit` loop condition `while (currentToken != null)` fails. Loop ends.
+
+Is there a NPE elsewhere?
+In `Lexer.java`, `skipWhitespace`:
+```java
+private void skipWhitespace() {
+    while (peekChar() != null && (peekChar() == ' ' || peekChar() == '\t' || peekChar() == '\r')) {
+        nextChar();
+    }
+    if (peekChar() != null && peekChar() == '\n') { // peekChar returns Character object or null?
+        lineNum++;
+        nextChar();
+    }
+}
+```
+`peekChar` returns `Character` (object) or `null`. Comparing `peekChar() == '\n'` unboxes the Character. If `peekChar()` is `null`, `peekChar() != null` check protects it.
+
+Let's look at `Lexer.tokenize()` again.
+```java
+while (curPos < curLine.length()) {
+    skipWhitespace(); 
+    Character currentChar = nextChar(); 
+    // ...
+    if (currentChar == '/'&& curPos< curLine.length() && curLine.charAt(curPos) == '*' ) {
+         // ...
+    }
+```
+If `nextChar()` returns `null` (end of line)?
+`nextChar`:
+```java
+private Character nextChar() {
+    if (curPos >= curLine.length()) {
+        return '\n'; // Returns char primitive, autoboxed to Character
+    }
+    // ...
+}
+```
+It returns `'\n'` (newline character) if out of bounds. It does NOT return `null`.
+So `currentChar` is never `null` inside the loop.
+
+However, `skipWhitespace` increments `lineNum` if it sees `\n`. But `tokenize` iterates through `allLines` map entries. `lineNum` is set to `entry.getKey()` at the start of each line.
+If `skipWhitespace` encounters a `\n` (which `nextChar` returns when `curPos >= length`), it increments `lineNum`. But `curPos` is not incremented by `nextChar` in the out-of-bounds case?
+```java
+private Character nextChar() {
+    if (curPos >= curLine.length()) {
+        return '\n';
+    }
+    char ch = curLine.charAt(curPos);
+    curPos++;
+    return ch;
+}
+```
+If `curPos >= length`, it returns `'\n'` but does **not** increment `curPos`.
+In `skipWhitespace`:
+```java
+if (peekChar() != null && peekChar() == '\n') {
+    lineNum++;
+    nextChar();
+}
+```
+`peekChar` also returns `'\n'` if out of bounds.
+So if we are at the end of the line, `peekChar` is `'\n'`. `nextChar` is called. It returns `'\n'` again. `curPos` is still `>= length`.
+The `while` loop in `tokenize` checks `curPos < curLine.length()`.
+If `curPos` is at `length`, the loop terminates.
+So `skipWhitespace` consuming the "virtual" newline at the end of the line might cause `lineNum` to increment incorrectly if not careful, but since the loop terminates, it might just be an off-by-one in line numbering for errors, not a crash.
+
+Let's look at the `NullPointerException` risk in `Parser` again.
+`checkNext()` can return `null`.
+Usage in `parseCompUnit`:
+```java
+if(currentToken.getType() == Type.INTTK && checkNext().getType() == Type.MAINTK)
+```
+If `currentToken` is the last token (`INTTK`), `checkNext()` is `null`. `null.getType()` -> **NPE**.
+Does the input end with `int`? No.
+But what if there is a trailing declaration?
+The input is:
+```
+int main() { ... }
+```
+Tokens: `int`, `main`, `(`, `)`, `{`, `printf`, ... `}`, `return`, `0`, `;`, `}`.
+When `parseCompUnit` starts, `currentToken` is `int`. `checkNext` is `main`. OK.
+After `parseMain`, `currentToken` is `null`. Loop ends.
+
+What if the program has syntax errors? The prompt says "For a correct source program...". The test case is correct.
+
+Let's look at `Compiler.java` file reading again.
+```java
+BufferedReader reader = new BufferedReader(new FileReader("C:\\Users\\86136\\Desktop\\hw2_Lexer\\hw2_Lexer\\testfile.txt"));
+```
+This is the most likely culprit for "No output file" in a generic testing environment. The file path is absolute and specific to the student's machine. The grader likely places `testfile.txt` in the current working directory. The code fails to find the file at the hardcoded path, throws `FileNotFoundException`, prints to stderr, and exits. The `parser.txt` and `error.txt` files might be created by `new FileWriter` (which truncates/creates them) but since the exception happens before any writing or closing, they remain empty or the OS might not even finalize their creation depending on buffering/OS behavior, or simply the grader sees empty files.
+
+Actually, `new FileWriter(parserOutputFileName)` is executed **before** `new FileReader(...)`.
+```java
+BufferedWriter parserWriter = new BufferedWriter(new FileWriter(parserOutputFileName));
+BufferedWriter errorWriter = new BufferedWriter(new FileWriter(errorOutputFileName));
+// ...
+BufferedReader reader = new BufferedReader(new FileReader("...")); // Exception here
+```
+So `parser.txt` and `error.txt` ARE created (empty). Then the exception occurs. The `catch` block executes. The writers are NOT closed. The buffers are NOT flushed. The files remain empty. The grader expects content in `parser.txt`. It finds an empty file. This matches "No output file" (interpreted as empty/missing content).
+
+The fix is to use the relative path `"testfile.txt"` instead of the absolute path.
+
+<Compiler.java>
+...
+        try {
+            BufferedReader reader = new BufferedReader(new FileReader("C:\\Users\\86136\\Desktop\\hw2_Lexer\\hw2_Lexer\\testfile.txt"));
+            BufferedWriter parserWriter = new BufferedWriter(new FileWriter(parserOutputFileName));
+...

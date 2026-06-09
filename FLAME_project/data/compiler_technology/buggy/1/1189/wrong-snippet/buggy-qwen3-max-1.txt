@@ -1,0 +1,167 @@
+Looking at the problem, I need to analyze why the error output order is incorrect. The expected output is:
+```
+16 j
+18 a
+19 j
+```
+
+But the buggy output is:
+```
+18 a
+16 j
+19 j
+```
+
+The issue is that error type 'a' (illegal symbols "&" and "|") is being detected during lexical analysis, while errors 'j' (missing right parenthesis) are detected during syntax analysis. However, the errors should be output in ascending line number order regardless of when they are detected.
+
+Looking at the code structure:
+
+1. In `Lexer.java`, when illegal single '&' or '|' is found, it calls `addError(lineNum, ErrorType.a)` immediately during lexical analysis.
+
+2. In `Parser.java`, when missing right parenthesis is detected, it calls `lexer.addError(last.getLineNum(), ErrorType.j)` during syntax analysis.
+
+3. The `syntaxAnalysis()` method in `Parser.java` calls `lexer.errorOutput()` at the end, which outputs all errors in the order they were added to `errorList`.
+
+The problem is that the lexer adds error 'a' (line 18) to the error list first during lexical analysis, then the parser adds errors 'j' (lines 16 and 19) later during syntax analysis. But the final output should be sorted by line number.
+
+Looking at the `Lexer.java` file, I can see that `errorList` is an `ArrayList<Map.Entry<Integer, ErrorType>>` and the `errorOutput()` method outputs errors in the order they were added, not sorted by line number.
+
+However, examining the test case more carefully:
+- Line 16: `ch = getchar( ; // error 1` - missing ')' → error j at line 16
+- Line 18: `if (f2() & f1()) { // error 2` - single '&' → error a at line 18  
+- Line 19: `printf("%c",s[0]; // error 3` - missing ')' → error j at line 19
+
+The lexer processes the entire file first, so it would encounter the '&' on line 18 during lexical analysis and add error 'a' immediately. Then during syntax analysis, the parser encounters the missing ')' on line 16 first (since it parses from top to bottom), then line 19.
+
+But wait, looking more carefully at the parsing order: the parser processes the main function block, and within that block, it would encounter line 16 first (the getchar call), then line 18 (the if statement), then line 19 (the printf call).
+
+The real issue seems to be in how the error detection is implemented. Let me check the lexical analysis part for error 'a'.
+
+In `Lexer.java`, in the `getsym()` method:
+
+```java
+} else if (this.Char == '&') {
+    getChar();
+    if (this.Char == '&') {
+        catToken();
+        symbol = TokenType.AND;
+    } else {
+        retract();
+        catToken('&');
+        symbol = TokenType.AND;
+        return -1;
+    }
+} else if (this.Char == '|') {
+    getChar();
+    if (this.Char == '|') {
+        catToken();
+        symbol = TokenType.OR;
+    } else {
+        retract();
+        catToken('|');
+        symbol = TokenType.OR;
+        return -1;
+    }
+}
+```
+
+When it returns -1, the `lexicalAnalysis()` method calls `this.addError(lineNum, ErrorType.a)`. This happens immediately when the illegal character is encountered during lexical analysis.
+
+However, the problem states that for erroneous source programs, we should output "the line number of the error and the error category code" sorted by line number in ascending order.
+
+The bug is that the errors are not being sorted by line number before output. Looking at the `errorOutput()` method in `Lexer.java`:
+
+```java
+public void errorOutput() {
+    try (BufferedWriter err = new BufferedWriter(new FileWriter("error.txt"))) {
+        for (Map.Entry<Integer, ErrorType> entry : errorList) {
+            err.write(entry.getKey().toString() + " " + entry.getValue().toString());
+            err.newLine();
+        }
+    } catch (IOException e) {
+        throw new RuntimeException(e);
+    }
+}
+```
+
+This outputs errors in the order they were added, not sorted by line number.
+
+But wait, let me reconsider. Looking at the test input again, the lexical analyzer would process the entire file sequentially. It would encounter:
+1. Line 16: `ch = getchar( ;` - this contains valid tokens until the ';', no illegal '&' or '|' here
+2. Line 18: `if (f2() & f1()) {` - here it encounters a single '&' which triggers error 'a'
+3. Line 19: `printf("%c",s[0];` - this has valid tokens, no illegal symbols
+
+So during lexical analysis, only error 'a' at line 18 is added.
+
+Then during syntax analysis, the parser goes through the tokens:
+- When parsing the getchar statement (line 16), it expects a ')' after '(' but finds ';', so it adds error 'j' at line 16
+- When parsing the if statement (line 18), the '&' was already processed as an AND token (incorrectly), but the parser might handle this differently
+- When parsing the printf statement (line 19), it expects a ')' after the expression list but finds ';', so it adds error 'j' at line 19
+
+Actually, looking more carefully at the lexer code for '&' handling:
+
+```java
+} else {
+    retract();
+    catToken('&');
+    symbol = TokenType.AND;
+    return -1;
+}
+```
+
+This is problematic! When it encounters a single '&', it:
+1. Retracts (goes back one character)
+2. Adds '&' to the token 
+3. Sets symbol to TokenType.AND (which represents "&&")
+4. Returns -1 to indicate an error
+
+But this means it's creating a token with value "&" but type AND (which should be for "&&"). This is incorrect tokenization.
+
+However, the main issue for the ordering is that errors are collected in the order they're detected, not sorted by line number.
+
+Looking at the `Parser.java` file, specifically the error checking methods:
+
+```java
+private Token checkRightParen() {
+    Token rightParen;
+    if (now.getType() == TokenType.RPARENT) {
+        rightParen = now;
+        getToken();
+    } else {
+        rightParen = new Token(TokenType.RPARENT, ")", last.getLineNum());
+        if (errorState) lexer.addError(last.getLineNum(), ErrorType.j);
+    }
+    return rightParen;
+}
+```
+
+The key insight is that `last.getLineNum()` is used to determine the error line number. The `last` token is the previous token that was successfully consumed.
+
+For the getchar call on line 16: `ch = getchar( ;`
+- The tokens would be: IDENFR(ch), ASSIGN(=), IDENFR(getchar), LPARENT((), SEMICN(;)
+- When parsing, after consuming LPARENT, the next token is SEMICN, not RPARENT
+- So `last` would be the LPARENT token, which is on line 16
+- Thus error 'j' is added with line 16
+
+For the printf call on line 19: `printf("%c",s[0];`
+- After parsing the string and expression, it expects RPARENT but finds SEMICN
+- `last` would be the last token of the expression (likely RBRACK from s[0]), which is on line 19
+- Thus error 'j' is added with line 19
+
+The real problem is that the error list is not sorted by line number before output.
+
+Looking at the `Lexer.java` file, the `errorOutput()` method needs to sort the errors by line number.
+
+<frontend/Lexer.java>
+...
+    public void errorOutput() {
+        try (BufferedWriter err = new BufferedWriter(new FileWriter("error.txt"))) {
+            for (Map.Entry<Integer, ErrorType> entry : errorList) {
+                err.write(entry.getKey().toString() + " " + entry.getValue().toString());
+                err.newLine();
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+...

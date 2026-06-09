@@ -1,0 +1,33 @@
+#include <stdio.h>
+#include<stdio.h>
+#include<string.h>
+#include<stdlib.h>
+#include<math.h>
+char s[200];
+int main()
+{
+    gets(s);
+    int len=strlen(s);
+    for(int i=0; i<len; i++)
+    {
+        if(s[i]=='-'&&(s[i+1]<='Z'&&s[i-1]>='A')&&(s[i+1]<='z'&&s[i-1]>='a')) // @@ [Error: Condition is impossible because it requires s[i-1] and s[i+1] to be both uppercase and lowercase simultaneously. Should check separate ranges for lowercase, uppercase, and digits, and also ensure s[i+1] > s[i-1].]
+        {
+            int k=s[i+1]-s[i-1];
+            for(int j=1; j<k; j++)
+            {
+                printf("%c",s[i-1]+j);
+            }
+
+        }
+else
+printf("%c",s[i]);
+
+
+
+    }
+
+
+
+
+
+}

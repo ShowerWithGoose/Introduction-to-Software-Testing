@@ -1,0 +1,294 @@
+Based on the problem description and the test case analysis:
+
+1.  **Test Case Input**:
+    ```c
+    void f(int a {} // error 1 (Missing ')') -> Line 1
+    int main( { // error 2 (Missing ')') -> Line 3
+        int a = 10;
+        f(a + 10; // error 3 (Missing ')') -> Line 5
+        return 0;
+    }
+    ```
+    *Note: The input provided in the prompt has `void f(int a {}` on line 1, `int main( {` on line 3 (assuming an empty line 2 or just counting non-empty lines, but standard line counting includes all lines. Let's assume standard line numbering: Line 1: `void...`, Line 2: empty/comment?, Line 3: `int main...`. The expected output says errors are at lines 1, 3, 5. This implies line 2 is likely empty or part of the previous statement in the user's view, but typically `testfile.txt` lines are counted physically. Let's look at the errors.*
+    
+    The expected errors are:
+    - Line 1: `j` (Missing right parenthesis) for `void f(int a {}`. The parser sees `int`, `a`, then `{`. It expects `)`.
+    - Line 3: `j` (Missing right parenthesis) for `int main( {`. The parser sees `(`, then `{`. It expects `)`.
+    - Line 5: `j` (Missing right parenthesis) for `f(a + 10;`. The parser sees `f`, `(`, `a`, `+`, `10`, `;`. It expects `)`.
+
+2.  **Buggy Output**:
+    ```
+    1 j
+    3 j
+    5 j
+    5 j
+    5 j
+    5 ...
+    ```
+    The program outputs multiple errors for line 5. This suggests that when an error is detected (like missing `)`), the parser records the error but does not correctly synchronize or consume tokens to prevent subsequent parsing steps from also failing and reporting errors for the same location or subsequent tokens that are now misinterpreted.
+
+3.  **Code Analysis**:
+    In `Parser.java`, specifically in methods like `parseFuncDef`, `parseMainFuncDef`, `parseStmt`, etc., when a missing right parenthesis `)` is detected, the code adds an error log:
+    ```java
+    } else {//没有小括号
+        back();
+        ErrorLog errorLog = new ErrorLog(getToken().getLineNum(), 'j', pos);
+        errorLogs.add(errorLog);
+        next();
+    }
+    ```
+    The issue is likely in how the parser recovers or continues after detecting the error. However, looking closely at `parseCompUnit`, there is a significant logical flaw in how it identifies `Decl`s and `FuncDef`s.
+
+    Let's look at `parseCompUnit`:
+    ```java
+    public void parseCompUnit() {
+        ArrayList<Decl> decls = new ArrayList<>();
+        ArrayList<FuncDef> funcDefs = new ArrayList<>();
+        next();
+        next();//验证第三个Token是不是（
+        Token token1 = getToken();
+        if (!token1.getType().equals(Token.TokenType.LPARENT.toString())) {//处理Decls
+            while (!isEnd()) {
+                back();
+                back();
+                decls.add(parseDecl());
+                next();
+                next();
+                if (getToken().getType().equals(Token.TokenType.LPARENT.toString())) {
+                    back();
+                    back();
+                    break;
+                }
+            }
+        } else {
+            back();
+            back();
+        }
+        // ... similar logic for FuncDefs
+    }
+    ```
+    This manual lookahead logic (`next(); next(); ... back(); back();`) is extremely fragile and incorrect for general parsing. It assumes specific token structures. For example, `void f(int a {}` starts with `void` (VOIDTK). `parseCompUnit` advances twice. If the first token is `void`, `next()` moves to `f`, `next()` moves to `(`. `token1` is `(`. It goes to `else`, backs up twice. Then it proceeds to check for `MAINTK`. It sees `void`, not `main`. So it enters the `FuncDef` parsing loop.
+
+    Inside `parseFuncDef`:
+    ```java
+    public FuncDef parseFuncDef() {
+        ArrayList<Syntax> syntaxes = new ArrayList<>();
+        syntaxes.add(parseFuncType()); // consumes 'void'
+        syntaxes.add(getToken());//Ident ('f')
+        next();
+        syntaxes.add(getToken());//( ('(')
+        next();
+        if (getToken().getType().equals(Token.TokenType.CHARTK.toString())
+                || getToken().getType().equals(Token.TokenType.INTTK.toString())) {
+            syntaxes.add(parseFuncFParams());
+        }
+        if (getToken().getType().equals(Token.TokenType.RPARENT.toString())) {
+             // ...
+        } else {//没有小括号
+            back();
+            ErrorLog errorLog = new ErrorLog(getToken().getLineNum(), 'j', pos);
+            errorLogs.add(errorLog);
+            next();
+        }
+        syntaxes.add(parseBlock());
+        return new FuncDef(syntaxes);
+    }
+    ```
+    For `void f(int a {}`:
+    1. `parseFuncType` consumes `void`.
+    2. Consumes `f`.
+    3. Consumes `(`.
+    4. Next token is `int`. It enters `parseFuncFParams`.
+    5. `parseFuncFParams` calls `parseFuncFParam`.
+    6. `parseFuncFParam` consumes `int`, `a`.
+    7. Back in `parseFuncFParams`, it checks for `,`. Next is `{`. Loop ends.
+    8. Back in `parseFuncDef`, it checks for `)`. Next is `{`.
+    9. Error `j` is logged at line 1. `next()` consumes `{`? No, `back()` is called first.
+       Wait, `getToken()` returns `{`. `back()` sets `pos` back to `{`. Then `next()` advances past `{`.
+       So `pos` is now at `}`.
+    10. `parseBlock()` is called. It expects `{`. But current token is `}`.
+        `parseBlock`:
+        ```java
+        public Block parseBlock() {
+            ArrayList<Syntax> syntaxes = new ArrayList<>();
+            syntaxes.add(getToken());//{  <-- Gets '}'
+            next();
+            while (!getToken().getType().equals(Token.TokenType.RBRACE.toString())) { // '}' == RBRACE, so loop doesn't run
+                syntaxes.add(parseBlockItem());
+            }
+            syntaxes.add(getToken());//} <-- Gets next token, which is likely EOF or newline? Or if there are more tokens.
+            next();
+            return new Block(syntaxes);
+        }
+        ```
+        If `parseBlock` consumes `}` as the opening brace, it then looks for closing `}`. If the next token is not `}`, it might hang or error out depending on implementation. In this case, `void f(int a {}` has `}` immediately.
+        If `parseBlock` treats `}` as the opening brace, it consumes it. Then it checks `while (!getToken().equals(RBRACE))`. The next token might be EOF or the next line. If it's EOF, `getToken` might return null or cause issues. If it's the next line `int`, it enters the loop.
+        
+    However, the main issue causing duplicate errors on Line 5 (`f(a + 10;`) is likely in `parseStmt` or `parseUnaryExp`/`parsePrimaryExp`.
+
+    Let's look at `f(a + 10;`.
+    This is inside `main`'s block.
+    `parseBlockItem` -> `parseStmt`.
+    `parseStmt` sees `f` (IDENFR).
+    It enters the `if (getToken().getType().equals(Token.TokenType.IDENFR.toString()))` block.
+    It tries to distinguish between `LVal = ...` and `Exp ;`.
+    
+    The code in `parseStmt` for IDENFR:
+    ```java
+    if (getToken().getType().equals(Token.TokenType.IDENFR.toString())) {//LVal
+        int flag = 0;
+        int initPos = pos;
+        if (getToken().getType().equals(Token.TokenType.SEMICN.toString())) {//只有分号
+             // ...
+        }
+        parseExp(); // <--- This consumes tokens for the expression
+        if (getToken().getType().equals(Token.TokenType.ASSIGN.toString())) {//有等号
+            flag = 1;
+            next();
+        }
+        backto(initPos); // <--- Resets position
+        if (flag == 0) { // This path is taken if no '=' was found after the exp
+             syntaxes.add(parseExp()); // <--- Parses Exp again
+             if (getToken().getType().equals(Token.TokenType.SEMICN.toString())) {
+                 // ...
+             } else {//没有分号
+                 back();
+                 ErrorLog errorLog = new ErrorLog(getToken().getLineNum(), 'i', pos);
+                 errorLogs.add(errorLog);
+                 next();
+             }
+             return new Stmt(syntaxes);
+        }
+        // ... handles LVal = ...
+    }
+    ```
+    
+    For `f(a + 10;`:
+    1. `initPos` is at `f`.
+    2. `parseExp()` is called.
+       `parseExp` -> `parseAddExp` -> ... -> `parseUnaryExp`.
+       `parseUnaryExp` sees `f` (IDENFR) and next is `(`. It identifies it as a function call `Ident '(' [FuncRParams] ')'`.
+       Inside `parseUnaryExp`:
+       ```java
+       if (getToken().getType().equals(Token.TokenType.IDENFR.toString())
+               && token.getType().equals(Token.TokenType.LPARENT.toString())) { 
+           syntaxes.add(getToken());//Ident ('f')
+           next();
+           syntaxes.add(getToken());//( ('(')
+           next();
+           if (getToken().getType().equals(Token.TokenType.RPARENT.toString())) {
+               // ...
+           } else {
+               syntaxes.add(parseFuncRParams()); // Parses 'a + 10'
+               if (getToken().getType().equals(Token.TokenType.RPARENT.toString())) {
+                   // ...
+               } else {//没有小括号
+                   back();
+                   ErrorLog errorLog = new ErrorLog(getToken().getLineNum(), 'j', pos); // Logs error 'j' at line 5
+                   errorLogs.add(errorLog);
+                   next(); // Consumes ';' ? No, back() put us at ';'. next() consumes ';'.
+               }
+           }
+       }
+       ```
+       So `parseUnaryExp` logs error `j` at line 5. And consumes `;`.
+       
+    3. Back in `parseStmt`, `parseExp()` returns.
+    4. `getToken()` is now likely the next token after `;`, which is `return`.
+    5. `ASSIGN` check fails.
+    6. `backto(initPos)` resets `pos` to `f`.
+    7. `flag == 0`, so it enters the `if (flag == 0)` block.
+    8. `syntaxes.add(parseExp());` is called AGAIN.
+       This re-parses `f(a + 10;`.
+       Inside this second `parseExp`, `parseUnaryExp` is called again.
+       It sees `f`, `(`, parses params, sees `;` instead of `)`.
+       It logs error `j` at line 5 AGAIN.
+       
+    This explains the duplicate errors. The speculative parsing in `parseStmt` for `IDENFR` causes side effects (error logging) even when the speculation is discarded via `backto`.
+
+    The fix should ensure that error logs generated during speculative parsing are not retained if the speculation fails, or that the parser structure avoids re-parsing in a way that triggers errors multiple times. However, simply removing the error logging from the speculative path is hard because `parseExp` is a complex recursive descent.
+
+    A better approach for `parseStmt` when handling `IDENFR` is to determine if it's an assignment or an expression statement without fully re-parsing or by managing the error log state. But given the constraints, identifying the location is key.
+
+    The error is in `Parser.java` in the `parseStmt` method, specifically the block handling `IDENFR` where `parseExp` is called speculatively, causing side effects (error logs) that persist after `backto`.
+
+    Additionally, the `parseCompUnit` logic is flawed but might not be the direct cause of the *duplicate* errors on line 5, though it contributes to the general fragility. The duplicate errors are clearly from the re-parsing in `parseStmt`.
+
+    Here is the code snippet for `Parser.java` focusing on `parseStmt`:
+
+<Parser/Parser.java>
+...
+    public Stmt parseStmt() {
+        ArrayList<Syntax> syntaxes = new ArrayList<>();
+        if (getToken().getType().equals(Token.TokenType.IDENFR.toString())) {//LVal
+            int flag = 0;
+            int initPos = pos;
+            if (getToken().getType().equals(Token.TokenType.SEMICN.toString())) {//只有分号
+                flag = 1;
+                syntaxes.add(getToken());
+                next();
+                return new Stmt(syntaxes);
+            }
+            parseExp();
+            if (getToken().getType().equals(Token.TokenType.ASSIGN.toString())) {//有等号
+                flag = 1;
+                next();
+            }
+            backto(initPos);
+            if (flag == 0) { //这种符合[Exp];的情况，单独讨论一下
+                syntaxes.add(parseExp());
+                if (getToken().getType().equals(Token.TokenType.SEMICN.toString())) {
+                    syntaxes.add(getToken());
+                    next();
+                } else {//没有分号
+                    back();
+                    ErrorLog errorLog = new ErrorLog(getToken().getLineNum(), 'i', pos);
+                    errorLogs.add(errorLog);
+                    next();
+                }
+                return new Stmt(syntaxes);
+            }
+            syntaxes.add(parseLVal());
+            syntaxes.add(getToken());// '='
+            next();
+
+            if (getToken().getType().equals(Token.TokenType.GETINTTK.toString())
+                    || getToken().getType().equals(Token.TokenType.GETCHARTK.toString())) {
+                //LVal '=' 'getint''('')'';' (1)
+                //| LVal '=' 'getchar''('')'';' (2)
+                syntaxes.add(getToken());// 'getint'||'getchar'
+                next();
+                syntaxes.add(getToken());// (
+                next();
+                if (getToken().getType().equals(Token.TokenType.RPARENT.toString())) {
+                    syntaxes.add(getToken());
+                    next();
+                } else {//没有小括号
+                    back();
+                    ErrorLog errorLog = new ErrorLog(getToken().getLineNum(), 'j', pos);
+                    errorLogs.add(errorLog);
+                    next();
+                }
+                if (getToken().getType().equals(Token.TokenType.SEMICN.toString())) {
+                    syntaxes.add(getToken());
+                    next();
+                } else {//没有分号
+                    back();
+                    ErrorLog errorLog = new ErrorLog(getToken().getLineNum(), 'i', pos);
+                    errorLogs.add(errorLog);
+                    next();
+                }
+            } else {// Stmt → LVal '=' Exp ';'  (3)
+                syntaxes.add(parseExp());
+                if (getToken().getType().equals(Token.TokenType.SEMICN.toString())) {
+                    syntaxes.add(getToken());
+                    next();
+                } else {//没有分号
+                    back();
+                    ErrorLog errorLog = new ErrorLog(getToken().getLineNum(), 'i', pos);
+                    errorLogs.add(errorLog);
+                    next();
+                }
+            }
+        } else if (getToken().getType().equals(Token.TokenType.LBRACE.toString())) { //Block (4)
+...

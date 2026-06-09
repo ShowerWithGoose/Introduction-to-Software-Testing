@@ -1,0 +1,23 @@
+#include <stdio.h>
+#include <string.h>
+#define len 200
+int main()
+{
+    char c;
+    int i;
+    char str[len];
+    gets(str);
+    for (i = 0; str[i] != '\0'; i++)
+    {
+        if (str[i] == '-' && (str[i - 1] < str[i + 1]) && ((str[i - 1] >= 'a' && str[i + 1] <= 'z') || (str[i - 1] >= 'A' && str[i + 1] <= 'Z') || (str[i - 1] >= '0' && str[i + 1] <= '9')) && ((i - 1) != 0) && (str[i + 1] != '\0')) // @@ Condition uses wrong range checks (should ensure both chars are within same class) and incorrect bound check: (i-1)!=0 should be i>0 to allow dash at index 1 with left char at index 0.
+        {
+            for (int j = 1; j < (str[i + 1] - str[i - 1]); j++)
+            {
+                printf("%c", str[i - 1] + j);
+            }
+        }
+        else
+            printf("%c", str[i]);
+    }
+    return 0;
+}

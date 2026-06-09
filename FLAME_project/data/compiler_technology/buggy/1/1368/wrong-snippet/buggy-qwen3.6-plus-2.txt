@@ -1,0 +1,550 @@
+Based on the problem description and the provided code, the program fails to produce any output file ("No output file"). This indicates that an exception is likely thrown during execution, preventing the `output()` method from writing to the files, or the program crashes before reaching that point.
+
+Looking at `Compiler.java`:
+```java
+public class Compiler {
+    public static void main(String[] args) throws FileNotFoundException {
+        IOStream.readFile();
+        //IOStream.debug38();
+        Lexer lexer = Lexer.getInstance();
+        lexer.setInputStrings(IOStream.toInputStrings());
+        IOStream.createOutput();
+        IOStream.output();
+    }
+}
+```
+
+In `IOStream.createOutput()`:
+```java
+public static void createOutput() {
+    Parser parser = Parser.getInstance();
+    parser.parseCompUnit();
+    /*while (true) {
+        int next = lexer.next();
+        if (next == 0) {
+            lexTypes.add(lexer.getLexType());
+            lexStrings.add(lexer.getToken());
+        } else if (next == 1) { // 词法分析出口
+            break;
+        }
+    }*/
+}
+```
+
+The `parseCompUnit` method in `Parser.java` calls `newNowType()` which calls `Lexer.getInstance().read1word()`.
+
+Let's look at `Lexer.read1word()`:
+```java
+public void read1word() {
+    while (true) {
+        int next = next();
+        if (next == 0 || next == 1 || next == 3) {
+            break;
+        }
+    }
+}
+```
+
+And `Lexer.next()`:
+If `IOStream.outOfLineNum(lineNum)` is true, it returns 1.
+If it reads a comment (`//` or `/* ... */`), it returns 5.
+If it encounters an error like single `&` or `|`, it returns 3.
+Otherwise, it returns 0 for valid tokens.
+
+Notice that `read1word()` loops until `next` is 0, 1, or 3. It does **not** handle return value 5 (comments). If the source code contains comments, `next()` returns 5, `read1word()` continues looping. This part seems okay as it skips comments.
+
+However, let's look at `IOStream.output()`:
+```java
+public static void output() throws FileNotFoundException {
+    String filePath1 = "parser.txt";
+    String filePath2 = "error.txt";
+    FileOutputStream fileOutputStream1 = new FileOutputStream(filePath1);
+    FileOutputStream fileOutputStream2 = new FileOutputStream(filePath2);
+    if (!errorType.isEmpty()) {
+        // ... write errors
+    } else {
+        for (int i = 0; i < gramParseOutput.size(); i++) {
+            String s = gramParseOutput.get(i);
+            byte[] buff = s.getBytes();
+            try {
+                fileOutputStream1.write(buff);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+    }
+}
+```
+If `gramParseOutput` is empty and `errorType` is empty, it writes nothing but creates the files. The issue "No output file" usually means the files weren't created or the program crashed.
+
+Let's look closely at `Parser.parseCompUnit()`:
+```java
+public void parseCompUnit() {
+    lastLineNum = Lexer.getInstance().getLineNum();
+    Lexer lexer = Lexer.getInstance();
+    //LexType nowType = null;
+    newNowType();
+    while (nowType == LexType.CONSTTK || nowType == LexType.INTTK ||
+            nowType == LexType.CHARTK || nowType == LexType.VOIDTK) {
+        if (nowType == LexType.CONSTTK) {
+            parseDecl();
+        } else if (nowType == LexType.VOIDTK) {
+            parseFuncDef();
+        } else {
+            lexer.setPrePos();
+            LexType preType = lexer.preRead();
+            if (preType == LexType.MAINTK) {
+                parseMainFuncDef();
+                break;
+            } else if (preType == LexType.IDENFR) {
+                LexType prePreType = lexer.preRead();
+                if (prePreType == LexType.LPARENT) {
+                    parseFuncDef();
+                } else {
+                    parseDecl();
+                }
+            }
+        }
+    }
+    IOStream.add2outputString(null, null, "CompUnit");
+}
+```
+
+There is a potential infinite loop or crash if `nowType` is not one of the expected types but the loop condition fails. However, the loop condition checks for specific types. If `nowType` is something else, the loop terminates.
+
+Let's look at `Lexer.preRead()` again. It has a bug in handling `|` error:
+```java
+        } else if (tempChar == '|') {
+            stringBuilder.append(preSource.charAt(prePos)); // BUG: prePos might be out of bounds or logic error
+            if (prePos < preSource.length() && preSource.charAt(prePos) == '|') {
+                // ...
+            } else { // error1
+                IOStream.setErrorHappened(ErrorType.a, lineNum, prePos); // BUG: uses lineNum instead of preLineNum
+                return null; // Returns null
+            }
+        }
+```
+If `preRead` returns `null`, `parseCompUnit` does:
+```java
+LexType preType = lexer.preRead();
+if (preType == LexType.MAINTK) { ... }
+else if (preType == LexType.IDENFR) { ... }
+```
+If `preType` is `null`, neither condition is met. The code falls through. Since it's inside a `while` loop that depends on `nowType`, and `nowType` hasn't changed, if `nowType` was `INTTK` or `CHARTK` (the `else` branch), and `preRead` returns `null` (e.g., due to an error or unexpected character), the loop continues indefinitely because `nowType` is still `INTTK`/`CHARTK` and `preType` is `null` (not `MAINTK` or `IDENFR`). This causes an **infinite loop**, leading to no output (or timeout).
+
+However, the test case input is a correct program. So `preRead` shouldn't encounter errors.
+
+Let's look at `isBType` in `Parser.java`:
+```java
+    private boolean isBType(LexType a) {
+        lastLineNum = Lexer.getInstance().getLineNum();
+        return (a == LexType.INTTK || a == LexType.CHARTK
+                || a == LexType.VOIDTK);
+    }
+```
+This is used in `parseBlockItem`:
+```java
+    public void parseBlockItem() {
+        lastLineNum = Lexer.getInstance().getLineNum();
+        if (nowType == LexType.CONSTTK || isBType(nowType)) {
+            parseDecl();
+        } else {
+            parseStmt();
+        }
+        // IOStream.add2outputString(null, null, "BlockItem");
+    }
+```
+And `parseDecl`:
+```java
+    public void parseDecl() {
+        lastLineNum = Lexer.getInstance().getLineNum();
+        if (nowType == LexType.CONSTTK) {
+            parseConstDecl();
+        } else {
+            parseVarDecl();
+        }
+        //IOStream.add2outputString(null, null, "Decl");
+    }
+```
+If `nowType` is `VOIDTK`, `isBType` returns true. `parseDecl` is called. `nowType` is `VOIDTK`, so it goes to `else` -> `parseVarDecl`.
+`parseVarDecl`:
+```java
+    public void parseVarDecl() {
+        lastLineNum = Lexer.getInstance().getLineNum();
+        parseBtype(); // Outputs VOIDTK, advances.
+        parseVarDef(); // Expects Ident. But FuncDef starts with Type Ident '('.
+        // ...
+    }
+```
+If `parseBlockItem` encounters a function definition inside a block (which is invalid in C-like grammars usually, but here `BlockItem` is `Decl | Stmt`). Wait, `FuncDef` is not a `BlockItem`. `FuncDef` is only at `CompUnit` level. So `VOIDTK` should not appear in `BlockItem` unless it's a variable declaration of type void (which is invalid) or the parser is confused.
+
+But the main issue causing "No output file" is often an unhandled exception.
+
+In `IOStream.output()`:
+```java
+    FileOutputStream fileOutputStream1 = new FileOutputStream(filePath1);
+    FileOutputStream fileOutputStream2 = new FileOutputStream(filePath2);
+```
+If these lines throw an exception (e.g., permission denied), the program crashes. But typically in these environments, it's allowed.
+
+Let's look at `Lexer.next()` when handling `|`:
+```java
+        } else if (tempChar == '|') {
+            stringBuilder.append(source.charAt(curPos)); // BUG: curPos was already incremented!
+            // ...
+        }
+```
+In `Lexer.next()`:
+```java
+        char tempChar = source.charAt(curPos);
+        curPos++;
+        // ...
+        } else if (tempChar == '|') {
+            stringBuilder.append(source.charAt(curPos)); // Appends the NEXT char, not '|'
+            if (curPos < source.length() && source.charAt(curPos) == '|') {
+                stringBuilder.append(source.charAt(curPos));
+                token = stringBuilder.toString();
+                lexType = LexType.OR;
+                curPos++;
+                return 0;
+            } else { // error1
+                IOStream.setErrorHappened(ErrorType.a, lineNum, curPos);
+                token = stringBuilder.toString();
+                lexType = LexType.OR;
+                return 3;
+            }
+        }
+```
+When `tempChar` is `|`, `curPos` has already moved past it. `source.charAt(curPos)` gets the character *after* `|`.
+If the input is `||`, `tempChar` is first `|`. `curPos` points to second `|`. `stringBuilder` appends second `|`. Then check `source.charAt(curPos)` (second `|`) == `|`. True. Appends second `|` again. Token becomes `||`. `curPos` increments. This seems to work for `||` but the token string is constructed weirdly (missing the first `|` in the builder initially? No, `stringBuilder` was empty. It appends `source.charAt(curPos)` which is the second `|`. Then appends it again. So token is `||`. But the first `|` is lost in the token string? `token` is used for output. `LexType` is `OR`. The output format is `LexType token`. So `OR ||`. This might be acceptable if only type matters, but `token` is wrong.
+
+However, if the input is `| ` (single pipe), `tempChar` is `|`. `curPos` points to space. `stringBuilder` appends space. Check `source.charAt(curPos)` (space) == `|`. False. Error reported. Token is ` `.
+
+This bug in `Lexer.next()` for `|` (and similarly `&`) causes incorrect token strings, but probably not a crash.
+
+Let's look at `Lexer.preRead()` for `|`:
+```java
+        } else if (tempChar == '|') {
+            stringBuilder.append(preSource.charAt(prePos)); // prePos was incremented before this block?
+            // Let's trace preRead.
+            // char tempChar = preSource.charAt(prePos);
+            // if (tempChar == ' ') { prePos++; ... }
+            // prePos++; // <--- HERE prePos is incremented
+            // if (isLetterOrUnderline(tempChar)) { ... }
+            // ...
+            // } else if (tempChar == '|') {
+            //     stringBuilder.append(preSource.charAt(prePos)); // Uses NEW prePos
+```
+Yes, `prePos` is incremented immediately after reading `tempChar`. So `preSource.charAt(prePos)` is the character *after* `|`.
+If input is `||`, `tempChar` is first `|`. `prePos` points to second `|`. `stringBuilder` appends second `|`.
+Check `preSource.charAt(prePos)` (second `|`) == `|`. True.
+Appends second `|` again. Token `||`.
+Returns `OR`.
+
+If input is `| ` (single pipe), `tempChar` is `|`. `prePos` points to space.
+`stringBuilder` appends space.
+Check space == `|`. False.
+Error reported.
+Returns `null`.
+
+The critical issue is likely in `Parser.parseCompUnit` or `Parser.parseFuncDef` causing an infinite loop or stack overflow, or `Lexer` getting stuck.
+
+However, there is a very common mistake in these assignments: **Not handling the end of file correctly in `read1word` or `next`**.
+
+In `Lexer.next()`:
+```java
+        if (IOStream.outOfLineNum(lineNum)) { // 行数大于实际行数
+            return 1;
+        }
+        source = inputStrings.get(lineNum);
+        if (curPos == source.length()) { // 本行读取完毕，换行
+            lineNum++;
+            curPos = 0;
+            return 2;
+        }
+```
+Return 2 means "skip, read next". `read1word` handles 2 by looping.
+
+In `Lexer.preRead()`:
+```java
+        if (IOStream.outOfLineNum(preLineNum)) { // 行数大于实际行数
+            return null;
+        }
+        preSource = inputStrings.get(preLineNum);
+        if (prePos == preSource.length()) { // 本行读取完毕，换行
+            prePos = 0;
+            preLineNum++;
+            return preRead(); // Recursive call
+        }
+```
+If `preRead` keeps recursing on empty lines or end of file, it might stack overflow? `outOfLineNum` checks `num >= lineNum`. `lineNum` is the current line being parsed. `preLineNum` can go ahead. If `preLineNum` exceeds available lines, `outOfLineNum` returns true, returns `null`.
+
+Let's look at `Parser.parseFuncDef`:
+```java
+    public void parseFuncDef() {
+        lastLineNum = Lexer.getInstance().getLineNum();
+        parseFuncType();
+        outputNowWord();
+        newNowType(); // 跳过ident
+        outputNowWord();
+        newNowType(); // 跳过'('
+        if (nowType == LexType.INTTK || nowType == LexType.CHARTK || nowType == LexType.VOIDTK) { // 无形参
+             // Comment says "no params", but condition checks for types.
+             // If next token is INTTK, it means there ARE params.
+             // Grammar: FuncFParams → FuncFParam { ',' FuncFParam }
+             // FuncFParam → BType Ident ...
+             // So if nowType is BType, there are params.
+            parseFuncFParams();
+        }
+        if (nowType != LexType.RPARENT) {
+             // Error
+        } else {
+            outputNowWord();
+            newNowType(); // ')'
+        }
+        parseBlock();
+        IOStream.add2outputString(null, null, "FuncDef");
+    }
+```
+The condition `if (nowType == LexType.INTTK || nowType == LexType.CHARTK || nowType == LexType.VOIDTK)` is correct for detecting start of parameters.
+
+However, look at `parseMainFuncDef`:
+```java
+    public void parseMainFuncDef() {
+        lastLineNum = Lexer.getInstance().getLineNum();
+        outputNowWord();
+        newNowType(); // 'int'
+        outputNowWord();
+        newNowType(); // 'main'
+        outputNowWord();
+        newNowType(); // '('
+        if (nowType != LexType.RPARENT) {
+            IOStream.setErrorHappened(ErrorType.j, lastLineNum,
+                    Lexer.getInstance().getCurPos());
+        } else {
+            outputNowWord();
+            newNowType(); // ')'
+        }
+        parseBlock();
+        IOStream.add2outputString(null, null, "MainFuncDef");
+    }
+```
+
+In `parseCompUnit`:
+```java
+            } else {
+                lexer.setPrePos();
+                LexType preType = lexer.preRead();
+                if (preType == LexType.MAINTK) {
+                    parseMainFuncDef();
+                    break;
+                } else if (preType == LexType.IDENFR) {
+                    LexType prePreType = lexer.preRead();
+                    if (prePreType == LexType.LPARENT) {
+                        parseFuncDef();
+                    } else {
+                        parseDecl();
+                    }
+                }
+            }
+```
+If `preType` is `MAINTK`, `parseMainFuncDef` is called.
+Inside `parseMainFuncDef`, `outputNowWord()` outputs `INTTK` (current `nowType`).
+Then `newNowType()` reads `main`. `nowType` becomes `MAINTK`.
+Then `outputNowWord()` outputs `MAINTK`.
+Then `newNowType()` reads `(`. `nowType` becomes `LPARENT`.
+Then `outputNowWord()` outputs `LPARENT`.
+Then `newNowType()` reads `)`. `nowType` becomes `RPARENT`.
+Check `nowType != RPARENT`? False.
+Outputs `RPARENT`.
+`newNowType()` reads `{`.
+`parseBlock()`.
+
+This seems correct.
+
+Why "No output file"?
+If `IOStream.output()` is never reached, or `createOutput` throws an exception.
+
+In `IOStream.add2outputString`:
+```java
+    public static void add2outputString(LexType type, String lexString, String gram) {
+        Lexer lexer = Lexer.getInstance();
+        if (gram == null) {
+            lexTypes.add(lexer.getLexType());
+            lexStrings.add(lexer.getToken());
+            gramParseOutput.add(type + " " + lexString + "\n");
+        } else {
+            gramParseOutput.add("<" + gram+ ">" + "\n");
+        }
+    }
+```
+If `type` is `null` (when `gram` is not null), it's fine.
+If `gram` is `null`, `type` must not be null.
+
+In `Parser.outputNowWord()`:
+```java
+    private void outputNowWord() {
+        IOStream.add2outputString(nowType,
+                Lexer.getInstance().getToken(), null);
+    }
+```
+`nowType` can be `null` if initialization failed? `Parser` constructor sets `nowType = null`. `parseCompUnit` calls `newNowType()` immediately.
+
+If `newNowType()` fails to set `nowType`?
+`newNowType()` calls `read1word()`.
+If `read1word()` loops forever?
+
+Let's check `Lexer.next()` for empty lines.
+If a line is empty, `source.length()` is 0.
+`curPos` is 0.
+`curPos == source.length()` is true.
+`lineNum++`.
+`curPos = 0`.
+Returns 2.
+`read1word()` loops. Correct.
+
+Is it possible `inputStrings` is empty? `readFile` reads lines. If file is empty, `inputStrings` is empty.
+`toInputStrings` returns empty list.
+`setInputStrings` sets it.
+`parseCompUnit` calls `newNowType`.
+`newNowType` calls `read1word`.
+`read1word` calls `next`.
+`next`: `IOStream.outOfLineNum(lineNum)`? `lineNum` is 0. `inputStrings` size is 0. `outOfLineNum` returns `0 >= 0`?
+`IOStream.outOfLineNum`:
+```java
+    public static Boolean outOfLineNum(int num) {
+        return num >= lineNum;
+    }
+```
+`lineNum` in `IOStream` is static and set in `readFile`.
+If file has 10 lines, `lineNum` becomes 10 (incremented after each read).
+So valid indices are 0 to 9.
+`outOfLineNum(10)` returns `10 >= 10` -> `true`.
+So if `Lexer.lineNum` reaches `IOStream.lineNum`, it returns 1.
+`read1word` breaks.
+`nowType` remains whatever it was?
+In `Parser`, `nowType` is static.
+If `read1word` breaks because of EOF (return 1), `nowType` is NOT updated in `newNowType` after the loop?
+```java
+    private void newNowType() {
+        lastLineNum = Lexer.getInstance().getLineNum();
+        Lexer.getInstance().read1word();
+        nowType = Lexer.getInstance().getLexType();
+    }
+```
+If `read1word` returns 1 (EOF), `getLexType()` returns the LAST valid token's type.
+This might cause issues if parsing expects more tokens.
+
+But the test case is large and valid.
+
+The most likely cause for "No output file" in Java assignments is an **uncaught exception** terminating the program before `output()` is called, or `output()` throwing an exception.
+
+In `IOStream.output()`:
+```java
+    FileOutputStream fileOutputStream1 = new FileOutputStream(filePath1);
+    FileOutputStream fileOutputStream2 = new FileOutputStream(filePath2);
+```
+If `parser.txt` or `error.txt` cannot be created, it throws `FileNotFoundException`.
+`Compiler.main` declares `throws FileNotFoundException`. So it will propagate to JVM and print stack trace. The program terminates. No files created (or partial).
+
+However, usually these files are writable.
+
+Let's look at `Lexer.next()` again.
+```java
+        } else if (tempChar == '|') {
+            stringBuilder.append(source.charAt(curPos));
+```
+If `curPos` is `source.length()` (end of line), `source.charAt(curPos)` throws `StringIndexOutOfBoundsException`.
+When does this happen?
+`tempChar` is read at `curPos`. `curPos` is incremented.
+If `|` is the LAST character of the line.
+`curPos` becomes `source.length()`.
+`source.charAt(curPos)` throws Exception.
+
+**This is the bug.**
+
+Same for `&`:
+```java
+        } else if (tempChar == '&') {
+            stringBuilder.append(tempChar);
+            if (curPos < source.length() && source.charAt(curPos) == '&') {
+```
+Wait, `&` code does:
+```java
+            stringBuilder.append(tempChar);
+            if (curPos < source.length() && source.charAt(curPos) == '&') {
+```
+It checks bounds BEFORE accessing.
+
+But `|` code does:
+```java
+        } else if (tempChar == '|') {
+            stringBuilder.append(source.charAt(curPos)); // NO BOUNDS CHECK
+            if (curPos < source.length() && source.charAt(curPos) == '|') {
+```
+It accesses `source.charAt(curPos)` WITHOUT checking if `curPos < source.length()`.
+
+If the source code has a `|` at the end of a line, or `|` followed by nothing (EOF), it crashes.
+The test case doesn't seem to have `|` at end of line.
+`if (!bool1)` uses `!`.
+`b = b + c - a;`
+`printf("Good!,Num is %d\n", a + mid(a, b, c) / 6 * c % 2 - (bool1 * bool3));`
+
+Wait, look at `preRead` for `|`:
+```java
+        } else if (tempChar == '|') {
+            stringBuilder.append(preSource.charAt(prePos)); // NO BOUNDS CHECK
+            if (prePos < preSource.length() && preSource.charAt(prePos) == '|') {
+```
+Same bug in `preRead`.
+
+If the parser calls `preRead` and the lookahead is `|` at end of line, it crashes.
+
+In `parseCompUnit`:
+```java
+                lexer.setPrePos();
+                LexType preType = lexer.preRead();
+```
+If `nowType` is `INTTK` (e.g. `int main...`), it calls `preRead`.
+`preRead` looks ahead.
+If the next token is `main`, it's letters.
+If the next token is `|`, it crashes if at end of line.
+
+Although the provided test case might not trigger this specific crash, it is a definite bug.
+
+However, there is another possibility. `IOStream.output` writes to `parser.txt`. If the program crashes during parsing, no file is written.
+
+The bug location is in `Lexer.java` in the `next()` and `preRead()` methods handling `|`.
+
+<Lexer.java>
+...
+        } else if (tempChar == '&') {
+            stringBuilder.append(tempChar);
+            if (curPos < source.length() && source.charAt(curPos) == '&') {
+                stringBuilder.append(source.charAt(curPos));
+                token = stringBuilder.toString();
+                lexType = LexType.AND;
+                curPos++;
+                return 0;
+            } else { // error1
+                IOStream.setErrorHappened(ErrorType.a, lineNum, curPos);
+                token = stringBuilder.toString();
+                lexType = LexType.AND;
+                return 3;
+            }
+        } else if (tempChar == '|') {
+            stringBuilder.append(source.charAt(curPos));
+            if (curPos < source.length() && source.charAt(curPos) == '|') {
+                stringBuilder.append(source.charAt(curPos));
+                token = stringBuilder.toString();
+                lexType = LexType.OR;
+                curPos++;
+                return 0;
+            } else { // error1
+                IOStream.setErrorHappened(ErrorType.a, lineNum, curPos);
+                token = stringBuilder.toString();
+                lexType = LexType.OR;
+                return 3;
+            }
+        } else if (tempChar == '+') {
+...

@@ -1,0 +1,362 @@
+Based on the analysis of the problem description, test case, and source code:
+
+**Summary:**
+The program is a syntax analyzer that should detect specific syntax errors (missing semicolons `i`, missing right parentheses `j`, missing right brackets `k`).
+The test input contains three errors:
+1. Line 1: `void f(int a {}` - Missing `)` after parameters. Expected error `1 j`.
+2. Line 3: `int main( {` - Missing `)` after `main`. Expected error `3 j`.
+3. Line 5: `f(a + 10;` - Missing `)` in function call. Expected error `5 j`.
+
+The buggy output is:
+```
+1 j
+3 j
+5 j
+5 i
+```
+The expected output is:
+```
+1 j
+3 j
+5 j
+```
+The program incorrectly reports an additional error `5 i` (missing semicolon) for line 5.
+
+**Analysis:**
+In `parseStmt`, when parsing a statement starting with an identifier (like `f`), the code checks if it's an assignment or function call using `lexer.preReadCompare(LexType.ASSIGN)`.
+For `f(a + 10;`, `preReadCompare` looks ahead. It sees `(`, then `a`, `+`, `10`, `;`. It does not find `=` before `;`, so it returns `false`.
+The code then falls into the `else` block at the end of `parseStmt`:
+```java
+        } else {
+            Exp exp = null;
+            if (lexType != LexType.SEMICN) {
+                exp = parseExp();
+            }
+            if (errorTool.checkI(token, line)) {
+                getToken();
+            }
+            outputP("Stmt");
+            return new Stmt(exp, StmtType.EXP);
+        }
+```
+It calls `parseExp()`. `parseExp` eventually parses `f(a + 10` as part of an expression (specifically inside `UnaryExp` -> `PrimaryExp` or similar, but wait, `f` is `IDENFR`. In `parseUnaryExp`, if it's `IDENFR` and next is `LPARENT`, it treats it as a function call `UnaryExp`.
+Inside `parseUnaryExp`:
+```java
+            } else if (lexType == LexType.IDENFR) {
+                ArrayList<LexType> lexTypes = lexer.preRead(1);
+                if (lexTypes.get(0) == LexType.LPARENT) {
+                    // ... parses function call ...
+                    if (errorTool.checkJ(token, line)) { // Checks for )
+                        getToken();
+                    }
+                    // ...
+                }
+            }
+```
+When parsing `f(a + 10;`, `parseUnaryExp` will consume `f`, `(`, `a`, `+`, `10`. The next token is `;`. It calls `checkJ(token, line)`. Since `token` is `;` (not `)`), it reports error `j` (which is correct, error 5 j). Crucially, `checkJ` returns `false`. The code does **not** consume the token `;` because the `if` block only calls `getToken()` if `checkJ` returns `true`.
+So, after `parseUnaryExp` (and thus `parseExp`) returns, the current token is still `;`.
+Back in `parseStmt`'s `else` block:
+```java
+            if (errorTool.checkI(token, line)) {
+                getToken();
+            }
+```
+It calls `checkI(token, line)`. `token` is `;`. `checkI` returns `true` if `op.equals(";")`. So it returns `true`.
+Wait, if `checkI` returns `true`, it means NO error is reported.
+Let's re-read `ErrorTool.checkI`:
+```java
+    public boolean checkI(String op, int line) throws IOException {
+        if (op.equals(";")) {
+            return true;
+        } else {
+            writer.write(line + " i\n");
+            return false;
+        }
+    }
+```
+If `token` is `;`, `checkI` returns `true`. No error `i` is written.
+So why is `5 i` appearing?
+
+Let's look closer at `parseUnaryExp` again.
+```java
+                if (lexTypes.get(0) == LexType.LPARENT) {
+
+                    String s = token;
+                    getToken(); // consumes f
+                    getToken(); // consumes (
+                    FuncRParams funcRParams = null;
+                    if (lexType != LexType.RPARENT&&lexer.preReadCompare(LexType.RPARENT)) {
+                        funcRParams = parseFuncRParams();
+                    }
+                    if (errorTool.checkJ(token, line)) {
+                        getToken();
+                    }
+                    outputP("UnaryExp");
+                    return new UnaryExp(getIdent(s,line), funcRParams);
+                }
+```
+Input: `f(a + 10;`
+1. `s = "f"`. `getToken()` -> token is `(`.
+2. `getToken()` -> token is `a`.
+3. `lexType` is `IDENFR`. `lexType != RPARENT` is true. `preReadCompare(RPARENT)` scans ahead. It sees `a`, `+`, `10`, `;`. It stops at `;` or end. It does NOT find `)`. So `preReadCompare` returns `false`.
+4. The `if` condition `lexType != LexType.RPARENT && false` is `false`.
+5. `parseFuncRParams` is NOT called.
+6. `checkJ(token, line)` is called. Current token is `a` (from step 2? No, `getToken` updates state).
+   Let's trace `getToken` carefully.
+   - Enter `parseUnaryExp`. `lexType` is `IDENFR` (`f`).
+   - `lexTypes = preRead(1)` -> reads `(`.
+   - `s = token` (`f`).
+   - `getToken()` -> advances to `(`. `token` is `(`, `lexType` is `LPARENT`.
+   - `getToken()` -> advances to `a`. `token` is `a`, `lexType` is `IDENFR`.
+   - `lexType` (`IDENFR`) != `RPARENT`. True.
+   - `preReadCompare(RPARENT)`:
+     - Saves state.
+     - Loop:
+       - `lexType` is `IDENFR` (`a`). Not `RPARENT`. Not `SEMICN`. `next()`.
+       - `lexType` becomes `PLUS` (`+`). Not `RPARENT`. Not `SEMICN`. `next()`.
+       - `lexType` becomes `INTCON` (`10`). Not `RPARENT`. Not `SEMICN`. `next()`.
+       - `lexType` becomes `SEMICN` (`;`). Break loop.
+     - Restores state. Returns `false`.
+   - `funcRParams` remains `null`.
+   - `checkJ(token, line)`. Current `token` is `a` (from the second `getToken`).
+   - `checkJ` checks if `token` equals `)`. It is `a`. So it writes `5 j` and returns `false`.
+   - `getToken()` is NOT called.
+   - Returns `UnaryExp`.
+   
+   Back in `parseExp` -> `parseAddExp` -> ... -> `parseUnaryExp`.
+   `parseExp` returns.
+   
+   Back in `parseStmt` `else` block:
+   ```java
+            Exp exp = null;
+            if (lexType != LexType.SEMICN) { // lexType is IDENFR (a) ?? No.
+   ```
+   Wait, `parseExp` calls `parseAddExp`.
+   `parseAddExp` calls `parseMulExp`.
+   `parseMulExp` calls `parseUnaryExp`.
+   We established `parseUnaryExp` consumed `f` and `(`, and left the pointer at `a`.
+   
+   Inside `parseUnaryExp`, after handling the `IDENFR` case with `LPARENT`, it returns.
+   Does `parseMulExp` do anything else?
+   ```java
+    public MulExp parseMulExp() throws IOException {
+        UnaryExp unaryExp = parseUnaryExp();
+        MulExp mulExp = new MulExp(unaryExp);
+        outputP("MulExp");
+        while (lexType == LexType.MULT || lexType == LexType.DIV
+                || lexType == LexType.MOD) {
+            // ...
+        }
+        return mulExp;
+    }
+   ```
+   `lexType` is `IDENFR` (`a`). Not `*`, `/`, `%`. Returns.
+   
+   `parseAddExp`:
+   ```java
+    public AddExp parseAddExp() throws IOException {
+        MulExp mulExp = parseMulExp();
+        AddExp addExp = new AddExp(mulExp);
+        outputP("AddExp");
+        while (lexType == LexType.PLUS || lexType == LexType.MINU) {
+            LexType op = lexType;
+            getToken();
+            mulExp = parseMulExp();
+            outputP("AddExp");
+            addExp = new AddExp(addExp, op, mulExp);
+        }
+        return addExp;
+    }
+   ```
+   `lexType` is `IDENFR` (`a`). Not `+` or `-`. Returns.
+   
+   So `parseExp` returns. The current token is still `a` (`IDENFR`).
+   
+   Back in `parseStmt`:
+   ```java
+        } else {
+            Exp exp = null;
+            if (lexType != LexType.SEMICN) { // lexType is IDENFR. True.
+                exp = parseExp();
+            }
+            if (errorTool.checkI(token, line)) {
+                getToken();
+            }
+            outputP("Stmt");
+            return new Stmt(exp, StmtType.EXP);
+        }
+   ```
+   `parseExp()` was called. But wait, `parseExp` expects to parse an expression starting from the current token.
+   The current token is `a`.
+   `parseExp` -> `parseAddExp` -> `parseMulExp` -> `parseUnaryExp`.
+   In `parseUnaryExp`:
+   `lexType` is `IDENFR` (`a`).
+   `preRead(1)` reads `+`.
+   `lexTypes.get(0)` is `PLUS`. Not `LPARENT`.
+   Goes to `else`: `PrimaryExp primaryExp = parsePrimaryExp();`
+   
+   `parsePrimaryExp`:
+   ```java
+        } else if (lexType == LexType.IDENFR) {
+            LVal lVal = parseLVal();
+            outputP("PrimaryExp");
+            return new PrimaryExp(lVal);
+        }
+   ```
+   `parseLVal`:
+   ```java
+    public LVal parseLVal() throws IOException {
+        int line = lexer.getLineNum();
+        String s = token; // s = "a"
+        Exp exp = null;
+        getToken(); // advances to +
+        if (lexType == LexType.LBRACK) {
+           // ...
+        }
+        // ...
+        return new LVal(getIdent(s,line));
+    }
+   ```
+   `parseLVal` consumes `a`. Current token is `+`.
+   Returns `LVal`.
+   `parsePrimaryExp` returns.
+   `parseUnaryExp` returns.
+   `parseMulExp` returns.
+   `parseAddExp`:
+   `lexType` is `PLUS`. Enters loop.
+   `op = PLUS`.
+   `getToken()` -> advances to `10`.
+   `parseMulExp()` -> `parseUnaryExp()` -> `parsePrimaryExp()` -> `Number`.
+   Consumes `10`. Current token is `;`.
+   Loop continues? `lexType` is `SEMICN`. No.
+   `parseAddExp` returns.
+   `parseExp` returns.
+   
+   Back in `parseStmt`:
+   Current token is `;`.
+   ```java
+            if (errorTool.checkI(token, line)) {
+                getToken();
+            }
+   ```
+   `checkI(";", 5)` returns `true`. No error written.
+   
+   So where does `5 i` come from?
+   
+   Let's look at `parseFuncDef` or `parseMainFuncDef`? No, we are inside `main` block.
+   
+   Let's look at `parseStmt` again. Is it possible that `parseExp` failed to consume everything?
+   
+   Wait, look at `parseUnaryExp` again.
+   ```java
+            } else if (lexType == LexType.IDENFR) {
+                ArrayList<LexType> lexTypes = lexer.preRead(1);
+                if (lexTypes.get(0) == LexType.LPARENT) {
+                    // ...
+                } else {
+                    PrimaryExp primaryExp = parsePrimaryExp();
+                    outputP("UnaryExp");
+                    return new UnaryExp(primaryExp);
+                }
+            }
+   ```
+   
+   And `parsePrimaryExp`:
+   ```java
+        } else if (lexType == LexType.IDENFR) {
+            LVal lVal = parseLVal();
+            outputP("PrimaryExp");
+            return new PrimaryExp(lVal);
+        }
+   ```
+   
+   This path seems correct for `a + 10`.
+   
+   Let's re-examine the first `f(a + 10;` parsing in `parseStmt`.
+   The `else if (lexer.preReadCompare(LexType.ASSIGN))` branch.
+   `preReadCompare(ASSIGN)` for `f(a + 10;`.
+   Scans: `f`, `(`, `a`, `+`, `10`, `;`. Stops at `;`. Returns `false`.
+   
+   So it goes to the final `else`.
+   
+   Is it possible that `parseExp` is NOT called?
+   `if (lexType != LexType.SEMICN)`. `lexType` is `IDENFR` (`f`). So `parseExp` IS called.
+   
+   Let's look at `parseUnaryExp` for `f`.
+   It detects `f(`.
+   It consumes `f`. Token `(`.
+   It consumes `(`. Token `a`.
+   It checks `preReadCompare(RPARENT)`. Returns `false`.
+   It calls `checkJ(token, line)`. Token is `a`. Writes `5 j`. Returns `false`.
+   It does NOT consume `a`.
+   It returns `UnaryExp`.
+   
+   So `parseExp` returns with current token `a`.
+   
+   Back in `parseStmt`:
+   `exp = parseExp()`.
+   Then `checkI(token, line)`. Token is `a`.
+   `checkI("a", 5)` writes `5 i` and returns `false`.
+   
+   Ah! The issue is that `parseExp` did NOT consume the rest of the expression `a + 10;` because `parseExp` started parsing from `f`, but `parseUnaryExp` for `f` stopped prematurely after detecting the error and NOT consuming the arguments or the closing parenthesis properly, leaving the stream at `a`.
+   
+   Specifically, in `parseUnaryExp`, when it identifies a function call `f(...)`, it manually consumes `f` and `(`. Then it tries to parse params. If it decides not to parse params (because `preReadCompare` failed to find `)`), it leaves the stream at the first argument `a`. It then checks for `)` using `checkJ` on `a`, reports error, but does NOT advance past `a`.
+   
+   Then `parseExp` returns. The caller `parseStmt` sees `a` as the current token. It expects a semicolon (end of statement expression). It calls `checkI` on `a`. Since `a` is not `;`, it reports error `i`.
+   
+   The fix should be in `parseUnaryExp`. When a function call syntax is detected (`IDENFR` followed by `LPARENT`), even if errors occur, the parser should attempt to synchronize or consume tokens up to a reasonable point, or at least, the logic for `checkJ` should probably consume the token if it's an error? No, `checkJ` doesn't consume.
+   
+   However, the standard recursive descent behavior for error recovery often involves consuming tokens until a sync point. Here, the lack of consumption causes the subsequent `checkI` to fire falsely.
+   
+   The most direct error location is in `parseUnaryExp` where it handles the function call case. It fails to advance the lexer past the erroneous construct, causing the parent `parseStmt` to misinterpret the remaining tokens.
+   
+   Another possibility: `parseStmt`'s logic for `LVal = ...` vs `Exp ;`.
+   If `preReadCompare(ASSIGN)` is false, it assumes `Exp ;`.
+   It calls `parseExp`.
+   `parseExp` parses `f` as a unary exp (function call).
+   Inside `parseUnaryExp`, it eats `f` and `(`.
+   It sees `a`. It doesn't eat `a`.
+   It returns.
+   `parseExp` returns.
+   `parseStmt` checks `checkI` on `a`. Fails. Reports `i`.
+   
+   So the error is that `parseUnaryExp` does not consume the arguments or skip to `)` when `preReadCompare` fails, leaving the parser in a bad state.
+   
+   Code snippet:
+<frontend/parser/Parser.java>
+...
+    public UnaryExp parseUnaryExp() throws IOException {int line = lexer.getLineNum();
+        if (lexType == LexType.PLUS || lexType == LexType.MINU
+                || lexType == LexType.NOT) {
+            UnaryOp op = parseUnaryOp();
+            UnaryExp unaryExp = parseUnaryExp();
+            outputP("UnaryExp");
+            return new UnaryExp(op, unaryExp);
+        } else if (lexType == LexType.IDENFR) {
+            ArrayList<LexType> lexTypes = lexer.preRead(1);
+            if (lexTypes.get(0) == LexType.LPARENT) {
+
+                String s = token;
+                getToken();
+                getToken();
+                FuncRParams funcRParams = null;
+                if (lexType != LexType.RPARENT&&lexer.preReadCompare(LexType.RPARENT)) {
+                    funcRParams = parseFuncRParams();
+                }
+                if (errorTool.checkJ(token, line)) {
+                    getToken();
+                }
+                outputP("UnaryExp");
+                return new UnaryExp(getIdent(s,line), funcRParams);
+            } else {
+                PrimaryExp primaryExp = parsePrimaryExp();
+                outputP("UnaryExp");
+                return new UnaryExp(primaryExp);
+            }
+        } else {
+            PrimaryExp primaryExp = parsePrimaryExp();
+            outputP("UnaryExp");
+            return new UnaryExp(primaryExp);
+        }
+    }
+...

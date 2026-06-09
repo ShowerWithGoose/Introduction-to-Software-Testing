@@ -1,0 +1,450 @@
+Looking at the difference between the buggy output and expected output, I can see that in the `editdistDP` function, there are incorrect LVal productions being generated. Specifically, in the buggy output, I see:
+
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+
+But in the expected output, it should be:
+
+```
+IDENFR Dp
+LBRACK [
+...
+```
+
+The issue is that the parser is not correctly handling array assignments. When parsing statements like `Dp[cal(0,j)] = j;`, the parser should recognize `Dp` as the identifier and then parse the bracket expression, but instead it's starting with `LBRACK` directly.
+
+Looking at the `stmtParser` method in `Parser.java`, specifically the IDENFR case, I can see the problem. The code uses a "fake mode" to lookahead and determine if it's an assignment or just an expression, but when it switches back from fake mode, it's not properly reconstructing the LVal.
+
+The issue appears to be in the `lValParser` method and how it's called in the statement parser. Let me examine the relevant code:
+
+<frontend/Parser.java>
+...
+    private Stmt stmtParser() {
+        Token pos1 = tokenIterator.getNext();
+        switch (pos1.getLexType()) {
+            ...
+            case IDENFR: {
+                tokenIterator.getPrevious();
+                switchFake(true);
+                lValParser();
+                if (tokenIterator.getNext().getLexType().equals(LexType.ASSIGN)) {
+                    tokenIterator.getBack(step + 1);
+                    switchFake(false);
+                    LVal lVal = lValParser();
+                    tokenIterator.getNext();
+                    pos1 = tokenIterator.getNext();
+                    ...
+                }
+                else {
+                    tokenIterator.getBack(step + 1);
+                    switchFake(false);
+                    Exp exp = expParser();
+                    ...
+                }
+            }
+            ...
+        }
+    }
+...
+
+The problem is in the `lValParser` method itself. When parsing an LVal like `Dp[cal(0,j)]`, it should output the identifier first, then the bracket expression. But looking at the buggy output, it seems like the LVal parsing is starting from the bracket instead of the identifier.
+
+Looking more carefully at the `lValParser` method:
+
+<frontend/Parser.java>
+...
+    private LVal lValParser() {
+        Token pos1 = tokenIterator.getNext();
+        if (fakeMode) step++;
+        Token ident = pos1;
+        if (tokenIterator.getNext().getLexType().equals(LexType.LBRACK)) {
+            if (fakeMode) step++;
+            Exp exp = expParser();
+            if (! tokenIterator.getNext().getLexType().equals(LexType.RBRACK)) {
+                if (fakeMode) {
+                    step--;
+                    tokenIterator.getPrevious();
+                }
+                if (! fakeMode) addErrorK(tokenIterator.getPrevious().getLineNum());//K  error
+            }
+            if (fakeMode) step++;
+            return new LVal(ident, exp);
+        }
+        else {
+            tokenIterator.getPrevious();
+            return new LVal(ident);
+        }
+    }
+...
+
+The issue is actually in the `Stmt` parsing logic. When the parser encounters `Dp[cal(0,j)] = j;`, it should create an `AssignStmt` with the proper LVal. However, looking at the buggy output, I see that instead of getting the full LVal starting with the identifier, it's somehow starting with just the bracket.
+
+Wait, let me look more carefully at the output difference. In the buggy output, I see:
+
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+
+But this doesn't make sense because `LBRACK` should not be the start of an LVal. An LVal should start with an identifier.
+
+Actually, looking more carefully at the buggy output around line 287-293:
+
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+<Number>
+...
+```
+
+This suggests that the parser is incorrectly parsing the left-hand side of the assignment. It should be parsing `Dp[cal(0,j)]` as an LVal, which would output:
+- `IDENFR Dp`
+- `LBRACK [`
+- ... (the expression inside)
+- `RBRACK ]`
+- `<LVal>`
+
+But instead, it's starting with `LBRACK [` directly, which means the identifier `Dp` is being lost somewhere.
+
+Looking at the `AssignStmt` class in the output generation:
+
+<frontend/SyntaxUnits/StmtUnits/AssignStmt.java>
+...
+    @Override
+    public String toPrint() {
+        StringBuilder stringBuilder = new StringBuilder();
+        stringBuilder.append(lVal.toPrint());
+        stringBuilder.append("ASSIGN" + " =" +  "\n");
+        stringBuilder.append(exp.toPrint());
+        stringBuilder.append("SEMICN" + " ;" +  "\n");
+        return stringBuilder.toString();
+    }
+...
+
+And the `LVal` class:
+
+<frontend/SyntaxUnits/Exps/LVal.java>
+...
+    public String toPrint() {
+        StringBuilder stringBuilder = new StringBuilder();
+        stringBuilder.append(ident.toPrint());
+        if (exp != null) {
+            stringBuilder.append("LBRACK" + " [" + "\n");
+            stringBuilder.append(exp.toPrint());
+            stringBuilder.append("RBRACK" + " ]" + "\n");
+        }
+        stringBuilder.append("<LVal>\n");
+        return stringBuilder.toString();
+    }
+...
+
+So the LVal should always start with the identifier. The fact that the buggy output starts with `LBRACK [` suggests that the `ident` field in the LVal object is null or incorrect.
+
+Looking back at the parser, in the `stmtParser` method, when it handles the IDENFR case, it calls `lValParser()` after switching out of fake mode. But there might be an issue with the token positioning.
+
+The real issue is in this part of `stmtParser`:
+
+```java
+case IDENFR: {
+    tokenIterator.getPrevious();
+    switchFake(true);
+    lValParser();
+    if (tokenIterator.getNext().getLexType().equals(LexType.ASSIGN)) {
+        tokenIterator.getBack(step + 1);
+        switchFake(false);
+        LVal lVal = lValParser();
+        // ... rest of assignment handling
+    }
+}
+```
+
+The problem is that `tokenIterator.getBack(step + 1)` might not be positioning the iterator correctly. The `step` variable tracks how many tokens were consumed during fake mode, but the calculation might be off.
+
+Looking at the `lValParser` method again, when it's called in fake mode, it consumes tokens and increments `step`. But when we call `tokenIterator.getBack(step + 1)`, we might be going back too far or not far enough.
+
+However, looking more carefully at the actual buggy output vs expected output, I notice another pattern. In the buggy output, for the statement `Dp[cal(0,j)] = j;`, instead of seeing:
+
+```
+IDENFR Dp
+LBRACK [
+...
+RBRACK ]
+<LVal>
+ASSIGN =
+...
+```
+
+We see:
+
+```
+LBRACK [
+<LVal>
+ASSIGN =
+...
+```
+
+This suggests that the `ident` token is completely missing from the LVal. This points to an issue in how the LVal is constructed.
+
+Wait, let me check the exact difference. Looking at the buggy output around line 285-295:
+
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RPARENT )
+<PrimaryExp>
+```
+
+But in the expected output, it should be:
+
+```
+IDENFR Dp
+LBRACK [
+IDENFR cal
+LPARENT (
+INTCON 0
+...
+```
+
+Ah! I see the issue now. In the buggy output, after `LBRACK [`, it goes directly to `<LVal>`, but it should have the identifier `Dp` first, then the bracket with the expression inside.
+
+Actually, looking even more carefully, I think the issue is not in the LVal parsing, but in how the array assignment is being parsed. The buggy output shows:
+
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+
+But this doesn't match the source code `Dp[cal(0,j)] = j;`. 
+
+Wait, I think I'm misunderstanding the output format. Let me look at a correct example from earlier in the output. For instance, in the `_strlen` function, we have:
+
+```
+IDENFR str
+LBRACK [
+IDENFR i
+<LVal>
+<PrimaryExp>
+...
+RBRACK ]
+<LVal>
+```
+
+So the correct pattern is: identifier, then LBRACK, then the expression inside (which itself may contain LVal), then RBRACK, then <LVal>.
+
+But in the buggy output for the Dp assignments, it starts with `LBRACK [` directly, without the `IDENFR Dp` before it.
+
+This strongly suggests that in the `stmtParser`, when handling the assignment case, the parser is not correctly parsing the LVal starting from the identifier.
+
+Looking at the source code again, the problematic lines are in the `stmtParser` method where it handles IDENFR tokens. The issue is likely in the token positioning after the fake mode lookahead.
+
+But actually, looking at the very beginning of the buggy output section for the first Dp assignment:
+
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+
+This suggests that the parser thinks the LVal starts with a bracket, which means it has lost track of the identifier token.
+
+The root cause appears to be in the `lValParser` method. When called normally (not in fake mode), it should consume the identifier token first. But if the token iterator is positioned incorrectly, it might be consuming the wrong token.
+
+Looking at the call sequence:
+1. `stmtParser` gets an IDENFR token (`Dp`)
+2. It does lookahead with fake mode by calling `lValParser()`
+3. After determining it's an assignment, it calls `tokenIterator.getBack(step + 1)` 
+4. Then calls `lValParser()` again
+
+The issue is likely that `tokenIterator.getBack(step + 1)` is not positioning the iterator back to the original IDENFR token.
+
+Let me check the `getBack` method in `TokenIterator`:
+
+<frontend/TokenIterator.java>
+...
+    public void getBack(int n) {
+        for (int i = 0; i < n; i++) {
+            getPrevious();
+        }
+    }
+...
+
+And `getPrevious()`:
+
+```java
+    public Token getPrevious() {
+        if (iterator.hasPrevious()) {
+            iterator.previous();
+        }
+        if (iterator.hasPrevious()) {
+            iterator.previous();
+        }
+        return getNext();
+    }
+```
+
+This `getPrevious()` method is problematic! It moves back two positions and then returns the next token, which effectively moves back by one position. But this logic is confusing.
+
+Actually, let me trace through what `getPrevious()` does:
+- If the iterator is at position i, `iterator.previous()` moves to position i-1
+- Then another `iterator.previous()` moves to position i-2  
+- Then `getNext()` moves to position i-1 and returns that token
+
+So `getPrevious()` effectively moves the iterator back by 1 position and returns the token at that position.
+
+Therefore, `getBack(n)` calls `getPrevious()` n times, which moves back by n positions total.
+
+But in the `stmtParser`, when we do `tokenIterator.getBack(step + 1)`, we need to ensure we're going back to the right position.
+
+However, looking more carefully at the actual bug, I think the issue might be simpler. Let me look at the `lValParser` method again:
+
+```java
+private LVal lValParser() {
+    Token pos1 = tokenIterator.getNext();
+    if (fakeMode) step++;
+    Token ident = pos1;
+    if (tokenIterator.getNext().getLexType().equals(LexType.LBRACK)) {
+        // ... handle array case
+    }
+    else {
+        tokenIterator.getPrevious();
+        return new LVal(ident);
+    }
+}
+```
+
+In the array case, it doesn't call `tokenIterator.getPrevious()`, so the iterator remains positioned after the RBRACK token. That's correct.
+
+But in the non-array case, it calls `tokenIterator.getPrevious()` to put the iterator back to after the identifier, which is also correct.
+
+The real issue might be elsewhere. Let me look at the specific problematic code in the test input:
+
+```c
+Dp[cal(0,j)] = j;
+```
+
+In the buggy output, this becomes:
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+
+But it should be:
+```
+IDENFR Dp
+LBRACK [
+IDENFR cal
+LPARENT (
+INTCON 0
+...
+```
+
+Wait a minute! Looking at the buggy output more carefully, I see that after `LBRACK [`, it shows `<LVal>`, but then it shows `LPARENT (` and `INTCON 0`. This suggests that the parser is treating `cal(0,j)` as a primary expression wrapped in parentheses, rather than as a function call inside the array index.
+
+Actually, no - looking at the expected output, it shows:
+
+```
+IDENFR Dp
+LBRACK [
+IDENFR cal
+LPARENT (
+INTCON 0
+...
+```
+
+So the `cal` should be parsed as an identifier (function name), then LPARENT, etc.
+
+But in the buggy output, it shows:
+
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+
+This is very strange. It seems like the entire left-hand side is being parsed incorrectly.
+
+I think I need to focus on the exact location where the error occurs. Looking at the difference between buggy and expected output, the first discrepancy appears in the `editdistDP` function at the first assignment to `Dp`.
+
+In the expected output, we have:
+```
+IDENFR Dp
+LBRACK [
+IDENFR cal
+LPARENT (
+INTCON 0
+...
+```
+
+In the buggy output, we have:
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+
+This suggests that the parser is not recognizing `Dp` as the identifier for the LVal. Instead, it seems like it's starting the LVal parsing from the wrong position.
+
+Looking back at the `stmtParser` method, the issue is likely in this section:
+
+```java
+case IDENFR: {
+    tokenIterator.getPrevious();
+    switchFake(true);
+    lValParser();
+    if (tokenIterator.getNext().getLexType().equals(LexType.ASSIGN)) {
+        tokenIterator.getBack(step + 1);
+        switchFake(false);
+        LVal lVal = lValParser();
+        // ... rest
+    }
+}
+```
+
+The problem is that `tokenIterator.getBack(step + 1)` should position the iterator back to the IDENFR token, but it's not doing so correctly.
+
+Given the complexity of the token iterator logic and the fake mode tracking, the most likely location of the error is in the `stmtParser` method's handling of IDENFR tokens, specifically around the `tokenIterator.getBack(step + 1)` call.
+
+But actually, looking at the output again, I notice something else. In the buggy output, after `LBRACK [`, it immediately shows `<LVal>`, which suggests that the LVal parsing is completing immediately without parsing any content. This would happen if the `lValParser` method is called when the current token is `LBRACK` instead of an identifier.
+
+This confirms that the token iterator positioning is wrong after the fake mode lookahead.
+
+The error is in the `stmtParser` method in `Parser.java`.

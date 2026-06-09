@@ -1,0 +1,679 @@
+Based on the problem description and the test case, the program is failing to correctly identify syntax errors (specifically missing right parentheses `)`) in the source code. The expected output indicates three errors of type `j` (missing `)`) at lines 13, 15, and 20.
+
+Let's analyze the input code around these lines:
+Line 13: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7); // error 1`
+Here, there is an opening `(` before `1`, but no matching closing `)`. The parser should detect this when it expects a `)` or `;` but finds `;` while inside an expression context that started with `(`. However, the grammar for `PrimaryExp` handles `(` Exp `)`. If the `)` is missing, `PrimaryExp` will fail to consume it.
+
+Line 15: `if (3 > 0 { // error 2`
+Here, the `if` statement has a condition `(3 > 0` but is missing the closing `)`. The `Stmt` rule for `if` explicitly calls `pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));`. This looks correct for detecting the missing `)`.
+
+Line 20: `i = (((((f(str))))); // error 3`
+This line actually looks syntactically correct regarding parentheses balance if we assume `f(str)` returns a value. Wait, let's look closer. `i = (((((f(str)))));`. There are 5 opening parens before `f` and 4 closing parens after `str`. So one `)` is missing. This occurs inside an `Exp`.
+
+The core issue lies in how the parser handles errors and continues parsing. In recursive descent parsers, if an expected token is missing, the parser reports the error but must decide whether to consume the current token or stay on it to allow the parent rule to handle synchronization.
+
+Looking at `Parser.java`, specifically the `pushToken` method used for checking expected tokens:
+
+```java
+    private static void pushToken(AstNode node, Token token, TokenType type, ErrInfo errInfo) {
+        if (token.type == type) {
+            pushToken(node, token);
+        } else {
+            ErrHandler.addError(errInfo);
+        }
+    }
+```
+
+If the token does not match, it adds the error but **does not advance** the parser (`next()` is not called). This means `now` remains the same. This can cause infinite loops or incorrect subsequent parsing if the caller doesn't handle the state change. However, usually, in error recovery, you might want to skip tokens or just report and continue.
+
+Let's look at `PrimaryExp`:
+```java
+    private static AstNode PrimaryExp() {
+        AstNode node = new AstNode(AstType.PrimaryExp, now.line);
+        if (now.type == singleType('(')) {
+            pushToken(node, now); // (
+            node.add(Exp());
+            pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+        } 
+        // ...
+    }
+```
+If `)` is missing, `pushToken` reports error `j` but does NOT consume the next token (which is likely `;` or something else). The control returns to the caller (e.g., `UnaryExp`, then `MulExp`, etc.).
+
+Now look at `Stmt` for the assignment `i = ... ;`:
+```java
+        } else if (now.type == TokenType.IDENFR && peek(1).type != singleType('(')) {
+            // ...
+            if (nextToken.type == singleType('=')) {
+                // ...
+                node.add(Exp());
+                pushToken(node, now, singleType(';'), new ErrInfo(ErrType.i, node.lstLine));
+            }
+            // ...
+        }
+```
+When `Exp()` is called for line 13 `int i = (1 + ... ;`, it eventually calls `PrimaryExp`. `PrimaryExp` sees `(`, consumes it, parses `Exp`, and then expects `)`. It finds `;` instead. It reports error `j`. It does **not** consume `;`. Control returns up the stack to `Stmt`. `Stmt` then expects `;`. `now` is still `;`. So `pushToken` for `;` succeeds. The parser moves to the next line. This seems to work for Line 13?
+
+Wait, let's look at Line 15: `if (3 > 0 {`.
+`Stmt` sees `IFTK`.
+`pushToken` consumes `if`.
+`pushToken` consumes `(`.
+`Cond()` is called. `Cond` -> `LOrExp` -> ... -> `PrimaryExp`.
+Inside `PrimaryExp` or deeper, it parses `3 > 0`.
+Then `Cond` returns.
+Back in `Stmt`: `pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));`
+`now` is `{`. It is not `)`. Error `j` is reported. `now` remains `{`.
+Next line in `Stmt`: `node.add(Stmt());` (the body of the if).
+`Stmt` sees `{`. It matches `else if (now.type == singleType('{')) { node.add(Block()); }`.
+`Block` consumes `{`, parses items, consumes `}`.
+This seems to handle Line 15 correctly too.
+
+Why is the output empty/wrong?
+The problem states "Buggy Output:" is empty (or implies it didn't produce the expected errors).
+Let's look at `Compiler.java`.
+```java
+        ArrayList<Token> tokens = Lexer.lex(IO.read(Config.inputFile));
+        if (Config.taskType == Config.TaskType.LEXER && !ErrHandler.hasErr()) {
+            IO.printTokens(tokens);
+        }
+        IO.printTokens(tokens); // This always prints tokens to lexer.txt
+        AstNode root = Parser.parse(tokens);
+        if (Config.taskType == Config.TaskType.PARSER && !ErrHandler.hasErr()) {
+            IO.printAst(root);
+        }
+        
+        if (ErrHandler.hasErr()) {
+            ErrHandler.printErrs();
+        }
+```
+If `ErrHandler.hasErr()` is true, it prints errors.
+
+Let's re-examine `pushToken` behavior in `PrimaryExp` vs `Stmt`.
+In `PrimaryExp`:
+```java
+            pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+```
+If `)` is missing, error is added. `now` is NOT advanced.
+The caller `UnaryExp` or `MulExp` continues.
+Eventually, the `Exp` finishes.
+Control returns to `Stmt` (for assignment) or `Stmt` (for if).
+
+For Line 13: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);`
+The outer `PrimaryExp` starts at the first `(`.
+It calls `Exp()`.
+Inside `Exp`, it parses `1 + ...`.
+Eventually, it encounters the inner `(` for `(3...`.
+That `PrimaryExp` expects `)`. It finds `/` or `+`? No, `(3 + 1000 * (4 - 5) / 6 + 7)`.
+Wait, the input is: `(1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);`
+There is a `(` before `1`.
+There is a `(` before `3`.
+There is a `(` before `4`.
+`(4 - 5)` is balanced.
+`(3 + ... + 7)` is missing `)`.
+`(1 + ...` is missing `)`.
+
+When parsing the inner `(3 ...`, `PrimaryExp` consumes `(`, parses `Exp`, expects `)`.
+The `Exp` inside will parse `3 + 1000 * (4 - 5) / 6 + 7`.
+After `7`, the next token is `;`.
+So `PrimaryExp` for `(3...` sees `;` instead of `)`. Reports error `j`. Does not consume `;`.
+Returns to `MulExp`/`AddExp`.
+The `Exp` parser for the inner part finishes.
+Control returns to the `PrimaryExp` for the outer `(1...`.
+It expects `)`. `now` is still `;`.
+It reports error `j` again?
+Then returns to `Stmt`. `Stmt` expects `;`. `now` is `;`. Consumes it.
+So we might get two errors for line 13? Or just one?
+The `lstLine` in `ErrInfo` is set to `node.lstLine`.
+In `PrimaryExp`, `node` is created with `now.line`.
+For the inner `(3...`, `node.line` is the line of `(`.
+For the outer `(1...`, `node.line` is the line of `(`.
+Both are line 13.
+So we might get duplicate errors or multiple errors.
+
+However, the critical bug is often in **how the parser recovers**. If `pushToken` doesn't advance, the parser might get stuck or misinterpret the next token.
+
+But look at `FuncDef` and `MainFuncDef`.
+```java
+    private static AstNode FuncDef() {
+        // ...
+        pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+        node.add(Block());
+        return node;
+    }
+```
+If `)` is missing here, error is reported. `now` is not advanced.
+Then `Block()` is called. `Block` expects `{`.
+If `now` is `{` (because `)` was missing before `{`), `Block` consumes `{`.
+This works.
+
+Let's look at the specific failure: "Wrong Answer". Expected: `13 j`, `15 j`, `20 j`.
+If the buggy output is empty, it means `ErrHandler.hasErr()` returned false, or errors were not added.
+
+Is it possible that `Config.taskType` is not `PARSER`?
+In `Compiler.java`:
+```java
+        if (Config.taskType == Config.TaskType.PARSER && !ErrHandler.hasErr()) {
+            IO.printAst(root);
+        }
+        
+        if (ErrHandler.hasErr()) {
+            ErrHandler.printErrs();
+        }
+```
+If `taskType` is `LEXER`, it prints tokens. Then it parses. If errors occur, it prints them.
+The `Config.initialize()` doesn't set `taskType`. It defaults to `PARSER` in the enum definition?
+```java
+    public static TaskType taskType = TaskType.PARSER;
+```
+Yes.
+
+Let's look at `Lexer.java` for error `a`.
+```java
+            } else if (c == '|') {
+                if (nc == '|') {
+                    tokens.add(new Token(TokenType.OR, "||", atLine));
+                    i += 2;
+                } else {
+                    ErrHandler.addError(new ErrInfo(ErrType.a, atLine));
+                    tokens.add(new Token(TokenType.OR, "|", atLine));
+                    i++;
+                }
+            }
+```
+This adds errors during lexing.
+
+Now, look at `Parser.java`'s `pushToken` again.
+```java
+    private static void pushToken(AstNode node, Token token, TokenType type, ErrInfo errInfo) {
+        if (token.type == type) {
+            pushToken(node, token);
+        } else {
+            ErrHandler.addError(errInfo);
+        }
+    }
+```
+If the token is wrong, it adds the error. It does **not** call `next()`.
+This is a common pattern in simple recursive descent parsers where the caller is responsible for synchronization, OR it's a bug because the parser is now stuck on the wrong token.
+
+Consider Line 20: `i = (((((f(str)))));`
+Missing `)`.
+`PrimaryExp` sees `(`. Consumes it.
+Calls `Exp`.
+`Exp` calls `AddExp` ... `UnaryExp`.
+`UnaryExp` sees `(`. Consumes it.
+Calls `Exp`...
+Eventually `f(str)` is parsed.
+`UnaryExp` for `f(str)` expects `)`. It finds `)`. OK.
+Returns to `PrimaryExp` for the innermost `(`.
+`PrimaryExp` expects `)`. It finds `)`. OK.
+...
+One level of `PrimaryExp` expects `)`. It finds `;`.
+Reports error `j`. `now` is `;`.
+Returns up.
+Outer `PrimaryExp` expects `)`. `now` is `;`.
+Reports error `j`. `now` is `;`.
+Returns to `Stmt`.
+`Stmt` expects `;`. `now` is `;`. Consumes it.
+
+So errors ARE being added. Why is the output wrong/empty?
+
+Check `ErrHandler.printErrs()`:
+```java
+    public static void printErrs() {
+        errors.sort(null);
+        IO.setOut(Config.errorFile);
+        for (ErrInfo err : errors) {
+            IO.writeln(err.toString());
+        }
+    }
+```
+It sorts errors. `ErrInfo.compareTo` uses `line`.
+
+Is it possible that the errors are being suppressed?
+`ErrHandler.isOpen` is true by default.
+`Parser.Stmt` has this block:
+```java
+            int lstIndex = index;
+            ErrHandler.close();
+            LVal(); // parse a LVal
+            ErrHandler.open();
+            Token nextToken = now;
+            index = lstIndex;
+            now = tokens.get(index);
+            if (nextToken.type == singleType('=')) {
+                // ...
+                node.add(LVal()); // rerun to make ErrHandler work
+```
+Here, `ErrHandler.close()` is called before parsing `LVal` to check if it's an assignment or an expression. If `LVal()` encounters errors, they are ignored. Then `ErrHandler.open()` is called. Then `LVal()` is called AGAIN. This time errors are recorded. This seems correct.
+
+However, look at `PrimaryExp` inside `Exp`.
+If `PrimaryExp` fails to find `)`, it reports error.
+Does `Exp` or `AddExp` handle this? No, they just return.
+
+Let's look closely at `Compiler.java` again.
+```java
+        ArrayList<Token> tokens = Lexer.lex(IO.read(Config.inputFile));
+        if (Config.taskType == Config.TaskType.LEXER && !ErrHandler.hasErr()) {
+            IO.printTokens(tokens);
+        }
+        IO.printTokens(tokens);
+        AstNode root = Parser.parse(tokens);
+        if (Config.taskType == Config.TaskType.PARSER && !ErrHandler.hasErr()) {
+            IO.printAst(root);
+        }
+        
+        if (ErrHandler.hasErr()) {
+            ErrHandler.printErrs();
+        }
+```
+Wait! `IO.printTokens(tokens)` is called **before** parsing.
+`IO.printTokens` calls `setOut(Config.lexerOutputFile)`.
+Then `Parser.parse` is called.
+If errors are found, `ErrHandler.printErrs()` is called.
+`ErrHandler.printErrs()` calls `IO.setOut(Config.errorFile)`.
+Then it writes errors.
+
+This logic seems fine for generating `error.txt`.
+
+Is it possible that the `Parser` is crashing or not reaching the error reporting?
+Or is `Config.taskType` being changed? No.
+
+Let's look at the `pushToken` implementation again.
+```java
+    private static void pushToken(AstNode node, Token token, TokenType type, ErrInfo errInfo) {
+        if (token.type == type) {
+            pushToken(node, token);
+        } else {
+            ErrHandler.addError(errInfo);
+        }
+    }
+```
+If `token.type != type`, it adds error. It does NOT advance.
+In many cases, this leads to infinite recursion or stuck parsing if the caller doesn't advance.
+For example, in `PrimaryExp`:
+```java
+        if (now.type == singleType('(')) {
+            pushToken(node, now); // (
+            node.add(Exp());
+            pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+        }
+```
+If `)` is missing, `now` is still the token after `Exp` (e.g., `;`).
+`PrimaryExp` returns.
+Caller `UnaryExp` returns.
+Caller `MulExp` returns.
+Caller `AddExp` returns.
+Caller `Exp` returns.
+Caller `Stmt` (assignment) continues.
+`pushToken(node, now, singleType(';'), ...)`
+`now` is `;`. Matches. Advances.
+Parsing continues.
+
+So the errors SHOULD be recorded.
+
+Why would the output be wrong?
+Maybe the `ErrInfo` line number is wrong?
+`new ErrInfo(ErrType.j, node.lstLine)`
+`node` is created in `PrimaryExp` with `now.line`.
+`now` is the `(` token.
+So the line number should be correct.
+
+Let's look at the `Compiler.java` output logic again.
+```java
+        if (ErrHandler.hasErr()) {
+            ErrHandler.printErrs();
+        }
+```
+If there are NO errors, `error.txt` is empty (initialized by `initAllFiles`).
+If there ARE errors, it prints them.
+
+Is it possible that `Parser.parse` throws an exception?
+If `now` becomes `EOF` and we try to access it?
+`next()` handles EOF by creating an EOF token.
+
+Let's look at `Lexer.java` again.
+Does it produce the correct tokens?
+`int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);`
+Tokens: `int`, `i`, `=`, `(`, `1`, `+`, `2`, `*`, `(`, `3`, `+`, `1000`, `*`, `(`, `4`, `-`, `5`, `)`, `/`, `6`, `+`, `7`, `)`, `;` ??
+Wait, the input is: `(1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);`
+Count parens:
+1. `(` before 1
+2. `(` before 3
+3. `(` before 4
+4. `)` after 5
+5. `)` after 7? NO. The input says `+ 7);`.
+So there is a `)` after 7.
+Let's re-read the input carefully.
+`int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7); // error 1`
+Parens:
+`(` before 1.
+`(` before 3.
+`(` before 4.
+`)` after 5.
+`)` after 7.
+`;`
+So:
+Inner `(4-5)` is balanced.
+Middle `(3 + ... + 7)` has `(` before 3 and `)` after 7. Balanced.
+Outer `(1 + ...` has `(` before 1. Where is its `)`?
+It is MISSING.
+So `PrimaryExp` for outer `(` expects `)`.
+It parses `Exp`.
+`Exp` parses `1 + 2 * (3 ... + 7)`.
+The `)` after 7 closes the middle `(3...`.
+So after `Exp` returns to outer `PrimaryExp`, `now` is `;`.
+`PrimaryExp` expects `)`. Finds `;`. Error `j`.
+
+So error 1 is detected.
+
+Line 15: `if (3 > 0 {`
+`(` before 3.
+`3 > 0`.
+`{` instead of `)`.
+`Stmt` for `if` expects `)`. Finds `{`. Error `j`.
+
+Line 20: `i = (((((f(str)))));`
+Parens before `f`: 5.
+Parens after `str`: 4.
+So one `)` is missing.
+The innermost `PrimaryExp` corresponding to the unmatched `(` will fail to find `)`.
+It will find `;` (after consuming the 4 closing parens for the other 4 opening parens? No.)
+Let's trace:
+`(((((`
+1. `PrimaryExp` sees `(`. Consumes. Calls `Exp`.
+2. `UnaryExp` sees `(`. Consumes. Calls `Exp`.
+3. `UnaryExp` sees `(`. Consumes. Calls `Exp`.
+4. `UnaryExp` sees `(`. Consumes. Calls `Exp`.
+5. `UnaryExp` sees `(`. Consumes. Calls `Exp`.
+6. `UnaryExp` sees `f`. `peek(1)` is `(`. So it's a function call.
+   Parses `f(str)`. Expects `)`. Finds `)`. OK.
+   Returns `UnaryExp` node.
+7. Back in step 5 `PrimaryExp`. Expects `)`. Finds `)`. OK.
+8. Back in step 4 `PrimaryExp`. Expects `)`. Finds `)`. OK.
+9. Back in step 3 `PrimaryExp`. Expects `)`. Finds `)`. OK.
+10. Back in step 2 `PrimaryExp`. Expects `)`. Finds `)`. OK.
+11. Back in step 1 `PrimaryExp`. Expects `)`. Finds `;`. Error `j`.
+
+So all 3 errors should be detected.
+
+Why is the output wrong?
+Look at `Compiler.java` again.
+```java
+        IO.printTokens(tokens);
+        AstNode root = Parser.parse(tokens);
+        if (Config.taskType == Config.TaskType.PARSER && !ErrHandler.hasErr()) {
+            IO.printAst(root);
+        }
+        
+        if (ErrHandler.hasErr()) {
+            ErrHandler.printErrs();
+        }
+```
+If `ErrHandler.hasErr()` is true, it prints errors.
+BUT, look at `IO.printTokens(tokens)`.
+It calls `setOut(Config.lexerOutputFile)`.
+Then `Parser.parse` runs.
+Then `ErrHandler.printErrs()` calls `setOut(Config.errorFile)`.
+This should work.
+
+Is it possible that `Config.taskType` is `LEXER`?
+If `taskType` is `LEXER`:
+1. `Lexer.lex` runs.
+2. `if (LEXER && !hasErr)` -> prints tokens.
+3. `IO.printTokens(tokens)` -> ALWAYS prints tokens to `lexer.txt`.
+4. `Parser.parse` runs. Errors might be added.
+5. `if (LEXER && !hasErr)` -> Skipped.
+6. `if (hasErr)` -> Prints errors.
+
+So even if `taskType` is `LEXER`, errors should be printed.
+
+Wait! Look at `Lexer.java` error handling for `&` and `|`.
+```java
+                } else {
+                    ErrHandler.addError(new ErrInfo(ErrType.a, atLine));
+                    tokens.add(new Token(TokenType.OR, "|", atLine));
+                    i++;
+                }
+```
+This adds error `a`.
+
+The test case doesn't have `&` or `|` errors.
+
+Let's look at the `Parser.java` `pushToken` again.
+Is it possible that `node.lstLine` is incorrect?
+`AstNode` constructor:
+```java
+    public AstNode(AstType type, int line) {
+        this.type = type;
+        this.line = line;
+        this.lstLine = line;
+    }
+```
+`add` updates `lstLine`:
+```java
+    public void add(AstNode node) {
+        sons.add(node);
+        lstLine = node.lstLine;
+    }
+```
+So `node.lstLine` is the line of the **last** added son.
+In `PrimaryExp`:
+```java
+        AstNode node = new AstNode(AstType.PrimaryExp, now.line);
+        if (now.type == singleType('(')) {
+            pushToken(node, now); // (
+            node.add(Exp());
+            pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+        }
+```
+`node.lstLine` is updated by `node.add(Exp())`.
+`Exp()` returns a node. Its `lstLine` is the line of the last token in the expression.
+So if the expression ends on line 13, `node.lstLine` is 13.
+The error is reported with line 13. Correct.
+
+What if the error is in `Compiler.java` logic?
+```java
+        if (ErrHandler.hasErr()) {
+            ErrHandler.printErrs();
+        }
+```
+If `ErrHandler.hasErr()` is false, nothing is printed.
+Why would it be false?
+Maybe `ErrHandler.addError` is not being called?
+Or `isOpen` is false?
+`isOpen` is true by default.
+`Parser.Stmt` closes and opens it.
+But `PrimaryExp` is called from `Exp`, which is called from `Stmt`.
+When `Stmt` calls `Exp`, `isOpen` is true (unless we are in the lookahead phase).
+In the lookahead phase:
+```java
+            ErrHandler.close();
+            LVal(); 
+            ErrHandler.open();
+            // ...
+            if (nextToken.type == singleType('=')) {
+                node.add(LVal()); 
+                pushToken(node, now); // =
+                if (now.type == TokenType.GETINTTK || now.type == TokenType.GETCHARTK) {
+                    // ...
+                } else {
+                    node.add(Exp());
+                    pushToken(node, now, singleType(';'), new ErrInfo(ErrType.i, node.lstLine));
+                }
+            }
+```
+If it's an assignment, `Exp()` is called with `isOpen` = true.
+So errors in `Exp` SHOULD be recorded.
+
+Is it possible that the `Parser` is not being called?
+`AstNode root = Parser.parse(tokens);`
+Yes, it is.
+
+Let's look at the `Compiler.java` file provided in the prompt.
+```java
+<Compiler.java>
+import ast.AstNode;
+import astGen.Lexer;
+import astGen.Parser;
+import config.Config;
+import err.ErrHandler;
+import token.Token;
+import utils.IO;
+
+import java.util.ArrayList;
+
+public class Compiler {
+    public static void main(String[] args) {
+        Config.initialize();
+        IO.initAllFiles();
+        ArrayList<Token> tokens = Lexer.lex(IO.read(Config.inputFile));
+        if (Config.taskType == Config.TaskType.LEXER && !ErrHandler.hasErr()) {
+            IO.printTokens(tokens);
+        }
+        IO.printTokens(tokens);
+        AstNode root = Parser.parse(tokens);
+        if (Config.taskType == Config.TaskType.PARSER && !ErrHandler.hasErr()) {
+            IO.printAst(root);
+        }
+        
+        if (ErrHandler.hasErr()) {
+            ErrHandler.printErrs();
+        }
+    }
+}
+```
+
+Wait! `IO.printTokens(tokens)` is called **twice**?
+No, once in the `if`, and once unconditionally.
+If `taskType` is `PARSER`, the `if` is skipped.
+Then `IO.printTokens(tokens)` is called.
+Then `Parser.parse(tokens)`.
+
+Is it possible that `Parser.parse` modifies `tokens`? No.
+
+Let's look at `ErrHandler.printErrs`.
+```java
+    public static void printErrs() {
+        errors.sort(null);
+        IO.setOut(Config.errorFile);
+        for (ErrInfo err : errors) {
+            IO.writeln(err.toString());
+        }
+    }
+```
+It sorts errors.
+If `errors` is empty, nothing is written.
+
+I suspect the issue is in `Parser.java`'s `pushToken` not advancing, causing the parser to get stuck or behave unexpectedly in a way that prevents subsequent errors from being detected or causes a crash/exit before printing.
+However, if it got stuck, it would likely loop infinitely or crash.
+
+Another possibility: The `Compiler.java` outputs `lexer.txt` and `parser.txt` but the test system checks `error.txt`.
+If `ErrHandler.hasErr()` is true, `error.txt` is written.
+
+Let's look at the `pushToken` method again.
+```java
+    private static void pushToken(AstNode node, Token token, TokenType type, ErrInfo errInfo) {
+        if (token.type == type) {
+            pushToken(node, token);
+        } else {
+            ErrHandler.addError(errInfo);
+        }
+    }
+```
+If `token.type != type`, it adds error.
+It does NOT advance.
+This means `now` is still the unexpected token.
+If the caller expects to consume the token or move past it, it won't.
+In `PrimaryExp`, if `)` is missing, `now` is `;`.
+`PrimaryExp` returns.
+`UnaryExp` returns.
+`MulExp` returns.
+`AddExp` returns.
+`Exp` returns.
+`Stmt` (assignment) continues.
+`pushToken(node, now, singleType(';'), ...)`
+`now` is `;`. Matches.
+`pushToken` calls `pushToken(node, token)` which calls `next()`.
+So `;` is consumed.
+Parsing continues.
+
+This logic seems robust enough for these simple cases.
+
+However, there is a subtle bug in `Compiler.java`.
+```java
+        IO.printTokens(tokens);
+        AstNode root = Parser.parse(tokens);
+```
+`IO.printTokens` sets the output file to `lexer.txt`.
+`Parser.parse` does not change the output file.
+`ErrHandler.printErrs` sets the output file to `error.txt`.
+
+If the test case expects `error.txt` to contain the errors, and the program produces it, why is it wrong?
+
+Maybe the errors are NOT being added?
+Check `ErrHandler.isOpen`.
+It is `true` by default.
+In `Stmt`, it is closed/opened around `LVal`.
+But `PrimaryExp` is called from `Exp`.
+In `Stmt` assignment:
+```java
+                node.add(Exp());
+```
+`isOpen` is true.
+So errors SHOULD be added.
+
+Wait! Look at `Lexer.java` again.
+```java
+            } else if (c == '|') {
+                if (nc == '|') {
+                    tokens.add(new Token(TokenType.OR, "||", atLine));
+                    i += 2;
+                } else {
+                    ErrHandler.addError(new ErrInfo(ErrType.a, atLine));
+                    tokens.add(new Token(TokenType.OR, "|", atLine));
+                    i++;
+                }
+            }
+```
+This is for lexical errors.
+
+I will bet on the `pushToken` not advancing causing issues in more complex scenarios, but for these specific cases, it seems to work.
+However, there is one major issue: **The `Compiler.java` prints tokens to `lexer.txt` BEFORE parsing.**
+If the test system compares `error.txt`, it should be fine.
+
+Let's look at the `Parser.java` `pushToken` again.
+If `token.type != type`, it adds error.
+Does it return? Yes.
+Does it advance? No.
+
+If I had to guess the location of the error, it's likely in `Compiler.java` where the output logic might be flawed or `Parser.java` where error recovery is insufficient.
+
+But wait! Look at `Compiler.java`:
+```java
+        if (Config.taskType == Config.TaskType.PARSER && !ErrHandler.hasErr()) {
+            IO.printAst(root);
+        }
+        
+        if (ErrHandler.hasErr()) {
+            ErrHandler.printErrs();
+        }
+```
+If `ErrHandler.hasErr()` is true, `printAst` is SKIPPED.
+Then `printErrs` is called.
+
+This seems correct.
+
+I will output the `Compiler.java` snippet as the likely location because the interaction between lexer/parser output and error output is often where these "Wrong Answer" bugs lie (e.g. printing to wrong file, or not printing at all if conditions are met). Specifically, the unconditional `IO.printTokens(tokens)` might be interfering if the test harness expects clean output or if `taskType` is misconfigured. However, the most suspicious part is actually in `Parser.java`'s `pushToken` not advancing, which is a classic bug source. But since the prompt asks for the code snippet where the error is likely located, and the symptoms are "Wrong Answer" (implying output mismatch), I'll focus on the output generation in `Compiler.java` or the error recording in `Parser.java`.
+
+Given the specific errors `j` (missing `)`), and the fact that `pushToken` doesn't advance, I'll highlight `Parser.java`.
+
+<Parser.java>
+...
+    private static void pushToken(AstNode node, Token token, TokenType type, ErrInfo errInfo) {
+        if (token.type == type) {
+            pushToken(node, token);
+        } else {
+            ErrHandler.addError(errInfo);
+        }
+    }
+...

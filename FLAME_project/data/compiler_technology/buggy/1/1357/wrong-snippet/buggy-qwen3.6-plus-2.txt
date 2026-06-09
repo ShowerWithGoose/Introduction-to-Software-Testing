@@ -1,0 +1,647 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The task is to implement a syntax analyzer (parser) for a specific grammar. It must output lexical tokens and non-terminal syntax component names (e.g., `<VarDecl>`, `<Stmt>`) to `parser.txt` for correct programs, or error codes to `error.txt` for incorrect ones.
+2.  **Test Case Input**: A valid C-like source code containing variable declarations, a main function, arithmetic expressions, and a `printf` statement.
+3.  **Expected Output**: A sequence of lexical tokens and syntax component tags corresponding to the structure of the input code. Notably, it includes tags like `<VarDef>`, `<VarDecl>`, `<Exp>`, `<Stmt>`, etc.
+4.  **Buggy Output**: "No output file". This indicates that the program likely crashed (threw an exception) or terminated prematurely before writing any output files, or the output files were empty/not created due to an early error.
+5.  **Code Analysis**:
+    *   In `Parser.java`, the `parseCompUnit` method starts by calling `lexer.next()`.
+    *   The `Lexer.next()` method checks if `lexType != null`. Initially, `lexType` is `null`, so it skips logging. Then it calls `nextNoPrint()`.
+    *   `nextNoPrint()` saves the current state (which is null/initial) to history lists, skips whitespace/comments, and identifies the first token (`INTTK` for `int`). It updates `lexType` and `token`.
+    *   Back in `parseCompUnit`, the loop checks for declarations.
+    *   The critical issue lies in how the parser handles the lookahead for distinguishing `Decl` from `FuncDef`.
+    *   However, looking closer at the `Logger` and `Compiler` class:
+        *   `Compiler.java` calls `parser.parseCompUnit()`.
+        *   If an exception occurs during parsing, the `try-catch` block in `main` catches `IOException` but lets `RuntimeException` propagate (as seen in `Lexer` and `Parser` throwing `RuntimeException`). If a `RuntimeException` is thrown, the program crashes, and no files are written.
+    *   Let's look at `Parser.parseStmt`. The input contains `printf("%d\n%d %d\n", a, b, c);`.
+    *   The `parseStmt` method has a branch for `PRINTFTK`.
+    *   Inside `parseStmt`:
+        ```java
+        } else if (lexer.getLexType() == LexType.PRINTFTK) {
+            // 'printf' '(' StringConst { ',' Exp } ')' ';'
+            lexer.next(); // PRINTFTK
+            lexer.next(); // LPARENT
+            String string = lexer.getToken();
+            lexer.next(); // STRCON
+            ArrayList<Exp> exps = new ArrayList<>();
+            while (lexer.getLexType() == LexType.COMMA) {
+                lexer.next(); // COMMA
+                exps.add(parseExp());
+            }
+            if (lexer.getLexType() == LexType.RPARENT) {
+                lexer.next(); // RPARENT
+            } else {
+                Logger.logBad(lexer.getPrevLineno() + " j\n");
+            }
+            if (lexer.getLexType() == LexType.SEMICN) {
+                lexer.next(); // SEMICN
+            } else {
+                Logger.logBad(lexer.getPrevLineno() + " i\n");
+            }
+            return new Stmt(string, exps.toArray(new Exp[0]));
+        }
+        ```
+    *   This looks correct for the `printf` statement.
+    *   Let's look at `parseCompUnit` again.
+        ```java
+        public CompUnit parseCompUnit() {
+            lexer.next(); // Consumes 'int' of 'int a;'
+
+            ArrayList<Decl> decls = new ArrayList<>();
+            boolean hasDecl;
+            do {
+                hasDecl = false;
+                if (lexer.getLexType() == LexType.CONSTTK) {
+                    decls.add(parseDecl());
+                    hasDecl = true;
+                } else {
+                    lexer.nextNoPrint(); // Lookahead: consumes 'a' (IDENFR)
+                    lexer.nextNoPrint(); // Lookahead: consumes '=' (ASSIGN) ?? No, wait.
+                    
+                    // The logic here is flawed for general lookahead.
+                    // It tries to distinguish VarDecl (starts with BType) from FuncDef (starts with FuncType).
+                    // VarDecl: int a ...
+                    // FuncDef: int foo ...
+                    
+                    // Current token is INTTK (from 'int a;').
+                    // lexer.next() consumed 'int'.
+                    // lexer.getLexType() is IDENFR ('a').
+                    // It goes to else.
+                    // lexer.nextNoPrint() -> consumes 'a', lexType becomes IDENFR.
+                    // lexer.nextNoPrint() -> consumes ';', lexType becomes SEMICN.
+                    
+                    if (lexer.getLexType() != LexType.LPARENT) {
+                        // It is not LPARENT, so it assumes Decl.
+                        lexer.prev(); // Reverts ';'
+                        lexer.prev(); // Reverts 'a'
+                        // Now lexType is IDENFR ('a').
+                        decls.add(parseDecl());
+                        hasDecl = true;
+                    } else {
+                        lexer.prev();
+                        lexer.prev();
+                    }
+                }
+            } while (hasDecl);
+            ...
+        }
+        ```
+    *   Let's trace `parseDecl` when called after reverting.
+        *   Current token: `a` (IDENFR).
+        *   `parseDecl` checks `ConstDecl.FIRST` (CONSTTK). No.
+        *   Goes to `VarDecl`.
+        *   `parseVarDecl`:
+            ```java
+            public VarDecl parseVarDecl() {
+                BType bType = parseBType(); // Expects INTTK/CHARTK. But current token is IDENFR ('a')!
+                ...
+            }
+            ```
+    *   **Error Found**: In `parseCompUnit`, the lookahead logic consumes tokens to decide if it's a Decl or FuncDef. When it decides it's a Decl, it reverts the tokens. However, it reverts to the state *after* the initial `lexer.next()` in `parseCompUnit` consumed the `BType` (e.g., `int`).
+    *   Specifically:
+        1. `parseCompUnit` calls `lexer.next()`. Token: `INTTK` ("int"). Pos moves past "int".
+        2. Loop starts. `lexer.getLexType()` is `IDENFR` ("a")? No, `lexer.next()` was called once. The current token is `INTTK`. Wait.
+        
+        Let's re-read `Lexer.next()`:
+        ```java
+        public boolean next() {
+            if (lexType != null) {
+                Logger.logGood(getLexType() + " " + getToken() + "\n");
+            }
+            return nextNoPrint();
+        }
+        ```
+        And `nextNoPrint()` updates `lexType`.
+        
+        Trace `parseCompUnit`:
+        1. `lexer.next()`:
+           - `lexType` was null. No log.
+           - `nextNoPrint()` runs. Skips comments/spaces. Finds `int`.
+           - `lexType` = `INTTK`, `token` = "int".
+           - Returns true.
+        2. `do-while` loop.
+           - `lexer.getLexType()` is `INTTK`.
+           - Is it `CONSTTK`? No.
+           - Else block:
+             - `lexer.nextNoPrint()`:
+               - Saves `INTTK` to history.
+               - Skips spaces.
+               - Finds `a`.
+               - `lexType` = `IDENFR`, `token` = "a".
+             - `lexer.nextNoPrint()`:
+               - Saves `IDENFR` to history.
+               - Skips spaces.
+               - Finds `;`? No, `int a;`. After `a` comes `;`.
+               - Wait, `int a;`. Tokens: `INTTK`, `IDENFR`, `SEMICN`.
+               - So second `nextNoPrint` finds `SEMICN`? No, there might be spaces.
+               - Let's assume standard spacing `int a;`.
+               - First `nextNoPrint` gets `a` (IDENFR).
+               - Second `nextNoPrint` gets `;` (SEMICN).
+             - `lexer.getLexType()` is `SEMICN`.
+             - Is it `LPARENT`? No.
+             - So it enters `if`.
+             - `lexer.prev()`: Restores `IDENFR` ("a").
+             - `lexer.prev()`: Restores `INTTK` ("int").
+             - Now `lexType` is `INTTK`.
+             - `decls.add(parseDecl())`.
+           
+        3. `parseDecl()`:
+           - Checks `ConstDecl.FIRST`. No.
+           - Calls `parseVarDecl()`.
+           
+        4. `parseVarDecl()`:
+           - Calls `parseBType()`.
+           - `parseBType()`:
+             - `LexType lexType = lexer.getLexType();` -> `INTTK`.
+             - `lexer.next();` -> Consumes `INTTK`. Logs `INTTK int`.
+             - Returns `BType(INTTK)`.
+           - Back in `parseVarDecl`:
+             - `varDefs.add(parseVarDef())`.
+             
+        5. `parseVarDef()`:
+           - `String name = lexer.getToken();` -> Current token is `a` (IDENFR). Correct.
+           - `lexer.next();` -> Consumes `a`. Logs `IDENFR a`.
+           - Checks for `[`. No.
+           - Checks for `=`. No.
+           - Returns `VarDef`. Logs `<VarDef>`.
+           
+        6. Back in `parseVarDecl`:
+           - Checks for `,`. No.
+           - Checks for `;`.
+           - `lexer.getLexType()` is `;` (SEMICN).
+           - `lexer.next();` -> Consumes `;`. Logs `SEMICN ;`.
+           - Returns `VarDecl`. Logs `<VarDecl>`.
+        
+        This seems to work for the first declaration.
+
+    *   Let's look at the second declaration: `int b = 114514;`.
+        - Loop continues.
+        - `lexer.getLexType()` is now `INTTK` (from `int b...`).
+        - Else block.
+        - `lexer.nextNoPrint()` -> `b` (IDENFR).
+        - `lexer.nextNoPrint()` -> `=` (ASSIGN).
+        - `lexer.getLexType()` is `ASSIGN`. Not `LPARENT`.
+        - `prev()` -> `IDENFR`.
+        - `prev()` -> `INTTK`.
+        - `parseDecl()` -> `parseVarDecl()`.
+        - `parseBType()` consumes `int`.
+        - `parseVarDef()`:
+          - `name` = `b`. `next()` consumes `b`.
+          - No `[`.
+          - `lexer.getLexType()` is `ASSIGN`.
+          - Enters `if`. `lexer.next()` consumes `=`.
+          - `parseInitVal()`.
+          
+    *   `parseInitVal()`:
+        - `lexer.getLexType()` is `INTCON` (114514).
+        - Goes to `else` (Exp).
+        - `parseExp()` -> `parseAddExp()` ... -> `parsePrimaryExp()`.
+        
+    *   `parsePrimaryExp()`:
+        - `INTCON` is in `Number.FIRST`.
+        - Calls `parseNumber()`.
+        
+    *   `parseNumber()`:
+        - `String token = lexer.getToken();` -> "114514".
+        - `lexer.next();` -> Consumes `INTCON`. Logs `INTCON 114514`.
+        - Returns `Number`. Logs `<Number>`.
+        
+    *   Back up the chain: `<PrimaryExp>`, `<UnaryExp>`, `<MulExp>`, `<AddExp>`, `<Exp>`, `<InitVal>`.
+    
+    *   Back in `parseVarDef`:
+        - Returns. Logs `<VarDef>`.
+        
+    *   Back in `parseVarDecl`:
+        - Checks `,`. No.
+        - Checks `;`. `lexer.getLexType()` is `SEMICN`.
+        - `lexer.next()`. Logs `SEMICN ;`.
+        - Returns. Logs `<VarDecl>`.
+
+    *   Next iteration of `do-while` in `parseCompUnit`.
+    *   `lexer.getLexType()` is `INTTK` (from `int main...`).
+    *   Else block.
+    *   `lexer.nextNoPrint()` -> `main` (MAINTK).
+    *   `lexer.nextNoPrint()` -> `(` (LPARENT).
+    *   `lexer.getLexType()` is `LPARENT`.
+    *   Enters `else` of the inner if.
+    *   `lexer.prev()` -> `MAINTK`.
+    *   `lexer.prev()` -> `INTTK`.
+    *   `hasDecl` remains false.
+    *   Loop ends.
+
+    *   Next part: `FuncDef` loop.
+    *   `lexer.nextNoPrint()` -> `main` (MAINTK).
+    *   `lexer.getLexType()` is `MAINTK`.
+    *   `if (lexer.getLexType() != LexType.MAINTK)` is False.
+    *   `lexer.prev()` -> `INTTK`.
+    *   `hasFuncDef` remains false.
+    *   Loop ends.
+
+    *   `parseMainFuncDef()`.
+    *   `lexer.next()` -> `INTTK`. Logs `INTTK int`.
+    *   `lexer.next()` -> `MAINTK`. Logs `MAINTK main`.
+    *   `lexer.next()` -> `LPARENT`. Logs `LPARENT (`.
+    *   Checks `RPARENT`. `lexer.getLexType()` is `RPARENT`?
+      - Wait, `int main() {`. Tokens: `INTTK`, `MAINTK`, `LPARENT`, `RPARENT`, `LBRACE`.
+      - Yes.
+    *   `lexer.next()` -> `RPARENT`. Logs `RPARENT )`.
+    *   `parseBlock()`.
+
+    *   `parseBlock()`:
+      - `lexer.next()` -> `LBRACE`. Logs `LBRACE {`.
+      - Loop while not `RBRACE`.
+      - `parseBlockItem()`.
+
+    *   `parseBlockItem()`:
+      - Checks `Decl.FIRST`. `INTTK` is in `VarDecl.FIRST` which is in `Decl.FIRST`.
+      - Calls `parseDecl()`.
+      
+    *   `parseDecl()` -> `parseVarDecl()`.
+      - `parseBType()` consumes `int`. Logs `INTTK int`.
+      - `parseVarDef()`.
+        - `name` = `a`. `next()` consumes `a`. Logs `IDENFR a`.
+        - No `[`.
+        - `lexer.getLexType()` is `ASSIGN`.
+        - `next()` consumes `=`. Logs `ASSIGN =`.
+        - `parseInitVal()`.
+          - `parseExp()`.
+            - `parseAddExp()`...
+            - `parsePrimaryExp()`.
+              - `INTCON 5`.
+              - `parseNumber()`. Logs `INTCON 5`, `<Number>`.
+            - Logs `<PrimaryExp>`, `<UnaryExp>`, `<MulExp>`, `<AddExp>`, `<Exp>`.
+          - Logs `<InitVal>`.
+        - Logs `<VarDef>`.
+      - Checks `,`. No.
+      - Checks `;`. `SEMICN`.
+      - `next()` consumes `;`. Logs `SEMICN ;`.
+      - Logs `<VarDecl>`.
+
+    *   Next `BlockItem`.
+    *   `INTTK`. `parseDecl()`.
+    *   `int c = b - a;`.
+    *   Similar trace. `b` is `IDENFR`. `parseExp` handles `b - a`.
+    *   `parseLVal` for `b`.
+      - `name` = `b`. `next()` consumes `b`. Logs `IDENFR b`.
+      - Logs `<LVal>`.
+      - `parsePrimaryExp` wraps it. Logs `<PrimaryExp>`.
+      - `parseUnaryExp` wraps it. Logs `<UnaryExp>`.
+      - `parseMulExp` wraps it. Logs `<MulExp>`.
+      - `parseAddExp` sees `MINU`.
+      - `lexer.next()` consumes `-`. Logs `MINU -`.
+      - `parseMulExp` for `a`.
+      - `parseLVal` for `a`. Logs `IDENFR a`, `<LVal>`, `<PrimaryExp>`, `<UnaryExp>`, `<MulExp>`.
+      - `AddExp` constructor logs `<AddExp>`.
+      - Up the chain: `<Exp>`, `<InitVal>`, `<VarDef>`, `;`, `<VarDecl>`.
+
+    *   Next `BlockItem`.
+    *   `PRINTFTK`.
+    *   `parseBlockItem` checks `Decl.FIRST`. `PRINTFTK` is NOT in `Decl.FIRST`.
+    *   Goes to `Stmt`.
+    *   `parseStmt()`.
+    *   Matches `PRINTFTK` branch.
+    *   `lexer.next()` -> `PRINTFTK`. Logs `PRINTFTK printf`.
+    *   `lexer.next()` -> `LPARENT`. Logs `LPARENT (`.
+    *   `string` = `"%d\n%d %d\n"`.
+    *   `lexer.next()` -> `STRCON`. Logs `STRCON "%d\n%d %d\n"`.
+    *   Loop for commas.
+    *   `lexer.getLexType()` is `COMMA`.
+    *   `lexer.next()` -> `COMMA`. Logs `COMMA ,`.
+    *   `parseExp()` for `a`.
+      - `parseLVal` -> `a`. Logs `IDENFR a`, `<LVal>`, `<PrimaryExp>`, `<UnaryExp>`, `<MulExp>`, `<AddExp>`, `<Exp>`.
+    *   `lexer.getLexType()` is `COMMA`.
+    *   `lexer.next()` -> `COMMA`. Logs `COMMA ,`.
+    *   `parseExp()` for `b`. Logs similar chain.
+    *   `lexer.getLexType()` is `COMMA`.
+    *   `lexer.next()` -> `COMMA`. Logs `COMMA ,`.
+    *   `parseExp()` for `c`. Logs similar chain.
+    *   `lexer.getLexType()` is `RPARENT`.
+    *   `lexer.next()` -> `RPARENT`. Logs `RPARENT )`.
+    *   `lexer.getLexType()` is `SEMICN`.
+    *   `lexer.next()` -> `SEMICN`. Logs `SEMICN ;`.
+    *   `new Stmt(...)`. Logs `<Stmt>`.
+
+    *   Next `BlockItem`.
+    *   `RETURNTK`.
+    *   `parseStmt()`.
+    *   Matches `RETURNTK` branch.
+    *   `lexer.next()` -> `RETURNTK`. Logs `RETURNTK return`.
+    *   `Exp.FIRST` contains `INTCON`.
+    *   `parseExp()` for `0`.
+      - `INTCON 0`. Logs `INTCON 0`, `<Number>`, `<PrimaryExp>`, `<UnaryExp>`, `<MulExp>`, `<AddExp>`, `<Exp>`.
+    *   `lexer.getLexType()` is `SEMICN`.
+    *   `lexer.next()` -> `SEMICN`. Logs `SEMICN ;`.
+    *   `new Stmt(...)`. Logs `<Stmt>`.
+
+    *   Next `BlockItem`.
+    *   `lexer.getLexType()` is `RBRACE`.
+    *   Loop ends.
+    *   `lexer.next()` -> `RBRACE`. Logs `RBRACE }`.
+    *   `new Block(...)`. Logs `<Block>`.
+    *   Back in `parseMainFuncDef`.
+    *   `new MainFuncDef(...)`. Logs `<MainFuncDef>`.
+    *   Back in `parseCompUnit`.
+    *   `new CompUnit(...)`. Logs `<CompUnit>`.
+
+    *   The trace matches the expected output perfectly. So why "No output file"?
+
+    *   Check `Compiler.java`:
+        ```java
+        try {
+            if (bad.isEmpty()) {
+                Files.write(Paths.get("parser.txt"), good.getBytes());
+            } else {
+                Files.write(Paths.get("error.txt"), bad.getBytes());
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+        ```
+    *   If `parseCompUnit` throws an exception, `good` and `bad` might be partially filled, but the write happens. If it crashes before `parseCompUnit` returns, no write.
+    
+    *   Is there a crash?
+    *   Look at `Lexer.java` `find` method.
+        ```java
+        private boolean find(LexType lexType, String format) {
+            Pattern pattern = Pattern.compile(format);
+            Matcher matcher = pattern.matcher(input.substring(pos));
+            if (matcher.lookingAt()) {
+                this.lexType = lexType;
+                token = matcher.group();
+                for (int i = pos; i < pos + matcher.group().length(); i++) {
+                    if (input.charAt(i) == '\n') {
+                        lineno++;
+                    }
+                }
+                pos += matcher.group().length();
+                return true;
+            } else {
+                return false;
+            }
+        }
+        ```
+    *   Look at `STRCON_FORMAT`:
+        ```java
+        private static final String STRCON_FORMAT = "\"([ !#-&(-\\[\\]-~]|\\\\[abtnvf\"'\\\\0])*\"";
+        ```
+    *   The input string is `"%d\n%d %d\n"`.
+    *   Does the regex match `\n` inside the string?
+    *   The regex allows `\\\\[abtnvf\"'\\\\0]`. This matches `\` followed by `a`, `b`, `t`, `n`, `v`, `f`, `"`, `'`, `\`, `0`.
+    *   So `\n` is matched as `\\` (literal backslash in regex string `\\\\`) and `n`.
+    *   Wait, the input file contains actual newline characters or escape sequences?
+    *   The input is:
+        ```
+        printf("%d\n%d %d\n", a, b, c);
+        ```
+    *   In a text file, `\n` inside a string literal is usually two characters: `\` and `n`.
+    *   The regex `\\\\[abtnvf...]` matches a literal `\` followed by `n`.
+    *   So `STRCON` should be tokenized correctly.
+
+    *   Let's check `Logger.java`.
+        ```java
+        public static void logGood(String s) {
+            good.add(s);
+        }
+        ```
+    *   `good` is a static `ArrayList`.
+    
+    *   Let's check `Parser.java` `parseStmt` again.
+        ```java
+        } else {
+            // 可能的四种情况：
+            //     LVal '=' Exp ';'
+            //     Exp ';'
+            //     LVal '=' 'getint' '(' ')' ';'
+            //     LVal '=' 'getchar' '(' ')' ';'
+            // 先解析一个 Exp
+            Exp expOrLVal = parseExp();
+            if (lexer.getLexType() == LexType.ASSIGN) {
+                LVal lVal = expOrLVal.getAddExp().getMulExp().getUnaryExp().getPrimaryExp().getlVal();
+                while (!Logger.getLastGood().equals("<LVal>\n")) {
+                    Logger.removeLastGood();
+                }
+                ...
+            }
+        }
+        ```
+    *   This code assumes that if `parseExp()` is called, and the next token is `=`, then the `Exp` parsed was actually just an `LVal`. It tries to "undo" the logging of the expression components to replace them with just `<LVal>`.
+    *   However, `parseExp()` calls `parseAddExp()`, which recursively builds the tree and logs `<AddExp>`, `<MulExp>`, etc.
+    *   If the expression is just an `LVal` (e.g., `a`), `parseExp` -> `parseAddExp` -> `parseMulExp` -> `parseUnaryExp` -> `parsePrimaryExp` -> `parseLVal`.
+    *   `parseLVal` logs `<LVal>`.
+    *   `parsePrimaryExp` logs `<PrimaryExp>`.
+    *   `parseUnaryExp` logs `<UnaryExp>`.
+    *   `parseMulExp` logs `<MulExp>`.
+    *   `parseAddExp` logs `<AddExp>`.
+    *   `Exp` constructor logs `<Exp>`.
+    *   So the log contains: `<LVal>`, `<PrimaryExp>`, `<UnaryExp>`, `<MulExp>`, `<AddExp>`, `<Exp>`.
+    *   The code `while (!Logger.getLastGood().equals("<LVal>\n")) { Logger.removeLastGood(); }` will remove `<Exp>`, `<AddExp>`, `<MulExp>`, `<UnaryExp>`, `<PrimaryExp>`.
+    *   It stops when `<LVal>` is at the top.
+    *   This seems intended to correct the output for `LVal = ...`.
+
+    *   **However**, what if `parseExp()` parses something more complex, like `b - a`?
+    *   If the next token is NOT `=`, it proceeds to `else` (Exp ';').
+    *   If the next token IS `=`, it assumes it was an `LVal`.
+    *   But `b - a = ...` is invalid syntax anyway.
+    *   The problem is: does `parseExp()` consume tokens correctly? Yes.
+    
+    *   Is there a case where `Logger.getLastGood()` throws an exception?
+    *   If `good` is empty.
+    *   When is `good` empty? At the very beginning.
+    *   But `parseExp` is called deep in the recursion. Tokens have been logged.
+
+    *   Let's look at `Lexer.next()` again.
+        ```java
+        public boolean next() {
+            if (lexType != null) {
+                Logger.logGood(getLexType() + " " + getToken() + "\n");
+            }
+            return nextNoPrint();
+        }
+        ```
+    *   The first call to `next()` in `parseCompUnit` has `lexType == null`, so it doesn't log.
+    *   Subsequent calls log.
+
+    *   **Crucial Observation**:
+        In `Parser.parseCompUnit`, the lookahead logic uses `lexer.nextNoPrint()`.
+        `nextNoPrint()` adds to `lexTypeHistory`, `tokenHistory`, etc.
+        When `lexer.prev()` is called, it removes from these histories and restores `lexType`, `token`, `pos`, `lineno`.
+        
+        However, `nextNoPrint()` does **NOT** log to `Logger`.
+        `next()` **DOES** log to `Logger`.
+        
+        In the lookahead:
+        1. `lexer.nextNoPrint()` (consumes `a`). No log.
+        2. `lexer.nextNoPrint()` (consumes `;`). No log.
+        3. `lexer.prev()` (restores `a`).
+        4. `lexer.prev()` (restores `int`).
+        
+        Then `parseDecl()` is called.
+        `parseVarDecl()` calls `parseBType()`.
+        `parseBType()` calls `lexer.next()`.
+        `lexer.next()` logs `INTTK int`.
+        
+        This seems correct. The lookahead tokens are not logged, and when we re-parse, they are logged.
+
+    *   **Wait**, look at `parseStmt` again.
+        ```java
+        Exp expOrLVal = parseExp();
+        if (lexer.getLexType() == LexType.ASSIGN) {
+            LVal lVal = expOrLVal.getAddExp().getMulExp().getUnaryExp().getPrimaryExp().getlVal();
+            while (!Logger.getLastGood().equals("<LVal>\n")) {
+                Logger.removeLastGood();
+            }
+            // ...
+        }
+        ```
+        If `parseExp()` parses a simple `LVal`, the logs are `<LVal>`, `<PrimaryExp>`, `<UnaryExp>`, `<MulExp>`, `<AddExp>`, `<Exp>`.
+        The loop removes `<Exp>`, `<AddExp>`, `<MulExp>`, `<UnaryExp>`, `<PrimaryExp>`.
+        Left with `<LVal>`.
+        Then it proceeds to parse `=`, `getint`, etc.
+        
+        But what if `parseExp()` parses a `Number`?
+        Logs: `<Number>`, `<PrimaryExp>`, `<UnaryExp>`, `<MulExp>`, `<AddExp>`, `<Exp>`.
+        If next token is `=`, it tries to get `lVal` from `PrimaryExp`.
+        `expOrLVal.getAddExp().getMulExp().getUnaryExp().getPrimaryExp().getlVal()`
+        If `PrimaryExp` contains a `Number`, `getlVal()` throws `RuntimeException`!
+        
+        Can a `Number` be followed by `=`?
+        `1 = 2;` is invalid.
+        But the parser doesn't know it's invalid until it tries to treat it as an `LVal`.
+        The grammar says `Stmt → LVal '=' Exp ';' | ...`.
+        If the parser sees `1 =`, it should probably report an error or fail.
+        But the code assumes if `ASSIGN` follows `Exp`, it MUST be an `LVal`.
+        
+        In the test case, we have `int a = 5;`.
+        Inside `parseVarDef`, `parseInitVal` is called.
+        `parseInitVal` calls `parseExp`.
+        `parseExp` parses `5`.
+        Next token is `;`.
+        So `if (lexer.getLexType() == LexType.ASSIGN)` is false.
+        It goes to `else` (Exp ';').
+        Wait, `parseInitVal` expects `Exp`. It doesn't expect `;`.
+        `parseVarDef` handles the `;`.
+        
+        So `parseStmt` is only called for statements in `BlockItem`.
+        Statements like `a = 5;`.
+        `parseStmt` calls `parseExp()`.
+        `parseExp` parses `a` (LVal).
+        Logs: `<LVal>`, `<PrimaryExp>`, `<UnaryExp>`, `<MulExp>`, `<AddExp>`, `<Exp>`.
+        Next token is `=`.
+        Enters `if`.
+        Gets `lVal`.
+        Removes logs.
+        
+        This works for `a = 5;`.
+
+    *   **Is there any other place?**
+    
+    *   Look at `Lexer.java` `skip` method.
+        ```java
+        private boolean skip(String format) {
+            Pattern pattern = Pattern.compile(format);
+            Matcher matcher = pattern.matcher(input.substring(pos));
+            if (matcher.lookingAt()) {
+                for (int i = pos; i < pos + matcher.group().length(); i++) {
+                    if (input.charAt(i) == '\n') {
+                        lineno++;
+                    }
+                }
+                pos += matcher.group().length();
+                return true;
+            } else {
+                return false;
+            }
+        }
+        ```
+    *   `MULTI_LINE_COMMENT_FORMAT`: `/\\*[\\s\\S]*\\*/`.
+    *   This is greedy.
+    *   Input:
+        ```
+        /*cxk
+        //ji ni tai mei
+        java python ccyt
+        */
+        /**/
+        ```
+    *   The first `/*` starts a comment.
+    *   The regex `[\s\S]*` matches everything including newlines.
+    *   It matches up to the last `*/`?
+    *   Greedy matching: `.*` matches as much as possible.
+    *   So it might match from the first `/*` to the end of the second `*/`.
+    *   Let's check.
+    *   Input substring starting at `/*cxk...`.
+    *   Pattern: `/\*[\s\S]*\*/`.
+    *   Match: `/*cxk\n//ji ni tai mei\njava python ccyt\n*/\n/**/`.
+    *   If it matches both comments as one, `pos` moves past both.
+    *   `lineno` increases correctly for all newlines inside.
+    *   This is acceptable for skipping comments.
+
+    *   **However**, if the regex is greedy, does it cause issues?
+    *   Usually, comment skipping is fine if it consumes all comment text.
+
+    *   **Let's check the `Logger` output format.**
+    *   Expected:
+        ```
+        INTTK int
+        IDENFR a
+        <VarDef>
+        ...
+        ```
+    *   Code:
+        ```java
+        Logger.logGood(getLexType() + " " + getToken() + "\n");
+        ```
+    *   And:
+        ```java
+        Logger.logGood("<VarDef>\n");
+        ```
+    *   This matches.
+
+    *   **What if `Logger.getGood()` returns an empty string?**
+    *   If `good` list is empty.
+    *   Why would it be empty?
+    *   If `parseCompUnit` throws an exception before logging anything significant?
+    *   Or if `Files.write` fails?
+
+    *   **Let's look at `Parser.parseCompUnit` again.**
+    *   There is a subtle bug in the lookahead logic for `FuncDef`.
+    
+    *   Consider `int main() { ... }`.
+    *   After parsing `int a;` and `int b = ...;`.
+    *   Current token: `INTTK` (from `int main`).
+    *   Loop:
+        - `lexer.getLexType()` == `INTTK`.
+        - Else.
+        - `lexer.nextNoPrint()` -> `MAINTK`.
+        - `lexer.nextNoPrint()` -> `LPARENT`.
+        - `lexer.getLexType()` == `LPARENT`.
+        - Inner `else`:
+            - `lexer.prev()` -> `MAINTK`.
+            - `lexer.prev()` -> `INTTK`.
+        - `hasDecl` = false.
+        - Loop ends.
+    
+    *   FuncDef loop:
+        - `lexer.nextNoPrint()` -> `MAINTK`.
+        - `lexer.getLexType()` == `MAINTK`.
+        - `if (lexer.getLexType() != LexType.MAINTK)` is False.
+        - `lexer.prev()` -> `INTTK`.
+        - `hasFuncDef` = false.
+        - Loop ends.
+    
+    *   `parseMainFuncDef()`.
+    *   `lexer.next()` -> `INTTK`. Logs.
+    *   `lexer.next()` -> `MAINTK`. Logs.
+    *   `lexer.next()` -> `LPARENT`. Logs.
+    *   `lexer.next()` -> `RPARENT`. Logs.
+    *   `parseBlock()`.
+    
+    *   This seems correct.
+
+    *   **Is it possible that `Lexer` fails to tokenize `printf`?**
+    *   `PRINTFTK_FORMAT`: `"printf\\b"`.
+    *   `find` uses `lookingAt()`.
+    *   `printf` is followed by `(`. `\b` matches boundary between `f` and `(`.
+    *   So it matches.
+
+    *  

@@ -1,0 +1,445 @@
+Based on the problem description and test case, the issue is that the program should detect a lexical error "a" (individual "|" symbol) on line 23 of the input file. The test input contains `if (1 | 1 == 1) {}` which has a single "|" instead of "||", which should trigger error code "a".
+
+Looking at the lexer implementation, the error handling for single "&" and "|" symbols appears in the `dealOthers` method in the Lexer class. The code correctly writes the error to `errOut`, but there's a critical issue: after detecting the error, the method doesn't return the next character properly, which could cause the lexer to continue processing incorrectly.
+
+However, the main issue is more fundamental: the `Compiler.main` method calls `Lexer.lex(source, error)` but then proceeds to build an AST and print tokens regardless of whether lexical errors occurred. According to the problem specification, if there's a lexical error, the program should only output to `error.txt` and not produce any token output in `lexer.txt`.
+
+But looking more closely at the test case, the expected output is just "23 a" in error.txt, meaning the lexer should detect the error and the program should not produce any lexer output.
+
+The actual bug is in the `Compiler.main` method - it always calls `Printer.print(lexer)` regardless of whether lexical errors were found. However, examining the provided code more carefully, I notice that the Lexer class doesn't actually track whether errors occurred.
+
+But wait, looking at the specific test case line 23: `if (1 | 1 == 1) {}`
+
+The issue is in the `dealOthers` method in Lexer.java. When it encounters a single "|" (not followed by another "|"), it correctly writes the error to `errOut`, but then it doesn't consume the next character properly. Let me trace through:
+
+1. Current character is '|'
+2. It reads the next character `c = src.read()`
+3. If that next character is not '|', it writes the error
+4. But then it falls through without setting `c` to the next character to process
+
+Actually, looking at the code structure, in the '|' case:
+- If c == '|', it consumes another character with `c = src.read()`
+- If c != '|', it writes the error but doesn't read the next character
+
+This means after detecting the single "|", the lexer doesn't advance to the next character, which could cause issues. But more importantly, the bigger issue is that the program continues to parse and generate tokens even after a lexical error.
+
+However, re-examining the problem statement: "each erroneous example will contain only lexical analysis errors. Each erroneous example will have exactly one error."
+
+The expected behavior is that when a lexical error is detected, the program should output ONLY to error.txt and nothing to lexer.txt.
+
+Looking at the Compiler.main method:
+```java
+Lexer.lex(source, error);
+Ast ast = Builder.build();
+Printer.print(lexer);
+```
+
+The problem is that `Builder.build()` and `Printer.print(lexer)` are called even when lexical errors occur. The lexer should probably stop processing or there should be a mechanism to prevent further processing.
+
+But actually, looking at the Lexer.lex method, it processes the entire file and collects tokens in `tokenList`, while also writing errors to `errOut`. Then the printer always prints all tokens.
+
+The correct behavior should be: if ANY lexical error is detected, don't output any tokens, only the error.
+
+However, the immediate bug that's causing the wrong answer is likely in the error reporting itself. Let me check line numbers.
+
+In the test input, the problematic line is:
+`    if (1 | 1 == 1) {}`
+
+Counting lines from the beginning:
+1: int M;
+2: int L;  
+3: int N;
+4: (empty)
+5: int mul(int a0[],...
+...
+23:     if (1 | 1 == 1) {}
+
+So line 23 is correct.
+
+Now, looking at the `dealOthers` method for the '|' case:
+
+```java
+case '|':
+    c = src.read();
+    if (c == '|') {
+        tokenList.addToken(new Token(TokenType.OR, "||"));
+        c = src.read();
+    } else {
+        errOut.write(lineno + " " + "a");
+        errOut.newLine();
+    }
+    break;
+```
+
+The issue here is that when a single "|" is encountered, after writing the error, the method breaks out of the switch but doesn't set `c` to the next character to process. The character that was read (which is not '|') needs to be processed in the next iteration.
+
+But actually, looking at the control flow in the main lex loop:
+
+```java
+while (c != -1) {
+    c = skipWhiteSpace(src, c);
+    if (c == -1) {
+        break;
+    } else if (c == '/') {
+        c = dealComment(src);
+    } else if (isLetter(c)) {
+        c = dealIdentifier(src, c);
+    } else if (Character.isDigit(c)) {
+        c = dealNumber(src, c);
+    } else if (c == '\'') {
+        c = dealChar(src, c);
+    } else if (c == '\"') {
+        c = dealString(src, c);
+    } else {
+        c = dealOthers(src, c, errOut);
+    }
+}
+```
+
+The `dealOthers` method is expected to return the next character to process. In the case of single "|", it doesn't return anything - it just breaks. This means `c` remains whatever it was set to before the switch statement.
+
+Wait, no - looking at the `dealOthers` method signature: `private static int dealOthers(BufferedInputStream src, int c, BufferedWriter errOut) throws IOException`
+
+It takes `c` as input and should return the next character. But in the '|' case when it's a single "|", after writing the error, it breaks out of the switch and then... what does it return?
+
+Looking at the end of the method:
+```java
+        return c;
+    }
+```
+
+So if we have:
+- Input: '|' followed by ' ' (space)
+- `c` initially = '|'
+- In dealOthers, it reads next char: c = src.read() → gets ' '
+- Since ' ' != '|', it writes error "a"
+- Then breaks out of switch
+- Returns c, which is ' '
+
+This is actually correct behavior. The space will be handled by skipWhiteSpace in the next iteration.
+
+So the lexer error detection seems correct.
+
+The real issue must be that the program is still outputting tokens to lexer.txt even when there are lexical errors. According to the problem specification, for erroneous programs, only error.txt should be written to, not lexer.txt.
+
+Looking at Compiler.java:
+```java
+public class Compiler {
+    public static void main(String[] args) throws IOException {
+        BufferedInputStream source = new BufferedInputStream(Config.getSrc());
+        BufferedWriter lexer = new BufferedWriter(Config.getLexer());
+        BufferedWriter error = new BufferedWriter(Config.getErr());
+        BufferedWriter output = new BufferedWriter(Config.getAsm());
+        Lexer.lex(source, error);
+        Ast ast = Builder.build();
+        Printer.print(lexer);
+        lexer.close();
+        error.close();
+        output.close();
+    }
+}
+```
+
+The problem is that `Printer.print(lexer)` is always called, regardless of whether lexical errors occurred. The lexer should track if any errors occurred and the compiler should only print tokens if there were no errors.
+
+However, looking at the Lexer class, there's no mechanism to track whether errors occurred. The `lex` method writes errors directly to the error writer but doesn't return any status.
+
+But wait - the problem says "each erroneous example will have exactly one error", so maybe the expectation is that once an error is detected, lexing should stop? But the current implementation continues.
+
+Actually, re-reading the problem: "For an erroneous source program, the program should detect errors and output the line number of the error along with the corresponding error type code."
+
+It doesn't say to stop processing, but the output format specifies that only error information should be in error.txt, implying no token output.
+
+The bug is that the program outputs tokens even when there are lexical errors.
+
+However, looking at the provided code, I don't see where this decision is made. The Printer always prints if Config.printLex is true.
+
+But maybe the issue is simpler. Let me look again at the `dealOthers` method for the '|' case.
+
+Actually, I think I found the real bug. In the test input, the line is:
+`    if (1 | 1 == 1) {}`
+
+When the lexer encounters the '|', it reads the next character which is ' ' (space). Since ' ' != '|', it reports error "a". 
+
+But according to the error specification, error "a" is for "The symbols "&" and "|" appearing individually".
+
+This is correct.
+
+However, looking at the expected output: "23 a"
+
+But what if the line number tracking is wrong?
+
+In the `skipWhiteSpace` method:
+```java
+private static int skipWhiteSpace(BufferedInputStream src, int c) throws IOException {
+    while (Character.isWhitespace(c) || c == '\n') {
+        if (c == '\n') {
+            lineno++;
+        }
+        c = src.read();
+    }
+    return c;
+}
+```
+
+This increments lineno when it encounters '\n'. But what about the initial state? lineno starts at 1.
+
+Let's trace through a simple case:
+- Line 1: "abc"
+- Line 2: "def"
+
+Processing:
+- Start with lineno = 1
+- Read 'a' - not whitespace, process as identifier
+- Eventually read '\n' in skipWhiteSpace, increment lineno to 2
+- Continue...
+
+This seems correct.
+
+But wait, in the main lex loop, when we call `skipWhiteSpace`, it handles newlines and increments lineno. However, when we're in the middle of processing a line and encounter a newline within a token (like in comments), those are handled in the specific methods.
+
+For the '|' error case, the line number should be correct.
+
+I think the actual bug might be that the program is not stopping after the first error, but the problem states there's exactly one error, so that shouldn't matter.
+
+Wait, looking back at the problem statement: "In the first round of the conversation, please first summarize the information above and output the code snippet where the error is likely to be located."
+
+Given that the expected output is "23 a" but the buggy output is empty (implying no error was reported), the issue must be that the error is not being detected or reported.
+
+Looking again at the `dealOthers` method:
+
+```java
+case '|':
+    c = src.read();
+    if (c == '|') {
+        tokenList.addToken(new Token(TokenType.OR, "||"));
+        c = src.read();
+    } else {
+        errOut.write(lineno + " " + "a");
+        errOut.newLine();
+    }
+    break;
+```
+
+The problem is that after writing the error, it doesn't return the next character properly. But as I analyzed before, it does return `c` which is the character after the '|'.
+
+However, there's a more subtle issue: the `errOut.write()` and `errOut.newLine()` calls don't flush the buffer. But since the BufferedWriter is closed at the end, it should be flushed.
+
+But the real issue I'm noticing now: in the `dealOthers` method, for the '|' case, when it's a single '|', it writes the error but then falls through and returns `c` (which is the next character). However, that next character hasn't been processed yet, so it will be processed in the next iteration of the main loop.
+
+This should be fine.
+
+Wait, but what if the next character is part of another token? That should be handled correctly.
+
+I think the issue might be elsewhere. Let me check if the error is actually being written.
+
+Looking at the Compiler.main method again:
+```java
+Lexer.lex(source, error);
+// ... rest of code
+error.close();
+```
+
+The error BufferedWriter is closed, so any buffered data should be written.
+
+But maybe the issue is that the lexer continues to process the entire file and collect tokens, and then the syntax analyzer runs and possibly overwrites or interferes with the error output.
+
+However, the problem states this is a lexical analysis error, so it should be caught in lexing.
+
+Actually, looking at the test input more carefully:
+`    if (1 | 1 == 1) {}`
+
+The characters are: 'i', 'f', ' ', '(', '1', ' ', '|', ' ', '1', ' ', '=', '=', ' ', '1', ')', ' ', '{', '}'
+
+When the lexer reaches the '|', it:
+1. Current c = '|'
+2. Enters dealOthers
+3. Reads next c = ' ' (space)
+4. Since ' ' != '|', writes error "a" for current lineno
+5. Returns ' '
+
+Then in the main loop, it calls skipWhiteSpace(' '), which consumes the space and returns the next character '1'.
+
+This seems correct.
+
+But what is the value of `lineno` at this point? Let's count the lines in the test input up to the problematic line:
+
+1: int M;
+2: int L;
+3: int N;
+4: (empty line)
+5: int mul(int a0[],int a1[], int a2[],int b0[],int b1[],int b2[],int c0[],int c1[],int c2[])
+6: {
+7:     int i;
+8:     i=0;
+9:     c0[0]=a0[0]*b0[0]+a0[1]*b1[0]+a0[2]*b2[0];
+10:     c0[1]=a0[0]*b0[1]+a0[1]*b1[1]+a0[2]*b2[1];
+11:     c0[2]=a0[0]*b0[2]+a0[1]*b1[2]+a0[2]*b2[2];
+12:     c1[0]=a1[0]*b0[0]+a1[1]*b1[0]+a1[2]*b2[0];
+13:     c1[1]=a1[0]*b0[1]+a1[1]*b1[1]+a1[2]*b2[1];
+14:     c1[2]=a1[0]*b0[2]+a1[1]*b1[2]+a1[2]*b2[2];
+15:     c2[0]=a2[0]*b0[0]+a2[1]*b1[0]+a2[2]*b2[0];
+16:     c2[1]=a2[0]*b0[1]+a2[1]*b1[1]+a2[2]*b2[1];
+17:     c2[2]=a2[0]*b0[2]+a2[1]*b1[2]+a2[2]*b2[2];
+18:     return 0;
+19: }
+20: 
+21: int main()
+22: {
+23:     if (1 | 1 == 1) {}
+24:     N=3;
+
+Yes, line 23 is correct.
+
+I think the issue might be that the error is being written, but the program is also writing tokens, and the test is expecting only the error output. But the problem says the buggy output is empty, which suggests no error was written at all.
+
+Wait, looking at the `dealOthers` method again, I see a potential issue. In the '|' case:
+
+```java
+case '|':
+    c = src.read();
+    if (c == '|') {
+        tokenList.addToken(new Token(TokenType.OR, "||"));
+        c = src.read();
+    } else {
+        errOut.write(lineno + " " + "a");
+        errOut.newLine();
+    }
+    break;
+```
+
+After writing the error, it breaks, but it doesn't set `c` to anything. It relies on the current value of `c` (which is the character after '|') to be returned. But what if `src.read()` returns -1 (end of file)?
+
+If the input ended with a single '|', then `c = src.read()` would return -1, and it would write the error, then return -1, which would terminate the loop. That's correct.
+
+But in our case, it's not EOF.
+
+Another possibility: the BufferedWriter `errOut` needs to be flushed, but it's closed at the end, so that should happen.
+
+I'm starting to think the issue might be in the line number tracking. Let me check how newlines are counted.
+
+In the test input, after the function definition ends at line 19 with '}', there's an empty line (line 20), then "int main()" (line 21), "{" (line 22), and the problematic line (line 23).
+
+When processing, every time a '\n' is encountered in `skipWhiteSpace`, `lineno` is incremented.
+
+But what about newlines inside other token processing? For example, in comments or strings?
+
+In this case, there are no comments or strings around the problematic area.
+
+Actually, I think I found the bug. Look at the main lex loop:
+
+```java
+public static void lex(BufferedInputStream src, BufferedWriter errOut) throws IOException {
+    int c = src.read();
+    //read读到结尾时返回-1
+    while (c != -1) {
+        c = skipWhiteSpace(src, c);
+        if (c == -1) {
+            break;
+        } else if (c == '/') {
+            c = dealComment(src);
+        } else if (isLetter(c)) {
+            c = dealIdentifier(src, c);
+        } else if (Character.isDigit(c)) {
+            c = dealNumber(src, c);
+        } else if (c == '\'') {
+            c = dealChar(src, c);
+        } else if (c == '\"') {
+            c = dealString(src, c);
+        } else {
+            c = dealOthers(src, c, errOut);
+        }
+    }
+}
+```
+
+The issue is in the `dealOthers` call. It passes `c` (the current character) to `dealOthers`, but `dealOthers` is designed to handle that character and return the next one.
+
+However, in the '|' case within `dealOthers`:
+
+```java
+case '|':
+    c = src.read();  // This reads the NEXT character
+    if (c == '|') {
+        tokenList.addToken(new Token(TokenType.OR, "||"));
+        c = src.read();  // Read the character after "||"
+    } else {
+        errOut.write(lineno + " " + "a");
+        errOut.newLine();
+        // c is still the character after the single '|'
+    }
+    break;
+```
+
+This is correct.
+
+But wait, there's a critical bug here. In the `else` branch (single '|'), after writing the error, the method returns `c` which is the character immediately following the '|'. However, this character has NOT been processed for whitespace or anything else. It will be processed in the next iteration of the main loop, which is correct.
+
+I'm running out of ideas. Let me consider that maybe the error is not in the lexer but in how the error output is handled.
+
+Looking back at the problem: the expected output is "23 a" in error.txt, but the buggy output is empty. This suggests the error is not being written at all.
+
+What if the `lineno` variable is not what we expect?
+
+Let me trace the line number counting more carefully.
+
+The `lineno` starts at 1.
+
+Every time `skipWhiteSpace` encounters a '\n', it increments `lineno`.
+
+In the main loop, `skipWhiteSpace` is called at the beginning of each iteration.
+
+For the problematic line "    if (1 | 1 == 1) {}", let's say we're at the start of this line.
+
+The previous line was "{", which ended with a '\n'. When that '\n' was processed in `skipWhiteSpace`, `lineno` was incremented to 23.
+
+Then the spaces at the beginning of line 23 are consumed by `skipWhiteSpace`, but since they're not '\n', `lineno` remains 23.
+
+Then 'i' is processed as an identifier, etc.
+
+When we get to '|', `lineno` should still be 23.
+
+So that seems correct.
+
+Wait a minute! I think I see the issue. In the `dealOthers` method, for the '|' case, when it's a single '|', it writes the error, but it doesn't consume the '|' character from the input stream in the same way as other tokens.
+
+Actually, no - the '|' character was already consumed by the main loop before calling `dealOthers`. The `c` passed to `dealOthers` is the '|' character.
+
+The issue might be that after detecting the error, the lexer should stop, but it doesn't. However, the problem states there's exactly one error, so continuing shouldn't matter.
+
+I'm going to go with the most likely issue: the program outputs tokens even when there are lexical errors, but the test expects only error output.
+
+However, the problem says the buggy output is empty, which suggests no output at all, not that there's token output when there shouldn't be.
+
+Given the information, I think the most probable location of the error is in the `dealOthers` method in Lexer.java, specifically in the handling of single '|' and '&' characters.
+
+<frontend/lex/Lexer.java>
+...
+    private static int dealOthers(BufferedInputStream src, int c, BufferedWriter errOut) throws IOException {
+        switch (c) {
+...
+            case '&':
+                c = src.read();
+                if (c == '&') {
+                    tokenList.addToken(new Token(TokenType.AND, "&&"));
+                    c = src.read();
+                } else {
+                    errOut.write(lineno + " " + "a");
+                    errOut.newLine();
+                }
+                break;
+            case '|':
+                c = src.read();
+                if (c == '|') {
+                    tokenList.addToken(new Token(TokenType.OR, "||"));
+                    c = src.read();
+                } else {
+                    errOut.write(lineno + " " + "a");
+                    errOut.newLine();
+                }
+                break;
+...
+        }
+        return c;
+    }
+...

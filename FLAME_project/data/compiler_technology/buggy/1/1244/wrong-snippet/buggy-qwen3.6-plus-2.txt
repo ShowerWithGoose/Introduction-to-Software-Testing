@@ -1,0 +1,216 @@
+Based on the analysis of the problem description, test case, and source code:
+
+1.  **Test Case Analysis**:
+    *   Input Line 1: `void f(int a {}` -> Missing `)`. The last token before the expected `)` is `a` (IDENFR) at line 1. Error should be `1 j`.
+    *   Input Line 2: `int main( {` -> Missing `)`. The last token before the expected `)` is `(` (LPARENT) at line 2. However, the parser logic for `MainFuncDef` skips tokens differently. Let's trace carefully.
+    *   Input Line 3: `f(a + 10;` -> Missing `)`. The last token before the expected `)` is `10` (INTCON) at line 3. Error should be `3 j`.
+    *   Input Line 5: `}` -> This closes `main`.
+    *   Expected Output: `1 j`, `3 j`, `5 j`.
+    *   Buggy Output: `1 j`, `2 j`, `3 j`.
+
+2.  **Discrepancy Analysis**:
+    *   The buggy output reports an error at line 2 (`2 j`). This corresponds to `int main( {`.
+    *   The expected output does *not* report an error at line 2, but reports one at line 5 (`5 j`).
+    *   Wait, looking at the input:
+        ```
+        void f(int a {} // error 1
+        int main( { // error 2
+            int a = 10;
+            f(a + 10; // error 3
+            return 0;
+        }
+        ```
+    *   Line 1: `void f(int a {}`. Parser sees `void`, `f`, `(`, `int`, `a`. Then expects `)` or `,`. Sees `{`. Error `j` (missing `)`). Last token was `a` (line 1). Correct: `1 j`.
+    *   Line 2: `int main( {`. Parser sees `int`, `main`, `(`. Then expects `)`. Sees `{`. Error `j` (missing `)`). Last token was `(` (line 2). So `2 j` seems correct for this specific syntax error if parsed in isolation.
+    *   However, the expected output is `1 j`, `3 j`, `5 j`. Why `5 j`?
+    *   Let's look at Line 5 in the input file provided in the prompt.
+        Line 1: `void f(int a {}`
+        Line 2: `` (Empty? No, usually inputs are contiguous). Let's assume standard line breaks.
+        Line 1: `void f(int a {}`
+        Line 2: `int main( {`
+        Line 3: `    int a = 10;`
+        Line 4: `    f(a + 10;`
+        Line 5: `    return 0;`
+        Line 6: `}`
+        
+        If the expected output is `5 j`, there must be a missing `)` detected at line 5.
+        Let's re-read the input carefully.
+        `void f(int a {}` -> Error at 1.
+        `int main( {` -> If the parser recovers or handles errors, maybe it doesn't report here? Or maybe the "error 2" comment in the prompt implies it *is* an error, but the expected output doesn't list it?
+        
+        Actually, look at `parseMainFunc`:
+        ```java
+        private MainFuncDef parseMainFunc() {
+            ArrayList<BlockItem> blockItems = new ArrayList<>();
+            curTokenIndex += 2; // Skips 'int' and 'main'
+            curToken = tokens.get(++curTokenIndex); // Moves to '('
+            checkRParent(); // Checks if current token is ')'
+            parseBlock(blockItems);
+            ...
+        }
+        ```
+        In `int main( {`, `curToken` becomes `(`. `checkRParent` sees `(` != `)`, so it adds error `j` with line number of `tokens.get(curTokenIndex - 1)`. `curTokenIndex` is index of `(`. `curTokenIndex - 1` is `main`. Line 2. So it outputs `2 j`.
+        
+        Why is `2 j` not in expected? And why is `5 j` there?
+        
+        Let's look at `f(a + 10;`.
+        `parseStmt` -> `parseExpStmt` -> `parseExp` -> ... -> `parseUnaryExp`.
+        `f` is IDENFR. Next is `(`. It enters the function call branch.
+        `++curTokenIndex` (to `(`).
+        `curToken = tokens.get(++curTokenIndex)` (to `a`).
+        Parses params.
+        `checkRParent()`. Current token is `;`. Last token was `10` (Line 3/4?).
+        If `f(a + 10;` is on line 4, error is `4 j`? But expected is `3 j`.
+        
+        Let's look at the line numbers in the prompt's input block:
+        ```
+        void f(int a {} // error 1  (Line 1)
+        
+        int main( { // error 2      (Line 3? Or Line 2 if blank line ignored?)
+            int a = 10;             (Line 4)
+            f(a + 10; // error 3    (Line 5)
+            return 0;               (Line 6)
+        }                           (Line 7)
+        ```
+        If there is a blank line 2:
+        Line 1: `void...`
+        Line 2: ``
+        Line 3: `int main...`
+        Line 4: `int a...`
+        Line 5: `f(a...`
+        
+        Expected: `1 j`, `3 j`, `5 j`.
+        This matches lines 1, 3, 5.
+        
+        Buggy: `1 j`, `2 j`, `3 j`.
+        
+        The buggy program is reporting errors at lines 1, 2, 3.
+        This suggests the Lexer is assigning line numbers incorrectly, likely ignoring blank lines or counting them differently than expected, OR the Parser is recovering from the first error and misaligning the token stream/line numbers for subsequent errors.
+        
+        However, look at `Lexer.java`:
+        ```java
+        } else if (curCh == '/') {
+            curStr.append(curCh);
+            curCh = (char) input.read();
+            if (curCh == '/') {
+                do {
+                    curCh = (char) input.read();
+                } while (curCh != '\n' && curCh != '\uFFFF');
+            } 
+            // ...
+        }
+        ```
+        The lexer skips comments. It does NOT increment `curLine` inside the comment skipping loop for `//` comments until it hits `\n`. When it hits `\n`, the loop terminates. The `\n` is read into `curCh`. The loop ends. The code falls through to the end of the `if/else if` chain? No, it's inside `if (curCh == '/')`. After the inner `do-while`, it exits the `if (curCh == '/')` block. It does NOT process the `\n` to increment `curLine` immediately there.
+        
+        Wait, look at the start of `next()`:
+        ```java
+        private void next() throws IOException {
+            curCh = (char) input.read();
+            // ...
+            if (isWhitespace(curCh)) {
+                do {
+                    if (curCh == '\n')
+                        curLine++;
+                    curCh = (char) input.read();
+                } while (isWhitespace(curCh));
+                input.unread(curCh);
+            }
+            // ...
+        }
+        ```
+        
+        If `// comment\n` is processed:
+        1. `curCh` is `/`.
+        2. Enters `else if (curCh == '/')`.
+        3. Reads next char. It is `/`.
+        4. Enters `if (curCh == '/')`.
+        5. Loop reads until `\n`. `curCh` becomes `\n`.
+        6. Loop ends.
+        7. Exits `if (curCh == '/')` block.
+        8. Exits `else if (curCh == '/')` block.
+        9. Method `next()` ends.
+        
+        The `\n` is left in `curCh`. It is NOT unread. It is NOT processed as whitespace in *this* call.
+        In the *next* call to `next()`:
+        1. `curCh = (char) input.read()`. This reads the character *after* the newline.
+        2. The newline itself was consumed in the previous call but `curLine` was not incremented because the increment logic is only in the `isWhitespace` block at the start, which was skipped because `curCh` was `/`.
+        
+        Therefore, **newlines inside or at the end of comments are not counted**, causing line numbers to be lower than expected for all subsequent tokens.
+        
+        Specifically:
+        Line 1: `void f(int a {} // error 1\n`
+        Lexer processes `void`, `f`, `(`, `int`, `a`, `{`, `}`, `//`.
+        When processing `//`, it consumes up to `\n`. `curLine` is still 1.
+        Next token `int` (start of line 2/3) is read. `curLine` is still 1?
+        Wait, if `curLine` is not incremented, the next token gets line 1.
+        
+        Let's trace:
+        1. `void` (Line 1).
+        2. ...
+        3. `}` (Line 1).
+        4. Space. `next()` called. `curCh` is space. `isWhitespace` loop. Reads spaces. Stops at `/`. Unreads `/`.
+        5. `next()` called. `curCh` is `/`. Comment logic. Consumes `// error 1\n`. `curCh` is `\n`. Loop ends. `next()` returns. `curLine` is 1.
+        6. `next()` called. `curCh = read()`. This reads the first char of the next line (e.g., `i` from `int`).
+        The `\n` was consumed in step 5 but `curLine` was not incremented.
+        So `int` is assigned Line 1.
+        
+        This explains why the errors are shifted up.
+        Expected Line 3 (`int main`) is seen as Line 1 or 2?
+        If `int` is Line 1, then `main` is Line 1. `(` is Line 1. Error at `(` would be Line 1?
+        
+        Let's look at the Buggy Output: `1 j`, `2 j`, `3 j`.
+        Expected: `1 j`, `3 j`, `5 j`.
+        
+        If the lexer fails to increment line on comment newlines:
+        Line 1 tokens get Line 1.
+        Line 2 (blank) tokens? Blank lines are whitespace.
+        If Line 2 is blank `\n`:
+        After comment on Line 1, `curCh` is `\n`.
+        Next `next()`: reads first char of Line 3? No, `curCh` was `\n`. It wasn't unread.
+        So next `next()` reads char after `\n`.
+        The `\n` itself was lost without incrementing `curLine`.
+        
+        So all tokens on Line 3 (`int main...`) will have Line 1? Or Line 2?
+        If `curLine` starts at 1.
+        Tokens on physical line 1 get 1.
+        Comment consumes `\n`. `curLine` stays 1.
+        Next token (on physical line 3) gets `curLine` 1?
+        Unless there is whitespace processing.
+        
+        If the next char is `i` (not whitespace), it goes to identifier logic. Line 1.
+        So `int` is Line 1. `main` is Line 1. `(` is Line 1.
+        Error `j` at `(`. Last token `main` (Line 1). Output `1 j`.
+        But we already have `1 j` for the first error.
+        
+        The buggy output has `1 j`, `2 j`, `3 j`.
+        This implies some line increments are happening, but fewer than expected.
+        
+        The fix is to ensure `curLine` is incremented when a newline is consumed, even inside comments.
+        
+        Location: `frontend/Lexer.java`, inside the comment handling blocks.
+
+<frontend/Lexer.java>
+...
+        } else if (curCh == '/') {
+            curStr.append(curCh);
+            curCh = (char) input.read();
+            if (curCh == '/') {
+                do {
+                    curCh = (char) input.read();
+                } while (curCh != '\n' && curCh != '\uFFFF');
+            } else if (curCh == '*') {
+                do {
+                    curCh = (char) input.read();
+                    if (curCh == '*') {
+                        curCh = (char) input.read();
+                        if (curCh == '/')
+                            break;
+                        else
+                            input.unread(curCh);
+                    }
+                } while (true);
+            } else {
+                tokens.add(new Token(TokenType.DIV, "/", curLine));
+                input.unread(curCh);
+            }
+...

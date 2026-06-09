@@ -1,0 +1,487 @@
+Based on the problem description and the test case, the program fails to detect missing semicolons (error code 'i') in specific contexts.
+
+1.  **Test Case Analysis**:
+    *   Line 2: `printf("Hello SysY!\n")` is missing a semicolon. The expected output is `2 i`.
+    *   Line 9: `int a` is missing a semicolon. The expected output is `9 i`.
+    *   Line 13: `return 0` is missing a semicolon. The expected output is `13 i`.
+
+2.  **Code Analysis**:
+    *   The `Stmt.java` file handles statement parsing.
+    *   For `printf` statements (lines ~105-125 in `Stmt.java`), there is a check for the semicolon:
+        ```java
+        if (lex.getFirst() != TOKEN.SEMICN) {
+            error.put(line.get(line.size() - 1), 'i');
+        } else {
+            addList(new Others(lex));
+        }
+        ```
+        However, looking closely at the logic flow in `Stmt`:
+        The `printf` branch starts with `else if (lex.getFirst() == TOKEN.PRINTFTK)`.
+        Inside this block, it consumes tokens. If it encounters an error or mismatch earlier, it might return or set `err = true`.
+        Crucially, if the `printf` call is parsed successfully up to the closing parenthesis, it checks for the semicolon.
+        
+    *   Let's look at `VarDecl.java` for `int a`.
+        ```java
+        if (lex.getFirst() != TOKEN.SEMICN) {
+            error.put(line.get(line.size() - 1), 'i');
+        } else {
+            addList(new Others(lex));
+        }
+        ```
+        This looks correct for detecting the missing semicolon. Why did it fail?
+        
+    *   Let's look at `Stmt.java` for `return 0`.
+        ```java
+        } else if (lex.getFirst() == TOKEN.RETURNTK) {
+            addList(new Others(lex));
+            tmp = new Exp(lex);
+            if (!tmp.isErr()) {
+                addList(tmp);
+            }
+            if (lex.getFirst() != TOKEN.SEMICN) {
+                lex.returnTo(pre);
+                err = true;
+                return;
+            }
+            addList(new Others(lex));
+        }
+        ```
+        Here, if the semicolon is missing, it sets `err = true` and returns. It does **not** record the error 'i'. It just treats the whole statement as failed/parsed incorrectly. The caller (`BlockItem`) might then try to parse it as something else or fail silently without reporting the specific syntax error 'i'.
+
+    *   Let's re-examine `printf` in `Stmt.java`.
+        ```java
+        } else if (lex.getFirst() == TOKEN.PRINTFTK) {
+            // ... consumes tokens ...
+            if (lex.getFirst() != TOKEN.RPARENT) {
+                error.put(line.get(line.size() - 1), 'j');
+            } else {
+                addList(new Others(lex));
+            }
+            if (lex.getFirst() != TOKEN.SEMICN) {
+                error.put(line.get(line.size() - 1), 'i');
+            } else {
+                addList(new Others(lex));
+            }
+        }
+        ```
+        This part actually *does* put the error 'i'. So why is the output empty/wrong?
+        
+    *   Let's look at `CompUnit.java` and how errors are aggregated.
+        `Parser.work()` calls `top.getError()` and puts them into `error`.
+        `Parser.print()` checks `if (top.getError().isEmpty())`. If not empty, it prints from `error`.
+        
+    *   Wait, look at `Stmt.java` again.
+        In the `return` case:
+        ```java
+        if (lex.getFirst() != TOKEN.SEMICN) {
+            lex.returnTo(pre);
+            err = true;
+            return;
+        }
+        ```
+        It does NOT add the error to the `error` map. It just marks the node as erroneous.
+        
+    *   In the `printf` case:
+        It DOES add the error.
+        
+    *   In `VarDecl.java`:
+        It DOES add the error.
+
+    *   Why did the test fail with *no* output (Buggy Output is empty)?
+        If `Stmt` returns `err = true` for the `return` statement, `BlockItem` sees `Stmt` is err.
+        `BlockItem` constructor:
+        ```java
+        tmp = new Decl(lex);
+        if (!tmp.isErr()) { ... }
+        else {
+            tmp = new Stmt(lex);
+            if (tmp.isErr()) {
+                err = true;
+                return;
+            }
+            ...
+        }
+        ```
+        If `Stmt` is err, `BlockItem` becomes err.
+        `Block` loops `while (!tmp.isErr())`. If `BlockItem` is err, the loop stops.
+        `Block` then checks for `RBRACE`.
+        
+        The issue is likely that when a syntax error occurs (like missing semicolon), the parser enters an error state (`err = true`) but doesn't necessarily stop parsing the rest of the file correctly, or the error reporting mechanism relies on the `error` map being populated.
+        
+        Specifically for `return 0 // error 3`:
+        The code executes `lex.returnTo(pre)` and sets `err = true`. It does **not** call `error.put(...)`. Therefore, no error 'i' is recorded for line 13.
+        
+        For `int a // error 2`:
+        `VarDecl` is called.
+        `BType` consumes `int`.
+        `VarDef` consumes `a`.
+        Back in `VarDecl`, it checks `lex.getFirst() != TOKEN.SEMICN`. It is `}` (next token).
+        It executes `error.put(line.get(line.size() - 1), 'i');`.
+        So error 2 *should* be recorded.
+        
+        For `printf(...) // error 1`:
+        `Stmt` handles `PRINTFTK`.
+        It parses arguments.
+        Checks `RPARENT`. OK.
+        Checks `SEMICN`. Missing.
+        Executes `error.put(line.get(line.size() - 1), 'i');`.
+        So error 1 *should* be recorded.
+
+        Why is the output empty?
+        Let's look at `Parser.print`:
+        ```java
+        public void print(OutputStream out, OutputStream err) {
+            if (top.getError().isEmpty()) {
+                top.print(new PrintStream(out));
+            } else {
+                PrintStream prt = new PrintStream(err);
+                for (int t : error.keySet()) {
+                    prt.println(t + " " + error.get(t));
+                }
+            }
+        }
+        ```
+        And `Parser.work`:
+        ```java
+        public void work() {
+            top = new CompUnit(lexer);
+            error.putAll(top.getError());
+        }
+        ```
+        
+        If `top.getError()` contains the errors, they should be printed.
+        
+        Let's look at `CompUnit`.
+        ```java
+        tmp = new MainFuncDef(lex);
+        if (tmp.isErr()) {
+            lex.returnTo(pre);
+            err = true;
+            return;
+        }
+        addList(tmp);
+        ```
+        If `MainFuncDef` encounters an error inside its `Block`, does it return `isErr() = true`?
+        
+        `MainFuncDef` calls `new Block(lex)`.
+        `Block` parses items. If a `BlockItem` fails (e.g., `Stmt` returns err), `Block` stops adding items.
+        Then `Block` checks for `RBRACE`.
+        If the input is:
+        ```c
+        int main() {
+            printf("...") 
+            if (1)
+            ;
+            int a
+            for (;;) {}
+            return 0
+        }
+        ```
+        
+        1. `printf` stmt: `Stmt` parses `printf`. Detects missing `;`. Adds error 'i' to its local `error` map. Does it set `err = true`? No, it continues and finishes the `Stmt` constructor. `Stmt.isErr()` remains false (default).
+           Wait, `Stmt` extends `LabelList`. `err` is initialized to false.
+           In the `printf` branch, if `SEMICN` is missing, it adds error but does NOT set `err = true`.
+           So `Stmt` is considered successful.
+           
+        2. `if (1)` stmt:
+           `Stmt` sees `IFTK`.
+           Parses `Cond`.
+           Parses `Stmt` (the empty statement `;`).
+           This should succeed.
+           
+        3. `int a`:
+           Next token is `int`.
+           `BlockItem` tries `Decl`.
+           `Decl` tries `ConstDecl` (fails).
+           `Decl` tries `VarDecl`.
+           `VarDecl` parses `int a`.
+           Detects missing `;`. Adds error 'i'.
+           Does `VarDecl` set `err = true`?
+           Looking at `VarDecl.java`:
+           ```java
+           if (lex.getFirst() != TOKEN.SEMICN) {
+               error.put(line.get(line.size() - 1), 'i');
+           } else {
+               addList(new Others(lex));
+           }
+           ```
+           It does NOT set `err = true`. So `VarDecl` is considered successful.
+           
+        4. `for (;;) {}`:
+           Next token `for`.
+           `BlockItem` tries `Decl` (fails).
+           `BlockItem` tries `Stmt`.
+           `Stmt` sees `FORTK`. Parses successfully.
+           
+        5. `return 0`:
+           Next token `return`.
+           `BlockItem` tries `Decl` (fails).
+           `BlockItem` tries `Stmt`.
+           `Stmt` sees `RETURNTK`.
+           Parses `Exp` (`0`).
+           Checks `SEMICN`. Missing.
+           Code:
+           ```java
+           if (lex.getFirst() != TOKEN.SEMICN) {
+               lex.returnTo(pre);
+               err = true;
+               return;
+           }
+           ```
+           Here, it DOES set `err = true`.
+           So `Stmt` returns `isErr() = true`.
+           
+           Back in `BlockItem`:
+           ```java
+           tmp = new Stmt(lex);
+           if (tmp.isErr()) {
+               err = true;
+               return;
+           }
+           ```
+           `BlockItem` becomes `err = true`.
+           
+           Back in `Block`:
+           ```java
+           Label tmp = new BlockItem(lex);
+           while (!tmp.isErr()) {
+               addList(tmp);
+               tmp = new BlockItem(lex);
+           }
+           ```
+           The loop terminates.
+           `Block` then checks for `RBRACE`.
+           The current token is `return` (because `Stmt` did `lex.returnTo(pre)`).
+           `lex.getFirst()` is `RETURNTK`.
+           `RBRACE` check fails.
+           `Block` constructor:
+           ```java
+           if (lex.getFirst() != TOKEN.RBRACE) {
+               lex.returnTo(pre); // pre was start of Block '{'
+               err = true;
+               return;
+           }
+           ```
+           So `Block` returns `err = true`.
+           
+           Back in `MainFuncDef`:
+           ```java
+           tmp = new Block(lex);
+           if (tmp.isErr()) {
+               lex.returnTo(pre);
+               err = true;
+               return;
+           }
+           ```
+           `MainFuncDef` returns `err = true`.
+           
+           Back in `CompUnit`:
+           ```java
+           tmp = new MainFuncDef(lex);
+           if (tmp.isErr()) {
+               lex.returnTo(pre);
+               err = true;
+               return;
+           }
+           ```
+           `CompUnit` returns `err = true`.
+           
+           Now, what about the errors collected?
+           `Stmt` (printf) added error 'i' to its `error` map.
+           `VarDecl` (int a) added error 'i' to its `error` map.
+           `Stmt` (return) did NOT add error 'i', but caused a cascade failure.
+           
+           These `error` maps are merged up via `addList` in `LabelList`.
+           `MainFuncDef` adds `Block` to its list? No, if `Block` is err, `MainFuncDef` returns early and does NOT `addList(tmp)`.
+           
+           Look at `MainFuncDef`:
+           ```java
+           tmp = new Block(lex);
+           if (tmp.isErr()) {
+               lex.returnTo(pre);
+               err = true;
+               return; // <--- Returns without adding Block to list
+           }
+           addList(tmp);
+           ```
+           If `Block` is err, `MainFuncDef` does not call `addList(tmp)`.
+           Therefore, the errors contained in `Block` (which came from `Stmt` and `VarDecl`) are NOT propagated to `MainFuncDef`'s error map via `addList`.
+           
+           However, `Block` itself might have accumulated errors in its own `error` map before failing?
+           `Block` extends `LabelList`.
+           Inside `Block`:
+           ```java
+           Label tmp = new BlockItem(lex);
+           while (!tmp.isErr()) {
+               addList(tmp); // <--- Errors from successful BlockItems are added here
+               tmp = new BlockItem(lex);
+           }
+           ```
+           
+           Let's trace:
+           1. `BlockItem` (printf `Stmt`): `Stmt` is NOT err. `addList(tmp)` is called in `Block`. Errors from `Stmt` (including 'i' for printf) are added to `Block.error`.
+           2. `BlockItem` (if `Stmt`): `Stmt` is NOT err. `addList(tmp)` called.
+           3. `BlockItem` (`int a` `VarDecl`): `Decl` is NOT err. `addList(tmp)` called. Errors from `VarDecl` (including 'i' for int a) are added to `Block.error`.
+           4. `BlockItem` (`for` `Stmt`): `Stmt` is NOT err. `addList(tmp)` called.
+           5. `BlockItem` (`return` `Stmt`): `Stmt` IS err. Loop terminates.
+           
+           So `Block.error` contains errors for printf and int a.
+           
+           Then `Block` checks for `RBRACE`. Fails. Sets `Block.err = true`.
+           Returns to `MainFuncDef`.
+           `MainFuncDef` sees `Block.isErr()`.
+           It does `lex.returnTo(pre)` and `err = true` and `return`.
+           It does NOT call `addList(tmp)`.
+           
+           So `MainFuncDef.error` does NOT receive `Block.error`.
+           
+           Then `CompUnit` sees `MainFuncDef.isErr()`.
+           It does `lex.returnTo(pre)` and `err = true` and `return`.
+           It does NOT call `addList(tmp)`.
+           
+           So `CompUnit.error` is empty (or only contains errors from previous successful Decls/FuncDefs, which there are none).
+           
+           Thus, `top.getError()` is empty.
+           `Parser.print` goes to the `if (top.getError().isEmpty())` branch and prints to `parser.txt` (likely nothing or partial parse), and nothing to `error.txt`.
+           
+           **The Fix**:
+           The errors detected in child nodes must be preserved even if the parent node fails structurally.
+           In `MainFuncDef`, `FuncDef`, `CompUnit`, etc., when a child component fails (`isErr()`), we should still merge its errors into the current node's error map before returning.
+           
+           Alternatively, simpler fix: In `MainFuncDef`, `FuncDef`, `CompUnit`, before returning due to error, call `error.putAll(tmp.getError())`.
+           
+           Let's look at `MainFuncDef.java`:
+<Compiler.java>
+...
+<pac/Lexer.java>
+...
+<pac/Parser.java>
+...
+<pac/tool/AddExp.java>
+...
+<pac/tool/BType.java>
+...
+<pac/tool/Block.java>
+...
+<pac/tool/BlockItem.java>
+...
+<pac/tool/Char.java>
+...
+<pac/tool/CompUnit.java>
+...
+<pac/tool/Cond.java>
+...
+<pac/tool/ConstDecl.java>
+...
+<pac/tool/ConstDef.java>
+...
+<pac/tool/ConstExp.java>
+...
+<pac/tool/ConstInitVal.java>
+...
+<pac/tool/Decl.java>
+...
+<pac/tool/EqExp.java>
+...
+<pac/tool/Exp.java>
+...
+<pac/tool/ForStmt.java>
+...
+<pac/tool/FuncDef.java>
+...
+<pac/tool/FuncFParam.java>
+...
+<pac/tool/FuncFParams.java>
+...
+<pac/tool/FuncRParams.java>
+...
+<pac/tool/FuncType.java>
+...
+<pac/tool/InitVal.java>
+...
+<pac/tool/LAndExp.java>
+...
+<pac/tool/LOrExp.java>
+...
+<pac/tool/LVal.java>
+...
+<pac/tool/Label.java>
+...
+<pac/tool/LabelList.java>
+...
+<pac/tool/Lex.java>
+...
+<pac/tool/MainFuncDef.java>
+package pac.tool;
+
+import java.io.PrintStream;
+
+public class MainFuncDef extends LabelList implements Label {
+    public MainFuncDef(Lex lex) {
+        int pre = lex.getP();
+        Label tmp;
+        if (lex.getFirst() != TOKEN.INTTK) {
+            lex.returnTo(pre);
+            err = true;
+            return;
+        }
+        addList(new Others(lex));
+        if (lex.getFirst() != TOKEN.MAINTK) {
+            lex.returnTo(pre);
+            err = true;
+            return;
+        }
+        addList(new Others(lex));
+        if (lex.getFirst() != TOKEN.LPARENT) {
+            lex.returnTo(pre);
+            err = true;
+            return;
+        }
+        addList(new Others(lex));
+        if (lex.getFirst() != TOKEN.RPARENT) {
+            error.put(line.get(line.size() - 1), 'j');
+        } else {
+            addList(new Others(lex));
+        }
+        tmp = new Block(lex);
+        if (tmp.isErr()) {
+            error.putAll(tmp.getError()); // Add this line to preserve errors from Block
+            lex.returnTo(pre);
+            err = true;
+            return;
+        }
+        addList(tmp);
+    }
+
+    @Override
+    public void print(PrintStream out) {
+        for(Label val:list){
+            val.print(out);
+        }
+        out.println("<MainFuncDef>");
+    }
+}
+<pac/tool/MulExp.java>
+...
+<pac/tool/Number.java>
+...
+<pac/tool/Others.java>
+...
+<pac/tool/Pair.java>
+...
+<pac/tool/PrimaryExp.java>
+...
+<pac/tool/RelExp.java>
+...
+<pac/tool/Stmt.java>
+...
+<pac/tool/TOKEN.java>
+...
+<pac/tool/UnaryExp.java>
+...
+<pac/tool/UnaryOp.java>
+...
+<pac/tool/VarDecl.java>
+...
+<pac/tool/VarDef.java>
+...

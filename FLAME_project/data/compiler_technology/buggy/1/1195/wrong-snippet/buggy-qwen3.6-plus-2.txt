@@ -1,0 +1,557 @@
+Based on the analysis of the problem description, test case, and source code:
+
+1.  **Problem Analysis**:
+    *   The test case contains three syntax errors:
+        *   Line 13: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);` -> Missing right parenthesis `)`. Expected error: `13 j`.
+        *   Line 15: `if (3 > 0 {` -> Missing right parenthesis `)`. Expected error: `15 j`.
+        *   Line 20: `i = (((((f(str)))));` -> This is an assignment statement `LVal '=' Exp ';'`. The expression part is `((((f(str)))))`. Inside, `f(str)` is a function call `UnaryExp`. The parser needs to correctly parse the nested parentheses and the function call. The expected output is `20 j`, implying a missing right parenthesis error is detected at line 20. However, looking at the code `i = (((((f(str)))));`, there are 5 opening parens before `f` and 4 closing parens after `str` before the semicolon. So one `)` is indeed missing.
+    *   The buggy output reports errors at lines 13, 15, 16 (three times), and 20.
+    *   The expected output reports errors at lines 13, 15, and 20.
+    *   The extra errors at line 16 suggest that the parser is incorrectly recovering from the error at line 15 or misinterpreting the structure following the `if` statement, leading it to believe there are missing semicolons in the subsequent valid code `g((((f(str)))), arr);`.
+    *   Specifically, line 16 is `g((((f(str)))), arr);`. This is a function call statement (which falls under `Stmt` -> `[Exp] ';'`). The parser seems to be failing to parse this correctly after the `if` block error.
+
+2.  **Code Analysis**:
+    *   In `Parser.java`, the `Stmt()` method handles `if` statements.
+    *   When parsing `if (Cond) Stmt [else Stmt]`, if a syntax error occurs (like missing `)`), the parser adds an error but does not necessarily synchronize the token stream correctly for the subsequent `Stmt`.
+    *   However, the more likely issue lies in how `UnaryExp` or `PrimaryExp` handles nested parentheses and function calls, or how `Stmt` distinguishes between an expression statement and other constructs.
+    *   Let's look at `UnaryExp`:
+        ```java
+        public void UnaryExp(){
+            if(now().equals("+")||now().equals("-")||now().equals("!")){
+                UnaryOp();
+                UnaryExp();
+            }else if(preRead().equals("(")){ // Checks if next token is '('
+                getsym(); // Consumes Ident
+                getsym(); // Consumes '('
+                // ... parses FuncRParams ...
+                if(!now().equals(")")){
+                    Error error = new Error(lexer.special(),'j');
+                    errors.add(error);
+                }else {
+                    getsym();
+                }
+            }else{
+                PrimaryExp();
+            }
+            fakeInsert("<UnaryExp>");
+        }
+        ```
+    *   And `PrimaryExp`:
+        ```java
+        public void PrimaryExp(){
+            if(now().equals("(")){
+                getsym();
+                Exp();
+                if(!now().equals(")")){
+                    Error error = new Error(lexer.special(), 'j');
+                    errors.add(error);
+                }else{
+                    getsym();
+                }
+            }else if(now().charAt(0) == '\''){
+                Character();
+            }else if(Character.isDigit(now().charAt(0))){
+                Number();
+            }else {
+                LVal();
+            }
+            fakeInsert("<PrimaryExp>");
+        }
+        ```
+    *   The issue with Line 20 `i = (((((f(str)))));` and Line 16 `g((((f(str)))), arr);` involves parsing function calls inside expressions.
+    *   In `UnaryExp`, the condition `preRead().equals("(")` is used to decide if an identifier is followed by a function call. `preRead` consumes the next token to check it. If it is `(`, it proceeds.
+    *   However, if `preRead` is called, it advances the lexer. Then `getsym()` is called twice. This logic is fragile.
+    *   The main discrepancy is the extra errors at line 16. The code at line 16 is `g((((f(str)))), arr);`. This is a valid statement. Why does the parser think there are errors?
+    *   After parsing the `if` statement at line 15 (`if (3 > 0 {`), the parser encounters `{`. It enters `Block()`. Inside `Block()`, it parses `BlockItem()`.
+    *   The `if` statement parsing in `Stmt()`:
+        ```java
+        else if(now().equals("if")){
+            getsym(); // consumes if
+            getsym(); // consumes (
+            Cond();
+            if(!now().equals(")")){
+                Error error = new Error(lexer.special(),'j');
+                errors.add(error);
+                // MISSING SYNCHRONIZATION: The parser does not consume tokens to skip to the next valid point.
+                // It proceeds to parse Stmt() assuming the current token is the start of the statement body.
+            }else{
+                getsym();
+            }
+            Stmt(); // Parses the body
+            // ...
+        }
+        ```
+    *   At line 15, `Cond()` parses `3 > 0`. The next token is `{`. The check `!now().equals(")")` fails. Error `15 j` is added.
+    *   Then `Stmt()` is called. The current token is `{`. `Stmt()` sees `{` and calls `Block()`.
+    *   `Block()` consumes `{`, then parses `BlockItem`s until `}`.
+    *   The content inside is `g((((f(str)))), arr);`.
+    *   `BlockItem()` calls `Stmt()`.
+    *   `Stmt()` sees `g`. It goes to the `else` branch (LVal/Exp handling).
+    *   It calls `fakeLVal()`. `fakeLVal()` consumes `g`. Then checks for `[`. No. Returns.
+    *   Back in `Stmt()`, it checks `now().equals("=")`. Current token is `(`. Not equal.
+    *   So it restores state and calls `Exp()`.
+    *   `Exp()` -> `AddExp()` -> ... -> `UnaryExp()`.
+    *   `UnaryExp()` sees `g`. Calls `preRead()`. `preRead()` looks ahead and sees `(`.
+    *   So `UnaryExp()` treats `g` as a function call.
+    *   `getsym()` consumes `g`. `getsym()` consumes `(`.
+    *   Then it checks for params. `FuncRParams()` is called if params exist.
+    *   Inside `FuncRParams`, it calls `Exp()`.
+    *   The argument is `(((f(str))))`.
+    *   `Exp()` -> `PrimaryExp()`. `PrimaryExp()` sees `(`. Consumes it. Calls `Exp()`.
+    *   This recursion continues.
+    *   Eventually `f(str)` is parsed. `f` is ident. `preRead` sees `(`. `UnaryExp` handles it.
+    *   The parsing of arguments should succeed.
+    *   Why are errors generated at line 16?
+    *   Let's look at `Lexer.preRead()` and `Lexer.prePreRead()`. They modify the lexer state and then restore it.
+    *   In `UnaryExp`, `preRead().equals("(")` is checked. If true, it proceeds.
+    *   There is a known issue in some student implementations where `preRead` or `prePreRead` might have side effects or the restoration isn't perfect, or the logic for distinguishing `LVal` vs `UnaryExp` (function call) is flawed.
+    *   However, the most suspicious part is the `Stmt` method's handling of the `else` branch for `LVal` vs `Exp`.
+    *   Look at the `Stmt` method's `else` block again.
+    *   It saves state, calls `fakeLVal()`.
+    *   `fakeLVal()` calls `getsym()`. If the token is an identifier, it consumes it.
+    *   Then it checks `now().equals("[")`.
+    *   If it's `g`, `fakeLVal` consumes `g`. Next is `(`.
+    *   Back in `Stmt`, it checks `now().equals("=")`. It is `(`. So it goes to the `else` branch (restore and parse `Exp`).
+    *   When restoring, it calls `lexer.reSet(...)`.
+    *   Then it clears `tokens` and restores them from `t`.
+    *   Then it calls `Exp()`.
+    *   `Exp()` eventually calls `UnaryExp()`.
+    *   `UnaryExp()` calls `preRead()`.
+    *   If `preRead` works correctly, it should identify `g(...)` as a function call.
+    *   
+    *   Let's look at the errors reported: `16 i`, `16 i`, `16 i`. These are "Missing semicolon" errors.
+    *   This suggests that the parser thinks the statement at line 16 is incomplete or malformed in a way that expects a semicolon earlier.
+    *   
+    *   Actually, let's look at `FuncDef` parsing.
+    *   The input starts with `int f(char str[]) { ... }`.
+    *   `CompUnit` calls `FuncDef`.
+    *   `FuncDef`:
+        ```java
+        public void FuncDef(){
+            FuncType(); // consumes int
+            getsym(); // consumes f
+            getsym(); // consumes (
+            if(now().equals("int")||now().equals("char")){
+                FuncFParams();
+            }
+            if(!now().equals(")")){
+                Error error = new Error(lexer.special(),'j');
+                errors.add(error);
+            }else {
+                getsym();
+            }
+            Block();
+            fakeInsert("<FuncDef>");
+        }
+        ```
+    *   For `int f(char str[])`, `FuncType` consumes `int`. `getsym` consumes `f`. `getsym` consumes `(`.
+    *   `now()` is `char`. `FuncFParams` is called.
+    *   `FuncFParams` -> `FuncFParam`.
+    *   `FuncFParam`:
+        ```java
+        public void FuncFParam(){
+            BType(); // consumes char
+            getsym(); // consumes str
+            if(now().equals("[")){
+                getsym(); // consumes [
+                if(!now().equals("]")){
+                    Error error = new Error(lexer.special(),'k');
+                    errors.add(error);
+                }else{
+                    getsym(); // consumes ]
+                }
+            }
+            fakeInsert("<FuncFParam>");
+        }
+        ```
+    *   This parses `char str[]` correctly.
+    *   Back in `FuncDef`, `now()` should be `)`. It is. `getsym` consumes `)`.
+    *   `Block()` parses the body.
+    *   This seems correct for the first function.
+    *   
+    *   The second function `int g(int i, int arr[])` is similar.
+    *   
+    *   The `MainFuncDef` starts.
+    *   Line 13: `int i = ...`. This is inside `Block`.
+    *   `BlockItem` -> `Decl` -> `VarDecl`.
+    *   `VarDecl` -> `BType` (int) -> `VarDef`.
+    *   `VarDef`:
+        ```java
+        public void VarDef(){
+            getsym(); // consumes i
+            if(now().equals("=")){
+                getsym(); // consumes =
+                InitVal();
+            }
+            // ...
+        }
+        ```
+    *   `InitVal` -> `Exp`.
+    *   `Exp` parses `(1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7)`.
+    *   `PrimaryExp` sees `(`. Consumes it. Calls `Exp`.
+    *   Inner `Exp` parses `1 + ...`.
+    *   Eventually, the inner `PrimaryExp` for `(4-5)` works.
+    *   The outer `PrimaryExp` expects `)`.
+    *   The tokens are `... + 7 ) ;`.
+    *   Wait, the code is `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);`.
+    *   There is a missing `)` for the outermost parenthesis started at `(1`.
+    *   Structure: `( 1 + ... + 7 ) ;` is what it *should* be if balanced.
+    *   Actual: `( 1 + ... + 7 ;`.
+    *   So `PrimaryExp` calls `Exp`. `Exp` finishes parsing `1 + ... + 7`.
+    *   `PrimaryExp` checks `now().equals(")")`. `now()` is `;`.
+    *   Error `13 j` is added.
+    *   `PrimaryExp` returns.
+    *   `InitVal` returns.
+    *   `VarDef` returns.
+    *   `VarDecl` checks `now().equals(";")`. `now()` is `;`.
+    *   `getsym` consumes `;`.
+    *   `VarDecl` finishes.
+    *   This seems correct for Error 1.
+
+    *   Now Line 15: `if (3 > 0 {`.
+    *   `Stmt` sees `if`.
+    *   `getsym` consumes `if`.
+    *   `getsym` consumes `(`.
+    *   `Cond` parses `3 > 0`.
+    *   `now()` is `{`.
+    *   Check `!now().equals(")")`. True.
+    *   Error `15 j` added.
+    *   `Stmt()` is called for the body.
+    *   `now()` is `{`.
+    *   `Stmt` calls `Block()`.
+    *   `Block` consumes `{`.
+    *   `BlockItem` is called.
+    *   `now()` is `g`.
+    *   `BlockItem` calls `Stmt`.
+    *   `Stmt` sees `g`.
+    *   It goes to the complex `else` block.
+    *   Saves state.
+    *   `fakeLVal()` consumes `g`.
+    *   `now()` is `(`.
+    *   Check `now().equals("=")`. False.
+    *   Restores state.
+    *   Calls `Exp()`.
+    *   `Exp()` -> `AddExp()` -> `MulExp()` -> `UnaryExp()`.
+    *   `UnaryExp()` sees `g`.
+    *   `preRead()` checks next token. It is `(`.
+    *   So `UnaryExp` treats it as a function call.
+    *   `getsym()` consumes `g`.
+    *   `getsym()` consumes `(`.
+    *   Checks for params. `now()` is `(`.
+    *   The condition for `FuncRParams` in `UnaryExp` is:
+        ```java
+        if(now().equals("+")||...||now().charAt(0) == '_'||...){
+             FuncRParams();
+        }
+        ```
+    *   `now()` is `(`. `(` is not in the list of starting tokens for `Exp` (which `FuncRParams` expects).
+    *   Wait, `FuncRParams` expects `Exp`. `Exp` can start with `(`.
+    *   But the check in `UnaryExp` explicitly lists tokens. Does it include `(`?
+    *   Yes: `now().equals("(")` is in the list.
+    *   So `FuncRParams()` is called.
+    *   `FuncRParams` calls `Exp()`.
+    *   `Exp` parses `(((f(str))))`.
+    *   This should work fine.
+    *   After `FuncRParams` returns, `UnaryExp` checks `now().equals(")")`.
+    *   The tokens after `arr` are `) ;`.
+    *   Wait, the call is `g((((f(str)))), arr)`.
+    *   Params: `(((f(str))))` and `arr`.
+    *   `FuncRParams`:
+        ```java
+        public void FuncRParams(){
+            Exp(); // Parses (((f(str))))
+            while(now().equals(",")){
+                getsym(); // consumes ,
+                Exp(); // Parses arr
+            }
+            fakeInsert("<FuncRParams>");
+        }
+        ```
+    *   After parsing `arr`, `now()` is `)`.
+    *   `FuncRParams` returns.
+    *   `UnaryExp` checks `now().equals(")")`. It is `)`.
+    *   `getsym()` consumes `)`.
+    *   `UnaryExp` returns.
+    *   `Exp` returns.
+    *   Back in `Stmt`, after `Exp()`, it checks `now().equals(";")`.
+    *   `now()` is `;`.
+    *   `getsym()` consumes `;`.
+    *   `Stmt` finishes.
+    *   `BlockItem` finishes.
+    *   `Block` loops. `now()` is `}`.
+    *   `Block` consumes `}`.
+    *   `Block` returns.
+    *   `Stmt` (for if body) returns.
+    *   `Stmt` (for if) checks `else`. `now()` is `i` (from line 20).
+    *   `Stmt` returns.
+    *   
+    *   So why the errors at 16?
+    *   Maybe the `preRead` or `prePreRead` functions are messing up the lexer state permanently or incorrectly?
+    *   Or maybe `fakeLVal` is not restoring state correctly?
+    *   In `Stmt`, `fakeLVal` is called.
+    *   ```java
+    *   public void fakeLVal(){//假解析
+    *       getsym();
+    *       if(now().equals("[")){
+    *           getsym();
+    *           Exp();
+    *           if(now().equals("]")){
+    *               getsym();
+    *           }
+    *       }
+    *   }
+    *   ```
+    *   It calls `getsym()`. This advances the lexer.
+    *   Then in `Stmt`, if it's not `=`, it calls `lexer.reSet(...)`.
+    *   `reSet` restores `curChar`, `curLine`, `curPos`, `token`, `flag`.
+    *   It does NOT restore `tokens` list, `errors` list, etc. directly, but `Stmt` manually clears and restores `tokens` and `errors`.
+    *   
+    *   Is it possible that `preRead` in `UnaryExp` is causing issues?
+    *   `preRead` saves state, calls `next()`, saves result, removes last token from `tokens` and `total`, clears errors added, restores state.
+    *   It returns the string of the looked-ahead token.
+    *   
+    *   Let's check `Lexer.preRead`:
+    *   ```java
+    *   public StringBuilder preRead(){
+    *       // ... saves state ...
+    *       next();
+    *       StringBuilder s = new StringBuilder(token.toString());
+    *       tokens.remove(tokens.size()-1);
+    *       total.remove(total.size()-1);
+    *       errors.subList(tmpSize,errors.size()).clear();;
+    *       // ... restores state ...
+    *       return s;
+    *   }
+    *   ```
+    *   This looks okay.
+    *   
+    *   However, there is a subtle bug in `Lexer.next()` regarding `flag` and `curPos` when reaching end of input, but here we are in the middle.
+    *   
+    *   Let's look at `CompUnit` loop condition:
+    *   `while(now().equals("char")||now().equals("int")||now().equals("void")||now().equals("const"))`
+    *   This loop terminates when `now()` is not one of these.
+    *   After `MainFuncDef`, `now()` should be EOF or something else.
+    *   
+    *   The problem might be in `Stmt`'s handling of the `if` statement error recovery.
+    *   When `if (3 > 0 {` is parsed:
+    *   Error `15 j` is added.
+    *   `Stmt()` is called for the body.
+    *   It parses the block correctly.
+    *   But does the `Cond` parsing consume the `{`?
+    *   `Cond` -> `LOrExp` -> ... -> `PrimaryExp` -> `LVal`/`Number`.
+    *   `3` is `Number`. `>` is consumed. `0` is `Number`.
+    *   `Cond` returns. `now()` is `{`.
+    *   The `if` statement code does NOT consume the `{` if the `)` is missing.
+    *   It just calls `Stmt()`.
+    *   `Stmt()` sees `{` and calls `Block()`.
+    *   `Block()` consumes `{`.
+    *   This seems correct.
+    *   
+    *   Why `16 i`?
+    *   `16 i` means "Missing semicolon".
+    *   This error is generated in `Stmt` when parsing an expression statement or return/break/continue/etc.
+    *   Specifically:
+    *   ```java
+    *   if(!now().equals(";")){
+    *       Error error = new Error(lexer.special(),'i');
+    *       errors.add(error);
+    *   }else {
+    *       getsym();
+    *   }
+    *   ```
+    *   This happens after parsing `Exp()`.
+    *   If the parser successfully parsed `g(...)` as an `Exp`, it should see `;` and be happy.
+    *   
+    *   Is it possible that `g` is NOT parsed as a function call?
+    *   If `preRead` fails or returns wrong value?
+    *   If `UnaryExp` falls through to `PrimaryExp`?
+    *   `PrimaryExp` sees `g`. Calls `LVal`.
+    *   `LVal` consumes `g`.
+    *   `PrimaryExp` returns.
+    *   `UnaryExp` returns.
+    *   `MulExp` returns.
+    *   `AddExp` returns.
+    *   `Exp` returns.
+    *   Back in `Stmt`, `now()` is `(`.
+    *   Check `now().equals(";")`. False.
+    *   Error `16 i` added.
+    *   
+    *   So the question is: Why does `UnaryExp` fail to recognize `g(` as a function call?
+    *   It uses `preRead().equals("(")`.
+    *   If `preRead` returns something else, or if `preRead` has a bug.
+    *   
+    *   Let's look at `Lexer.preRead` again.
+    *   It calls `next()`.
+    *   `next()` skips whitespace.
+    *   If `curChar` is `(`, it creates a token `LPARENT`.
+    *   `token.toString()` should be `"("`.
+    *   
+    *   Is it possible that `preRead` is called when `flag` is set?
+    *   
+    *   Another possibility: The `Stmt` method's `else` block restores `tokens` from `t`.
+    *   `t` is a copy of `tokens` BEFORE `fakeLVal`.
+    *   `fakeLVal` adds a token? No, `fakeLVal` does NOT call `fakeInsert`.
+    *   But `fakeLVal` calls `getsym()`, which adds a token to `tokens`.
+    *   Then `Stmt` clears `tokens` and restores from `t`.
+    *   So the token added by `fakeLVal` is removed.
+    *   Then `Exp()` is called.
+    *   `Exp()` calls `getsym()` internally via `UnaryExp` etc.
+    *   
+    *   Wait, `fakeLVal` calls `getsym()`.
+    *   `getsym()` calls `lexer.next()`.
+    *   `lexer.next()` adds a token to `tokens`.
+    *   So `tokens` size increases.
+    *   `t` was saved before this.
+    *   So `t` has the old size.
+    *   `tokens.clear()` empties it.
+    *   `tokens` is restored from `t`.
+    *   So the lexer state is reset by `reSet`.
+    *   The `tokens` list is reset to `t`.
+    *   So when `Exp()` starts, the lexer is at `g`. The `tokens` list reflects the state before `fakeLVal`.
+    *   This seems correct.
+    *   
+    *   However, there is a bug in `Lexer.preRead` or `prePreRead`?
+    *   In `Lexer.preRead`:
+    *   `tokens.remove(tokens.size()-1);`
+    *   If `tokens` is empty, this crashes. But it shouldn't be.
+    *   
+    *   Let's look at `UnaryExp` again.
+    *   ```java
+    *   }else if(preRead().equals("(")){
+    *       getsym();
+    *       getsym();
+    *       // ...
+    *   }
+    *   ```
+    *   If `preRead` returns `"("`, it enters.
+    *   `getsym()` consumes `g`.
+    *   `getsym()` consumes `(`.
+    *   
+    *   What if `preRead` does NOT return `"("`?
+    *   Why would it not?
+    *   
+    *   Let's check `Lexer.next()` for `(`.
+    *   ```java
+    *   }else if(curChar == '('){
+    *       catToken();
+    *       Token tok = new Token(token.toString(), LexType.LPARENT, curLine);
+    *       tokens.add(tok);
+    *       total.add(tok);
+    *   }
+    *   ```
+    *   `token.toString()` is `"("`.
+    *   
+    *   Is it possible that `preRead` is interfering with `flag` or something?
+    *   
+    *   Actually, look at `Lexer.preRead`:
+    *   `StringBuilder tmpToken = new StringBuilder(token.toString());`
+    *   `token` is a `StringBuilder` member of `Lexer`.
+    *   `next()` modifies `token`.
+    *   `tmpToken` is a NEW StringBuilder with the same content.
+    *   Restoration: `token = tmpToken;`
+    *   This assigns the reference.
+    *   Wait. `token` is a member variable.
+    *   In `next()`, `token` is modified.
+    *   In `preRead`, `tmpToken` is a copy.
+    *   `token = tmpToken` restores the reference to the copy.
+    *   But `next()` might have modified the original `token` object.
+    *   Since `tmpToken` is a new object, `token = tmpToken` makes `lexer.token` point to the new object.
+    *   The old object (modified by `next()`) is lost.
+    *   This is fine, as long as the content is correct.
+    *   
+    *   However, in `Lexer.next()`, `clearToken()` is called at the beginning.
+    *   `clearToken()` does `token.setLength(0)`.
+    *   If `token` is shared, this might be an issue.
+    *   But `preRead` creates a new `StringBuilder` for `tmpToken`.
+    *   So `token` in `lexer` is replaced.
+    *   
+    *   There is a potential issue in `Stmt` where `tmpToken` is created:
+    *   `StringBuilder tmpToken = new StringBuilder(lexer.getToken());`
+    *   `lexer.getToken()` returns `token`.
+    *   `new StringBuilder(...)` creates a copy.
+    *   `lexer.reSet(..., tmpToken, ...)` sets `lexer.token = tmpToken`.
+    *   This also replaces the reference.
+    *   
+    *   The likely error is in `UnaryExp` or `Stmt` logic for `g(...)`.
+    *   Given the output `16 i` (missing semicolon), it implies `Exp()` was parsed, but `;` was not found.
+    *   If `g` was parsed as `LVal` (variable), `Exp()` finishes. `now()` is `(`. `;` check fails. Error `i`.
+    *   So `UnaryExp` is NOT recognizing `g(` as a function call.
+    *   
+    *   Why?
+    *   `preRead().equals("(")` must be returning false.
+    *   
+    *   Let's check `preRead` implementation in `Lexer.java` again.
+    *   It calls `next()`.
+    *   `next()` skips whitespace.
+    *   If the next char is `(`, it processes it.
+    *   
+    *   Is it possible that `preRead` is called, but `now()` in `UnaryExp` is not `g`?
+    *   `UnaryExp` is called from `MulExp` etc.
+    *   `getsym()` has not been called yet in `UnaryExp`.
+    *   So `now()` is `g`.
+    *   `preRead()` looks ahead.
+    *   
+    *   One common mistake: `preRead` consumes the token, removes it from `tokens`, but if `next()` added multiple tokens (e.g. if it was a multi-char operator), `remove(size-1)` only removes one.
+    *   But `(` is single char.
+    *   
+    *   Another possibility: `preRead` is defined in `Parser` as:
+    *   ```java
+    *   public String preRead(){
+    *       return lexer.preRead().toString();
+    *   }
+    *   ```
+    *   
+    *   If `lexer.preRead()` returns `null` or throws exception? Unlikely.
+    *   
+    *   Let's look at `Lexer.preRead` closely.
+    *   `tokens.remove(tokens.size()-1);`
+    *   If `tokens` was empty before `next()`, this crashes.
+    *   But `tokens` contains previous tokens.
+    *   
+    *   Is it possible that `preRead` is not working because `flag` is set?
+    *   
+    *   Actually, there is a bug in `Lexer.next()` for `|` and `&`.
+    *   But `(` is handled separately.
+    *   
+    *   Let's look at the `Stmt` code for `if` again.
+    *   If `Cond` fails to parse correctly?
+    *   `Cond` -> `LOrExp`.
+    *   `3 > 0`.
+    *   `RelExp` handles `>`.
+    *   
+    *   I suspect the issue is in `UnaryExp`'s use of `preRead`.
+    *   If `preRead` has a side effect that isn't fully undone, or if `now()` changes unexpectedly.
+    *   
+    *   However, the most standard error in these assignments is incorrect error recovery or lookahead.
+    *   
+    *   Let's look at the provided solution format. I need to output the code snippet.
+    *   The error is likely in `Parser.java` in the `UnaryExp` method or `Stmt` method.
+    *   Given the symptoms (valid function call treated as error), `UnaryExp` is the prime suspect.
+    *   
+    *   Code snippet:
+<frontend/Parser.java>
+...
+    public void UnaryExp(){
+        if(now().equals("+")||now().equals("-")||now().equals("!")){
+            UnaryOp();
+            UnaryExp();
+        }else if(preRead().equals("(")){
+            getsym();
+            getsym();
+            if(now().equals("+")||now().equals("-")||now().equals("!")||now().charAt(0) == '_'||
+                    Character.isLetter(now().charAt(0))||now().equals("(")||Character.isDigit(now().charAt(0))
+            ||now().charAt(0) == '\''){//说明有实参
+                FuncRParams();
+            }
+            if(!now().equals(")")){
+                Error error = new Error(lexer.special(),'j');//保留的是上一个token的行数
+                errors.add(error);
+            }else {
+                getsym();
+            }
+        }else{
+            PrimaryExp();
+        }
+        fakeInsert("<UnaryExp>");
+    }
+...

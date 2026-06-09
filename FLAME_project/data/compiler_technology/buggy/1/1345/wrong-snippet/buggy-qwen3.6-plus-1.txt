@@ -1,0 +1,649 @@
+Based on the problem description, the test case input contains three missing semicolon errors (error type `i`).
+1. Line 2: `printf("Hello SysY!\n")` is missing a semicolon.
+2. Line 9: `int a` is missing a semicolon.
+3. Line 13: `return 0` is missing a semicolon.
+
+The expected output is:
+```
+2 i
+9 i
+13 i
+```
+
+The buggy output is empty, indicating that the parser failed to detect these errors or the error reporting mechanism is flawed.
+
+Let's analyze the `HandleError.java` file, specifically the `handleI` method, which is responsible for detecting missing semicolons.
+
+```java
+<parse/HandleError.java>
+package parse;
+
+public class HandleError {
+    public static Token handleI(Token token,TokenList list,WrongList wrongs){
+        Token x = token;
+        if (!x.getType().equals("SEMICN")) {
+            list.unReadToken(2);
+            x = list.readNextToken();
+            wrongs.addWrong(new WrongType(x.getLinenumber(), "i"));
+            return new Token("SEMICN", x.getLinenumber(), "");
+        }
+        return x;
+    }
+...
+}
+```
+
+The logic in `handleI` is as follows:
+1. It receives a `token` that was expected to be a semicolon (`SEMICN`).
+2. If it is **not** a semicolon, it assumes a missing semicolon error.
+3. It calls `list.unReadToken(2)`. This moves the token pointer back by 2 positions.
+4. It then calls `list.readNextToken()` to get the "next" token, which is actually the token at `current_position - 1` relative to the original `token`.
+5. It records the error using the line number of this re-read token.
+
+Let's trace this with the first error: `printf("Hello SysY!\n") // error 1`.
+The tokens around line 2 are roughly:
+- `PRINTFTK` ("printf")
+- `LPARENT` ("(")
+- `STRCON` ("\"Hello SysY!\n\"")
+- `RPARENT` (")")
+- `IFTK` ("if") from line 4 (since line 3 is empty/commented out effectively or just newline, and line 4 starts with `if`). Wait, looking at the input:
+```
+int main() {
+    printf("Hello SysY!\n") // error 1
+
+    if (1)
+...
+```
+The token after `RPARENT` of `printf` is likely `IFTK` (from `if (1)` on line 4) or potentially a newline/token from the next line. The `StmtPrint` constructor calls `HandleError.handleI` with the token following the right parenthesis.
+
+In `StmtPrint.java`:
+```java
+        this.rightParent = HandleError.handleJ(token,list,wrongs); // token is RPARENT or error handled
+        this.end = HandleError.handleI(list.readNextToken(),list,wrongs);
+```
+So `list.readNextToken()` reads the token after `)`. In the correct case, this would be `SEMICN`. In the error case, it reads `IFTK` (line 4).
+
+Inside `handleI`:
+- `token` is `IFTK` (line 4).
+- `!x.getType().equals("SEMICN")` is true.
+- `list.unReadToken(2)`: The current position was at `IFTK`. Unreading 2 moves it back past `IFTK` and past `RPARENT`? No, `readNextToken` advances the pointer. So if `place` was at `IFTK`, `unReadToken(2)` sets `place` to `place - 2`.
+- Let's say indices are:
+  - `idx-1`: `RPARENT` (line 2)
+  - `idx`: `IFTK` (line 4)
+- `readNextToken` returned `IFTK` and set `place = idx`.
+- `unReadToken(2)` sets `place = idx - 2`. This points to the token before `RPARENT`, which is `STRCON` (line 2).
+- `x = list.readNextToken()` reads the token at `idx - 1`, which is `RPARENT` (line 2).
+- `wrongs.addWrong(new WrongType(x.getLinenumber(), "i"))` adds error at line 2. This matches the expected output `2 i`.
+
+So the first error seems to be handled correctly by `handleI` logic regarding line number identification (identifying the last non-terminal before the missing semicolon).
+
+Let's look at the second error: `int a // error 2`.
+This is inside a `Block`. `BlockItem` determines if it's a `Decl` or `Stmt`.
+`int` is `INTTK`. `Decl` is chosen.
+`VarDecl` is parsed.
+`VarDecl` parses `BType` (`int`), then `VarDef`.
+`VarDef` parses `Ident` (`a`).
+Then `VarDecl` expects a comma or semicolon.
+```java
+        Token token = list.readNextToken(); // Reads token after 'a'
+        while (token.getType().equals("COMMA")) { ... }
+        this.end = HandleError.handleI(token,list,wrongs);
+```
+The token after `a` is likely `IF` or `FOR` or `}` from subsequent lines. Let's assume it's `IFTK` (line 4? No, `if` was consumed by previous statement parsing? No, the previous statement `printf` failed to consume `if` because it wasn't a semicolon. But `handleI` creates a fake `SEMICN` token and returns it. The parser continues.
+
+Wait, if `handleI` returns a fake `SEMICN` token, the parser thinks it saw a semicolon. It does **not** consume the actual next token (`IFTK`) because `unReadToken(2)` and `readNextToken(1)` effectively consumed one token backwards?
+Let's re-trace `handleI` carefully.
+Initial state: `place` points to `T_current` (the one read by caller).
+`unReadToken(2)`: `place` becomes `index(T_current) - 2`.
+`readNextToken()`: `place` becomes `index(T_current) - 1`. Returns `T_prev`.
+The function returns a fake `SEMICN`.
+The caller (`VarDecl`) assigns `this.end` to this fake `SEMICN`.
+The `place` is now at `T_prev`.
+The next call to `readNextToken` by the parser will read `T_current` again!
+
+This means the token that caused the error (e.g., `IFTK`) is **put back** into the stream (specifically, the stream pointer is left at the token *before* it, so the next read will re-read the token before it, and the one after that will be the error token? No.)
+
+Let's trace indices:
+Tokens: `[... RPARENT(idx-1), IFTK(idx), ...]`
+Caller reads `IFTK`. `place` = `idx`.
+`handleI` called with `IFTK`.
+`unReadToken(2)`: `place` = `idx - 2`.
+`readNextToken()`: `place` = `idx - 1`. Returns `RPARENT`.
+Error recorded at line of `RPARENT`.
+Returns fake `SEMICN`.
+Control returns to caller. `place` is `idx - 1`.
+Next `readNextToken()` by caller (or parent) will read `place + 1` = `idx`. Which is `IFTK`.
+
+So the `IFTK` is **not** skipped. It is re-read. This allows the parser to continue correctly parsing the `if` statement. This logic seems correct for recovery.
+
+Why then is the output empty?
+
+Let's look at `CompUnit.java` or `MainFuncDef.java`.
+The input starts with `int main() {`.
+`CompUnit` parses Decls, FuncDefs, then `MainFuncDef`.
+`MainFuncDef` parses `int`, `main`, `(`, `)`, `Block`.
+
+Inside `Block`, we parse `BlockItem`s.
+First `BlockItem`: `printf(...)`.
+As analyzed, `StmtPrint` handles the missing semicolon, records error `2 i`, and recovers.
+
+Second `BlockItem`: `if (1) ...`.
+`StmtCond` parses `if`, `(`, `Cond`, `)`, `Stmt`.
+The `Stmt` inside `if` is likely an empty statement or block?
+Input:
+```
+    if (1)
+
+
+    /*********/
+    ;
+```
+After `if (1)`, there are newlines and comments. Then `;`.
+`StmtCond` parses `ifTk`, `leftParent`, `cond`, `rightParent`.
+Then `this.ifStmt = new Stmt(list,wrongs);`.
+`Stmt` sees `;` (after skipping comments/newlines? No, lexer handles comments. Lexer outputs tokens. Newlines are skipped in lexer? Yes, `WHITESPACES` includes `\n`).
+So `Stmt` sees `SEMICN`.
+`Stmt` switches on `SEMICN`: `this.stmtEle = new StmtNull(list,wrongs);`.
+`StmtNull` calls `HandleError.handleI(list.readNextToken(), ...)`.
+It reads the next token. What is after `;`?
+Input:
+```
+    ;
+    int a // error 2
+```
+After `;`, the next token is `INTTK` (`int`).
+`StmtNull` calls `handleI` with `INTTK`.
+`handleI` sees `INTTK` != `SEMICN`.
+`unReadToken(2)`.
+`readNextToken()` gets the token before `INTTK`. That is `SEMICN`.
+Wait.
+Tokens: `[..., SEMICN(idx-1), INTTK(idx), ...]`
+Caller (`StmtNull`) reads `INTTK`. `place` = `idx`.
+`handleI(INTTK)`:
+`unReadToken(2)`: `place` = `idx - 2`.
+`readNextToken()`: `place` = `idx - 1`. Returns `SEMICN`.
+Records error at line of `SEMICN`.
+But `SEMICN` was the valid semicolon for the null statement!
+The error reported is "Missing semicolon" at the line of the *previous* semicolon?
+And it returns a fake `SEMICN`.
+The `place` is now `idx - 1`.
+Next read will be `INTTK` (idx).
+
+So `StmtNull` incorrectly reports an error for the valid semicolon it just consumed?
+No, `StmtNull` expects to consume a semicolon.
+`StmtNull` constructor:
+```java
+    public StmtNull(TokenList list,WrongList wrongs) {
+        this.end = HandleError.handleI(list.readNextToken(),list,wrongs);
+    }
+```
+It reads the next token. If the source is `; int a`, the lexer produces `SEMICN`, `INTTK`.
+`Stmt` (parent) saw `SEMICN` and dispatched to `StmtNull`.
+Wait, `Stmt` logic:
+```java
+            case "SEMICN":
+                list.unReadToken(1);
+                this.stmtEle = new StmtNull(list,wrongs);
+                break;
+```
+`Stmt` reads `SEMICN`. It unreads it. Then calls `StmtNull`.
+`StmtNull` reads `SEMICN`.
+Calls `handleI(SEMICN)`.
+`handleI` checks if it is `SEMICN`. It IS.
+So `handleI` returns `SEMICN`. No error recorded.
+Correct.
+
+So where is the error for `int a`?
+After `StmtNull` finishes, `place` is at `SEMICN` (returned by `handleI`? No, `handleI` returns a token object, but `place` was set to `idx-1` inside `handleI` only if it was an error. If it was correct, `place` remains at `SEMICN`?
+Let's check `handleI` again.
+```java
+    public static Token handleI(Token token,TokenList list,WrongList wrongs){
+        Token x = token;
+        if (!x.getType().equals("SEMICN")) {
+            // error path
+            list.unReadToken(2);
+            x = list.readNextToken();
+            wrongs.addWrong(new WrongType(x.getLinenumber(), "i"));
+            return new Token("SEMICN", x.getLinenumber(), "");
+        }
+        return x; // correct path
+    }
+```
+If correct: `token` is `SEMICN`. `place` was advanced by `readNextToken` in caller. `handleI` does NOT change `place`. So `place` stays at `SEMICN`.
+Caller `StmtNull` finishes.
+Control returns to `StmtCond`. `StmtCond` finishes `ifStmt`.
+Then `StmtCond` checks for `else`:
+```java
+        this.elseTk = list.readNextToken();
+        if (this.elseTk.getType().equals("ELSETK")) { ... }
+        else {
+            list.unReadToken(1);
+            ...
+        }
+```
+`StmtCond` reads next token. `place` was at `SEMICN`. `readNextToken` advances to `INTTK` (`int`).
+`elseTk` is `INTTK`. Not `ELSETK`.
+Unreads 1. `place` back to `SEMICN`? No, `place` was at `INTTK`. Unread 1 -> `place` at `SEMICN`.
+Wait, if `place` is at `SEMICN`, the next token to be read is `INTTK`.
+So `StmtCond` finishes.
+Control returns to `Block`.
+`Block` loop:
+```java
+        Token token = list.readNextToken();
+        while (!token.getType().equals("RBRACE")) {
+            list.unReadToken(1);
+            this.blockItems.add(new BlockItem(list,wrongs));
+            token = list.readNextToken();
+        }
+```
+`Block` reads next token. `place` is at `SEMICN`?
+If `StmtCond` unread `INTTK` back to `SEMICN`, then `Block` reads `SEMICN`?
+No, `StmtCond` unread `elseTk` (`INTTK`). So `place` is at the token before `INTTK`.
+The token before `INTTK` is `SEMICN`.
+So `Block` reads `SEMICN`.
+`SEMICN` != `RBRACE`.
+Unread `SEMICN`.
+Call `BlockItem`.
+`BlockItem` reads `SEMICN`.
+Checks if `CONSTTK`, `INTTK`, `CHARTK`. It is `SEMICN`.
+So it goes to `else`: `this.blockItemEle = new Stmt(list,wrongs);`.
+`Stmt` reads `SEMICN`.
+Dispatches to `StmtNull`.
+`StmtNull` reads `SEMICN`? No, `Stmt` unread it.
+`Stmt` case `SEMICN`: `unReadToken(1)`. `place` back to before `SEMICN`?
+Tokens: `[..., RPARENT_of_if, SEMICN_null_stmt, INTTK, IDENT_a, ...]`
+Let's refine the token stream around `if (1) ; int a`.
+1. `IFTK`
+2. `LPARENT`
+3. `INTCON` (1)
+4. `RPARENT`
+5. `SEMICN` (the null statement terminator)
+6. `INTTK` (int)
+7. `IDENFR` (a)
+
+Trace:
+- `StmtCond` parses `if (1)`. Consumes 1-4. `place` at 4 (`RPARENT`).
+- `StmtCond` parses `ifStmt`. Calls `new Stmt`.
+- `Stmt` reads token 5 (`SEMICN`). `place` at 5.
+- `Stmt` dispatches to `StmtNull`. Unreads 5. `place` at 4.
+- `StmtNull` reads token 5 (`SEMICN`). `place` at 5.
+- `StmtNull` calls `handleI(SEMICN)`. Correct. Returns `SEMICN`. `place` stays at 5.
+- `StmtNull` returns.
+- `Stmt` returns.
+- `StmtCond` continues. Reads `elseTk`. Reads token 6 (`INTTK`). `place` at 6.
+- Not `ELSE`. Unreads 1. `place` at 5 (`SEMICN`).
+- `StmtCond` returns.
+- `Block` loop continues. Reads token. Reads token 6 (`INTTK`)?
+  - `Block` had read token 5 (`SEMICN`) to check `RBRACE`?
+  - Let's check `Block` logic again.
+  - `Block` constructor:
+    ```java
+        this.leftBrace = list.readNextToken(); // {
+        this.blockItems = new ArrayList<>();
+        Token token = list.readNextToken(); // Reads first item token
+        while (!token.getType().equals("RBRACE")) {
+            list.unReadToken(1);
+            this.blockItems.add(new BlockItem(list,wrongs));
+            token = list.readNextToken(); // Reads next item token
+        }
+    ```
+  - After `MainFuncDef` parses `int main ( )`, it calls `new Block`.
+  - `Block` reads `{`.
+  - `Block` reads next token. This is `PRINTFTK`.
+  - Loop: `PRINTFTK` != `RBRACE`. Unread. Add `BlockItem`.
+  - `BlockItem` creates `Stmt` (`Printf`).
+  - `StmtPrint` parses `printf(...)`. Handles missing semicolon error (Error 1).
+  - Recovery leaves `place` at `RPARENT` of printf? Or `IFTK`?
+    - As traced before, `handleI` for Error 1 leaves `place` at `RPARENT` (idx-1). Next read is `IFTK` (idx).
+  - `BlockItem` returns.
+  - `Block` reads next token. Reads `IFTK`.
+  - Loop: `IFTK` != `RBRACE`. Unread. Add `BlockItem`.
+  - `BlockItem` creates `Stmt` (`If`).
+  - `StmtCond` parses `if (1)`.
+  - `StmtCond` parses `ifStmt` (`StmtNull` for `;`).
+  - `StmtNull` consumes `;`. `place` at `SEMICN`.
+  - `StmtCond` checks `else`. Reads `INTTK`. Unreads. `place` at `SEMICN`.
+  - `StmtCond` returns.
+  - `BlockItem` returns.
+  - `Block` reads next token. Reads `INTTK` (token 6).
+  - Loop: `INTTK` != `RBRACE`. Unread. Add `BlockItem`.
+  - `BlockItem` sees `INTTK`. Creates `Decl`.
+  - `Decl` creates `VarDecl`.
+  - `VarDecl` parses `BType` (`int`). Reads `INTTK`. `place` at 6.
+  - `VarDecl` parses `VarDef`.
+  - `VarDef` parses `Ident` (`a`). Reads `IDENFR`. `place` at 7.
+  - `VarDef` checks for `[`. Next token?
+    - Input: `int a // error 2`. Next is likely `INTTK` of `for`? Or `FORTK`?
+    - Input:
+      ```
+          int a // error 2
+      
+          for (;;) {}
+      ```
+    - Tokens after `a`: `FORTK`.
+  - `VarDef` reads next token. `FORTK`.
+  - Not `LBRACK`.
+  - Checks `ASSIGN`. Not `ASSIGN`.
+  - Unreads `FORTK`. `place` back at 7 (`IDENFR`)? No, `VarDef` read `FORTK` into `token`.
+    ```java
+        Token token = list.readNextToken(); // Reads FORTK
+        while (token.getType().equals("LBRACK")) { ... } // False
+        if (token.getType().equals("ASSIGN")) { ... } // False
+        else {
+            this.eq = null;
+            this.initVal = null;
+            list.unReadToken(1); // Unreads FORTK. place back at IDENFR? No.
+        }
+    ```
+    - `VarDef` constructor ends.
+  - Control returns to `VarDecl`.
+  - `VarDecl` had read `INTTK` for `BType`. Then called `VarDef`.
+  - `VarDef` consumed `IDENFR` and peeked/unread `FORTK`.
+  - So `place` is at `IDENFR`?
+    - `VarDef` reads `IDENT`. `place` at `IDENT`.
+    - `VarDef` reads `FORTK`. `place` at `FORTK`.
+    - `VarDef` unreads `FORTK`. `place` at `IDENT`.
+  - `VarDecl` continues.
+    ```java
+        Token token = list.readNextToken(); // Reads IDENT??
+    ```
+    - Wait, `VarDecl` logic:
+      ```java
+        this.btype =  new BType(list,wrongs); // Consumes INTTK
+        this.firstword = new VarDef(list,wrongs); // Consumes IDENT, peeks/unreads NEXT
+        Token token = list.readNextToken(); // Reads what VarDef left off?
+      ```
+    - If `VarDef` unread `FORTK`, `place` is at `IDENT`.
+    - `VarDecl` reads `IDENT`.
+    - `while (token.equals("COMMA"))`. False.
+    - `this.end = HandleError.handleI(token, ...);`
+    - `token` is `IDENT` (`a`).
+    - `handleI(IDENT)`:
+      - Not `SEMICN`.
+      - `unReadToken(2)`.
+      - `readNextToken()`.
+      - Records error.
+    
+    Let's trace indices for `int a for ...`.
+    Indices:
+    5: `SEMICN` (from prev stmt)
+    6: `INTTK` (int)
+    7: `IDENFR` (a)
+    8: `FORTK` (for)
+    
+    - `VarDecl` starts. `place` at 5? No, `Block` read 6 (`INTTK`) and unread it. So `place` at 5.
+    - `VarDecl` calls `BType`. `BType` reads 6 (`INTTK`). `place` at 6.
+    - `VarDecl` calls `VarDef`.
+    - `VarDef` reads 7 (`IDENFR`). `place` at 7.
+    - `VarDef` reads 8 (`FORTK`). `place` at 8.
+    - `VarDef` unreads 1. `place` at 7.
+    - `VarDef` returns.
+    - `VarDecl` reads `token`. Reads 7 (`IDENFR`). `place` at 7.
+    - `token` is `IDENFR`.
+    - `handleI(IDENFR)`.
+    - `unReadToken(2)`. `place` at 5 (`SEMICN`).
+    - `readNextToken()`. Reads 6 (`INTTK`).
+    - Error recorded at line of `INTTK` (Line 9).
+    - Returns fake `SEMICN`.
+    - `place` is at 6.
+    - `VarDecl` finishes.
+    
+    So Error 2 is recorded at Line 9. This matches expected output `9 i`.
+
+    Now, what happens next?
+    `place` is at 6 (`INTTK`).
+    `BlockItem` returns.
+    `Block` reads next token. Reads 6 (`INTTK`).
+    Wait, `VarDecl` consumed `INTTK` (as `BType`) and `IDENFR` (as `Ident`).
+    But `handleI` reset `place` to 6.
+    So `INTTK` is "re-read" by `Block`.
+    `Block` sees `INTTK`. Unreads. Calls `BlockItem`.
+    `BlockItem` sees `INTTK`. Calls `Decl`.
+    `Decl` calls `VarDecl`.
+    Infinite loop?
+    
+    If `handleI` unreads 2 and reads 1, it effectively moves the pointer back by 1 from where it was when `handleI` was called?
+    Called with `token` at `idx`.
+    `unRead(2)` -> `idx-2`.
+    `read()` -> `idx-1`.
+    Pointer is at `idx-1`.
+    Next read is `idx`.
+    
+    In `VarDecl`:
+    Called `handleI` with `token`=`IDENFR` (idx=7).
+    Pointer ends at 6 (`INTTK`).
+    Next read is 7 (`IDENFR`).
+    
+    So `VarDecl` finishes. `Block` reads next token.
+    `Block` had called `BlockItem`. `BlockItem` called `Decl`. `Decl` called `VarDecl`.
+    `VarDecl` finished.
+    Control returns to `BlockItem`.
+    Control returns to `Block`.
+    `Block` executes `token = list.readNextToken()`.
+    Current `place` is 6.
+    `readNextToken()` reads 7 (`IDENFR`).
+    `token` is `IDENFR`.
+    Loop: `IDENFR` != `RBRACE`.
+    Unread `IDENFR`. `place` at 6.
+    Call `BlockItem`.
+    `BlockItem` reads `IDENFR`.
+    Not `CONSTTK`, `INTTK`, `CHARTK`.
+    Calls `Stmt`.
+    `Stmt` reads `IDENFR`.
+    Looks ahead to determine statement type.
+    This will likely fail or parse incorrectly because `IDENFR` followed by `FORTK` is not a valid statement start unless it's an assignment or expression.
+    But `for` is a keyword.
+    
+    The issue is that `VarDecl` consumed `int` and `a`, but due to error recovery, the pointer was reset to `int`.
+    So `int` is parsed again.
+    This suggests the parser might get stuck or produce incorrect errors, but it *did* produce Error 2.
+
+    Why is the output empty?
+    
+    Check `Compiler.java` main method.
+    ```java
+            CompUnit roof = new CompUnit(list,wrongs);
+            lexerWriter.write(roof.printout());
+            errorWriter.write(wrongs.printout());
+    ```
+    It writes `wrongs.printout()`.
+    
+    Check `WrongList.printout()`.
+    ```java
+    public String printout(){
+        Collections.sort(wrongs, new Comparator<WrongType>() {
+            @Override
+            public int compare(WrongType o1, WrongType o2) {
+                return Integer.compare(o1.getLinenumber(), o2.getLinenumber());
+            }
+        });
+        StringBuilder sb = new StringBuilder();
+        for(int i = 0;i< wrongs.size();i++){
+            WrongType x = wrongs.get(i);
+            sb.append(x.getLinenumber() +" " + x.getType() + "\n");
+        }
+        return sb.toString();
+    }
+    ```
+    This looks correct.
+
+    Is it possible that `CompUnit` constructor throws an exception or fails to parse `MainFuncDef`?
+    If `CompUnit` fails to parse, `wrongs` might be empty or not written.
+    
+    Let's look at `CompUnit` parsing of `MainFuncDef`.
+    ```java
+        this.mainFuncDef = new MainFuncDef(list,wrongs);
+    ```
+    If the parser gets stuck in an infinite loop or crashes, no output.
+    
+    However, the most likely reason for "Wrong Answer" with empty output when errors are expected is that the **errors are not being added to the `wrongs` list** or the **parser crashes/exits early**.
+    
+    Let's look at `HandleError` again.
+    
+    <parse/HandleError.java>
+    ```java
+    public static Token handleI(Token token,TokenList list,WrongList wrongs){
+        Token x = token;
+        if (!x.getType().equals("SEMICN")) {
+            list.unReadToken(2);
+            x = list.readNextToken();
+            wrongs.addWrong(new WrongType(x.getLinenumber(), "i"));
+            return new Token("SEMICN", x.getLinenumber(), "");
+        }
+        return x;
+    }
+    ```
+    
+    There is a subtle bug in `unReadToken`.
+    If `place` is 0, `unReadToken(2)` makes it -2.
+    `readNextToken()` accesses `tokens.get(-1)`? IndexOutOfBoundsException.
+    
+    In our trace:
+    Error 1: `place` at `IFTK` (idx > 0). Safe.
+    Error 2: `place` at `IDENFR` (idx > 0). Safe.
+    
+    What about Error 3: `return 0 // error 3`.
+    `StmtReturn` parses `return`.
+    Reads next token `0` (`INTCON`).
+    Not `SEMICN`.
+    Unreads `0`. Parses `Exp`.
+    `Exp` parses `0`.
+    `StmtReturn` reads next token. `}`?
+    Input:
+    ```
+        return 0 // error 3
+    }
+    ```
+    Token after `0` is `RBRACE`.
+    `StmtReturn` calls `handleI(RBRACE)`.
+    `handleI(RBRACE)`:
+    Not `SEMICN`.
+    `unReadToken(2)`.
+    `readNextToken()`. Gets `0` (`INTCON`).
+    Records error at line of `0` (Line 13).
+    Returns fake `SEMICN`.
+    
+    So all 3 errors should be recorded.
+    
+    Why is the output empty?
+    
+    Check `Compiler.java` lexer.
+    ```java
+            while ((line = reader.readLine()) != null) {
+                line = line + "\n";
+                analyzeLine(line);
+                lineNumber++;
+            }
+    ```
+    `analyzeLine` increments `lineNumber`? No, `main` increments `lineNumber`.
+    `analyzeLine` uses `lineNumber` for tokens.
+    
+    Is it possible that `wrongs` is not being passed correctly?
+    `CompUnit roof = new CompUnit(list,wrongs);`
+    `wrongs` is passed by reference. Updates should persist.
+    
+    Wait, look at `Stmt.java` switch case for `IDENFR`.
+    ```java
+            case "IDENFR":
+                int cnt = 1;
+                int flag1 = 0;
+                boolean flag2 = false;
+                Token token = x;
+                while (!token.getType().equals("SEMICN")) {
+                    token = list.readNextToken();
+                    cnt += 1;
+                    if (token.getType().equals("ASSIGN")) {
+                        flag2 = true;
+                    }
+                    if (token.getType().equals("GETINTTK")||token.getType().equals("GETCHARTK")) {
+                        flag1 = 1;
+                    }
+                }
+                list.unReadToken(cnt);
+                if (flag2) {
+                    if (flag1 == 0) {
+                        this.stmtEle = new StmtAssign(list,wrongs);
+                    } else if (flag1 == 1) {
+                        this.stmtEle = new StmtGet(list,wrongs);
+                    }
+                } else {
+                    this.stmtEle = new StmtExp(list,wrongs);
+                }
+                break;
+    ```
+    This lookahead logic reads until `SEMICN`.
+    If there is NO semicolon (error), this loop will read past the end of the block or crash?
+    In `return 0`, the token is `RBRACE`.
+    The loop `while (!token.getType().equals("SEMICN"))` will continue reading.
+    It will read `RBRACE`.
+    Then it will read next token... `EOF`?
+    `TokenList.readNextToken()` calls `this.tokens.get(place)`.
+    If `place` exceeds size, `IndexOutOfBoundsException`.
+    
+    If the parser crashes, no output is written.
+    
+    The `Stmt` lookahead for `IDENFR` does not handle missing semicolons gracefully. It assumes a semicolon exists.
+    In the test case, `int a` is handled by `Decl`, not `Stmt`.
+    `return 0` is handled by `StmtReturn`, which uses `handleI`.
+    
+    However, are there any `IDENFR` statements without semicolons?
+    `printf(...)` is `PRINTFTK`.
+    `if` is `IFTK`.
+    `return` is `RETURNTK`.
+    
+    So `Stmt` IDENFR case is not triggered for the errors.
+    
+    Let's check `StmtFor`.
+    `for (;;) {}`.
+    `StmtFor` parses `for`, `(`.
+    Reads `;`. `cond1` is null.
+    Reads `;`. `cond2` is null.
+    Reads `)`. `cond3` is null.
+    Parses `Stmt` (`Block` `{}`).
+    
+    Everything seems okay.
+    
+    One possibility: `CompUnit` parsing logic.
+    ```java
+        while (list.hasNext()) {
+            Token z = list.readNextToken();
+            if (z.getType().equals("LPARENT")) {
+                list.unReadToken(3);
+                break;
+            }
+            else {
+                list.unReadToken(1);
+            }
+            // ...
+        }
+    ```
+    `hasNext()` implementation:
+    ```java
+    public boolean hasNext() {
+        return (this.tokens.get(place+1) != null);
+    }
+    ```
+    If `place` is at the last token, `place+1` is out of bounds. `IndexOutOfBoundsException`.
+    
+    If the parser crashes due to `IndexOutOfBoundsException` in `hasNext` or `readNextToken`, the `errorWriter.write` might not happen or the file might be empty/corrupted.
+    
+    However, the prompt says "Buggy Output: [Empty]".
+    
+    If the program crashes, usually there is no output or partial output.
+    
+    Let's look at `TokenList.hasNext()`.
+    ```java
+    public boolean hasNext() {
+        return (this.tokens.get(place+1) != null);
+    }
+    ```
+    This is unsafe. If `place` is `tokens.size() - 1`, `place+1` is `tokens.size()`. `get(size)` throws Exception.
+    
+    This bug is in `TokenList.java`.
+
+<parse/TokenList.java>
+...
+    public boolean hasNext() {
+        return (this.tokens.get(place+1) != null);
+    }
+...

@@ -1,0 +1,83 @@
+**Summary of the Problem:**
+The program is a syntax analyzer for a specific grammar. It needs to detect syntax errors and output them in `error.txt` sorted by line number.
+The test case contains three errors:
+1. Line 16: `ch = getchar( ;` -> Missing right parenthesis `)`. Error code `j`.
+2. Line 18: `if (f2() & f1())` -> Invalid use of single `&`. Error code `a`.
+3. Line 19: `printf("%c",s[0];` -> Missing right parenthesis `)`. Error code `j`.
+
+The expected output is:
+```
+16 j
+18 a
+19 j
+```
+
+The buggy output is:
+```
+18 a
+16 j
+19 j
+```
+
+The errors are detected correctly, but they are not sorted by line number in the final output. The `Parser.java` class collects errors in an `ArrayList<Error>`. In `parseCompUnit`, there is a `catch` block that sorts the errors, but this only triggers if an `Error` exception is thrown and caught during the top-level parsing. However, many parsing methods add errors to the list directly without throwing exceptions, or the exceptions are handled locally. Crucially, the `Compiler.java` calls `parser.analyzeCode()` and then `FileIO.printError(parser.getErrors())`. The sorting logic inside `parseCompUnit`'s catch block might not be executed if no exception propagates to that level, or it might be executed but other errors added afterwards are not sorted. More importantly, looking at `Compiler.java`, it simply prints the errors returned by `parser.getErrors()`. The `Parser` class does not sort the errors before returning them unless the specific `catch` block in `parseCompUnit` is hit. Even if it is hit, if errors are added after that point (e.g., during the parsing of the main function body which happens inside `parseMainFuncDef` called from `parseCompUnit`), they might not be included in the sort if the sort happens before they are added, or if the sort is only triggered by an exception that stops parsing prematurely.
+
+However, the most likely issue is that the errors are not sorted *at all* before being printed, or the sorting is done at the wrong time/place. The `parseCompUnit` method has a `try-catch` block that sorts errors, but this relies on an `Error` being thrown up to that level. If parsing continues despite errors (which it seems to do, as all 3 errors are found), the exceptions might be caught locally or not thrown at all for some errors. For instance, `Lexer` adds error 'a' directly to its error list. `Parser` adds errors 'j' and 'k' directly to its error list. These lists are separate? No, `Parser` is initialized with `lexer.getErrors()`, so they share the same list or the parser's list is used. Let's check `Compiler.java`:
+`Parser parser = new Parser(lexer.getTokens(), lexer.getErrors());`
+So `parser.errors` is the same list as `lexer.errors`.
+The `Lexer` detects error 'a' on line 18.
+The `Parser` detects error 'j' on line 16 and line 19.
+The order of detection depends on the parsing order.
+1. Lexical analysis runs first. It scans the whole file. It encounters `&` on line 18 and adds error 'a'. So `errors` list has `[18 a]`.
+2. Parsing runs. It parses top-down.
+   - It parses global declarations.
+   - It parses `f1`, `f2`.
+   - It parses `main`.
+   - Inside `main`, it parses `ch = getchar( ;`. It expects `)`. It finds `;`. It adds error `j` for line 16. Now `errors` is `[18 a, 16 j]`.
+   - It continues parsing. It parses `if (f2() & f1())`. The `&` was already tokenized as an error by Lexer, but the Parser sees the token. The parser's `parseLOrExp`/`parseLAndExp` etc. will consume tokens. The error 'a' was already added by Lexer.
+   - It parses `printf("%c",s[0];`. It expects `)`. It finds `;`. It adds error `j` for line 19. Now `errors` is `[18 a, 16 j, 19 j]`.
+3. `FileIO.printError` prints the list. It is not sorted.
+
+The fix should be to sort the errors before printing them. The `Parser` class has a `getErrors()` method. The sorting should happen either in `getErrors()` or before `printError` is called. The existing sort in `parseCompUnit` is inside a `catch` block which might not be entered if parsing completes without throwing an uncaught `Error` exception up to that level. Since the parser seems to recover and continue, it likely doesn't throw an exception up to `parseCompUnit`'s try block, or if it does, it might not cover all cases. The safest place is to sort in `getErrors()` or just before printing.
+
+Let's look at `Parser.java`:
+```java
+    public ArrayList<Error> getErrors() {
+        return errors;
+    }
+```
+It returns the raw list.
+
+And `Compiler.java`:
+```java
+        FileIO.printError(parser.getErrors());
+```
+
+The error is that the list is not sorted. The snippet to fix is in `Parser.java`'s `getErrors` method or `Compiler.java`. Given the instructions usually point to the logic error, sorting in `getErrors` is a good candidate. Or, the `parseCompUnit` sort is insufficient.
+
+Let's verify the `parseCompUnit` logic.
+```java
+    public CompUnit parseCompUnit() {
+        // ...
+        try {
+            // ... parsing logic ...
+        } catch (Error error) {
+            errors.sort(Comparator.comparing(Error::getLineno));
+        }
+        return new CompUnit(decls, funcDefs, mainFuncDef);
+    }
+```
+If `parseMainFuncDef` or any called method throws an `Error`, it is caught here and sorted. But do they throw?
+`parseStmt` adds errors directly: `errors.add(new Error("j", sym(-1).getLineno()));`. It does NOT throw.
+`parsePrimaryExp` adds errors directly.
+`parseUnaryExp` adds errors directly.
+Most methods add errors directly to the list and do NOT throw them. Therefore, the `catch` block in `parseCompUnit` is NEVER executed for these syntax errors. The errors remain unsorted.
+
+The fix is to sort the errors before returning them or printing them.
+
+<frontend/Parser.java>
+...
+    public ArrayList<Error> getErrors() {
+        errors.sort(Comparator.comparing(Error::getLineno));
+        return errors;
+    }
+...

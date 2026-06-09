@@ -1,0 +1,367 @@
+Based on the problem description and the provided code, the issue is that the program produces **no output file** (`parser.txt` is empty or not created), while it should produce a detailed syntax analysis output.
+
+Looking at `Compiler.java`:
+```java
+if (Config.parser) {
+    if (ErrorHandler.getInstance().getErrors().isEmpty()) { // 源程序正确
+        Parser.getInstance().printParserRes();
+    } else   // 源程序错误
+        ErrorHandler.getInstance().printErrors();
+}
+```
+The `printParserRes()` method is only called if there are no errors. If there are errors, it prints errors. The test case input is a correct source program, so `ErrorHandler.getInstance().getErrors()` should be empty.
+
+However, looking at `Lexer.java`, specifically the handling of `&` and `|`:
+```java
+} else if (c == '&') {
+    if (next == '&') { // &&
+        tokens.add(new Token(TokenType.AND, lineNum, "&&"));
+        i++;
+    } else {
+        // BUG: 不能直接跳过，而是应该补全为&&，不然后续语法分析会出错！全局观！！
+        ErrorHandler.getInstance().addError(new Error(lineNum, ErrorType.a));
+        tokens.add(new Token(TokenType.AND, lineNum, "&&"));
+    }
+} else if (c == '|') {
+    if (next == '|') {  // ||
+        tokens.add(new Token(TokenType.OR, lineNum, "||"));
+        i++;
+    } else{
+        // BUG: 不能直接跳过，而是应该补全为||，不然后续语法分析会出错！全局观！！
+        ErrorHandler.getInstance().addError(new Error(lineNum, ErrorType.a));
+        tokens.add(new Token(TokenType.OR, lineNum, "||"));
+    }
+}
+```
+The test input does not contain standalone `&` or `|`, so this logic shouldn't trigger errors for this specific input.
+
+Let's look at `Parser.java`'s `compUnit()` method:
+```java
+private CompUnitNode compUnit() {
+    // 编译单元 CompUnit -> {Decl} {FuncDef} MainFuncDef
+    ArrayList<DeclNode> declNodes = new ArrayList<>();
+    ArrayList<FuncDefNode> funcDefNodes = new ArrayList<>();
+    MainFuncDefNode mainFuncDefNode;
+    // 首先匹配 Decl 成分
+    // 很难直接通过预读判断是 Decl,所以使用排除法，只要不是 FuncDef、 MainFuncDef就交由 Decl程序分析
+    while (tokens.get(index + 1).getType() != TokenType.MAINTK && tokens.get(index + 2).getType() != TokenType.LPARENT) {
+        DeclNode declNode = decl();
+        declNodes.add(declNode);
+    }
+    // 再匹配 FuncDef 成分
+    // 同样，很难直接通过预读判断是 FuncDef,所以使用排除法，只要不是MainFuncDef就交由 FuncDef 程序分析
+    while (tokens.get(index + 1).getType() != TokenType.MAINTK) {
+        FuncDefNode funcDefNode = funcDef();
+        funcDefNodes.add(funcDefNode);
+    }
+    mainFuncDefNode = mainFuncDef();
+    return new CompUnitNode(declNodes, funcDefNodes, mainFuncDefNode);
+}
+```
+The condition `tokens.get(index + 1).getType() != TokenType.MAINTK && tokens.get(index + 2).getType() != TokenType.LPARENT` is risky. It assumes that if the next token is not `main` AND the token after that is not `(`, it's a `Decl`.
+For `int ig1;`, `index` points to `int`. `index+1` is `ig1` (IDENFR). `index+2` is `;` (SEMICN). This works.
+For `int fuc1(){...}`, `index` points to `int`. `index+1` is `fuc1` (IDENFR). `index+2` is `(` (LPARENT). The condition `tokens.get(index + 2).getType() != TokenType.LPARENT` is FALSE. So the loop terminates. This means `int fuc1()` is NOT parsed as a `Decl`. It falls through to the `FuncDef` loop.
+In the `FuncDef` loop: `while (tokens.get(index + 1).getType() != TokenType.MAINTK)`.
+Current token is `int`. `index+1` is `fuc1`. Not `MAINTK`. So it calls `funcDef()`.
+`funcDef()` parses `FuncType Ident '(' ... ')' Block`.
+This seems correct for distinguishing Decls and FuncDefs based on the lookahead.
+
+However, there is a critical issue in `MyIO.java`:
+```java
+public static void write(String outputFilePath, String content) {
+    // OPT: 使用 BufferedWriter 进行缓冲，提高写入性能
+    try (FileOutputStream fos = new FileOutputStream(outputFilePath, true);
+         OutputStreamWriter osw = new OutputStreamWriter(fos);
+         BufferedWriter bw = new BufferedWriter(osw)) {
+        bw.write(content);
+    } catch (Exception e) {
+        e.printStackTrace();
+    }
+}
+```
+The `FileOutputStream` is opened with `append = true`.
+In `Compiler.java`, `Lexer.getInstance().fsa(...)` is called first. Then `Parser.getInstance().parsing()`.
+If `Config.lexer` is false, `Lexer.getInstance().printTokens()` is NOT called.
+If `Config.parser` is true, `Parser.getInstance().printParserRes()` IS called.
+
+The problem states "Buggy Output: No output file".
+If an exception occurs during parsing or writing, it might be swallowed or cause termination.
+But wait, look at `Config.java`:
+```java
+public static String outputLexerFilePath = "parser.txt";
+public static String outputParserFilePath = "parser.txt";
+```
+Both lexer and parser output to `parser.txt`.
+
+Let's look closely at `Parser.java` -> `match()` method.
+```java
+private Token match(TokenType tokenType) {
+    // 正确匹配
+    if (curToken.getType() == tokenType) {
+        Token tmpCurToken = curToken;
+        if (index + 1 < tokens.size()) {
+            index++;
+            curToken = tokens.get(index);
+        }
+        return tmpCurToken;
+    } else if (tokenType == TokenType.SEMICN) { // 缺少分号
+        ErrorHandler.getInstance().addError(new Error(tokens.get(index - 1).getLineNumber(), ErrorType.i));
+        return new Token(TokenType.SEMICN, tokens.get(index - 1).getLineNumber(), ";");
+    } 
+    // ...
+    else {    // 其他错误情况
+        throw new RuntimeException("ParserError in line " + curToken.getLineNumber() + ": " + curToken.getContent() + " is not " + tokenType);
+    }
+}
+```
+If a `RuntimeException` is thrown, the program crashes. If it crashes, no output might be flushed/written if the buffer wasn't closed properly, or simply the process terminates abnormally. However, `try-with-resources` in `MyIO.write` should close the stream. But if the exception happens *before* any write, the file might be empty or not created depending on OS buffering.
+
+Actually, the most likely cause for "No output file" when expecting a large output is that the program **crashed** due to an unhandled exception, or the logic for determining `Decl` vs `FuncDef` is flawed causing an infinite loop or incorrect parsing leading to a crash.
+
+Let's re-examine `compUnit()`:
+```java
+    while (tokens.get(index + 1).getType() != TokenType.MAINTK && tokens.get(index + 2).getType() != TokenType.LPARENT) {
+        DeclNode declNode = decl();
+        declNodes.add(declNode);
+    }
+```
+If `index` is at the last token, `index + 1` or `index + 2` will throw `IndexOutOfBoundsException`.
+The input ends with `}`. The tokens list includes all tokens.
+When parsing the last `FuncDef` or `MainFuncDef`, `index` advances.
+If `index` reaches the end of the token list inside the `while` condition check, `tokens.get(index + 1)` will crash.
+
+Consider the state before `MainFuncDef`.
+The loop `while (tokens.get(index + 1).getType() != TokenType.MAINTK)` processes `FuncDef`s.
+After the last `FuncDef` (`fuc6`), `index` should point to `int` of `int main()`.
+`tokens.get(index + 1)` is `main` (MAINTK). The loop terminates.
+Then `mainFuncDef()` is called.
+
+What if there are NO `FuncDef`s?
+The first loop handles `Decl`s.
+If the input starts with `int main()`, `index` is 0 (`int`). `index+1` is `main`. `tokens.get(index+1).getType() != MAINTK` is FALSE. Loop doesn't run.
+Second loop: `tokens.get(index+1).getType() != MAINTK` is FALSE. Loop doesn't run.
+`mainFuncDef()` is called. Correct.
+
+What if the input is just `int a;`?
+First loop: `index=0` (`int`). `index+1`=`a` (IDENFR). `index+2`=`;` (SEMICN). Condition TRUE.
+`decl()` is called. Parses `int a;`. `index` moves past `;`.
+Now `index` points to EOF? Or is there an EOF token?
+The lexer does NOT generate an explicit EOF token. `tokens` list ends with the last semantic token.
+If `index` is now `tokens.size() - 1` (pointing to `;`), after `match(SEMICN)`, `index` becomes `tokens.size()`.
+Wait, `match` increments `index`.
+If `index` equals `tokens.size()`, accessing `tokens.get(index + 1)` in the `while` condition will throw `IndexOutOfBoundsException`.
+
+In the provided test case, there are many declarations and functions.
+Let's trace the end of `Decl` parsing.
+Last Decl: `char ca5[5]="abcd";`.
+After parsing this, `index` points to the token AFTER `;`.
+The next token is `int` (start of `int main()`? No, `int main` is at the end).
+The structure is:
+`int ig1;` (Decl)
+`int fuc1()...` (FuncDef)
+...
+`int main()...` (MainFuncDef)
+
+The first `while` loop in `compUnit`:
+It stops when it sees `main` ahead OR `(` ahead at `index+2`.
+For `int fuc1()`, `index` is at `int`. `index+1` is `fuc1`. `index+2` is `(`.
+Condition: `tokens.get(index+1) != MAINTK` (True) AND `tokens.get(index+2) != LPARENT` (False).
+Result: False. Loop terminates.
+So `int fuc1()` is NOT parsed as a Decl. Correct.
+
+Then the second `while` loop:
+`while (tokens.get(index + 1).getType() != TokenType.MAINTK)`
+Current `index` is at `int` of `fuc1`. `index+1` is `fuc1`. Not `MAINTK`.
+Enters loop. Calls `funcDef()`.
+`funcDef()` parses the whole function including body.
+After `fuc1`, `index` is at `char` of `fuc2`.
+Loop continues.
+...
+After `fuc6`, `index` is at `int` of `main`.
+`tokens.get(index + 1)` is `main` (MAINTK).
+Condition `!= MAINTK` is False. Loop terminates.
+Calls `mainFuncDef()`.
+
+This logic seems robust against IndexOutOfBounds IF the tokens are structured such that `index+1` always exists when checked.
+Does `tokens.get(index + 1)` exist?
+If `index` is the last token, `index+1` is out of bounds.
+When would `index` be the last token?
+If the program ends with a `Decl` and no `FuncDef`/`MainFuncDef`? But grammar requires `MainFuncDef`.
+If `MainFuncDef` is missing? Then it's an error.
+
+However, there is a subtle bug in `compUnit`'s first loop condition:
+`tokens.get(index + 2).getType() != TokenType.LPARENT`
+If `index` is `tokens.size() - 2`, `index + 2` is `tokens.size() - 1` (valid).
+If `index` is `tokens.size() - 1`, `index + 1` is `tokens.size()` (INVALID).
+So we must ensure `index + 1 < tokens.size()` before accessing `tokens.get(index + 1)`.
+The code does NOT check this.
+
+In the test case, before `main`, we have `fuc6`.
+After `fuc6` is parsed, `index` points to `int` (of `main`).
+`tokens.size()` is large. `index + 1` is `main`. Valid.
+
+Is it possible the error is in `MyIO.write`?
+`new FileOutputStream(outputFilePath, true)`
+If the file doesn't exist, it creates it.
+If an exception happens in `Parser`, `printParserRes` is never called.
+If `Parser.parsing()` throws an exception, `Compiler.main` catches nothing. The program terminates.
+If the program terminates abruptly, the output file might be empty or not flushed.
+
+Let's look at `StmtNode.print()` for `Printf`:
+```java
+            case Printf:
+                // 'printf' '(' stringConstToken { ',' Exp } ')' ';'
+                MyIO.writeToken(printfToken.toString());
+                MyIO.writeToken(lparentToken.toString());
+                MyIO.writeToken(stringConstToken.toString());
+                for (ExpNode node : expNodes) {
+                    MyIO.writeToken(commaToken.toString());
+                    node.print();
+                }
+                MyIO.writeToken(rparentToken.toString());
+                MyIO.writeToken(semicnToken.toString());
+                break;
+```
+If `expNodes` is empty, the loop doesn't run. Correct.
+
+Let's look at `Lexer.fsa` again.
+`for (int i = 0; i < len; i++)`
+Inside, `i` is modified.
+`if (c == '\n') lineNum++;`
+This looks standard.
+
+Wait, look at `Config.java`:
+```java
+public static boolean lexer = false;
+public static boolean parser = true;
+```
+And `Compiler.java`:
+```java
+        if (Config.lexer) {
+            if (ErrorHandler.getInstance().getErrors().isEmpty()) { 
+                Lexer.getInstance().printTokens();
+            } else   
+                ErrorHandler.getInstance().printErrors();
+        }
+
+        if (Config.parser) {
+            if (ErrorHandler.getInstance().getErrors().isEmpty()) { 
+                Parser.getInstance().printParserRes();
+            } else   
+                ErrorHandler.getInstance().printErrors();
+        }
+```
+If `ErrorHandler` has errors, it prints errors.
+If `Parser` throws an exception, it crashes.
+
+The most likely location for a crash or logical error leading to no output is the **lookahead access without bounds checking** in `Parser.compUnit()`. Although the test case seems to avoid the boundary, if there's any mismatch in token count or structure, it crashes.
+
+However, there is another possibility. `MyIO.write` uses `FileOutputStream` with `append=true`.
+If the program ran previously and created a file, it appends.
+If the program crashes, the file might be incomplete.
+
+Let's look at `BlockItemNode.print()`:
+```java
+    public void print() {
+        if (declNode != null) {
+            declNode.print();
+        } else {
+            stmtNode.print();
+        }
+        // BUG: <BlockItem>, <Decl>, <BType>不输出
+    }
+```
+The comment says `<BlockItem>`, `<Decl>`, `<BType>` are NOT output.
+The problem description says:
+"Before completing the analysis of any syntax components in the grammar (except for `<BlockItem>`, `<Decl>`, `<BType>`), output the name of the current syntax component..."
+So `BlockItemNode` correctly does NOT print `<BlockItem>`.
+`DeclNode.print()`:
+```java
+    public void print() {
+        if (constDecl != null) {
+            constDecl.print();
+        } else {
+            varDecl.print();
+        }
+    }
+```
+It does NOT print `<Decl>`. Correct.
+`BTypeNode.print()`:
+```java
+    public void print() {
+        MyIO.writeToken(bTypeToken.toString());
+    }
+```
+It does NOT print `<BType>`. Correct.
+
+So the suppression of these tags is intentional and correct per spec.
+
+Why "No output file"?
+If `Parser.getInstance().parsing()` throws an exception, `printParserRes()` is never reached.
+The exception is likely `IndexOutOfBoundsException` in `compUnit`.
+
+Let's verify the bounds check in `compUnit`.
+```java
+    while (tokens.get(index + 1).getType() != TokenType.MAINTK && tokens.get(index + 2).getType() != TokenType.LPARENT) {
+```
+If `index` is `tokens.size() - 1`, `index + 1` is out of bounds.
+This can happen if the input is empty or malformed, but here the input is valid.
+However, if `decl()` or `funcDef()` consumes tokens incorrectly, `index` might go out of sync.
+
+Actually, look at `Lexer.fsa` handling of `char` constants.
+```java
+            } else if (c == '\'') { // 字符常量
+                String s = "'";
+                /*
+                 * METHOD 1
+                 * LEGACY: 不严谨，没严格判断ASCII
+                 */
+                for (int j = i + 1; j < len; j++) {
+                    char cc = input.charAt(j);
+                    char ccnext = j + 1 < len ? input.charAt(j + 1) : '\0';
+                    // BUG: ASCII中的'与CHRCON的形式单引号在二进制码层面相同，需要单独讨论
+                    if (cc == '\\' && ccnext == '\'') {
+                        s += cc;
+                        s += ccnext;
+                        j++;
+                    } else if (cc != '\'') {
+                        s += cc;
+                    } else {
+                        i = j;
+                        s += "'";
+                        break;
+                    }
+                }
+
+                tokens.add(new Token(TokenType.CHRCON, lineNum, s));
+            }
+```
+If the character constant is empty `''`? The loop starts at `i+1`. If `input.charAt(i+1)` is `'`, it enters `else` block `cc != '\''` is false. So it goes to `else`. `i=j`, `s+="'"`, breaks. Token is `''`. Valid? Grammar says `CharConst`. Usually non-empty.
+
+There is a known issue in some student implementations where `MyIO.write` fails because the directory doesn't exist or permissions, but here paths are simple filenames.
+
+Let's assume the crash is due to `IndexOutOfBoundsException` in `compUnit`.
+
+<frontend/Parser.java>
+...
+    private CompUnitNode compUnit() {
+        // 编译单元 CompUnit -> {Decl} {FuncDef} MainFuncDef
+        ArrayList<DeclNode> declNodes = new ArrayList<>();
+        ArrayList<FuncDefNode> funcDefNodes = new ArrayList<>();
+        MainFuncDefNode mainFuncDefNode;
+        // 首先匹配 Decl 成分
+        // 很难直接通过预读判断是 Decl,所以使用排除法，只要不是 FuncDef、 MainFuncDef就交由 Decl程序分析
+        while (tokens.get(index + 1).getType() != TokenType.MAINTK && tokens.get(index + 2).getType() != TokenType.LPARENT) {
+            DeclNode declNode = decl();
+            declNodes.add(declNode);
+        }
+        // 再匹配 FuncDef 成分
+        // 同样，很难直接通过预读判断是 FuncDef,所以使用排除法，只要不是MainFuncDef就交由 FuncDef 程序分析
+        while (tokens.get(index + 1).getType() != TokenType.MAINTK) {
+            FuncDefNode funcDefNode = funcDef();
+            funcDefNodes.add(funcDefNode);
+        }
+        mainFuncDefNode = mainFuncDef();
+        return new CompUnitNode(declNodes, funcDefNodes, mainFuncDefNode);
+    }
+...

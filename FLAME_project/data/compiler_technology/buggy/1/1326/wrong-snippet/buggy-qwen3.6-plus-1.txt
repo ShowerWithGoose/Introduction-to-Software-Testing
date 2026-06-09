@@ -1,0 +1,290 @@
+Based on the problem description and the provided code, the primary issue lies in the logic for distinguishing between an assignment statement (`LVal '=' Exp ';'`) and an expression statement (`[Exp] ';'`) within the `parseStmt` function.
+
+The current implementation attempts to use lexer backtracking (`LEXER::get_pos()` and `LEXER::put_pos()`) when it encounters an `IDENFR`. It parses an `LVal`, checks if the next token is `ASSIGN`, and if not, resets the lexer position and parses an `Exp`.
+
+However, there are two major flaws:
+1.  **Incorrect Backtracking Scope**: When `parseLVal()` is called, it consumes tokens (the identifier and potentially `[` `Exp` `]`). If the next token is *not* `ASSIGN`, the code resets the lexer position to *before* the `LVal` was parsed. This is correct for backtracking the whole `LVal`. However, `parseExp()` will then be called. `parseExp()` eventually calls `parsePrimaryExp()`, which handles `IDENFR` by calling `parseLVal()` again. This means the `LVal` is parsed twice in the successful "expression" path, which might be inefficient but logically okay if state is reset correctly.
+2.  **Failure to Handle Non-IDENFR Expression Statements**: The `if (peek().tk == "IDENFR")` block only handles statements starting with an identifier. If a statement starts with a number, character, parenthesis, or unary operator (e.g., `1;`, `'a';`, `(a+b);`, `!a;`), it falls through to the final `else` block: `tr[cur].push(parseExp()); parseijk("SEMICN", 'i');`. This part is actually correct for those cases.
+3.  **The Real Logic Error**: The critical error is in how `parseLVal` is integrated into the backtracking attempt.
+    In the line:
+    ```cpp
+    int tmp=parseLVal();
+    ```
+    `parseLVal` consumes the identifier. If the next token is `ASSIGN`, it proceeds. If not, it resets.
+    
+    But consider the case: `a = b;`.
+    1. `peek()` is `IDENFR` ("a").
+    2. `parseLVal()` consumes "a". Returns node for `LVal`.
+    3. `peek()` is `ASSIGN`.
+    4. Code enters `if` branch.
+    5. `tr[cur].push(tmp)` (pushes LVal).
+    6. `tr[cur].push(parseEnd())` (consumes `=`).
+    7. Checks for `GETINTTK`/`GETCHARTK`. If not, `parseExp()`.
+    8. `parseExp()` parses `b`.
+    9. `parseijk("SEMICN", 'i')` consumes `;`.
+    
+    This seems correct for simple assignments.
+    
+    Let's look at `printf` parsing in `parseStmt`:
+    ```cpp
+        } else if (peek().tk == "PRINTFTK") {
+            tr[cur].push(parseEnd()); // printf
+            tr[cur].push(parseEnd()); // (
+            tr[cur].push(parseEnd()); // StringConst
+            while (peek().tk == "COMMA") {
+                tr[cur].push(parseEnd());
+                tr[cur].push(parseExp());
+            }
+            parseijk("RPARENT", 'j');
+            parseijk("SEMICN", 'i');
+        }
+    ```
+    The grammar for `printf` is: `'printf''('StringConst {','Exp}')'';'`
+    The code assumes the first argument is always consumed by `parseEnd()` directly after `(`. This implies it expects the token *after* `(` to be `STRCON`. It does not verify this. If the source is `printf(1);`, `parseEnd()` will consume `1` (INTCON) and label it as part of the printf structure incorrectly, or rather, it just consumes the token. The grammar says `StringConst` is required. The code doesn't check if `peek().tk == "STRCON"` before consuming. It just consumes whatever is there. This might lead to incorrect parse trees or missed errors if strict checking is required, but usually syntax analyzers just follow the structure.
+    
+    However, the most likely cause for "Compilation Error" or logical failure in these types of assignments is often related to **how the `CompUnit` determines the end of Declarations and start of Function Definitions**.
+    
+    Look at `parseCompUnit`:
+    ```cpp
+    int parseCompUnit() {
+        tr[++nodecnt]=Parser_unit(0, "CompUnit");
+        int cur = nodecnt;
+        while (peek_peek_peek().tk != "LPARENT") {
+            tr[cur].push(parseDecl());
+        }
+        while (peek_peek().tk != "MAINTK") {
+            tr[cur].push(parseFuncDef());
+        }
+        int u=parseMainFuncDef();
+        tr[cur].push(u);
+        return cur;
+    }
+    ```
+    The condition `peek_peek_peek().tk != "LPARENT"` is extremely fragile. It looks 3 tokens ahead to decide if it's still a declaration.
+    Example: `int a = 1;`
+    Tokens: `INTTK`, `IDENFR`, `ASSIGN`, `INTCON`, `SEMICN`.
+    `peek()` is `INTTK`. `peek_peek()` is `IDENFR`. `peek_peek_peek()` is `ASSIGN`. `ASSIGN != LPARENT`, so it parses `Decl`. Correct.
+    
+    Example: `int main() {}`
+    Tokens: `INTTK`, `MAINTK`, `LPARENT`, ...
+    If we are at the start of `MainFuncDef` inside the loop? No, the loop is for `Decl`.
+    
+    Consider a function definition: `void func() {}`
+    Tokens: `VOIDTK`, `IDENFR`, `LPARENT`...
+    `peek()` is `VOIDTK`. `peek_peek()` is `IDENFR`. `peek_peek_peek()` is `LPARENT`.
+    The condition `peek_peek_peek().tk != "LPARENT"` becomes false. The loop terminates.
+    Then it goes to `while (peek_peek().tk != "MAINTK")`.
+    `peek()` is `VOIDTK`. `peek_peek()` is `IDENFR`. `IDENFR != MAINTK`. So it enters `parseFuncDef()`. Correct.
+    
+    What if we have `int a;` followed by `void func() {}`?
+    After parsing `int a;`, `peek()` is `VOIDTK`. `peek_peek()` is `IDENFR`. `peek_peek_peek()` is `LPARENT`. Loop terminates. Correct.
+    
+    What if we have `const int a = 1;`?
+    Tokens: `CONSTTK`, `INTTK`, `IDENFR`, `ASSIGN`...
+    `peek()` `CONSTTK`. `peek_peek()` `INTTK`. `peek_peek_peek()` `IDENFR`. `IDENFR != LPARENT`. Loop continues. Parses `ConstDecl`. Correct.
+    
+    The heuristic seems to rely on the fact that a `FuncDef` or `MainFuncDef` always has a `(` as the 3rd token (Type, Name, `(`).
+    `Decl` starts with `const` or `BType`.
+    If `Decl` is `int a[10];`: `INTTK`, `IDENFR`, `LBRACK`. `LBRACK != LPARENT`. Continues. Correct.
+    If `Decl` is `int a;`: `INTTK`, `IDENFR`, `SEMICN`. `SEMICN != LPARENT`. Continues. Correct.
+    
+    Is there a case where a `Decl` has `(` as the 3rd token? No.
+    Is there a case where a `FuncDef` does NOT have `(` as the 3rd token?
+    `FuncDef -> FuncType Ident '(' ...`
+    `FuncType -> void | int | char`.
+    So yes, always Type, Ident, `(`.
+    
+    So `parseCompUnit` logic seems robust for standard inputs.
+    
+    Let's look closer at `parseStmt` again.
+    
+    ```cpp
+        if (peek().tk == "IDENFR") {
+            int lexer_pos=LEXER::get_pos();
+            int tmp=parseLVal();
+            //这里还要分情况：有可能是个Exp;
+            //Lexer必须支持回溯
+            if(peek().tk == "ASSIGN"){
+                tr[cur].push(tmp);
+                tr[cur].push(parseEnd());
+                if (peek().tk == "GETINTTK" || peek().tk == "GETCHARTK") {  // 不会出现getint/getchar在exp中
+                    tr[cur].push(parseEnd());
+                    tr[cur].push(parseEnd());
+                    parseijk("RPARENT", 'j');
+                } else {
+                    tr[cur].push(parseExp());
+                }
+                parseijk("SEMICN", 'i');
+            }
+            else{
+                LEXER::put_pos(lexer_pos);
+                tr[cur].push(parseExp());
+                parseijk("SEMICN", 'i');
+            }
+        } 
+    ```
+    
+    If the input is `a[1] = 2;`
+    1. `peek()` is `IDENFR` ("a").
+    2. `parseLVal()` consumes `a`, `[`, `1`, `]`. Returns `LVal` node.
+    3. `peek()` is `ASSIGN`.
+    4. Enters `if`. Pushes `LVal`. Consumes `=`.
+    5. `peek()` is `INTCON` ("2"). Not `GETINTTK`.
+    6. `parseExp()` consumes `2`.
+    7. `parseijk` consumes `;`.
+    Correct.
+    
+    If the input is `a[1];` (Expression statement)
+    1. `peek()` is `IDENFR` ("a").
+    2. `parseLVal()` consumes `a`, `[`, `1`, `]`.
+    3. `peek()` is `SEMICN`.
+    4. Enters `else`.
+    5. `LEXER::put_pos(lexer_pos)` resets to before "a".
+    6. `parseExp()` is called.
+       - `parseExp` -> `parseAddExp` -> ... -> `parseUnaryExp` -> `parsePrimaryExp`.
+       - `parsePrimaryExp` sees `IDENFR` ("a").
+       - Calls `parseLVal()`. Consumes `a`, `[`, `1`, `]`.
+       - Returns.
+    7. `parseExp` returns.
+    8. `parseijk("SEMICN", 'i')` consumes `;`.
+    Correct.
+    
+    What if the input is `a = getint();`?
+    1. `peek()` `IDENFR`.
+    2. `parseLVal()` consumes `a`.
+    3. `peek()` `ASSIGN`.
+    4. Enters `if`.
+    5. Pushes `LVal`. Consumes `=`.
+    6. `peek()` is `GETINTTK`.
+    7. Enters `if (peek().tk == "GETINTTK" ...)`.
+    8. `parseEnd()` consumes `GETINTTK`.
+    9. `parseEnd()` consumes `LPARENT`.
+    10. `parseijk("RPARENT", 'j')` consumes `RPARENT`.
+    11. `parseijk("SEMICN", 'i')` consumes `SEMICN`.
+    Correct.
+    
+    There is a subtle bug in `parseUnaryExp`:
+    ```cpp
+    int parseUnaryExp() {
+        tr[++nodecnt]=Parser_unit(0, "UnaryExp");
+        int cur = nodecnt;
+        if (peek().tk == "IDENFR" && peek_peek().tk == "LPARENT") {
+            tr[cur].push(parseEnd()); // Ident
+            tr[cur].push(parseEnd()); // (
+            if (startByAnExp()) {
+                tr[cur].push(parseFuncRParams());
+            }
+            parseijk("RPARENT", 'j');
+        } else if ...
+    }
+    ```
+    If we have `a()`, `parseFuncRParams` is skipped because `startByAnExp()` is false (next is `)`). Then `)` is consumed. Correct.
+    
+    However, look at `parseFuncRParams`:
+    ```cpp
+    int parseFuncRParams() {
+        tr[++nodecnt]=Parser_unit(0, "FuncRParams");
+        int cur = nodecnt;
+        tr[cur].push(parseExp());
+        while (peek().tk == "COMMA") {
+            tr[cur].push(parseEnd());
+            tr[cur].push(parseExp());
+        }
+        return cur;
+    }
+    ```
+    
+    Now look at `parseInitVal` and `parseConstInitVal`.
+    
+    ```cpp
+    int parseInitVal() {
+        tr[++nodecnt]=Parser_unit(0, "InitVal");
+        int cur = nodecnt;
+        if (peek().tk == "LBRACE") {
+            tr[cur].push(parseEnd());
+            tr[cur].push(parseExp()); // <--- ERROR HERE?
+            while (peek().tk == "COMMA") {
+                tr[cur].push(parseEnd());
+                tr[cur].push(parseExp());
+            }
+            tr[cur].push(parseEnd());
+        } else if (peek().tk == "STRCON") {
+            tr[cur].push(parseEnd());
+        } else
+            tr[cur].push(parseExp());
+        return cur;
+    }
+    ```
+    Grammar: `InitVal → Exp | '{' [ Exp { ',' Exp } ] '}' | StringConst`
+    The content inside `{}` is optional: `[ Exp { ',' Exp } ]`.
+    The code currently does:
+    1. Consume `{`.
+    2. **Unconditionally** `parseExp()`.
+    3. While comma, parse Exp.
+    4. Consume `}`.
+    
+    If the input is `int a = {};`, `peek()` after `{` is `}`.
+    The code calls `parseExp()`. `parseExp` will try to parse an expression starting with `}`. This will likely crash or assert fail because `}` is not a valid start of an expression.
+    
+    Same issue in `parseConstInitVal`:
+    ```cpp
+    int parseConstInitVal() {
+        ...
+        if (peek().tk == "LBRACE") {
+            tr[cur].push(parseEnd());
+            tr[cur].push(parseConstExp()); // <--- ERROR HERE
+            while (peek().tk == "COMMA") {
+                tr[cur].push(parseEnd());
+                tr[cur].push(parseConstExp());
+            }
+            tr[cur].push(parseEnd());
+        } ...
+    }
+    ```
+    Grammar: `ConstInitVal → ConstExp | '{' [ ConstExp { ',' ConstExp } ] '}' | StringConst`
+    
+    The code fails to handle the empty initializer list `{}`.
+
+<file path>
+<main.cpp>
+...
+    int parseInitVal() {
+        tr[++nodecnt]=Parser_unit(0, "InitVal");
+        int cur = nodecnt;
+        if (peek().tk == "LBRACE") {
+            tr[cur].push(parseEnd());
+            if (peek().tk != "RBRACE") { // Fix: Check if empty
+                tr[cur].push(parseExp());
+                while (peek().tk == "COMMA") {
+                    tr[cur].push(parseEnd());
+                    tr[cur].push(parseExp());
+                }
+            }
+            tr[cur].push(parseEnd());
+        } else if (peek().tk == "STRCON") {
+            tr[cur].push(parseEnd());
+        } else
+            tr[cur].push(parseExp());
+        return cur;
+    }
+...
+    int parseConstInitVal() {
+        tr[++nodecnt]=Parser_unit(0, "ConstInitVal");
+        int cur = nodecnt;
+        if (peek().tk == "LBRACE") {
+            tr[cur].push(parseEnd());
+            if (peek().tk != "RBRACE") { // Fix: Check if empty
+                tr[cur].push(parseConstExp());
+                while (peek().tk == "COMMA") {
+                    tr[cur].push(parseEnd());
+                    tr[cur].push(parseConstExp());
+                }
+            }
+            tr[cur].push(parseEnd());
+        } else if (peek().tk == "STRCON") {
+            tr[cur].push(parseEnd());
+        } else
+            tr[cur].push(parseConstExp());
+        return cur;
+    }
+...

@@ -1,0 +1,830 @@
+Based on the problem description, the test case input contains three syntax errors (missing semicolons), but the program produces no output file. This suggests that the parser is likely crashing or throwing an exception before it can finish parsing and write the error list to `error.txt`.
+
+Let's analyze the flow:
+1.  **Input:**
+    ```c
+    int main() {
+        printf("Hello SysY!\n") // error 1: missing ';'
+    
+        if (1)
+    
+    
+        /*********/
+        ;
+        int a // error 2: missing ';'
+    
+        for (;;) {}
+    
+        return 0 // error 3: missing ';'
+    }
+    ```
+2.  **Expected Output:**
+    ```
+    2 i
+    9 i
+    13 i
+    ```
+3.  **Actual Output:** No output file.
+
+The `Writer.writeSyntaxTree` method checks `ErrorList.hasError()`. If there are errors, it writes them to `error.txt`. If the program crashes during parsing, `writeSyntaxTree` might not be called, or `ErrorList` might not be populated correctly if the exception occurs before error handling completes.
+
+Looking at `Stmt.java`, specifically the `assignOrExp` method:
+```java
+    private void assignOrExp() {
+        int count = 0;
+        while (tokens.hasNext()) {
+            Token token = tokens.next();
+            count++;
+            if (token.getType().equals(TokenType.ASSIGN)) {
+                Token tokenAfterAssign = tokens.next();
+                tokens.stepBack(count + 1);
+                switch (tokenAfterAssign.getType()) {
+                    case GETINTTK:
+                        stmtNode = new MyGetintStmt(tokens);
+                        break;
+                    case GETCHARTK:
+                        stmtNode = new MyGetcharStmt(tokens);
+                        break;
+                    default:
+                        stmtNode = new MyAssignStmt(tokens);
+                        break;
+                }
+                break;
+            }
+            if (token.getType().equals(TokenType.SEMICN)) {
+                tokens.stepBack(count);
+                stmtNode = new MyExpStmt(tokens);
+                break;
+            }
+        }
+    }
+```
+This method is called when the current token is an `IDENFR`. It looks ahead to decide if it's an assignment, a function call (`getint`/`getchar`), or an expression statement.
+
+Consider the first error: `printf("Hello SysY!\n")`.
+The parser enters `Stmt`. The current token is `PRINTFTK`. It goes to `case PRINTFTK:` and creates `MyPrintfStmt`.
+Inside `MyPrintfStmt.parse()`:
+1. Consumes `printf`.
+2. Consumes `(`.
+3. Parses `StringConst`.
+4. Checks for `,` followed by `Exp`. There is none.
+5. Calls `ErrorHandler.handleJError(tokens, children)`. The next token is `)`? No, the source is `printf("Hello SysY!\n") // error 1`. Wait, the source has `)` then newline then comment.
+   The lexer should produce: `PRINTFTK`, `LPARENT`, `STRCON`, `RPARENT`.
+   So `handleJError` sees `RPARENT`. It consumes it. Returns true.
+6. Calls `ErrorHandler.handleIError(tokens, children)`. The next token is likely the start of the next line or EOF?
+   The next line is empty/comment. The next significant token is `if` (`IFTK`).
+   `handleIError` expects `SEMICN`. It sees `IFTK`.
+   It steps back 2? `tokens.stepBack(2)`.
+   Then `token = tokens.next()`. This re-reads the token before `IFTK`?
+   Let's look at `ErrorHandler.handleIError`:
+   ```java
+   public static boolean handleIError(TokenIterator tokens, ArrayList<SyntaxNode> children) {
+       Token token;
+       token = tokens.next(); // Consumes IFTK
+       // handle I_MISSING_SEMICOLON
+       if (token.getType() != TokenType.SEMICN) {
+           tokens.stepBack(2); // Steps back past IFTK and the one before it?
+           token = tokens.next(); // Re-reads the one before IFTK?
+           children.add(new Token(TokenType.SEMICN, ";", token.getLineNum(), 0));
+           ErrorList.addError(MyErrorType.I_MISSING_SEMICOLON, token.getLineNum());
+           return false;
+       } else {
+           children.add(token);
+           return true;
+       }
+   }
+   ```
+   If `token` is `IFTK`, it's not `SEMICN`.
+   `tokens.stepBack(2)`. The iterator was at `IFTK`. Step back 1 -> `RPARENT` (from printf). Step back 2 -> `STRCON`? Or whatever was before `IFTK`.
+   Then `token = tokens.next()`. This advances to `RPARENT`?
+   Then it adds a synthetic semicolon with `token.getLineNum()`.
+   This seems risky but might work.
+
+However, let's look at `CompUnit.java` -> `parseDecls`.
+```java
+    private boolean parseDecls() {
+        Token token1 = tokens.next();
+        Token token2 = tokens.next();
+        while (tokens.hasNext()) {
+            Token token3 = tokens.next();
+            if (token3.getType().equals(TokenType.LPARENT)) {
+                tokens.stepBack(3);
+                break;
+            }
+            tokens.stepBack(1);
+            if (token1.getType().equals(TokenType.CONSTTK)
+                    || token1.getType().equals(TokenType.INTTK) && token2.getType().equals(TokenType.IDENFR)
+                    || token1.getType().equals(TokenType.CHARTK) && token2.getType().equals(TokenType.IDENFR)) {
+                tokens.stepBack(2);
+
+                Decl decl = new Decl(tokens);
+                decl.parse();
+                decls.add(decl);
+
+                token1 = tokens.next();
+                token2 = tokens.next();
+            } else {
+                tokens.stepBack(2);
+                break;
+            }
+        }
+        return true;
+    }
+```
+This logic is extremely fragile. It peeks 3 tokens ahead.
+For `int main() { ... }`:
+1. `token1` = `int` (`INTTK`)
+2. `token2` = `main` (`MAINTK`) -- Wait, `MAINTK` is not `IDENFR`.
+3. Loop: `token3` = `(` (`LPARENT`).
+4. `token3` is `LPARENT`. `stepBack(3)`. Break.
+So `parseDecls` finishes without parsing any decls. Correct.
+
+Then `parseFuncDefs`.
+```java
+    private boolean parseFuncDefs() {
+        Token token1 = tokens.next();
+        Token token2 = tokens.next();
+        while (tokens.hasNext()) {
+            if (!token2.getType().equals(TokenType.MAINTK)) {
+                tokens.stepBack(2);
+                FuncDef funcDef = new FuncDef(tokens);
+                funcDef.parse();
+                funcDefs.add(funcDef);
+            } else {
+                tokens.stepBack(2);
+                break;
+            }
+            token1 = tokens.next();
+            token2 = tokens.next();
+        }
+        return true;
+    }
+```
+1. `token1` = `int` (`INTTK`)
+2. `token2` = `main` (`MAINTK`)
+3. `token2` IS `MAINTK`. So `else` branch: `stepBack(2)`, `break`.
+Correct.
+
+Then `parseMainFuncDef`.
+```java
+    private boolean parseMainFuncDef() {
+        mainFuncDef = new MainFuncDef(tokens);
+        return mainFuncDef.parse();
+    }
+```
+`MainFuncDef.parse()`:
+1. `children.add(tokens.next());` -> `int`
+2. `children.add(tokens.next());` -> `main`
+3. `children.add(tokens.next());` -> `(`
+4. `ErrorHandler.handleJError(tokens, children);`
+   - `tokens.next()` -> `)`
+   - It is `RPARENT`. Adds it. Returns true.
+5. `block = new Block(tokens); block.parse();`
+
+`Block.parse()`:
+1. `Token lBrace = tokens.next();` -> `{`
+2. `Token token = tokens.next();` -> `printf` (`PRINTFTK`)
+3. While `token` != `RBRACE`:
+   - `stepBack(1)`
+   - `BlockItem blockItem = new BlockItem(tokens); blockItem.parse();`
+   
+`BlockItem.parse()`:
+- `token` = `printf` (`PRINTFTK`). Not `CONSTTK`, `INTTK`, `CHARTK`.
+- `stepBack(1)`
+- `blockItemNode = new Stmt(tokens);`
+- `blockItemNode.parse()` -> `Stmt.parse()`
+
+`Stmt.parse()`:
+- `token` = `printf` (`PRINTFTK`).
+- `stepBack(1)`
+- `case PRINTFTK:` -> `stmtNode = new MyPrintfStmt(tokens);`
+- `stmtNode.parse()`
+
+`MyPrintfStmt.parse()`:
+- `token` = `printf`. Add.
+- `token` = `(`. Add.
+- `stringConst.parse()`. Consumes `"Hello SysY!\n"`.
+- Loop for `, Exp`. Next token is `)`. Not `,`. Step back.
+- `ErrorHandler.handleJError(tokens, children);`
+  - `tokens.next()` -> `)`. Is `RPARENT`. Add. Return true.
+- `ErrorHandler.handleIError(tokens, children);`
+  - `tokens.next()` -> What is next?
+    The input is:
+    ```
+    printf("Hello SysY!\n") // error 1
+    
+    if (1)
+    ```
+    Lexer tokens: `PRINTFTK`, `LPARENT`, `STRCON`, `RPARENT`, `IFTK`, `LPARENT`, `INTCON`, `RPARENT`, `SEMICN` (wait, `if(1)` is followed by newline then empty lines then `;`?
+    Input:
+    ```
+        if (1)
+    
+    
+        /*********/
+        ;
+    ```
+    The `if (1)` is a statement. But it's missing a body? Or is the `;` on line 6 the body?
+    Grammar: `Stmt -> 'if' '(' Cond ')' Stmt [ 'else' Stmt ]`
+    The `Stmt` after `)` can be `;` (EmptyStmt/NopStmt).
+    
+    Back to `handleIError` in `MyPrintfStmt`.
+    Current token is `IFTK`.
+    `token` = `IFTK`. Not `SEMICN`.
+    `tokens.stepBack(2)`.
+    Iterator was at `IFTK`.
+    Step back 1: `RPARENT` (from printf).
+    Step back 2: `STRCON`?
+    `token = tokens.next()`. Advances to `RPARENT`.
+    `children.add(new Token(..., token.getLineNum(), ...))`. Line num of `RPARENT` is 2.
+    `ErrorList.addError(..., 2)`.
+    Returns `false`.
+
+    `MyPrintfStmt.parse()` returns `true` (always returns true at end).
+    
+    Back in `Stmt.parse()`. `stmtNode.parse()` returned `true`.
+    `Stmt.parse()` returns `true`.
+    
+    Back in `BlockItem.parse()`. Returns `true`.
+    
+    Back in `Block.parse()`.
+    `children.add(blockItem)`.
+    `token = tokens.next()`.
+    What is the current token?
+    `handleIError` left the iterator at `RPARENT`?
+    Let's trace `handleIError` carefully.
+    Start: Iterator at `IFTK`.
+    `token = tokens.next()` -> `IFTK`. Iterator now after `IFTK`.
+    `if` fails.
+    `tokens.stepBack(2)`. Iterator moves back 2 positions.
+    Pos 0: `PRINTFTK`
+    Pos 1: `LPARENT`
+    Pos 2: `STRCON`
+    Pos 3: `RPARENT`
+    Pos 4: `IFTK`
+    
+    If iterator was at 5 (after `IFTK`), step back 2 puts it at 3 (`RPARENT`).
+    `token = tokens.next()`. Advances to 4 (`IFTK`).
+    Wait. `ListIterator.previous()` moves the cursor backwards. `next()` moves it forwards.
+    If `next()` returned item at index `i`, cursor is at `i+1`.
+    `stepBack(2)` calls `previous()` twice. Cursor moves to `i-1`.
+    `next()` returns item at `i`. Cursor at `i+1`.
+    
+    So if `next()` returned `IFTK` (index 4), cursor was at 5.
+    `stepBack(2)` -> cursor at 3.
+    `next()` -> returns item at 3 (`RPARENT`). Cursor at 4.
+    
+    So after `handleIError`, the iterator is pointing at `IFTK` (index 4) as the *next* element to be read? No, `next()` returns the element at the current cursor position and advances.
+    If cursor is at 4, `next()` returns `IFTK` and cursor becomes 5.
+    
+    So after `handleIError`, the iterator is ready to read `IFTK` again?
+    In `handleIError`:
+    `token = tokens.next()` -> Reads `IFTK`. Cursor at 5.
+    `stepBack(2)` -> Cursor at 3.
+    `token = tokens.next()` -> Reads `RPARENT` (index 3). Cursor at 4.
+    
+    So when `handleIError` returns, the iterator's next element is `IFTK` (index 4).
+    
+    Back in `Block.parse()`:
+    `token = tokens.next()`. This reads `IFTK`.
+    Loop continues. `token` is `IFTK`. Not `RBRACE`.
+    `stepBack(1)`. Cursor at 4.
+    `BlockItem`. `Stmt`.
+    `Stmt.parse()`. `token` = `IFTK`.
+    `case IFTK:` -> `MyCondStmt`.
+    
+    `MyCondStmt.parse()`:
+    - `token` = `IFTK`. Add.
+    - `token` = `tokens.next()` -> `(`. Add.
+    - `cond.parse()`. `LOrExp`. `LAndExp`. `EqExp`. `RelExp`. `AddExp`. `MulExp`. `UnaryExp`. `PrimaryExp`.
+      - `PrimaryExp`: `token` = `1` (`INTCON`). `Number`.
+      - `Cond` finishes.
+    - `ErrorHandler.handleJError(tokens, children)`.
+      - `tokens.next()` -> `)`. Is `RPARENT`. Add. Return true.
+      - Iterator now after `)`.
+    - `ifStmt = new Stmt(tokens); ifStmt.parse();`
+      - Next token is newline/newline/comment/`;`.
+      - Lexer skips comments/whitespace. Next token is `;` (`SEMICN`).
+      - `Stmt.parse()`. `token` = `;`.
+      - `default:` -> `MyNopStmt`.
+      - `MyNopStmt.parse()`.
+        - `token = tokens.next()` -> `;`.
+        - Is `SEMICN`. Returns true.
+      - `Stmt` returns true.
+    - `MyCondStmt` continues.
+    - `token = tokens.next()`.
+      - Next token? After `;` on line 6.
+      - Line 7, 8 empty.
+      - Line 9: `int a`. Token `INTTK`.
+      - So `token` = `INTTK`.
+      - Is `ELSETK`? No.
+      - `stepBack(1)`.
+    - `MyCondStmt` returns true.
+    
+    Back in `Block.parse()`.
+    `children.add(blockItem)`.
+    `token = tokens.next()`.
+    Current iterator position: After `INTTK`?
+    Wait. `MyCondStmt` did `stepBack(1)` after reading `INTTK`. So iterator is at `INTTK`.
+    `Block.parse()` does `token = tokens.next()`. Reads `INTTK`.
+    Loop continues. `token` is `INTTK`. Not `RBRACE`.
+    `stepBack(1)`.
+    `BlockItem`.
+    `token` = `INTTK`.
+    `BlockItem.parse()`:
+    - `token` is `INTTK`. Matches `INTTK`.
+    - `stepBack(1)`.
+    - `blockItemNode = new Decl(tokens)`.
+    - `Decl.parse()`.
+      - `checkConst` = `INTTK`. Not `CONSTTK`.
+      - `stepBack(1)`.
+      - `declNode = new VarDecl(tokens)`.
+      - `VarDecl.parse()`.
+        - `bType.parse()`. `INTTK`. OK.
+        - `VarDef`.
+          - `Ident`. `a`. OK.
+          - `token` = `tokens.next()`.
+            - Next token? `// error 2`. Comment.
+            - Next token is `for` (`FORTK`) on line 11?
+            - Input:
+              ```
+              int a // error 2
+      
+              for (;;) {}
+              ```
+            - So next token is `FORTK`.
+          - `token` is `FORTK`.
+          - Is `LBRACK`? No. `stepBack(1)`.
+          - `token` = `tokens.next()`. `FORTK`.
+          - Is `ASSIGN`? No. `stepBack(1)`.
+          - `VarDef` returns true.
+        - `VarDecl` loop.
+          - `token` = `tokens.next()`. `FORTK`.
+          - Is `COMMA`? No.
+          - `stepBack(1)`.
+          - `ErrorHandler.handleIError(tokens, children)`.
+            - `tokens.next()` -> `FORTK`.
+            - Not `SEMICN`.
+            - `stepBack(2)`.
+            - `token = tokens.next()`. Reads `a` (`IDENFR`)?
+              - Iterator was at `FORTK`.
+              - `next()` -> `FORTK`. Cursor after `FORTK`.
+              - `stepBack(2)` -> Cursor at `a`?
+                - Tokens: ..., `INTTK`, `IDENFR` (`a`), `FORTK`.
+                - If cursor was after `FORTK`, step back 1 -> `FORTK`. Step back 2 -> `IDENFR`.
+              - `next()` -> `IDENFR`. Cursor after `IDENFR`.
+            - Add error `i` at line of `a` (Line 9).
+            - Return false.
+          - `VarDecl` returns true.
+        - `Decl` returns true.
+      - `BlockItem` returns true.
+    - `Block` adds child.
+    - `token = tokens.next()`.
+      - Iterator is after `IDENFR` (`a`).
+      - Next token is `FORTK`.
+      - `token` = `FORTK`.
+    - Loop continues.
+    - `stepBack(1)`.
+    - `BlockItem`. `Stmt`.
+    - `Stmt.parse()`. `FORTK`.
+    - `MyForStmt`.
+    
+    This seems to proceed without crashing. Why "No output file"?
+
+    Check `Writer.writeSyntaxTree`.
+    ```java
+    public static void writeSyntaxTree(CompUnit compUnit) {
+        File parserFile = new File("parser.txt");
+        File ErrorFile = new File("error.txt");
+        if (ErrorList.hasError()) {
+            try {
+                PrintWriter writer = new PrintWriter(ErrorFile);
+                writer.println(ErrorList.getInstance().toString());
+                writer.flush();
+                writer.close();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+
+        } else {
+            // ...
+        }
+    }
+    ```
+    If `ErrorList.hasError()` is true, it writes to `error.txt`.
+    
+    Is it possible that `CompUnit.parse()` throws an exception?
+    
+    Let's look at `MyForStmt.parse()`.
+    ```java
+    @Override
+    public boolean parse() {
+        Token forToken = tokens.next();
+        children.add(forToken);
+
+        Token lParent = tokens.next();
+        children.add(lParent);
+
+        Token checkSemicon = tokens.next();
+        if (checkSemicon.getType().equals(TokenType.SEMICN)) {
+            tokens.stepBack(1);
+        } else {
+            tokens.stepBack(1);
+            forStmt1 = new ForStmt(tokens);
+            forStmt1.parse();
+            children.add(forStmt1);
+        }
+        Token semicon1 = tokens.next();
+        children.add(semicon1);
+        // ...
+    }
+    ```
+    Input: `for (;;) {}`
+    Tokens: `FORTK`, `LPARENT`, `SEMICN`, `SEMICN`, `RPARENT`, `LBRACE`, `RBRACE`.
+    
+    1. `forToken` = `FORTK`.
+    2. `lParent` = `LPARENT`.
+    3. `checkSemicon` = `SEMICN`.
+    4. Is `SEMICN`. `stepBack(1)`. Iterator back to `SEMICN`.
+    5. `semicon1 = tokens.next()`. Reads `SEMICN`.
+    6. `checkSemicon` (reuse var?) = `tokens.next()`. Reads `SEMICN` (the second one).
+    7. Is `SEMICN`. `stepBack(1)`.
+    8. `semicon2 = tokens.next()`. Reads `SEMICN`.
+    9. `checkRParent` = `tokens.next()`. Reads `RPARENT`.
+    10. Is `RPARENT`. `stepBack(1)`.
+    11. `rParent = tokens.next()`. Reads `RPARENT`.
+    12. `stmt = new Stmt(tokens); stmt.parse();`
+        - Next token is `LBRACE`.
+        - `Stmt` -> `Block`.
+        - `Block` parses `{}`.
+        
+    This looks fine.
+
+    What about the third error? `return 0 // error 3`
+    Inside `Block` loop.
+    After `for` loop, `token = tokens.next()`.
+    Next token is `return` (`RETURNTK`).
+    `Stmt`. `MyReturnStmt`.
+    
+    `MyReturnStmt.parse()`:
+    ```java
+    @Override
+    public boolean parse() {
+        // 'return'
+        children.add(tokens.next());
+
+        Token token = tokens.next();
+        TokenType tokenType = token.getType();
+        tokens.stepBack(1);
+        switch (tokenType) {
+            case LPARENT:
+            case INTCON:
+            case CHRCON:
+            case PLUS:
+            case MINU:
+            case IDENFR:
+                // FIXME: may have bug here
+                exp = new Exp(tokens);
+                exp.parse();
+                children.add(exp);
+                break;
+            default:
+                break;
+        }
+
+        ErrorHandler.handleIError(tokens, children);
+        return true;
+
+    }
+    ```
+    1. `return`.
+    2. `token` = `0` (`INTCON`).
+    3. `stepBack(1)`.
+    4. `case INTCON:`. `exp.parse()`.
+       - `Exp` -> `AddExp` -> ... -> `PrimaryExp` -> `Number`.
+       - `Number.parse()` consumes `0`.
+    5. `ErrorHandler.handleIError(tokens, children)`.
+       - Next token? `}` (from `main` block).
+       - `token` = `}`.
+       - Not `SEMICN`.
+       - `stepBack(2)`.
+       - `token = tokens.next()`. Reads `0`?
+         - Iterator was at `}`.
+         - `next()` -> `}`. Cursor after `}`.
+         - `stepBack(2)` -> Cursor at `0`.
+         - `next()` -> `0`. Cursor after `0`.
+       - Add error `i` at line of `0` (Line 13).
+       
+    So errors 1, 2, 3 should be added.
+    
+    Why no output?
+    
+    Check `Lexer.java`.
+    ```java
+    } else if (c == '/') {
+        c = line.charAt(content++);
+        if (c == '/') { // 单行注释直接下一行
+            break;
+        } else if (c == '*') { // 多行注释
+            inAnnotation = true;
+        } else {
+            content--;
+            tokens.add(processWord("/"));// DIV
+        }
+    }
+    ```
+    If `inAnnotation` is true:
+    ```java
+    if (inAnnotation) {
+        if (c == '*') {
+            if (content < line.length()) {
+                c = line.charAt(content++);
+                if (c == '/') {
+                    inAnnotation = false;
+                }
+            }
+        }
+    }
+    ```
+    This logic for multi-line comments is flawed if the comment spans multiple lines.
+    `processLine` is called for each line. `inAnnotation` is a member variable.
+    If `inAnnotation` is true, it scans the line.
+    If it finds `*/`, it sets `inAnnotation = false`.
+    BUT, it continues scanning the rest of the line!
+    ```java
+    while (content < line.length()) {
+        char c = line.charAt(content++);
+        if (inAnnotation) {
+            if (c == '*') {
+                if (content < line.length()) {
+                    c = line.charAt(content++);
+                    if (c == '/') {
+                        inAnnotation = false;
+                    }
+                }
+            }
+        } else if (isWhite(c)) {
+    // ...
+    ```
+    If `inAnnotation` becomes false, it falls through to `else if (isWhite(c))` etc.
+    This means code after `*/` on the same line is processed. This is correct.
+    
+    However, look at the test input:
+    ```
+        /*********/
+        ;
+    ```
+    Line 5: `/*********/`.
+    `c` = `/`. Next `c` = `*`. `inAnnotation = true`.
+    Loop continues. `c` = `*`. Next `c` = `/`. `inAnnotation = false`.
+    Loop continues. Rest of line is empty/whitespace.
+    
+    Line 6: `;`.
+    `inAnnotation` is false.
+    `c` = `;`. Token `SEMICN`.
+    
+    This seems correct.
+
+    Is it possible `GlobalVars.curLab` is not `PARSER`?
+    `Compiler.java`:
+    ```java
+    if (GlobalVars.curLab == GlobalVars.CurLab.LEXER) {
+        Writer.writeTokens(tokens, lexer.isHasError());
+        return;
+    }
+    // ...
+    if (GlobalVars.curLab.equals(GlobalVars.CurLab.PARSER)) {
+        Writer.writeSyntaxTree(compUnit);
+    }
+    ```
+    `GlobalVars.curLab` is initialized to `CurLab.PARSER`.
+    
+    Wait. Look at `ErrorHandler.handleIError` again.
+    ```java
+    public static boolean handleIError(TokenIterator tokens, ArrayList<SyntaxNode> children) {
+        Token token;
+        token = tokens.next();
+        // handle I_MISSING_SEMICOLON
+        if (token.getType() != TokenType.SEMICN) {
+            tokens.stepBack(2);
+            token = tokens.next();
+            children.add(new Token(TokenType.SEMICN, ";", token.getLineNum(), 0));
+            ErrorList.addError(MyErrorType.I_MISSING_SEMICOLON, token.getLineNum());
+            return false;
+        } else {
+            children.add(token);
+            return true;
+        }
+    }
+    ```
+    If `tokens.next()` throws `NoSuchElementException`?
+    `TokenIterator.next()` calls `iterator.next()`.
+    If the iterator is at the end, it throws.
+    
+    In `MyPrintfStmt`, after `printf("...")`, the next token is `IFTK`.
+    In `VarDecl`, after `int a`, the next token is `FORTK`.
+    In `MyReturnStmt`, after `return 0`, the next token is `}`.
+    
+    What if the file ends without `}`?
+    The input has `}`.
+    
+    Let's look at `CompUnit.parseDecls` again.
+    ```java
+    Token token1 = tokens.next();
+    Token token2 = tokens.next();
+    while (tokens.hasNext()) {
+        Token token3 = tokens.next();
+        // ...
+    }
+    ```
+    If there are fewer than 2 tokens, `tokens.next()` throws.
+    Input has many tokens.
+
+    Is it possible the error is in `Writer`?
+    ```java
+    PrintWriter writer = new PrintWriter(ErrorFile);
+    writer.println(ErrorList.getInstance().toString());
+    ```
+    `ErrorList.toString()`:
+    ```java
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder();
+        for (Error error : errors) {
+            sb.append(error.toString()).append("\n");
+        }
+        return sb.toString();
+    }
+    ```
+    If `errors` is empty, it returns empty string. `println` prints empty line.
+    
+    Wait. `ErrorList` is a singleton.
+    `ErrorHandler` calls `ErrorList.addError`.
+    
+    Let's check `MyNopStmt`.
+    ```java
+    public class MyNopStmt implements StmtNode {
+        // ...
+        @Override
+        public boolean parse() {
+            token = tokens.next();
+            if (token.getType().equals(TokenType.SEMICN)) {
+                return true;
+            } else {
+                tokens.stepBack(2);
+                Token tokenBefore = tokens.next();
+                ErrorList.addError(MyErrorType.I_MISSING_SEMICOLON, tokenBefore.getLineNum());
+                token = new Token(TokenType.SEMICN, ";", tokenBefore.getLineNum(), 0);
+                return false;
+            }
+        }
+    }
+    ```
+    If `tokens.next()` throws because there are no more tokens?
+    
+    Consider the `if (1)` statement.
+    `MyCondStmt` parses `if (1)`.
+    Then `ifStmt = new Stmt(tokens)`.
+    Next token is `;`.
+    `Stmt` -> `MyNopStmt`.
+    `MyNopStmt.parse()` reads `;`. Returns true.
+    
+    What if the `if` statement was `if (1)` without `;`?
+    Input:
+    ```
+        if (1)
+
+
+        /*********/
+        ;
+    ```
+    The `;` is on line 6. The `if` is on line 3.
+    Between them are empty lines and a comment.
+    Lexer produces `IFTK`, `LPARENT`, `INTCON`, `RPARENT`, `SEMICN`.
+    
+    So `MyCondStmt` parses `if (1)`.
+    Then `Stmt` parses `;`.
+    
+    Everything seems to parse.
+    
+    Why "No output file"?
+    
+    Maybe `Compiler.java` throws an exception?
+    
+    Let's look at `Lexer.processLine` for `&` and `|`.
+    ```java
+    } else if (c == '&') {
+        c = line.charAt(content++);
+        if (c == '&') {
+            tokens.add(processWord("&&"));// AND
+        } else {
+            content--;
+            hasError = true;
+            // tokens.add(new UndefinedToken(TokenType.UNDEFINE, "&", lineNum, content));// &, error a
+            tokens.add(new Token(TokenType.AND, "&", lineNum, content));// &, error a
+            ErrorList.addError(MyErrorType.A_ILLEGAL_SYMBOL, lineNum);
+        }
+    }
+    ```
+    If `c == '&'` and next char is NOT '&', it adds an error.
+    
+    The input doesn't have `&` or `|`.
+    
+    Let's look at `CompUnit.parseDecls` again.
+    ```java
+    Token token1 = tokens.next();
+    Token token2 = tokens.next();
+    ```
+    If the file is empty? No.
+    
+    Is it possible `Writer.writeSyntaxTree` is not called?
+    Only if `GlobalVars.curLab` is not `PARSER`.
+    It is `PARSER`.
+    
+    Is it possible `compUnit.parse()` throws an exception?
+    
+    Let's look at `Block.parse()` loop condition.
+    ```java
+    Token token = tokens.next();
+    // until we reach the right brace
+    while (!token.getType().equals(TokenType.RBRACE)) {
+        tokens.stepBack(1);
+        BlockItem blockItem = new BlockItem(tokens);
+        blockItem.parse();
+        blockItems.add(blockItem);
+        children.add(blockItem);
+        token = tokens.next();
+    }
+    ```
+    If `tokens.next()` throws `NoSuchElementException` because `RBRACE` is never found?
+    The input has `}` at the end.
+    
+    However, if an error occurs such that the parser gets out of sync and consumes `}` incorrectly?
+    
+    Actually, look at `ErrorHandler.handleIError` again.
+    ```java
+    tokens.stepBack(2);
+    token = tokens.next();
+    ```
+    If `stepBack(2)` goes before the beginning of the list?
+    `TokenIterator.stepBack`:
+    ```java
+    public boolean stepBack(int steps) {
+        int cnt = steps;
+        while (cnt > 0) {
+            cnt--;
+            if (this.iterator.hasPrevious()) {
+                lastToken = iterator.previous();
+            } else {
+                break;
+            }
+        }
+        return true;
+    }
+    ```
+    It stops if `hasPrevious()` is false.
+    Then `token = tokens.next()`.
+    If `stepBack` didn't go back enough, `next()` might return the same token or the next one.
+    
+    If `stepBack` hits the beginning, `lastToken` is the first token.
+    `next()` returns the second token?
+    
+    If `handleIError` is called at the very beginning of the file? Unlikely.
+    
+    There is a subtle bug in `CompUnit.parseDecls`.
+    ```java
+    Token token1 = tokens.next();
+    Token token2 = tokens.next();
+    while (tokens.hasNext()) {
+        Token token3 = tokens.next();
+        if (token3.getType().equals(TokenType.LPARENT)) {
+            tokens.stepBack(3);
+            break;
+        }
+        tokens.stepBack(1);
+        if (token1.getType().equals(TokenType.CONSTTK)
+                || token1.getType().equals(TokenType.INTTK) && token2.getType().equals(TokenType.IDENFR)
+                || token1.getType().equals(TokenType.CHARTK) && token2.getType().equals(TokenType.IDENFR)) {
+            tokens.stepBack(2);
+            // ...
+        } else {
+            tokens.stepBack(2);
+            break;
+        }
+    }
+    ```
+    If `tokens.hasNext()` is false inside the loop?
+    `Token token3 = tokens.next()` will throw `NoSuchElementException`.
+    
+    When does `tokens.hasNext()` become false?
+    If the file has no `(` after the first two tokens?
+    Input: `int main() ...`
+    `token1` = `int`. `token2` = `main`.
+    `hasNext()` is true.
+    `token3` = `(`.
+    `token3` is `LPARENT`. `stepBack(3)`. Break.
+    
+    So `parseDecls` is safe for this input.
+    
+    What about `parseFuncDefs`?
+    ```java

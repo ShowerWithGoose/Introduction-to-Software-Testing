@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 2.8)
+project(Compiler)
+set(CMAKE_CXXSTANDARD 11)
+include_directories(head)
+add_executable(Compiler src/main.cpp src/lexer.cpp src/ERROR.cpp)

@@ -1,0 +1,809 @@
+Based on the problem description and the test case, the program is failing to correctly identify syntax errors (specifically missing right parentheses `)`) in the source code. The expected output indicates three errors of type `j` (missing `)`) at lines 13, 15, and 20.
+
+Let's analyze the input code around these lines:
+Line 13: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7); // error 1`
+Here, there is an opening `(` before `1`, but no matching closing `)` before the `;`. The parser should detect this missing `)`.
+
+Line 15: `if (3 > 0 { // error 2`
+Here, the `if` condition `(3 > 0` is missing the closing `)` before the block `{`.
+
+Line 20: `i = (((((f(str))))); // error 3`
+Wait, looking closely at line 20: `i = (((((f(str)))));`
+Counting parentheses:
+`i = `
+`(` 1
+`(` 2
+`(` 3
+`(` 4
+`(` 5
+`f(str)` -> `f` `(` `str` `)`
+So inside we have `f(str)`.
+Then `))))` closes 4 parentheses.
+Total opened: 5. Total closed: 4 (from explicit `)`) + 1 (from `f(str)` call)? No, `f(str)` consumes one `(` and one `)`.
+The expression is `(((( (f(str)) )))`.
+Let's trace:
+`(`
+`(`
+`(`
+`(`
+`(`
+`f`
+`(`
+`str`
+`)` -> closes `f`'s paren.
+`)` -> closes 4th `(`
+`)` -> closes 3rd `(`
+`)` -> closes 2nd `(`
+`)` -> closes 1st `(`
+`;`
+This line actually seems balanced if `f(str)` is a function call.
+However, the expected output says line 20 has error `j`.
+Let's re-read the input carefully:
+`i = (((((f(str)))));`
+If `f(str)` is parsed as a function call `UnaryExp`, it consumes `(` and `)`.
+Then we have 5 opening `(` before `f`.
+And 4 closing `)` after `str)`.
+So one `)` is missing.
+
+The issue lies in how the parser handles errors. When a syntax error occurs (like a missing token), the parser currently just records the error but often fails to synchronize or stop parsing the current construct correctly, potentially leading to cascading errors or missed errors.
+
+Specifically, look at `PrimaryExp`:
+```java
+    private static AstNode PrimaryExp() {
+        AstNode node = new AstNode(AstType.PrimaryExp, now.line);
+        if (now.type == singleType('(')) {
+            pushToken(node, now); // (
+            node.add(Exp());
+            pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+        } ...
+    }
+```
+When `pushToken` encounters a mismatch (expected `)` but found something else), it adds the error but **does not consume any token**. The `index` remains pointing to the incorrect token. In recursive descent parsers, if you don't consume or skip tokens after an error, the parser might get stuck or misinterpret subsequent tokens.
+
+However, the more critical issue in "missing parenthesis" detection for complex expressions often relates to how the parser recovers. If `PrimaryExp` expects `)` and doesn't find it, it reports error `j`. But if the calling function (like `MulExp` or `AddExp`) continues to parse, it might consume tokens that were intended to be part of the outer structure, masking further errors or causing incorrect line numbers.
+
+Let's look at `Stmt` parsing for Line 13:
+`int i = (1 + ... + 7);`
+This is a `VarDef` with `InitVal`.
+`InitVal` calls `Exp`.
+`Exp` calls `AddExp`.
+`AddExp` eventually calls `PrimaryExp`.
+Inside `PrimaryExp`, it sees `(`, consumes it, parses `Exp`, then expects `)`.
+The `Exp` inside will parse `1 + 2 * ...`.
+When the inner `Exp` finishes, `now` should be at `;` (because the closing `)` is missing).
+`PrimaryExp` checks `now` against `)`. It is `;`. So it reports error `j` at `node.lstLine`.
+`node.lstLine` for `PrimaryExp` was set to `now.line` when `PrimaryExp` started. At that point, `now` was `(`. The line number of `(` is 13.
+So Error `13 j` should be generated.
+
+Why is it not appearing or why is the output wrong?
+The buggy output is empty. This suggests `ErrHandler.hasErr()` might be false, or errors are not being printed, or the parser crashes/exits early.
+Wait, looking at `Compiler.java`:
+```java
+        ArrayList<Token> tokens = Lexer.lex(IO.read(Config.inputFile));
+        if (Config.taskType == Config.TaskType.LEXER && !ErrHandler.hasErr()) {
+            IO.printTokens(tokens);
+        }
+        IO.printTokens(tokens); // This always prints tokens to lexer.txt
+        AstNode root = Parser.parse(tokens);
+        if (Config.taskType == Config.TaskType.PARSER && !ErrHandler.hasErr()) {
+            IO.printAst(root);
+        }
+        
+        if (ErrHandler.hasErr()) {
+            ErrHandler.printErrs();
+        }
+```
+If `Config.taskType` is `PARSER`, it parses. If errors occur, `ErrHandler.printErrs()` is called.
+
+Let's look at `Parser.java` again.
+In `PrimaryExp`, if `)` is missing:
+```java
+            pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+```
+`pushToken` implementation:
+```java
+    private static void pushToken(AstNode node, Token token, TokenType type, ErrInfo errInfo) {
+        if (token.type == type) {
+            pushToken(node, token);
+        } else {
+            ErrHandler.addError(errInfo);
+        }
+    }
+```
+It adds the error. It does NOT advance `index`.
+So `now` is still `;`.
+The `PrimaryExp` returns.
+The `Exp` returns.
+The `InitVal` returns.
+The `VarDef` returns.
+The `VarDecl` expects `;`.
+`pushToken(node, now, singleType(';'), new ErrInfo(ErrType.i, node.lstLine));`
+Now `now` is `;`. So it matches! It consumes `;`.
+So for Line 13, we get Error `13 j`.
+
+Now Line 15: `if (3 > 0 {`
+`Stmt` sees `IFTK`.
+Consumes `if`.
+Consumes `(`.
+Calls `Cond()`.
+`Cond` -> `LOrExp` -> ... -> `PrimaryExp`.
+`PrimaryExp` sees `3` (INTCON). Goes to `Number`. Returns.
+Back in `RelExp`/`Cond`: `now` is `>`. Consumes `>`.
+Next `AddExp`: `PrimaryExp` sees `0`. Returns.
+Back in `Cond`: `now` is `{`.
+`Cond` returns.
+Back in `Stmt`:
+```java
+            pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+```
+`now` is `{`. Expected `)`. Mismatch.
+Adds Error `j`. `node.lstLine` for `Stmt` was set when `Stmt` started. `Stmt` starts at `if`. Line 15.
+So Error `15 j` is added.
+`now` is still `{`.
+Next: `node.add(Stmt());` (the body of the if).
+`Stmt` sees `{`.
+It goes to `else if (now.type == singleType('{')) { node.add(Block()); }`.
+`Block` consumes `{`.
+Parses items.
+Sees `}`. Consumes `}`.
+Returns.
+So Line 15 error `j` is generated.
+
+Now Line 20: `i = (((((f(str)))));`
+This is an assignment statement.
+`Stmt` sees `IDENFR`. `peek(1)` is `=`.
+Goes into `LVal = Exp ;` branch.
+`LVal()` consumes `i`.
+`pushToken` consumes `=`.
+`Exp()` is called.
+`Exp` -> `AddExp` -> ... -> `PrimaryExp`.
+`PrimaryExp` sees `(`.
+Enters `if (now.type == singleType('('))`.
+Consumes `(`. (Depth 1)
+Calls `Exp()`.
+Inside this `Exp`:
+`PrimaryExp` sees `(`.
+Consumes `(`. (Depth 2)
+Calls `Exp()`.
+...
+This continues recursively.
+Let's trace the parentheses count.
+Input: `(((( (f(str)) ))) ;`
+1. `PrimaryExp` (outermost) sees `(`. Consumes. Calls `Exp`.
+2. `PrimaryExp` (inside) sees `(`. Consumes. Calls `Exp`.
+3. `PrimaryExp` sees `(`. Consumes. Calls `Exp`.
+4. `PrimaryExp` sees `(`. Consumes. Calls `Exp`.
+5. `PrimaryExp` sees `(`. Consumes. Calls `Exp`.
+6. `PrimaryExp` sees `f`. `peek(1)` is `(`.
+   Goes to `else if (peek(1).type == singleType('('))` in `UnaryExp`?
+   Wait, `PrimaryExp` handles `LVal` if `IDENFR`.
+   `PrimaryExp`:
+   ```java
+        } else if (now.type == TokenType.IDENFR) {
+            node.add(LVal());
+        }
+   ```
+   `LVal()` consumes `f`.
+   Does `LVal` check for `(`? No. `LVal` is `Ident ['[' Exp ']']`.
+   So `LVal` returns.
+   `PrimaryExp` returns.
+   Back in `UnaryExp`? No, `PrimaryExp` is called from `UnaryExp`.
+   
+   Let's look at `UnaryExp`:
+   ```java
+    private static AstNode UnaryExp() {
+        AstNode node = new AstNode(AstType.UnaryExp, now.line);
+        if (now.type == singleType('+') || ...) {
+           ...
+        } else if (peek(1).type == singleType('(')) {
+            pushToken(node, now); // Ident
+            pushToken(node, now); // (
+            if (expFirst()) { 
+                node.add(FuncRParams());
+            }
+            pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+        } else {
+            node.add(PrimaryExp());
+        }
+        return node;
+    }
+   ```
+   
+   Trace for `f(str)`:
+   `UnaryExp` is called.
+   `now` is `f`. `peek(1)` is `(`.
+   Enters `else if (peek(1).type == singleType('('))`.
+   `pushToken(node, now)` consumes `f`.
+   `pushToken(node, now)` consumes `(`.
+   `expFirst()` checks if next token starts an exp. `str` is IDENFR. Yes.
+   `FuncRParams()` is called.
+   `FuncRParams` calls `Exp()`.
+   `Exp` -> ... -> `PrimaryExp` -> `LVal` -> consumes `str`.
+   `FuncRParams` returns.
+   `pushToken(node, now, singleType(')') ...)` checks `now`.
+   `now` is `)`. Matches. Consumes `)`.
+   `UnaryExp` returns.
+   
+   So `f(str)` is parsed correctly as a `UnaryExp` (function call).
+   
+   Now back to the nested `PrimaryExp`s.
+   We were at Depth 5 `PrimaryExp`.
+   It called `Exp()`.
+   `Exp()` called `AddExp()`.
+   `AddExp()` called `MulExp()`.
+   `MulExp()` called `UnaryExp()`.
+   `UnaryExp()` saw `f` and parsed `f(str)`.
+   `UnaryExp` returns.
+   `MulExp` returns.
+   `AddExp` returns.
+   `Exp` returns.
+   Back to Depth 5 `PrimaryExp`.
+   It expects `)`.
+   `pushToken(node, now, singleType(')') ...)`
+   What is `now`?
+   After `f(str)` was parsed, the token stream was: `)` `)` `)` `)` `;`
+   The `)` corresponding to `f(` was consumed by `UnaryExp`.
+   So `now` is the first `)` of the remaining four `))))`.
+   So Depth 5 `PrimaryExp` sees `)`. Matches. Consumes it.
+   
+   Back to Depth 4 `PrimaryExp`.
+   It expects `)`.
+   `now` is the second `)`. Matches. Consumes it.
+   
+   Back to Depth 3 `PrimaryExp`.
+   It expects `)`.
+   `now` is the third `)`. Matches. Consumes it.
+   
+   Back to Depth 2 `PrimaryExp`.
+   It expects `)`.
+   `now` is the fourth `)`. Matches. Consumes it.
+   
+   Back to Depth 1 `PrimaryExp`.
+   It expects `)`.
+   `now` is `;`.
+   Mismatch!
+   Adds Error `j`.
+   Line number? `node.lstLine` for Depth 1 `PrimaryExp`.
+   Depth 1 `PrimaryExp` started when `now` was the first `(` of the sequence `(((((`.
+   That `(` is on Line 20.
+   So Error `20 j` is added.
+   
+   Then `PrimaryExp` returns.
+   `Exp` returns.
+   `Stmt` expects `;`.
+   `pushToken(node, now, singleType(';') ...)`
+   `now` is `;`. Matches. Consumes it.
+   
+   So theoretically, the parser SHOULD generate:
+   13 j
+   15 j
+   20 j
+   
+   Why is the output empty or wrong?
+   
+   Let's check `Compiler.java` again.
+   ```java
+        IO.printTokens(tokens);
+        AstNode root = Parser.parse(tokens);
+        if (Config.taskType == Config.TaskType.PARSER && !ErrHandler.hasErr()) {
+            IO.printAst(root);
+        }
+        
+        if (ErrHandler.hasErr()) {
+            ErrHandler.printErrs();
+        }
+   ```
+   
+   Is it possible that `Parser.parse` throws an exception?
+   Or `ErrHandler` is not working?
+   
+   Let's look at `ErrHandler`.
+   ```java
+    private static boolean isOpen = true;
+    public static void close() { isOpen = false; }
+    public static void open() { isOpen = true; }
+    public static void addError(ErrInfo error) {
+        if (isOpen) {
+            errors.add(error);
+        }
+    }
+   ```
+   
+   In `Parser.java`, `Stmt` has this block:
+   ```java
+        } else if (now.type == TokenType.IDENFR && peek(1).type != singleType('(')) {
+            int lstIndex = index;
+            ErrHandler.close();
+            LVal(); // parse a LVal
+            ErrHandler.open();
+            Token nextToken = now;
+            index = lstIndex;
+            now = tokens.get(index);
+            if (nextToken.type == singleType('=')) {
+                // it is actually LVal, aad it into node
+                node.add(LVal()); // rerun to make ErrHandler work
+                ...
+   ```
+   
+   This logic is used to distinguish between `LVal = ...` (Assignment) and `Exp;` (Expression Statement starting with LVal).
+   It temporarily closes error reporting, tries to parse `LVal`, then restores state.
+   
+   However, look at Line 13: `int i = ...`
+   This is a `VarDecl`, not a `Stmt`.
+   `VarDecl` -> `VarDef` -> `InitVal` -> `Exp`.
+   So the `Stmt` lookahead logic is NOT involved in Line 13.
+   
+   Line 15: `if (...)`
+   `Stmt` handles `if`. No lookahead logic involved.
+   
+   Line 20: `i = ...`
+   This IS a `Stmt`.
+   `now` is `i` (IDENFR). `peek(1)` is `=` (ASSIGN).
+   `peek(1).type != singleType('(')` is true (`=` != `(`).
+   So it enters the block.
+   1. `lstIndex = index`.
+   2. `ErrHandler.close()`.
+   3. `LVal()`. Parses `i`. `now` becomes `=`.
+   4. `ErrHandler.open()`.
+   5. `nextToken = now` (`=`).
+   6. `index = lstIndex`. `now` resets to `i`.
+   7. `if (nextToken.type == singleType('='))` -> True.
+   8. `node.add(LVal())`. Parses `i` again. `now` becomes `=`.
+   9. `pushToken(node, now)` consumes `=`. `now` becomes `(`.
+   10. `node.add(Exp())`.
+   
+   Inside `Exp()`, we have the nested parentheses analysis we did earlier.
+   The error `20 j` is detected inside `Exp()` -> `PrimaryExp()`.
+   At that point, `ErrHandler` is OPEN (it was reopened in step 4).
+   So the error SHOULD be recorded.
+   
+   So why is the output wrong?
+   
+   Let's look at `IO.printErrs`? No, `ErrHandler.printErrs()`.
+   ```java
+    public static void printErrs() {
+        errors.sort(null);
+        IO.setOut(Config.errorFile);
+        for (ErrInfo err : errors) {
+            IO.writeln(err.toString());
+        }
+    }
+   ```
+   
+   Is it possible that `errors` list is empty?
+   
+   Let's check `Compiler.java` again.
+   ```java
+        ArrayList<Token> tokens = Lexer.lex(IO.read(Config.inputFile));
+        if (Config.taskType == Config.TaskType.LEXER && !ErrHandler.hasErr()) {
+            IO.printTokens(tokens);
+        }
+        IO.printTokens(tokens);
+   ```
+   Wait. `IO.printTokens(tokens)` sets the output file to `lexerOutputFile`.
+   ```java
+    public static void printTokens(ArrayList<Token> tokens) {
+        setOut(Config.lexerOutputFile);
+        for(Token token : tokens) {
+            writeln(token.toString());
+        }
+    }
+   ```
+   
+   Then `Parser.parse(tokens)` is called.
+   Then `ErrHandler.printErrs()` is called.
+   ```java
+    public static void printErrs() {
+        errors.sort(null);
+        IO.setOut(Config.errorFile); // Sets output to error.txt
+        for (ErrInfo err : errors) {
+            IO.writeln(err.toString());
+        }
+    }
+   ```
+   
+   This looks correct.
+   
+   Is there an issue with `Config.taskType`?
+   If `taskType` is `LEXER`, it prints tokens.
+   If `taskType` is `PARSER`, it parses.
+   
+   Maybe the issue is in `Lexer`?
+   The input has `// error 1`.
+   Lexer handles `//` comments.
+   
+   Let's look at the `Buggy Output` provided in the prompt. It is empty.
+   This implies `ErrHandler.hasErr()` returned `false`.
+   
+   Why would `ErrHandler` be empty?
+   
+   Check `ErrHandler.close()` usage again.
+   In `Stmt`, `ErrHandler.close()` is called.
+   If an error occurs during the speculative `LVal()` parse, it is ignored.
+   Then `ErrHandler.open()` is called.
+   Then `LVal()` is called AGAIN.
+   
+   In the second `LVal()` call (step 8 above), does it generate errors?
+   `LVal` is simple: `Ident ['[' Exp ']']`.
+   For `i`, it just consumes `i`. No errors.
+   
+   Then `Exp()` is called.
+   Errors in `Exp()` SHOULD be recorded because `isOpen` is true.
+   
+   Is it possible that `Parser.parse` throws an exception before finishing?
+   If `index` goes out of bounds?
+   `next()` handles EOF by creating an EOF token.
+   
+   Let's look at `PrimaryExp` again.
+   ```java
+    private static AstNode PrimaryExp() {
+        AstNode node = new AstNode(AstType.PrimaryExp, now.line);
+        if (now.type == singleType('(')) {
+            pushToken(node, now); // (
+            node.add(Exp());
+            pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+        } ...
+    }
+   ```
+   
+   If `now` is `EOF`?
+   `singleType(')')` is `RPARENT`.
+   `EOF` != `RPARENT`.
+   Error `j` is added.
+   
+   There is one subtle bug in `Parser.java` regarding `CompUnit`.
+   ```java
+    private static AstNode CompUnit() {
+        AstNode node = new AstNode(AstType.CompUnit, now.line);
+        while (now.type == TokenType.CONSTTK ||
+                (peek(1).type == TokenType.IDENFR && peek(2).type != singleType('('))) {
+            node.add(Decl());
+        }
+        while (peek(1).type == TokenType.IDENFR) {
+            node.add(FuncDef());
+        }
+        node.add(MainFuncDef());
+        return node;
+    }
+   ```
+   
+   The condition for `Decl` is:
+   `now.type == CONSTTK` OR (`peek(1)` is IDENFR AND `peek(2)` is NOT `(`).
+   
+   For `int f(char str[]) { ... }`:
+   `now` is `int`. `peek(1)` is `f` (IDENFR). `peek(2)` is `(`.
+   So `peek(2).type != singleType('(')` is FALSE.
+   So it does NOT enter the `Decl` loop.
+   
+   Next loop: `while (peek(1).type == TokenType.IDENFR)`.
+   `peek(1)` is `f` (IDENFR). True.
+   `node.add(FuncDef())`.
+   
+   `FuncDef`:
+   ```java
+    private static AstNode FuncDef() {
+        AstNode node = new AstNode(AstType.FuncDef, now.line);
+        node.add(FuncType()); // consumes int
+        pushToken(node, now); // Ident (f)
+        pushToken(node, now); // (
+        if (now.type == TokenType.INTTK || now.type == TokenType.CHARTK) {
+            node.add(FuncFParams());
+        }
+        pushToken(node, now, singleType(')'), new ErrInfo(ErrType.j, node.lstLine));
+        node.add(Block());
+        return node;
+    }
+   ```
+   
+   This looks correct for valid functions.
+   
+   Let's look at the `MainFuncDef` parsing.
+   After `FuncDef` loops finish, `MainFuncDef()` is called.
+   
+   If there are NO errors, `ErrHandler.hasErr()` is false.
+   
+   Why would errors NOT be detected?
+   
+   Ah! Look at `Compiler.java` again.
+   
+   ```java
+        ArrayList<Token> tokens = Lexer.lex(IO.read(Config.inputFile));
+        if (Config.taskType == Config.TaskType.LEXER && !ErrHandler.hasErr()) {
+            IO.printTokens(tokens);
+        }
+        IO.printTokens(tokens);
+        AstNode root = Parser.parse(tokens);
+        if (Config.taskType == Config.TaskType.PARSER && !ErrHandler.hasErr()) {
+            IO.printAst(root);
+        }
+        
+        if (ErrHandler.hasErr()) {
+            ErrHandler.printErrs();
+        }
+   ```
+   
+   Wait. `IO.printTokens(tokens)` is called UNCONDITIONALLY after the first `if`.
+   This writes to `lexer.txt`.
+   
+   Then `Parser.parse(tokens)` is called.
+   
+   If `Config.taskType` is `PARSER`:
+   The `if` block `if (Config.taskType == Config.TaskType.PARSER && !ErrHandler.hasErr())` checks `!ErrHandler.hasErr()`.
+   If there ARE errors, it skips `IO.printAst(root)`.
+   
+   Then `if (ErrHandler.hasErr())` prints errors.
+   
+   This logic seems fine.
+   
+   Is it possible that `Lexer` is generating errors that cause `ErrHandler` to behave differently?
+   No, `Lexer` only generates error `a` for single `&` or `|`.
+   
+   Let's look at `ErrHandler` initialization.
+   `private static ArrayList<ErrInfo> errors = new ArrayList<ErrInfo>();`
+   
+   Is it possible that `errors` is not static? It is static.
+   
+   Let's look at `Parser.java` `parse` method.
+   ```java
+    public static AstNode parse(ArrayList<Token> tokens) {
+        Parser.tokens = tokens;
+        Parser.index = 0;
+        now = tokens.get(0);
+        return CompUnit();
+    }
+   ```
+   
+   If `tokens` is empty? `tokens.get(0)` throws exception.
+   But input is not empty.
+   
+   Let's look at the `Buggy Output` again. It is completely empty.
+   
+   If the program crashed, there would be a stack trace.
+   If the program ran successfully but produced no output in `error.txt`, then `ErrHandler.hasErr()` returned `false`.
+   
+   This means `errors` list is empty.
+   
+   Why would `errors` be empty if errors occurred?
+   
+   1. `isOpen` was false when errors occurred.
+   2. Errors were not triggered.
+   
+   Let's re-evaluate `isOpen`.
+   `isOpen` starts as `true`.
+   
+   In `Stmt`, for Line 20 (`i = ...`):
+   `ErrHandler.close()` is called.
+   `LVal()` is called.
+   `ErrHandler.open()` is called.
+   `LVal()` is called again.
+   `Exp()` is called.
+   
+   Inside `Exp()`, `PrimaryExp()` is called.
+   If `PrimaryExp` detects an error, `isOpen` is `true`.
+   
+   Is it possible that `Stmt` is NOT entered for Line 20?
+   Line 20 is inside `main` block.
+   `BlockItem` -> `Stmt`.
+   
+   Wait. Look at `BlockItem`.
+   ```java
+    private static AstNode BlockItem() {
+        AstNode node = new AstNode(AstType.BlockItem, now.line);
+        if (now.type == TokenType.INTTK || now.type == TokenType.CHARTK || now.type == TokenType.CONSTTK) {
+            node.add(Decl());
+        } else {
+            node.add(Stmt());
+        }
+        return node;
+    }
+   ```
+   
+   Line 20 starts with `i` (IDENFR).
+   So `Stmt()` is called.
+   
+   Is it possible that the parser fails to parse `MainFuncDef` correctly, so it never reaches Line 20?
+   
+   Input:
+   ```c
+   int f(char str[]) {
+       return 0;
+   }
+   
+   int g(int i, int arr[]) {
+       return 1;
+   }
+   
+   int main() {
+       char str[3];
+       int arr[3];
+   
+       int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7); // error 1
+   
+       if (3 > 0 { // error 2
+           g((((f(str)))), arr); 
+       }
+       
+       
+       i = (((((f(str))))); // error 3
+       
+       g(i + 1, arr);
+   
+       return 0;
+   }
+   ```
+   
+   `CompUnit`:
+   1. `Decl` loop: `int f...` is not a decl (peek(2) is `(`).
+   2. `FuncDef` loop:
+      - Parses `f`.
+      - Parses `g`.
+      - Next is `int main`. `peek(1)` is `main` (IDENFR).
+      - Parses `main` as `FuncDef`?
+      
+      `FuncDef` expects `FuncType Ident '(' ... ')' Block`.
+      `MainFuncDef` expects `int main '(' ')' Block`.
+      
+      In `CompUnit`:
+      ```java
+        while (peek(1).type == TokenType.IDENFR) {
+            node.add(FuncDef());
+        }
+        node.add(MainFuncDef());
+      ```
+      
+      When `now` is `int` (of `main`), `peek(1)` is `main` (IDENFR).
+      So it enters the loop and calls `FuncDef()`.
+      
+      `FuncDef()`:
+      - `FuncType()` consumes `int`.
+      - `pushToken` consumes `main`.
+      - `pushToken` consumes `(`.
+      - `now` is `)`. `INTTK`/`CHARTK` check fails.
+      - `pushToken` expects `)`. Matches.
+      - `Block()` consumes `{ ... }`.
+      
+      So `main` is parsed as a `FuncDef`!
+      
+      Then `CompUnit` calls `MainFuncDef()`.
+      `now` is likely `EOF` or next token.
+      `MainFuncDef` expects `int`.
+      If `now` is `EOF`, `pushToken` fails.
+      
+      But wait. If `main` is consumed by `FuncDef`, then `MainFuncDef` will fail to parse.
+      This is a logical error in the parser's `CompUnit`.
+      `MainFuncDef` is a specific structure. `FuncDef` is general.
+      Usually, `MainFuncDef` should be parsed separately or `FuncDef` should exclude `main`.
+      
+      However, the grammar says:
+      `CompUnit → {Decl} {FuncDef} MainFuncDef`
+      
+      The parser implements:
+      ```java
+        while (peek(1).type == TokenType.IDENFR) {
+            node.add(FuncDef());
+        }
+        node.add(MainFuncDef());
+      ```
+      
+      If `main` is parsed as `FuncDef`, then `MainFuncDef` will try to parse whatever is left.
+      If there's nothing left, it might crash or report errors.
+      
+      BUT, the test case expects errors INSIDE `main`.
+      If `main` is consumed by `FuncDef`, the body of `main` is parsed as part of `FuncDef`'s `Block`.
+      So the statements inside `main` ARE parsed.
+      
+      So the errors inside `main` SHOULD be detected.
+      
+      Why are they not?
+      
+      Let's look at `ErrHandler` again.
+      
+      Is it possible that `Config.taskType` is not `PARSER`?
+      If `taskType` is `LEXER`, `Parser.parse` is still called.
+      
+      Wait. Look at `Compiler.java` line 13:
+      `IO.printTokens(tokens);`
+      
+      If `taskType` is `PARSER`, this prints tokens to `lexer.txt`.
+      
+      Then `Parser.parse(tokens)` is called.
+      
+      Then `if (Config.taskType == Config.TaskType.PARSER && !ErrHandler.hasErr())`
+      
+      If errors exist, `IO.printAst` is skipped.
+      
+      Then `if (ErrHandler.hasErr())` prints errors.
+      
+      This seems correct.
+      
+      Let's look at `ErrInfo.toString()`.
+      `return String.format("%d %s", line, type);`
+      
+      `type` is `ErrType.j`.
+      `ErrType` enum: `a, b, ... j`.
+      `toString()` of enum returns the name.
+      So `13 j`.
+      
+      This matches expected output.
+      
+      So the logic is correct. Why is the output empty?
+      
+      One possibility: `ErrHandler.errors` is cleared somewhere? No.
+      
+      Another possibility: The parser is NOT reaching the code with errors.
+      
+      If `main` is parsed as `FuncDef`, does it parse the block correctly?
+      Yes.
+      
+      Let's look at `Stmt` for Line 13 again.
+      `int i = ...`
+      This is inside `Block`.
+      `BlockItem` checks `now.type`.
+      `now` is `int`.
+      So `node.add(Decl())` is called.
+      
+      `Decl()` -> `VarDecl()`.
+      `VarDecl()` -> `BType()` (consumes `int`).
+      `VarDef()`.
+      `VarDef()` -> `pushToken` (consumes `i`).
+      `now` is `=`.
+      `pushToken` (consumes `=`).
+      `InitVal()`.
+      `InitVal()` -> `Exp()`.
+      
+      `Exp()` -> `AddExp()` -> ... -> `PrimaryExp()`.
+      
+      `PrimaryExp()` sees `(`.
+      Consumes `(`.
+      Calls `Exp()`.
+      
+      Inside this `Exp()`:
+      `1 + 2 * ...`
+      
+      Eventually, the inner `Exp` finishes.
+      `now` is `;` (because `)` is missing).
+      
+      `PrimaryExp` expects `)`.
+      `now` is `;`.
+      Mismatch.
+      `ErrHandler.addError(new ErrInfo(ErrType.j, node.lstLine));`
+      
+      `node.lstLine` is the line of `PrimaryExp` start.
+      `PrimaryExp` started at `(`.
+      Line 13.
+      
+      So Error `13 j` is added.
+      
+      THEN `PrimaryExp` returns.
+      `InitVal` returns.
+      `VarDef` returns.
+      `VarDecl` expects `;`.
+      `pushToken(node, now, singleType(';'), ...)`
+      `now` is `;`.
+      Matches. Consumes `;`.
+      
+      So `VarDecl` completes.
+      
+      So Error `13 j` IS added.
+      
+      Why is `ErrHandler.hasErr()` false?
+      
+      Is it possible that `ErrHandler` is a different instance?
+      No, it's static.
+      
+      Is it possible that `Compiler.java` is not the entry point?
+      No, `public static void main`.
+      
+      Is it possible that `Config.taskType` is `LEXER`?
+      If `taskType` is `LEXER`:
+      1. `Lexer.lex` runs.
+      2. `if (LEXER && !hasErr)` prints tokens.
+      3. `IO.printTokens(tokens)` prints tokens.
+      4. `Parser.parse(tokens)` runs. (Errors are added).
+      5. `if (LEXER && !hasErr)` -> False (because hasErr is true? No, condition is `!hasErr`).
+         Wait. `if (Config.taskType == Config.TaskType.PARSER ...)`
+         If `taskType` is `LEXER`, this block is skipped.
+      6. `if (ErrHandler.hasErr())` -> True.
+      7. `ErrHandler.printErrs()` -> Prints errors.
+      
+      So

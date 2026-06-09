@@ -1,0 +1,91 @@
+Based on the problem description and the test case analysis:
+
+1.  **Test Case Analysis**:
+    *   Line 16: `ch = getchar( ;` -> Missing right parenthesis `)`. Expected error `16 j`.
+    *   Line 18: `if (f2() & f1())` -> Illegal use of single `&`. Expected error `18 a`.
+    *   Line 19: `printf("%c",s[0];` -> Missing right parenthesis `)`. Expected error `19 j`.
+    *   **Expected Output Order**: `16 j`, `18 a`, `19 j` (sorted by line number).
+    *   **Buggy Output Order**: `18 a`, `16 j`, `19 j`.
+
+2.  **Error Identification**:
+    *   The buggy output shows that the error on line 18 (`a`) is detected and recorded *before* the error on line 16 (`j`).
+    *   This implies that during the parsing of the `if` statement starting on line 18, the parser encounters the `&` token, reports error `a`, but then **fails to synchronize** or stop parsing the condition properly. Instead, it likely continues parsing into the body of the `if` statement or subsequent tokens, eventually encountering the missing `)` from line 16 (which might be logically associated with the `getchar` call if the parser backtracked or got confused, but more likely, the `Cond` parsing consumed tokens incorrectly or the error reporting for `j` on line 16 was delayed/triggered later).
+    *   However, looking closely at the structure: `ch = getchar( ;` is on line 16. The `if` is on line 18.
+    *   If the parser processes statements sequentially in `BlockProcess`:
+        1.  It parses `ch = getchar( ;`. Inside `StmtProcess`, it handles `LVal = ...`. It sees `getchar`, then `(`. It expects `)`. It finds `;`. It should report `j` (Missing Rparent) here. The line number should be 16.
+        2.  Then it parses `if (...)`. Inside `CondProcess`, it parses `LOrExp`. `LOrExp` calls `LAndExp`. `LAndExp` calls `EqExp`... down to `PrimaryExp`/`UnaryExp`.
+        3.  When parsing `f2() & f1()`, `LAndExp` expects `&&`. It finds `&`. The lexer likely tokenized `&` as an illegal sign or just `&` if not handled. The code has `errorACheck` in Lexer. If Lexer produces an error token for `&`, does Parser see it?
+        4.  Let's look at `Lexer.checkSign`. If it sees `&`, it checks `signMap`. `&` is not in `signMap` (only `&&` is). It goes to `errorACheck`. It creates an `ErrorToken` with type `IllegalSign` ("a"). It adds it to `Lexer.errorTokens`. It then creates a `currentToken`. What is `currentToken`?
+            ```java
+            if(errorACheck(p)){
+                Compiler.errorExists = true;
+                currentErrorToken = new ErrorToken(ErrorToken.ErrorTokenType.IllegalSign,String.valueOf(p),lineno);
+                errorTokens.add(currentErrorToken);
+                if(p == '&')s = "&&"; // It forces the string to "&&"??
+                else if(p == '|')s = "||";
+            }
+            currentToken = new Token(Token.TokenType.fromValue(signMap.get(s)),s,lineno);
+            ```
+            If `p` is `&`, `s` becomes `"&&"`. `signMap.get("&&")` returns `AND`. So the Parser sees an `AND` token!
+            
+    *   **Crucial Logic Error in Lexer**:
+        In `Lexer.checkSign`, when a single `&` or `|` is encountered:
+        1.  It records the error `a`.
+        2.  It sets `s = "&&"` (or `"||"`).
+        3.  It creates a `Token` with type `AND` (or `OR`).
+        
+        This means the Parser receives a valid `AND` token instead of an error token or stopping. The Parser's `LAndExpProcess` looks for `Token.TokenType.And`. Since the Lexer converted `&` to `AND`, the Parser successfully parses `f2() & f1()` as a logical AND expression (`LAndExp`). It does **not** report a syntax error in the Parser for the `&`. The error `a` was already reported by the Lexer.
+
+    *   So, why is the order wrong?
+        The Lexer reports errors immediately when `read()` is called and `checkSign` processes the character.
+        The Parser reports errors (like `j`) when it detects missing symbols.
+        
+        Let's trace the execution order:
+        1.  `Compiler.main` calls `Lexer.read()` until EOF. This populates `Lexer.tokens` and `Lexer.errorTokens`.
+        2.  During this lexical analysis phase:
+            *   Line 16 `;` is read. No error in Lexer.
+            *   Line 18 `&` is read. `checkSign` is called. Error `a` (line 18) is added to `Lexer.errorTokens`. Token `AND` is added to `Lexer.tokens`.
+        3.  After Lexing, `Parser p = new Parser()` is called.
+        4.  Parser starts parsing.
+        5.  It reaches Line 16 `ch = getchar( ;`.
+            *   `StmtProcess` handles `LVal = ...`.
+            *   It matches `getchar`.
+            *   It matches `(`.
+            *   It reads next token. It expects `)`. It finds `;` (SEMICN).
+            *   It calls `Error(ErrorToken.ErrorTokenType.LackOfRparent)`.
+            *   This adds error `j` (line 16) to `Lexer.errorTokens` (via `Parser.Error` which adds to `Lexer.errorTokens`).
+        6.  It continues to Line 18 `if (f2() AND f1())`.
+            *   `CondProcess` -> `LOrExpProcess` -> ... -> `LAndExpProcess`.
+            *   `LAndExpProcess` sees `AND` token. It consumes it. No error reported by Parser.
+        7.  It continues to Line 19 `printf(...`.
+            *   Eventually misses `)`. Reports `j` (line 19).
+
+    *   **Resulting Order in `Lexer.errorTokens`**:
+        1.  Error `a` (Line 18) - Added during Lexing.
+        2.  Error `j` (Line 16) - Added during Parsing of Stmt 1.
+        3.  Error `j` (Line 19) - Added during Parsing of Stmt 3.
+
+    *   The `Parser.output` method writes `Lexer.errorTokens` in the order they were added.
+        ```java
+        for (ErrorToken errorToken : Lexer.errorTokens) {
+             writer.write( ... );
+        }
+        ```
+        It does **not** sort them by line number. The problem requires: "output the line number and error category code to `error.txt`, **sorted by line number in ascending order**".
+
+    *   **Location of Error**: The `output` method in `Parser.java` (or potentially `Compiler.java` calling it) fails to sort the errors before writing. Alternatively, the collection itself should be sorted. Given the static nature, sorting in `output` is the standard fix.
+
+<Parser.java>
+...
+    static void output(boolean f, String filePath, String errorFilePath){
+        if(f){
+            try (BufferedWriter writer = new BufferedWriter(new FileWriter(errorFilePath))) {
+                for (ErrorToken errorToken : Lexer.errorTokens) {
+                    writer.write( errorToken.toString(errorToken.lineno)+ ' ' + errorToken.type.getValue());
+                    writer.newLine();
+                }
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+...

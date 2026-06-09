@@ -1,0 +1,166 @@
+#include<stdio.h>
+#include<string.h>
+char a[10000],b[10000];
+int c[100]={0};
+int num(char ch[])
+{
+	int x,y=0;
+	for(x=0;ch[x]!='\0';x++)
+	{
+		if(ch[x]>='0'&&ch[x]<='9')
+		y=10*y+ch[x]-'0';
+	}
+	return y;
+}
+int main()
+{
+	int i,j=0,t,ans,m,n,q,l,r,p,jian=0;
+	gets(a);
+	for(i=0;a[i]!='=';i++)
+	{
+		if(a[i]!=' ')
+		{
+			a[j++]=a[i];
+		}
+	}
+	a[j]='=';
+	a[j+1]='\0';
+	j=0;
+	for(i=0;a[i]!='=';i++)
+	{
+		if(a[i]=='*')
+		{
+			t=i;
+			for(t=t-1;a[t]>='0'&&a[t]<='9';t--);
+			l=t+1;
+            for(t=t+1;t<=i-1;t++)
+            {
+            b[j++]=a[t];
+            }
+            b[j]='\0';
+            j=0;
+            m=num(b);
+            for(t=i+1;a[t]>='0'&&a[t]<='9';t++)
+            {
+            	b[j++]=a[t];
+			}
+			r=t-1;
+			b[j]='\0';
+			j=0;
+			n=num(b);
+			q=m*n;
+			for(p=r;p>=l;p--)
+			{
+				if(q>0)
+				{
+				a[p]=q%10+'0';
+				q=q/10;
+			    }
+			    else
+			    a[p]='0';
+			}
+		}
+		else if(a[i]=='/')
+		{
+			t=i;
+			for(t=t-1;a[t]>='0'&&a[t]<='9';t--);
+			l=t+1;
+            for(t=t+1;t<=i-1;t++)
+            {
+            b[j++]=a[t];
+            }
+            b[j]='\0';
+            j=0;
+            m=num(b);
+            for(t=i+1;a[t]>='0'&&a[t]<='9';t++)
+            {
+            	b[j++]=a[t];
+			}
+			r=t-1;
+			b[j]='\0';
+			j=0;
+			n=num(b);
+			q=m/n;
+			for(p=r;p>=l;p--)
+			{
+				if(q>0)
+				{
+				a[p]=q%10+'0';
+				q=q/10;
+			    }
+			    else
+			    a[p]='0';
+			}
+		}
+	}
+	for(i=0;a[i]!='=';i++)
+	{
+		if(a[i]=='+')
+		{
+			t=i;
+			for(t=t-1;a[t]>='0'&&a[t]<='9';t--);
+			l=t+1;
+            for(t=t+1;t<=i-1;t++)
+            {
+            b[j++]=a[t];
+            }
+            b[j]='\0';
+            j=0;
+            m=num(b);
+            for(t=i+1;a[t]>='0'&&a[t]<='9';t++)
+            {
+            	b[j++]=a[t];
+			}
+			r=t-1;
+			b[j]='\0';
+			j=0;
+			n=num(b);
+			q=m+n;
+			for(p=r;p>=l;p--)
+			{
+				if(q>0)
+				{
+				a[p]=q%10+'0';
+				q=q/10;
+			    }
+			    else
+			    a[p]='0';
+			}
+		}
+		else if(a[i]=='-')
+		{
+			t=i;
+			for(t=t-1;a[t]>='0'&&a[t]<='9';t--);
+			l=t+1;
+            for(t=t+1;t<=i-1;t++)
+            {
+            b[j++]=a[t];
+            }
+            b[j]='\0';
+            j=0;
+            m=num(b);
+            for(t=i+1;a[t]>='0'&&a[t]<='9';t++)
+            {
+            	b[j++]=a[t];
+			}
+			r=t-1;
+			b[j]='\0';
+			j=0;
+			n=num(b);
+			q=m-n;
+			c[jian++]=q;
+			for(p=r;p>=l;p--)
+			{
+				a[p]='0';
+			}
+		}
+	}
+	ans=num(a);
+	for(i=0;c[i]!=0;i++)
+	{
+		ans=ans+c[i];
+	}
+	printf("%d",ans);
+} 
+
+

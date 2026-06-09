@@ -1,0 +1,60 @@
+#include <stdio.h>
+
+void expandString(char *str) {
+    char expanded[1000]; 
+    int j = 0; 
+    int i = 0;
+
+    while (str[i] != '\0') {
+        
+        char prev = str[i-1];
+
+        
+        char current = str[i];
+
+        
+        char next = str[i+1];
+
+        
+        if (current == '-' && 
+            ((prev >= 'a' && prev <= 'z' && next >= 'a' && next <= 'z') || 
+             (prev >= 'A' && prev <= 'Z' && next >= 'A' && next <= 'Z') || 
+             (prev >= '0' && prev <= '9' && next >= '0' && next <= '9')) && 
+             next > prev && 
+             ((prev >= 'a' && next <= 'z') || 
+              (prev >= 'A' && next <= 'Z') || 
+              (prev >= '0' && next <= '9'))) {
+           
+            for (char c = prev + 1; c <= next; c++) {
+                expanded[j++] = c;
+            }
+            i++;
+        } else {
+            
+            expanded[j++] = str[i];
+        }
+
+        i++;
+    }
+
+    expanded[j] = '\0'; 
+    printf("%s\n", expanded);
+}
+
+int main() { // @@ [Error: Redefinition of 'main'. There are two main functions in the source code, which causes a compilation error. This duplicate main function block should be removed.]
+    char str[1000];
+   
+    scanf("%s", str);
+
+    expandString(str);
+
+    return 0;
+}
+
+
+int main() { // @@ [Error: Redefinition of 'main'. This is the second definition of the main function, which conflicts with the first one above. C programs can only have one main function.]
+    char str[1000];
+    scanf("%s", str);
+    expandString(str);
+    return 0;
+}

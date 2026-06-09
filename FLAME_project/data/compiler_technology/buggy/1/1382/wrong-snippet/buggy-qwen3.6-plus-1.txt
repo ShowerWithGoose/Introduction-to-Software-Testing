@@ -1,0 +1,252 @@
+Based on the comparison between the buggy output and the expected output, the error lies in the parsing of assignment statements involving array access (LVal with index) on the left-hand side.
+
+In the buggy output, for a statement like `Dp[cal(0,j)] = j;`, the parser incorrectly identifies `Dp` as an `LVal` (without index), then treats `[cal(0,j)]` as a separate expression or statement components, leading to a fragmented and incorrect parse tree structure (e.g., `<LVal> ASSIGN = LPARENT ...`). The expected output shows `IDENFR Dp LBRACK [ ... RBRACK ] <LVal> ASSIGN = ...`.
+
+This indicates that the `stmtParser`'s logic for distinguishing between an assignment statement (`LVal '=' Exp ';'`) and an expression statement (`Exp ';'`) is flawed when the `LVal` contains an array index. The "fake mode" lookahead used to check for `ASSIGN` likely fails to correctly parse or rewind the `LVal` if it includes brackets, causing the parser to fall through to the `ExpStmt` case or misinterpret the tokens.
+
+Specifically, in `stmtParser`, under `case IDENFR`:
+1. It calls `lValParser()` in fake mode.
+2. It checks if the next token is `ASSIGN`.
+3. If `LVal` is `Dp[cal(0,j)]`, `lValParser` consumes `Dp`, `[`, `cal(0,j)`, `]`.
+4. The next token should be `=`.
+5. However, the buggy output suggests that the parser is not correctly recognizing this sequence as an assignment, or the `getBack` logic is incorrect, leading it to treat `Dp` as an `LVal` (primary exp) and the rest as part of an expression or separate statements.
+
+Looking closely at `stmtParser`:
+```java
+            case IDENFR: {
+                tokenIterator.getPrevious();
+                switchFake(true);
+                lValParser();
+                if (tokenIterator.getNext().getLexType().equals(LexType.ASSIGN)) {
+                    tokenIterator.getBack(step + 1);
+                    switchFake(false);
+                    LVal lVal = lValParser();
+                    // ...
+                }
+                else {
+                    tokenIterator.getBack(step + 1);
+                    switchFake(false);
+                    Exp exp = expParser();
+                    // ...
+                }
+            }
+```
+The issue is likely that `lValParser` in fake mode increments `step` for every token consumed. When `getBack(step + 1)` is called, it should rewind exactly to before the `LVal`. If `step` counting is off or `lValParser` behaves differently in fake mode vs real mode regarding token consumption/rewinding, the parser state will be corrupted.
+
+However, a more obvious discrepancy in the buggy output is seen in lines like:
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+...
+```
+This suggests the parser treated `[` as the start of something else, or failed to associate it with the preceding `IDENFR`. In `lValParser`:
+```java
+    private LVal lValParser() {
+        Token pos1 = tokenIterator.getNext();
+        if (fakeMode) step++;
+        Token ident = pos1;
+        if (tokenIterator.getNext().getLexType().equals(LexType.LBRACK)) {
+            if (fakeMode) step++;
+            Exp exp = expParser();
+            if (! tokenIterator.getNext().getLexType().equals(LexType.RBRACK)) {
+                // ...
+            }
+            if (fakeMode) step++;
+            return new LVal(ident, exp);
+        }
+        else {
+            tokenIterator.getPrevious();
+            return new LVal(ident);
+        }
+    }
+```
+If `lValParser` is called in fake mode, it consumes `IDENFR`, sees `[`, consumes `Exp`, sees `]`. It returns an `LVal`. The `step` counter tracks tokens consumed.
+When `getBack(step + 1)` is called, it rewinds.
+Then `lValParser()` is called again in real mode.
+
+The buggy output shows that for `Dp[cal(0,j)] = j;`, it outputs:
+```
+LBRACK [
+<LVal>
+ASSIGN =
+...
+```
+This implies that the `IDENFR Dp` was NOT parsed as part of the `LVal` in the final output, or the `LVal` printed only the bracket part? No, `<LVal>` is printed by `LVal.toPrint()`.
+In `LVal.toPrint()`:
+```java
+    public String toPrint() {
+        StringBuilder stringBuilder = new StringBuilder();
+        stringBuilder.append(ident.toPrint());
+        if (exp != null) {
+            stringBuilder.append("LBRACK" + " [" + "\n");
+            stringBuilder.append(exp.toPrint());
+            stringBuilder.append("RBRACK" + " ]" + "\n");
+        }
+        stringBuilder.append("<LVal>\n");
+        return stringBuilder.toString();
+    }
+```
+If the output is `LBRACK [ <LVal>`, it means `ident.toPrint()` is missing or empty? Or `ident` is null?
+Actually, looking at the buggy output segment:
+```
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+It seems `IDENFR Dp` is missing from the `LVal` output, or `Dp` was consumed elsewhere.
+Wait, looking earlier in the buggy output for that specific statement:
+```
+FORTK for
+...
+RPARENT )
+LBRACE {
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+...
+```
+The `IDENFR Dp` is completely missing before `LBRACK [`.
+This suggests that in the `stmtParser`, when it detects an assignment, it rewinds, but then `lValParser()` fails to pick up `Dp`? Or `Dp` was consumed by the lookahead and not properly rewound?
+
+Let's look at `getBack`:
+```java
+    public void getBack(int n) {
+        for (int i = 0; i < n; i++) {
+            getPrevious();
+        }
+    }
+```
+And `getPrevious`:
+```java
+    public Token getPrevious() {
+        if (iterator.hasPrevious()) {
+            iterator.previous();
+        }
+        if (iterator.hasPrevious()) {
+            iterator.previous();
+        }
+        return getNext();
+    }
+```
+`getPrevious` moves back **two** positions effectively?
+1. `iterator.previous()` moves cursor back one.
+2. `iterator.previous()` moves cursor back another one.
+3. `getNext()` moves cursor forward one and returns that token.
+Net effect: Cursor moves back 1 position from where it was before `getPrevious` was called?
+Let's trace:
+Cursor is at index `i` (next element to return).
+`getNext()` returns element `i`, cursor becomes `i+1`.
+`getPrevious()`:
+`hasPrevious` (yes, `i`). `previous()` -> cursor `i`.
+`hasPrevious` (yes, `i-1`). `previous()` -> cursor `i-1`.
+`getNext()` -> returns element `i-1`, cursor `i`.
+So `getPrevious()` returns the token *before* the last returned token, and leaves cursor at `i` (same as before `getNext` was called initially? No).
+
+If I call `getNext()` (returns T1, cur=2), then `getPrevious()`:
+Returns T0, cur=1.
+So `getPrevious()` undoes the `getNext()` and goes one step further back?
+If `getBack(n)` calls `getPrevious()` n times, it moves back `n` tokens relative to the current position?
+
+In `stmtParser`:
+`lValParser()` in fake mode consumes tokens. `step` counts them.
+`tokenIterator.getNext().getLexType()` checks for `ASSIGN`. This consumes one more token.
+So total tokens consumed = `step` (from lVal) + 1 (for ASSIGN check).
+`tokenIterator.getBack(step + 1)` is called.
+This should rewind exactly to the position before `lValParser` started.
+
+If `getPrevious` logic is flawed, the rewind might be incorrect.
+However, the most likely cause of `IDENFR` missing in `LVal` output is that `lValParser` is not correctly identifying the `IDENFR` as the start of the `LVal` after rewinding, OR the `LVal` object created has a null/empty ident.
+
+But notice in the buggy output:
+```
+LBRACK [
+<LVal>
+```
+This matches `LVal.toPrint()` if `ident` is missing? No, `ident.toPrint()` would print `IDENFR ...`.
+If `ident` was `null`, it would crash.
+If `exp` is present, it prints `LBRACK ...`.
+Why is `ident` not printed?
+Maybe `lValParser` is returning an `LVal` where `ident` is somehow wrong?
+
+Let's look at `lValParser` again.
+```java
+    private LVal lValParser() {
+        Token pos1 = tokenIterator.getNext();
+        if (fakeMode) step++;
+        Token ident = pos1;
+        if (tokenIterator.getNext().getLexType().equals(LexType.LBRACK)) {
+             // ...
+             return new LVal(ident, exp);
+        }
+        else {
+            tokenIterator.getPrevious();
+            return new LVal(ident);
+        }
+    }
+```
+If `pos1` is `LBRACK`? No, `stmtParser` enters `case IDENFR`, so `pos1` in `lValParser` should be `IDENFR`.
+
+Wait, look at the buggy output context again:
+```
+LBRACE {
+LBRACK [
+<LVal>
+ASSIGN =
+LPARENT (
+INTCON 0
+```
+The token `IDENFR Dp` is missing.
+Before this, we had:
+```
+RPARENT )
+LBRACE {
+```
+The next token in source is `Dp`.
+If `stmtParser` reads `Dp` (IDENFR), enters `case IDENFR`.
+Calls `lValParser`.
+`lValParser` reads `Dp`.
+Reads `[`.
+Reads `cal(0,j)`.
+Reads `]`.
+Checks next token `=`.
+It IS an assignment.
+Rewinds `step + 1`.
+Calls `lValParser` again.
+It should read `Dp` again.
+
+If the output is `LBRACK [`, it implies `ident.toPrint()` produced nothing?
+Or did `lValParser` consume `Dp` in the lookahead, but the rewind failed to put `Dp` back, so the second `lValParser` read `[` as `pos1`?
+If `pos1` is `[`, `ident` becomes `[`.
+`[`.toPrint() -> `LBRACK [`.
+Then it checks next token. If next is `cal...`, it's not `LBRACK`.
+So it goes to `else`: `tokenIterator.getPrevious()`, returns `new LVal(ident)` where `ident` is `[`.
+Output: `LBRACK [ <LVal>`.
+This matches the buggy output!
+
+So the error is that `getBack(step + 1)` does not correctly rewind the iterator to the position before `lValParser` was first called. It likely leaves the cursor pointing at `[` instead of `Dp`.
+
+This points to `TokenIterator.getPrevious()` or `getBack()` implementation.
+
+<frontend/TokenIterator.java>
+    public Token getPrevious() {
+        if (iterator.hasPrevious()) {
+            iterator.previous();
+        }
+        if (iterator.hasPrevious()) {
+            iterator.previous();
+        }
+        return getNext();
+    }
+
+    public void getBack(int n) {
+        for (int i = 0; i < n; i++) {
+            getPrevious();
+        }
+    }

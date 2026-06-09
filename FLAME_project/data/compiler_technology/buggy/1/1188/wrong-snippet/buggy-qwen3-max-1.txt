@@ -1,0 +1,275 @@
+Based on the problem description and test case, the issue is that the error line numbers reported are off by 2 lines (e.g., reporting line 4 instead of 2). This suggests that the line number tracking in the lexer/parser is not correctly synchronized with the actual source code lines.
+
+Looking at the test input:
+```
+int main() {
+    printf("Hello SysY!\n") // error 1 (missing semicolon, should be line 2)
+    
+    if (1)
+    
+    
+    /*********/
+    ;
+    int a // error 2 (missing semicolon, should be line 9)
+    
+    for (;;) {}
+    
+    return 0 // error 3 (missing semicolon, should be line 13)
+}
+```
+
+The errors are on lines 2, 9, and 13, but the program reports 4, 11, and 14. This indicates the line counter is being incremented incorrectly.
+
+In the Lexer.java file, the `getChar()` method increments the line counter when `c == '\n'`, but this happens **before** processing the current character. This means when we encounter a newline, we immediately increment the line counter, so the next token is considered to be on the next line even if it's on the same line as the newline character.
+
+However, the real issue appears to be in how the line number is tracked when tokens span multiple lines or when comments are processed. Looking more carefully at the test case, the first error is on line 2 (the printf statement missing semicolon), but the parser reports line 4.
+
+The key issue is in the `Lexer.getChar()` method:
+
+<frontend/Lexer.java>
+...
+    private static void getChar() {
+        if (c == '\n') line++;
+        if (pos >= input.length()) {
+            c = 0;
+            pos++;
+        } else {
+            c = input.charAt(pos++);
+        }
+    }
+...
+
+This increments the line counter when the **previous** character was a newline, but it should increment when the **current** character is a newline. The correct approach is to check if the character being read is a newline, not the previous one.
+
+However, looking at the actual error reporting, the bigger issue might be in the Parser's error reporting mechanism. The Parser calls `Lexer.getLine()` to get the current line number when reporting errors, but if the lexer's line counter is not properly maintained, this will be wrong.
+
+But wait - looking at the test case more carefully, the printf statement is on line 2, and it's missing a semicolon. The parser should report this as line 2. However, the lexer processes the entire line including the comment, and when it reaches the end of the line (the newline), it increments the line counter. So by the time the parser realizes there's a missing semicolon, it might be on line 3 or 4.
+
+Actually, the core issue is likely in the `Stmt()` method in Parser.java, specifically in the handling of the printf statement and other statements that require semicolons. The error is being reported at the wrong line because the parser has already consumed tokens beyond the actual error location.
+
+Looking at the printf handling in Stmt():
+
+<frontend/Parser.java>
+...
+        } else if (type() == Type.PRINTFTK) {
+            getToken();
+            getToken();
+            getToken();
+            while (type() == Type.COMMA) {
+                getToken();
+                Exp();
+            }
+            if (type() != Type.RPARENT) {
+                error('j');
+            } else {
+                getToken();
+            }
+            if (type() != Type.SEMICN) {
+                error('i');
+            } else {
+                getToken();
+            }
+        }
+...
+
+The problem is that after processing the printf call, when it checks for the semicolon and doesn't find it, it reports the error using the current line number from the lexer. But by this point, the lexer may have advanced past the original line where the printf statement was written.
+
+However, the most likely culprit is actually in the line number tracking itself. Let me reconsider the `getChar()` method:
+
+When we read a character, if the **previous** character was `\n`, we increment the line. But actually, we should increment the line when we **read** a `\n` character.
+
+The correct logic should be:
+1. Read the character
+2. If the character is `\n`, then increment the line counter
+
+But the current code does:
+1. If the previous character was `\n`, increment line
+2. Read the character
+
+This means the line counter is always one ahead.
+
+Actually, looking at the initial state: `c` starts as undefined, `line = 1`. When we call `getChar()` for the first time, we check if `c == '\n'` (which it isn't initially), then we read the first character. This seems correct.
+
+But let's trace through a simple example:
+- Input: "a\nb"
+- Initial: c = ???, line = 1, pos = 0
+- First getChar(): c != '\n', so read 'a', c = 'a', pos = 1, line = 1
+- Second getChar(): c = 'a' != '\n', read '\n', c = '\n', pos = 2, line = 1  
+- Third getChar(): c = '\n' == '\n', so line++ (line = 2), read 'b', c = 'b', pos = 3, line = 2
+
+This is actually correct! When we're processing 'b', we're on line 2.
+
+So the line counting logic seems correct.
+
+The real issue must be elsewhere. Looking at the test output again:
+- Expected: 2 i, 9 i, 13 i  
+- Actual: 4 i, 11 i, 14 i
+
+The difference is +2, +2, +1. This is inconsistent, which suggests it's not a simple off-by-one in line counting.
+
+Wait, let me count the lines in the test input carefully:
+
+1: int main() {
+2:     printf("Hello SysY!\n") // error 1
+3: 
+4:     if (1)
+5: 
+6: 
+7:     /*********/
+8:     ;
+9:     int a // error 2
+10: 
+11:     for (;;) {}
+12: 
+13:     return 0 // error 3
+14: }
+
+Ah! The test input has 14 lines total. The errors are on lines 2, 9, and 13. The program reports 4, 11, 14.
+
+The pattern is: reported_line = actual_error_line + 2 for the first two errors, and +1 for the last.
+
+This suggests that the parser is reporting the line number of where it **detects** the error, not where the error **occurs**. For missing semicolons, the specification says: "The error line number corresponds to the line where the last non-terminal before the semicolon is located."
+
+So for the printf statement on line 2, the last non-terminal before the expected semicolon would be the printf call itself, which should be on line 2.
+
+But if the parser reads past the newline while looking for the semicolon, it might end up on line 4 when it finally gives up and reports the error.
+
+Looking at the Stmt() method again, particularly the general case for expressions:
+
+<frontend/Parser.java>
+...
+        } else if (type() == Type.PLUS || type() == Type.MINU || type() == Type.NOT ||
+                (type() == Type.IDENFR && pre(false, 1) == Type.LPARENT) || type() == Type.LPARENT || type() == Type.INTCON || type() == Type.CHRCON) {
+            //一部分[Exp]; 除去LVal开头的
+            Exp();
+            if (type() != Type.SEMICN) {
+                error('i');
+            } else {
+                getToken();
+            }
+        } else if (type() == Type.SEMICN) {
+            getToken();
+        } else {//LVal开头的
+            if (PreParser.start().getType() != Type.ASSIGN) {
+                Exp();
+                if (type() != Type.SEMICN) {
+                    error('i');
+                } else {
+                    getToken();
+                }
+            } else {
+                LVal();
+                getToken();
+                if (type() == Type.GETINTTK || type() == Type.GETCHARTK) {
+                    getToken();
+                    getToken();
+                    if (type() != Type.RPARENT) {
+                        error('j');
+                    } else {
+                        getToken();
+                    }
+                    if (type() != Type.SEMICN) {
+                        error('i');
+                    } else {
+                        getToken();
+                    }
+                } else {
+                    Exp();
+                    if (type() != Type.SEMICN) {
+                        error('i');
+                    } else {
+                        getToken();
+                    }
+                }
+            }
+        }
+...
+
+The issue is that when checking for a missing semicolon, the parser calls `error('i')` which uses `Lexer.getLine()` to get the current line number. But by the time the parser realizes the semicolon is missing, the lexer may have already advanced to a later line.
+
+For example, with the printf statement:
+- Line 2: printf("Hello SysY!\n") // no semicolon
+- The parser processes the printf, expects a ')', gets it, then expects a ';'
+- But the next token might be the newline or the 'if' on line 4
+- So when it checks `type() != Type.SEMICN`, the current token is whatever comes after, which could be on line 4
+
+The specification says the error line should be "the line where the last non-terminal before the semicolon is located." This means we need to track the line number of the last successfully parsed token, not the current token position.
+
+Looking at the error reporting in the Parser:
+
+<frontend/Parser.java>
+...
+    private static void error(char c) {
+        switch (c){
+            case 'i':
+                fileOut2.printf("%d %c\n", Lexer.getLine(), 'i');
+                break;
+...
+
+It's using `Lexer.getLine()` which returns the current line number of the lexer, not the line number where the last valid token was parsed.
+
+The fix would be to store the line number of the last successfully consumed token and use that for error reporting. But since we're only asked to identify the location of the error, the issue is in the error reporting logic in the Parser's `error` method and how it determines the line number.
+
+However, looking more carefully at the provided code, I notice that in the `Stmt()` method, for the printf case specifically:
+
+<frontend/Parser.java>
+...
+        } else if (type() == Type.PRINTFTK) {
+            getToken();
+            getToken();
+            getToken();
+            while (type() == Type.COMMA) {
+                getToken();
+                Exp();
+            }
+            if (type() != Type.RPARENT) {
+                error('j');
+            } else {
+                getToken();
+            }
+            if (type() != Type.SEMICN) {
+                error('i');
+            } else {
+                getToken();
+            }
+        }
+...
+
+After processing the printf arguments and the closing parenthesis, it checks for the semicolon. If it's not there, it calls `error('i')`. At this point, the current token is whatever comes after the ')', which could be on a different line.
+
+The same issue exists in other places where semicolons are expected.
+
+But wait, there's another possibility. Looking at the test input again:
+
+Line 2: `printf("Hello SysY!\n") // error 1`
+
+This line ends without a semicolon, but it has a comment. The lexer handles single-line comments (`//`) by reading until the newline. So when the lexer processes this line, it will:
+
+1. Tokenize `printf` -> PRINTFTK
+2. Tokenize `(` -> LPARENT  
+3. Tokenize `"Hello SysY!\n"` -> STRCON
+4. Tokenize `)` -> RPARENT
+5. See `//` and skip to the end of the line (including the newline)
+
+So after processing the printf statement, the lexer has already consumed the newline and is now at the beginning of line 3 (which is empty), then line 4 (`if (1)`).
+
+When the parser goes to check for the semicolon after the printf, the current token is probably the `if` token on line 4, so `Lexer.getLine()` returns 4.
+
+This explains why the first error is reported as line 4 instead of line 2.
+
+The root cause is that the error reporting uses the current lexer line position, but it should use the line position of the last token that was part of the statement being parsed.
+
+However, given the constraints of the question, I need to identify the specific code snippet where the error is located. The issue is in the error reporting mechanism in the Parser class, specifically in the `error` method and how it determines the line number.
+
+But looking at the actual locations where error 'i' is reported, it's in multiple places in the `Stmt()` method and other methods like `ConstDecl()`, `VarDecl()`, etc.
+
+The most relevant snippet is in the `Stmt()` method where it handles various statement types and checks for missing semicolons:
+
+<frontend/Parser.java>
+...
+            if (type() != Type.SEMICN) {
+                error('i');
+            } else {
+                getToken();
+            }
+...

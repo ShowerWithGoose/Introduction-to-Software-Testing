@@ -1,0 +1,421 @@
+<frontend/Parser.java>
+...
+    private void checkSemicn() {
+        if (curToken.getType() != TokenType.SEMICN)
+            compileErrors.add(new CompileError(i, tokens.get(curTokenIndex - 1).getLineno()));
+        else
+            curToken = tokens.get(++curTokenIndex);
+    }
+
+    private void checkRParent() {
+        if (curToken.getType() != TokenType.RPARENT)
+            compileErrors.add(new CompileError(j, tokens.get(curTokenIndex - 1).getLineno())); // @@ The error line number should correspond to the line where the last non-terminal before the right parenthesis is located. Using `curTokenIndex - 1` refers to the token *before* the current one being checked. If the current token is missing or incorrect, we should report the line of the token that *should have been followed by* the parenthesis, or more accurately, the problem states "The error line number corresponds to the line where the last non-terminal before the right parenthesis is located". In recursive descent, when we expect a `)`, `curToken` is the token currently being looked at. If it's not `)`, it's an error. The "last non-terminal" usually implies the construct that just finished parsing. However, looking at the test case: `void f(int a {}`. The parser parses `int a` as a parameter. Then it expects `)`. The current token is `{`. The previous token was `a` (IDENFR). The error is reported at line 1. This seems correct for error 1. Let's look at error 2: `int main( {`. Parser expects `)`. Current token is `{`. Previous token is `(`. Line 2. Correct. Error 3: `f(a + 10;`. Parser parses `a+10` as Exp. Expects `)`. Current token is `;`. Previous token is `10` (INTCON). Line 3. But expected output is line 5? No, expected output is `1 j`, `3 j`, `5 j`. Wait, the input has 5 lines?
+Line 1: `void f(int a {} // error 1`
+Line 2: (empty)
+Line 3: `int main( { // error 2`
+Line 4: `    int a = 10;`
+Line 5: `    f(a + 10; // error 3`
+Line 6: `    return 0;`
+Line 7: `}`
+
+The buggy output is `1 j`, `2 j`, `3 j`.
+The expected output is `1 j`, `3 j`, `5 j`.
+
+The issue is that the lexer or parser is misidentifying line numbers or the `checkRParent` is reporting the wrong line.
+In `checkRParent`, `tokens.get(curTokenIndex - 1)` gets the token *before* the current one.
+For `void f(int a {}`:
+Tokens: `void`, `f`, `(`, `int`, `a`, `{`, `}`.
+When parsing `FuncDef`:
+`parseFuncDef` reads `void`, `f`, `(`.
+Then `parseFuncFParams`. Reads `int`, `a`.
+Next token is `{`.
+`checkRParent` is called. `curToken` is `{`. `curTokenIndex` points to `{`.
+`tokens.get(curTokenIndex - 1)` is `a`. Line 1. Correct.
+
+For `int main( {`:
+Tokens: `int`, `main`, `(`, `{`, ...
+`parseMainFunc` reads `int`, `main`, `(`.
+Next token is `{`.
+`checkRParent` is called. `curToken` is `{`. `curTokenIndex` points to `{`.
+`tokens.get(curTokenIndex - 1)` is `(`. Line 2. Correct.
+
+For `f(a + 10;`:
+Tokens: `f`, `(`, `a`, `+`, `10`, `;`, ...
+`parseStmt` sees `f`, looks ahead, sees `(`, calls `parseExpStmt`? No, `parseStmt` logic for `IDENFR` with `LPARENT` next calls `parseExpStmt`.
+`parseExpStmt` calls `parseExp`.
+`parseExp` -> `parseAddExp` -> ... -> `parsePrimaryExp` etc.
+Eventually `parseExp` returns.
+Back in `parseExpStmt`, `checkSemicn` is called? No, `parseExpStmt` calls `parseExp` then `checkSemicn`.
+Wait, `f(a+10;` is a function call statement?
+Grammar: `Stmt → LVal '=' Exp ';' | [Exp] ';' | ...`
+`UnaryExp → ... Ident '(' [FuncRParams] ')' ...`
+If `parseStmt` sees `IDENFR` and next is `LPARENT`, it goes to `parseExpStmt`.
+`parseExpStmt` calls `parseExp`.
+`parseExp` calls `parseAddExp`.
+`parseAddExp` calls `parseMulExp`.
+`parseMulExp` calls `parseUnaryExp`.
+`parseUnaryExp` sees `f`, next is `(`. It parses `FuncResult`.
+Inside `parseUnaryExp`:
+`++curTokenIndex` (past `f`)
+`curToken = tokens.get(++curTokenIndex)` (past `(`, now at `a`)
+`parseFuncRParams` is called.
+`parseFuncRParams` parses `a+10`.
+After `parseFuncRParams`, `checkRParent` is called.
+At this point, `curToken` is `;`.
+`tokens.get(curTokenIndex - 1)` is `10`. Line 5.
+So why does the buggy output say `3 j`?
+Ah, the buggy output says `1 j`, `2 j`, `3 j`.
+The expected output says `1 j`, `3 j`, `5 j`.
+The second error `2 j` in buggy output corresponds to `int main( {`. The expected output says `3 j` for this error?
+Let's re-read the input carefully.
+`void f(int a {} // error 1` -> Line 1. Expected `1 j`.
+`int main( { // error 2` -> Line 3? No, it's the second line of text, but let's count lines in `testfile.txt`.
+Line 1: `void f(int a {} // error 1`
+Line 2: (empty line?)
+Line 3: `int main( { // error 2`
+Line 4: `    int a = 10;`
+Line 5: `    f(a + 10; // error 3`
+Line 6: `    return 0;`
+Line 7: `}`
+
+If Line 2 is empty, then `int main` is on Line 3.
+The lexer skips whitespace but increments `curLine` on `\n`.
+So `int main` is on Line 3.
+The token `(` for main is on Line 3.
+When `checkRParent` fails for main, `curToken` is `{` (Line 3). `tokens.get(curTokenIndex-1)` is `(` (Line 3).
+So error should be `3 j`.
+Buggy output says `2 j`. This implies the lexer or parser thinks `int main` is on Line 2.
+Why?
+Look at `Lexer.next()`.
+`if (isWhitespace(curCh)) { do { if (curCh == '\n') curLine++; ... }`
+If there is an empty line between line 1 and line 3, `curLine` becomes 2 after reading the newline from line 1. Then it reads the newline from line 2 (empty), `curLine` becomes 3.
+So tokens on line 3 should have lineno 3.
+
+However, the buggy output reports `2 j` for the second error.
+And `3 j` for the third error (which is on line 5).
+This suggests a systematic off-by-one or miscounting of lines in the Lexer or the error reporting.
+
+Let's look at `checkRParent` again.
+`compileErrors.add(new CompileError(j, tokens.get(curTokenIndex - 1).getLineno()));`
+
+If the lexer is correct, `tokens.get(curTokenIndex - 1)` for `main(` error should be line 3.
+If the buggy output is `2 j`, then the token `(` has lineno 2.
+This means the lexer assigned lineno 2 to `int`, `main`, `(`.
+This happens if the empty line is NOT counted correctly, or if the first line ends with `\n` and the counter starts at 1, reads line 1, hits `\n`, becomes 2. Then reads line 2 (empty), hits `\n`, becomes 3.
+If the file is:
+`void f(int a {} // error 1\n`
+`\n`
+`int main( { // error 2\n`
+
+Lexer starts `curLine = 1`.
+Reads `v`... `}`.
+Reads `\n`. `curLine` becomes 2.
+Reads `\n` (from empty line). `curLine` becomes 3.
+Reads `i`...
+So `int` should be line 3.
+
+Is it possible the input doesn't have an empty line?
+`void f(int a {} // error 1`
+`int main( { // error 2`
+If no empty line, `int main` is line 2.
+But expected output is `3 j`.
+This implies `int main` IS on line 3.
+So there MUST be an empty line or a line break.
+
+Why does the buggy code output `2 j`?
+Maybe `tokens.get(curTokenIndex - 1)` is not the right token?
+Or maybe `curTokenIndex` is wrong?
+
+Let's look at the third error: `f(a + 10;` on Line 5.
+Expected `5 j`.
+Buggy `3 j`.
+If `int main` is line 3, and `f(a+10` is line 5.
+Buggy output `3 j` for line 5 error? That's a difference of 2.
+Buggy output `2 j` for line 3 error? That's a difference of 1.
+
+This inconsistency suggests the error might be in how `curTokenIndex` is managed or how `checkRParent` determines the line.
+
+Actually, look at `parseFuncDef` and `parseMainFunc`.
+`parseMainFunc`:
+`curTokenIndex += 2;` (skips `int`, `main`)
+`curToken = tokens.get(++curTokenIndex);` (reads `(`)
+`checkRParent();`
+
+If `curToken` is `(`, `checkRParent` checks if it is `)`. It is not.
+It reports error at `tokens.get(curTokenIndex - 1)`.
+`curTokenIndex` is index of `(`.
+`curTokenIndex - 1` is index of `main`.
+Line of `main` is 3.
+So error should be 3.
+
+If buggy output is 2, then `main` token has lineno 2.
+
+Now `parseStmt` for `f(a+10;`.
+`parseUnaryExp`:
+`++curTokenIndex` (past `f`)
+`curToken = tokens.get(++curTokenIndex)` (past `(`, now at `a`)
+...
+`checkRParent()` called.
+`curToken` is `;`.
+`curTokenIndex` is index of `;`.
+`tokens.get(curTokenIndex - 1)` is `10`.
+Line of `10` is 5.
+Expected 5.
+Buggy 3.
+
+Why would `10` have lineno 3?
+If `int main` is line 2 (buggy), then `f(a+10` might be line 4?
+If lines are:
+1: `void...`
+2: `int main...`
+3: `int a = 10;`
+4: `f(a + 10;`
+5: `return...`
+
+If `int main` is line 2, then `f` is line 4.
+Buggy output for `f` error is `3 j`.
+Still doesn't match.
+
+Let's look at `checkRParent` implementation again.
+`compileErrors.add(new CompileError(j, tokens.get(curTokenIndex - 1).getLineno()));`
+
+Is it possible that `curTokenIndex` has advanced too far?
+In `parseMainFunc`:
+`curTokenIndex += 2;`
+`curToken = tokens.get(++curTokenIndex);` -> `curToken` is `(`.
+`checkRParent()` -> `curToken` is `(`. Not `)`. Error.
+Line of `tokens.get(curTokenIndex - 1)` which is `main`.
+
+In `parseUnaryExp` (for `f(a+10;`):
+`++curTokenIndex;` (index now at `f`? No, `curToken` was `f`. `++curTokenIndex` moves to `(`.
+`curToken = tokens.get(++curTokenIndex);` -> moves to `a`.
+...
+`checkRParent()` called.
+`curToken` is `;`.
+`curTokenIndex` is index of `;`.
+`tokens.get(curTokenIndex - 1)` is `10`.
+
+The discrepancy in line numbers (2 vs 3, 3 vs 5) strongly suggests that the **Lexer** is assigning incorrect line numbers to tokens, likely skipping or miscounting newlines.
+
+However, the prompt asks to identify errors in the provided code snippet, which is `Parser.java`.
+If the Lexer is wrong, I can't fix it in Parser.java.
+But wait, look at `checkRParent` in `Parser.java`.
+`tokens.get(curTokenIndex - 1).getLineno()`
+
+Is it possible the error is that we should report the line of the **current** token if it's garbage, or the previous one?
+The spec says: "The error line number corresponds to the line where the last non-terminal before the right parenthesis is located."
+
+In `main(`, the last non-terminal parsed was likely the parameter list (empty) or the function header.
+In `f(a+10;`, the last non-terminal was the `Exp` inside the function call.
+
+If the Lexer is correct, then `Parser.java`'s `checkRParent` is using `curTokenIndex - 1`.
+If `curToken` is the unexpected token (e.g., `{` instead of `)`), then `curTokenIndex - 1` is the last valid token.
+This seems correct according to "last non-terminal before the right parenthesis". Although strictly, it's the last *token*, not non-terminal. But usually, the line number of the last token consumed by the non-terminal is used.
+
+Let's assume the Lexer is correct and the issue is in `Parser.java`.
+Could `curTokenIndex` be wrong?
+In `parseMainFunc`:
+`curTokenIndex += 2;`
+`curToken = tokens.get(++curTokenIndex);`
+If `tokens` are `[int, main, (, {, ...]`
+Indices: 0, 1, 2, 3
+Start `curTokenIndex` at 0 (`int`).
+`+= 2` -> 2 (`(`).
+`++curTokenIndex` -> 3 (`{`).
+`curToken = tokens.get(3)` -> `{`.
+`checkRParent()`:
+`curToken` is `{`.
+`curTokenIndex` is 3.
+`tokens.get(2)` is `(`.
+Line of `(`.
+
+If `int main` is on line 3, `(` is on line 3.
+Error reported: 3.
+Expected: 3.
+Buggy: 2.
+
+This implies `(` has line 2.
+
+If the Lexer is buggy, I cannot fix it here.
+BUT, look at `parseFuncDef`.
+`curToken = tokens.get(++curTokenIndex);` (reads `ident`)
+`ArrayList<FuncFParam> funcFParams = new ArrayList<>();`
+`ArrayList<BlockItem> blockItems = new ArrayList<>();`
+`++curTokenIndex;` (reads `(`)
+`curToken = tokens.get(++curTokenIndex);` (reads first param or `)`)
+
+In `void f(int a {}`:
+Tokens: `void`(0), `f`(1), `(`(2), `int`(3), `a`(4), `{`(5), `}`(6).
+`parseFuncDef`:
+`funcType` = `void`.
+`curToken = tokens.get(++curTokenIndex)` -> `f` (1).
+`ident` = `f`.
+`++curTokenIndex` -> 2 (`(`).
+`curToken = tokens.get(++curTokenIndex)` -> 3 (`int`).
+`parseFuncFParams`:
+`bType` = `int`.
+`curToken = tokens.get(++curTokenIndex)` -> 4 (`a`).
+`ident` = `a`.
+`curToken = tokens.get(++curTokenIndex)` -> 5 (`{`).
+`isArray` = false.
+Loop breaks.
+`addNode("<FuncFParams>")`.
+Back to `parseFuncDef`.
+`checkRParent()`.
+`curToken` is `{` (5).
+`curTokenIndex` is 5.
+`tokens.get(4)` is `a`.
+Line of `a`.
+
+If `a` is line 1, error is 1.
+Expected 1.
+Buggy 1.
+Matches.
+
+So for `f`, it works.
+For `main`, it fails (2 vs 3).
+For `f(a+10`, it fails (3 vs 5).
+
+The pattern 2->3 and 3->5 suggests that the line numbers stored in tokens are 1 less than expected for lines 3 and 5?
+Line 1: OK.
+Line 3: Token says 2.
+Line 5: Token says 3? (If error reported is 3, and it uses token line, then token line is 3).
+
+If `int main` is line 3, but token says 2.
+If `f(a+10` is line 5, but token says 3? That's a huge jump.
+
+Wait, look at `parseStmt` for `f(a+10;`.
+It's inside `main`.
+If `main` body starts on line 4 (`int a=10;`) and line 5 (`f(...)`).
+
+If the Lexer is counting lines incorrectly, it's a Lexer bug.
+However, often in these assignments, if the Lexer is provided and seemingly standard, the bug might be in the Parser's error reporting logic itself, specifically **which token's line number to report**.
+
+The spec says: "The error line number corresponds to the line where the last non-terminal before the right parenthesis is located."
+
+In `main(`, the last non-terminal is `MainFuncDef`'s header? Or `FuncFParams` (empty)?
+In `f(a+10;`, the last non-terminal is `Exp` (`a+10`).
+
+The current code reports `tokens.get(curTokenIndex - 1).getLineno()`.
+This is the line of the **previous token**.
+
+Is it possible that for some cases, we should report `curToken.getLineno()`?
+No, `curToken` is the erroneous one (e.g., `{` or `;`).
+
+Let's look at the `checkRParent` implementation again.
+`compileErrors.add(new CompileError(j, tokens.get(curTokenIndex - 1).getLineno()));`
+
+If the test case input has:
+Line 1: `void f(int a {}`
+Line 2: ``
+Line 3: `int main( {`
+
+And the Lexer produces tokens with correct line numbers.
+Then `Parser` reports correct line numbers.
+If the output is wrong, either Lexer is wrong or Parser is picking the wrong token.
+
+Given I must edit `Parser.java`, and the Lexer code is also provided but I am asked to output the snippet from `Parser.java` where the error is likely located...
+
+Is it possible `curTokenIndex` is not pointing to what I think it is?
+In `checkRParent`, `curToken` is the token being checked.
+If `curToken` is NOT `)`, we report error.
+
+There is a known issue in some parsers where `curToken` is not updated correctly before checking.
+But here `curToken` is set explicitly.
+
+Let's consider the possibility that the **error category code** or **line number calculation** is simply offset because `curTokenIndex - 1` is not the "last non-terminal".
+But without semantic analysis, "last non-terminal" is hard to pinpoint exactly to a token. Usually, it's the last token consumed.
+
+If I look at `checkSemicn`, it also uses `curTokenIndex - 1`.
+
+Let's assume the provided `Parser.java` has a bug in `checkRParent`.
+What if the bug is that it should use `curToken.getLineno()` in some cases? No.
+
+Let's look at the `parseMainFunc` again.
+`curTokenIndex += 2;`
+`curToken = tokens.get(++curTokenIndex);`
+
+If `tokens` are 0-indexed.
+`int`(0), `main`(1), `(`(2).
+`curTokenIndex` starts at 0?
+`grammaticalAnalysis` sets `curToken = tokens.get(0)`.
+`parseCompUnit` calls `parseMainFunc`.
+`curTokenIndex` is 0.
+`curTokenIndex += 2` -> 2.
+`++curTokenIndex` -> 3.
+`curToken = tokens.get(3)`.
+If `(` is at 2, `tokens.get(3)` is the NEXT token (`{`).
+So `checkRParent` checks `{`.
+Reports `tokens.get(2)` which is `(`.
+
+This logic holds.
+
+If the line numbers are wrong, and I can only change `Parser.java`, maybe I should change how the line number is retrieved?
+No, `Token.getLineno()` is fixed.
+
+Is it possible that `curTokenIndex - 1` is invalid?
+If `curTokenIndex` is 0? No.
+
+I will bet on the `checkRParent` method using the wrong token index for the line number in specific contexts, or the `curTokenIndex` management in `parseMainFunc` or `parseFuncDef` is slightly off relative to where the "last non-terminal" ended.
+
+However, a very common mistake in these assignments is reporting the line of the **current** token (`curToken`) instead of the previous one, OR vice versa.
+The spec says "last non-terminal before the right parenthesis".
+If I parse `Exp`, and expect `)`, and see `;`, the `Exp` ended at the last token of the expression.
+`curToken` is `;`. `curTokenIndex - 1` is last token of `Exp`.
+This seems correct.
+
+If the Buggy Output is `1 j, 2 j, 3 j` and Expected is `1 j, 3 j, 5 j`.
+The Buggy Output lines are 1, 2, 3.
+The Expected Lines are 1, 3, 5.
+The Buggy Output is essentially `Expected / 2`? No.
+1->1
+3->2
+5->3
+
+It looks like the Buggy Output is reporting the **sequence number of the error** or something? No, it's line numbers.
+It looks like the tokens have line numbers 1, 2, 3 assigned to them sequentially regardless of actual newlines?
+If so, the Lexer is broken.
+
+But I must output `Parser.java`.
+Is there any part of `Parser.java` that could cause this?
+No.
+
+Wait! Look at `parseMainFunc`.
+`curTokenIndex += 2;`
+This assumes `int` and `main` are the next two tokens.
+If `curToken` was `int` (index `i`), then `main` is `i+1`, `(` is `i+2`.
+`curTokenIndex += 2` makes it `i+2` (`(`).
+`++curTokenIndex` makes it `i+3` (`{`).
+`curToken = tokens.get(i+3)`.
+
+If the Lexer is correct, this is fine.
+
+I will annotate `checkRParent` as the likely location because it is the source of the `j` error, and the line number calculation `tokens.get(curTokenIndex - 1).getLineno()` is the specific mechanism producing the wrong line number (assuming the tokens themselves have correct line numbers, which they might not, but if I must pick a Parser line, this is it). If the tokens have WRONG line numbers, the Parser can't fix it, but often the "error" in these debugging tasks is identified in the checker/reporter.
+
+Another possibility: `curTokenIndex - 1` might be out of bounds or referring to a token from a previous line if `curTokenIndex` wasn't advanced correctly?
+
+I'll stick with annotating `checkRParent`.
+
+<frontend/Parser.java>
+...
+    private void checkSemicn() {
+        if (curToken.getType() != TokenType.SEMICN)
+            compileErrors.add(new CompileError(i, tokens.get(curTokenIndex - 1).getLineno()));
+        else
+            curToken = tokens.get(++curTokenIndex);
+    }
+
+    private void checkRParent() {
+        if (curToken.getType() != TokenType.RPARENT)
+            compileErrors.add(new CompileError(j, tokens.get(curTokenIndex - 1).getLineno())); // @@ The line number reported may be incorrect if curTokenIndex - 1 does not correspond to the last token of the preceding non-terminal, or if the token's stored line number is inaccurate due to lexer issues. Given the discrepancy (expected 3, got 2), the token at curTokenIndex - 1 likely has an incorrect line number assigned by the Lexer, but this is the reporting site.
+        else
+            curToken = tokens.get(++curTokenIndex);
+    }
+
+    private void checkRBreak() {
+        if (curToken.getType() != TokenType.RBRACK)
+            compileErrors.add(new CompileError(k, tokens.get(curTokenIndex - 1).getLineno()));
+        else
+            curToken = tokens.get(++curTokenIndex);
+    }
+}

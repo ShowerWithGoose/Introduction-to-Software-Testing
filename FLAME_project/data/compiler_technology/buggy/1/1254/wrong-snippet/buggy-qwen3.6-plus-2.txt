@@ -1,0 +1,471 @@
+Based on the problem description, test case inputs, buggy output, and expected output, here is the analysis:
+
+**Summary:**
+The program is a syntax analyzer for a C-like language. It needs to detect specific syntax errors (missing semicolons, missing parentheses, missing brackets) and report them with the correct line number and error code.
+The test case contains three errors:
+1.  Line 13: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);` -> Missing right parenthesis `)`. Expected error: `13 j`.
+2.  Line 15: `if (3 > 0 {` -> Missing right parenthesis `)`. Expected error: `15 j`.
+3.  Line 20: `i = (((((f(str)))));` -> This is actually valid syntax if `f` returns a value, but looking closely at the structure `i = ...;`, it seems the user intended an error or the parser is misinterpreting nested parentheses. However, the expected output is `20 j`. Let's re-read the input carefully.
+    Input Line 20: `    i = (((((f(str))))); // error 3`
+    Wait, `i = (((((f(str)))));` has 5 opening parens and 5 closing parens before the semicolon. `f(str)` is a function call. `((((...))))` are just grouping operators. This is syntactically correct as an expression statement.
+    Let's look at the Buggy Output: `13 j`, `15 j`, `16 i`, `16 i`, `16 i`, `20 i`.
+    Expected Output: `13 j`, `15 j`, `20 j`.
+    
+    The discrepancy is:
+    1.  The parser reports extra errors on line 16 (`16 i` repeated 3 times). Line 16 is `g((((f(str)))), arr);`. This looks like a valid function call. The parser likely fails to parse this correctly after recovering from previous errors, or it misidentifies tokens.
+    2.  The parser reports `20 i` (missing semicolon) instead of `20 j` (missing right parenthesis). Or perhaps the expected output implies there *is* an error on line 20. Let's look at the input again: `i = (((((f(str)))));`. If the expected output is `20 j`, then the parser thinks a right parenthesis is missing. But there are equal numbers. 
+    Actually, let's look at Error 1 on Line 13: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);`. There are 3 opening `(` after `=` and only 2 closing `)` before `;`. So one `)` is missing. The parser correctly identifies `13 j`.
+    
+    Error 2 on Line 15: `if (3 > 0 {`. Missing `)`. Parser correctly identifies `15 j`.
+    
+    Error 3 on Line 20: `i = (((((f(str)))));`. 
+    Count parens: `(` `(` `(` `(` `(` `f` `(` `str` `)` `)` `)` `)` `)` `)`.
+    Inner `f(str)` consumes 1 pair.
+    Remaining outer: 4 opening, 4 closing?
+    `((((` ... `))))`.
+    Let's count carefully:
+    `i = `
+    1. `(`
+    2. `(`
+    3. `(`
+    4. `(`
+    5. `(`
+    `f(str)` -> `f` `(` `str` `)`
+    6. `)`
+    7. `)`
+    8. `)`
+    9. `)`
+    10. `)`
+    Total 5 open, 5 close. It is balanced. Why is `20 j` expected?
+    Maybe the comment `// error 3` in the input file is misleading or I am miscounting.
+    Let's look at the Buggy Output again. It outputs `20 i`. This means it thought a semicolon was missing.
+    If the expected output is `20 j`, it means a right parenthesis is missing.
+    
+    Regardless of the specific validity of line 20 in standard C, the key issue is how the parser handles error recovery and reporting.
+    
+    The main issue causing the "Wrong Answer" is likely in the **error recovery mechanism** or the **logic determining which error to report**. Specifically:
+    1.  The parser generates spurious errors on line 16 (`16 i`). This suggests that after encountering the error on line 15 (missing `)`), the parser's state is corrupted or it doesn't skip tokens correctly to resynchronize, leading it to misinterpret the valid code on line 16.
+    2.  The parser reports `20 i` instead of `20 j`. This suggests a logic error in detecting missing parentheses vs missing semicolons, possibly due to incorrect lookahead or state after previous errors.
+
+    Looking at `Parser.java`, the `stmtParser` and related methods use `iterator.nextToken()` to peek. When an error is detected (e.g., missing `)`), it adds an error but **does not consume any token** to synchronize. It just returns. This often leads to cascading errors because the parser is still stuck at the same token or a nearby token that doesn't match the expected follow set.
+    
+    However, the most distinct difference between the buggy and expected output is the presence of `16 i` errors and the wrong error type for line 20.
+    
+    Let's look at `stmtIfParser`:
+    ```java
+    private StmtIf stmtIfParser() {
+        Token ifTk = iterator.readNextToken();
+        Token lParent = iterator.readNextToken();
+        Cond cond = condParser();
+        Token rParent = null;
+        if (iterator.nextToken().isType(TokenType.RPARENT)) {
+            rParent = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.j, iterator.lastToken().getLineNum()));
+        }
+        Stmt stmt1 = stmtParser(); // Recursively parses the body
+        ...
+    }
+    ```
+    On line 15: `if (3 > 0 {`.
+    `condParser` parses `3 > 0`. The next token is `{`.
+    `iterator.nextToken()` is `{`. It is not `RPARENT`.
+    Error `j` is added with line number of `lastToken` (which is `0`, an IntConst on line 15). Correct.
+    Then `stmtParser()` is called. The current token is `{`.
+    `stmtParser` sees `{` and calls `stmtBlockParser`.
+    `blockParser` reads `{`, then parses items until `}`.
+    Inside the block is `g((((f(str)))), arr);`.
+    This should parse correctly as a function call statement.
+    
+    Why does it fail on line 16?
+    The function call `g(...)` involves `UnaryExpFunc`.
+    In `unaryExpParser`:
+    ```java
+    private UnaryExp unaryExpParser() {
+        Token token0 = iterator.nextToken();
+        Token token1 = iterator.nextToken(1);
+        if (token0.isType(TokenType.PLUS) || ...) {
+             ...
+        } else if (token1.isType(TokenType.LPARENT)) {
+            return unaryExpFuncParser();
+        } else {
+            return unaryExpPriParser();
+        }
+    }
+    ```
+    If `g` is an identifier, `token0` is `IDENFR`, `token1` is `LPARENT`. It goes to `unaryExpFuncParser`.
+    
+    The spurious errors `16 i` suggest that the parser thinks semicolons are missing. This usually happens if the parser fails to recognize a statement terminator or misinterprets the structure.
+    
+    However, there is a more subtle bug in how `lastToken` is used for error reporting line numbers.
+    In `Error.java`, `compareTo` sorts by line number.
+    
+    Let's look at the specific error on Line 20.
+    Input: `i = (((((f(str)))));`
+    If the parser expects `20 j`, it believes a `)` is missing.
+    If the parser outputs `20 i`, it believes a `;` is missing.
+    
+    The root cause of the discrepancy in Line 20 and the extra errors on Line 16 is likely that the parser **does not perform error synchronization**. When it misses a `)`, it continues parsing as if the `)` was there (or wasn't needed), but the token stream still contains the `{` or whatever followed.
+    
+    In `stmtIfParser`, after detecting missing `)`, it proceeds to `stmtParser()`. The current token is `{`. This matches `StmtBlock`. So it enters the block.
+    Inside the block, it parses `g(...)`.
+    
+    Wait, look at `primaryExpParser` or `unaryExpParser`.
+    
+    Actually, the provided solution often requires **synchronizing** the parser after an error. Without synchronization, the parser might try to parse the `{` as part of the condition or something else, leading to confusion.
+    
+    But looking at the code, `stmtIfParser` calls `stmtParser` immediately.
+    
+    Let's look at `PrimaryExpExp`:
+    ```java
+    private PrimaryExpExp primaryExpExpParser() {
+        Token lparent = iterator.readNextToken();
+        Exp exp = expParser();
+        Token rparent = null;
+        if (iterator.nextToken().isType(TokenType.RPARENT)) {
+            rparent = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.j, iterator.lastToken().getLineNum()));
+        }
+        return new PrimaryExpExp(lparent, exp, rparent);
+    }
+    ```
+    
+    The critical issue is likely in **how the parser recovers**. If it doesn't skip tokens to a safe point, subsequent parses are garbage.
+    
+    However, there is a specific logical error in `Parser.java` regarding **Line 20**.
+    If the input is `i = (((((f(str)))));`, and the expected error is `20 j`, it implies the test case *actually* has a missing parenthesis, or the parser is expected to detect an imbalance that I'm not seeing, OR the parser is incorrectly balancing them.
+    
+    Let's re-read the input string provided in the prompt:
+    `    i = (((((f(str))))); // error 3`
+    
+    If the expected output is `20 j`, then the "correct" behavior is to flag a missing `)`.
+    Why would a missing `)` be flagged?
+    Perhaps the grammar or parser implementation has a constraint I'm missing, or the input text in the prompt has a typo and actually meant `i = (((((f(str)));` (4 opens, 3 closes inside?).
+    
+    Regardless, the **Buggy Output** contains `16 i` which is definitely wrong (Line 16 is valid). This indicates that the parser's state is messed up after Line 15.
+    
+    The fix usually involves **synchronization**. For example, if a `)` is missing, the parser should ideally skip tokens until it finds a `)` or a statement terminator, or simply accept the loss and ensure the next parse starts correctly.
+    
+    In many student implementations, the error is that they **don't consume the token that caused the conflict** or **don't advance past the error point**.
+    
+    In `stmtIfParser`:
+    ```java
+        } else {
+            errors.add(new Error(Error.ErrorType.j, iterator.lastToken().getLineNum()));
+        }
+        Stmt stmt1 = stmtParser();
+    ```
+    If `)` is missing, the current token is `{`. `stmtParser` is called. `stmtParser` sees `{` and calls `stmtBlockParser`. This seems fine.
+    
+    Let's look at `funcDefParser` or `mainFuncDefParser`.
+    
+    Actually, look at `unaryExpFuncParser`:
+    ```java
+    private UnaryExpFunc unaryExpFuncParser() {
+        Token ident = iterator.readNextToken();
+        Token lParent = iterator.readNextToken();
+        Exp firstExp = null;
+        ArrayList<Exp> exps = new ArrayList<>();
+        ArrayList<Token> commas = new ArrayList<>();
+        if (!iterator.nextToken().isType(TokenType.RPARENT)) {
+            firstExp = expParser();
+            while (iterator.nextToken().isType(TokenType.COMMA)) {
+                commas.add(iterator.readNextToken());
+                exps.add(expParser());
+            }
+        }
+        Token rParent = null;
+        if (iterator.nextToken().isType(TokenType.RPARENT)) {
+            rParent = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.j, iterator.lastToken().getLineNum()));
+        }
+        return new UnaryExpFunc(ident, lParent, firstExp, exps, commas, rParent);
+    }
+    ```
+    
+    If there is a missing `)`, it reports error `j`.
+    
+    The problem with Line 16 errors (`16 i`) suggests that the parser is interpreting the semicolon on line 16 as missing, or interpreting the structure incorrectly.
+    
+    There is a known issue in recursive descent parsers without synchronization: if an error occurs, the parser might get "stuck" in a loop or misinterpret subsequent tokens.
+    
+    However, the most likely candidate for the specific "Wrong Answer" involving extra errors and wrong error types is the **lack of error synchronization** or **incorrect lookahead/peeking logic** in `stmtParser` or `unaryExpParser`.
+    
+    Let's look at `stmtParser`'s logic for `LVal = ...`.
+    
+    Actually, I suspect the error lies in how `iterator.lastToken()` is used.
+    
+    But wait, look at the Buggy Output: `16 i` appears **three times**.
+    Line 16: `        g((((f(str)))), arr); `
+    
+    If the parser failed to parse the function call `g(...)` correctly, it might fall through to other statement parsers or retry.
+    
+    Let's look at `stmtAssOrExpParser`. It uses `iterator.addRecord()` and `iterator.returnToRecord()`.
+    
+    If `stmtParser` calls `stmtAssOrExpParser` (because it sees an IDENFR `g`), `stmtAssOrExpParser` tries to parse `LVal`.
+    `lValParser` reads `g`.
+    Then it checks for `ASSIGN`. The next token is `(`. So it's not assignment.
+    It returns to record.
+    Then it calls `expParser()`.
+    `expParser` -> `addExpParser` -> ... -> `unaryExpParser`.
+    `unaryExpParser` sees `g` and `(`. Calls `unaryExpFuncParser`.
+    `unaryExpFuncParser` parses arguments.
+    Arguments: `(((f(str)))), arr`.
+    First arg: `(((f(str))))`.
+    `expParser` on `(((f(str))))`.
+    This is a `PrimaryExpExp` nested.
+    
+    If `unaryExpFuncParser` fails to find the closing `)` for `g`, it reports error `j`.
+    
+    The fact that `16 i` is reported suggests `stmtExpParser` or similar thinks a semicolon is missing.
+    
+    The core issue is likely that **after reporting an error, the parser does not advance the token stream to a safe synchronization point**, causing it to re-process or mis-process the same tokens, leading to cascading errors.
+    
+    To fix this, one typically adds synchronization logic (e.g., skipping tokens until a semicolon or brace is found) when an error is detected.
+    
+    However, identifying the *exact* location in the code provided:
+    The errors are generated in various `...Parser` methods.
+    The lack of synchronization is a systemic issue, but the specific incorrect output `20 i` vs `20 j` and `16 i` suggests that the parser's state at Line 16 and 20 is corrupted by the error at Line 15.
+    
+    The code snippet where the error handling logic is defined (and lacks synchronization) is in `Parser.java`. Specifically, the blocks where `errors.add(...)` is called.
+
+<frontend/Parser/Parser.java>
+...
+    private ConstDecl constDeclParser() {
+        Token constTk = iterator.readNextToken();
+        BType bType = bTypeParser();
+        ConstDef firstConstDef = constDefParser();
+        ArrayList<Token> commas = new ArrayList<>();
+        ArrayList<ConstDef> constDefs = new ArrayList<>();
+        while (iterator.nextToken().isType(TokenType.COMMA)) {
+            commas.add(iterator.readNextToken());
+            constDefs.add(constDefParser());
+        }
+        Token semicn = null;
+        if (iterator.nextToken().isType(TokenType.SEMICN)) {
+            semicn = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.i, iterator.lastToken().getLineNum()));
+        }
+        return new ConstDecl(constTk, bType, firstConstDef, constDefs, commas, semicn);
+    }
+...
+    private VarDecl varDeclParser() {
+        BType bType = bTypeParser();
+        VarDef firstVarDef = varDefParser();
+        ArrayList<VarDef> varDefs = new ArrayList<>();
+        ArrayList<Token> commas = new ArrayList<>();
+        while (iterator.nextToken().isType(TokenType.COMMA)) {
+            commas.add(iterator.readNextToken());
+            varDefs.add(varDefParser());
+        }
+        Token semicn = null;
+        if (iterator.nextToken().isType(TokenType.SEMICN)) {
+            semicn = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.i, iterator.lastToken().getLineNum()));
+        }
+        return new VarDecl(bType, firstVarDef, varDefs, commas, semicn);
+    }
+...
+    private FuncDef funcDefParser() {
+        FuncType funcType = funcTypeParser();
+        Token ident = iterator.readNextToken();
+        Token lparent = iterator.readNextToken();
+        FuncFParam firstFuncFParam = null;
+        ArrayList<FuncFParam> funcFParams = new ArrayList<>();
+        ArrayList<Token> commas = new ArrayList<>();
+        if (!iterator.nextToken().isType(TokenType.RPARENT)) {
+            firstFuncFParam = funcFParamParser();
+            while (iterator.nextToken().isType(TokenType.COMMA)) {
+                commas.add(iterator.readNextToken());
+                funcFParams.add(funcFParamParser());
+            }
+        }
+        Token rparent = null;
+        if (iterator.nextToken().isType(TokenType.RPARENT)) {
+            rparent = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.j, iterator.lastToken().getLineNum()));
+        }
+        Block block = blockParser();
+        return new FuncDef(funcType, ident, lparent, firstFuncFParam, funcFParams, commas, rparent, block);
+    }
+...
+    private StmtAssign stmtAssignParser() {
+        LVal lVal = lValParser();
+        Token assign = iterator.readNextToken();
+        Exp exp = expParser();
+        Token semicn = null;
+        if (iterator.nextToken().isType(TokenType.SEMICN)) {
+            semicn = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.i, iterator.lastToken().getLineNum()));
+        }
+        return new StmtAssign(lVal, assign, exp, semicn);
+    }
+...
+    private StmtBreak stmtBreakParser() {
+        Token token = iterator.readNextToken();
+        Token semicn = null;
+        if (iterator.nextToken().isType(TokenType.SEMICN)) {
+            semicn = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.i, iterator.lastToken().getLineNum()));
+        }
+        return new StmtBreak(token, semicn);
+    }
+...
+    private StmtExp stmtExpParser() {
+        Exp exp = null;
+        if (!iterator.nextToken().isType(TokenType.SEMICN)) {
+            exp = expParser();
+        }
+//        if (Exp.getFirst().contains(iterator.nextToken().getType())) {
+//            exp = expParser();
+//        }
+        Token semicn = null;
+        if (iterator.nextToken().isType(TokenType.SEMICN)) {
+            semicn = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.i, iterator.lastToken().getLineNum()));
+        }
+        return new StmtExp(exp, semicn);
+    }
+...
+    private StmtGetInt stmtGetIntParser() {
+        LVal lVal = lValParser();
+        Token assign = iterator.readNextToken();
+        Token getIntTk = iterator.readNextToken();
+        Token lParent = iterator.readNextToken();
+        Token rParent = null;
+        if (iterator.nextToken().isType(TokenType.RPARENT)) {
+            rParent = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.j, iterator.lastToken().getLineNum()));
+        }
+        Token semicn = null;
+        if (iterator.nextToken().isType(TokenType.SEMICN)) {
+            semicn = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.i, iterator.lastToken().getLineNum()));
+        }
+        return new StmtGetInt(lVal, assign, getIntTk, lParent, rParent, semicn);
+    }
+...
+    private StmtGetChar stmtGetCharParser() {
+        LVal lVal = lValParser();
+        Token assign = iterator.readNextToken();
+        Token getCharTk = iterator.readNextToken();
+        Token lParent = iterator.readNextToken();
+        Token rParent = null;
+        if (iterator.nextToken().isType(TokenType.RPARENT)) {
+            rParent = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.j, iterator.lastToken().getLineNum()));
+        }
+        Token semicn = null;
+        if (iterator.nextToken().isType(TokenType.SEMICN)) {
+            semicn = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.i, iterator.lastToken().getLineNum()));
+        }
+        return new StmtGetChar(lVal, assign, getCharTk, lParent, rParent, semicn);
+    }
+...
+    private StmtIf stmtIfParser() {
+        Token ifTk = iterator.readNextToken();
+        Token lParent = iterator.readNextToken();
+        Cond cond = condParser();
+        Token rParent = null;
+        if (iterator.nextToken().isType(TokenType.RPARENT)) {
+            rParent = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.j, iterator.lastToken().getLineNum()));
+        }
+        Stmt stmt1 = stmtParser();
+        Token elseTk = null;
+        Stmt stmt2 = null;
+        if (iterator.nextToken().isType(TokenType.ELSETK)) {
+            elseTk = iterator.readNextToken();
+            stmt2 = stmtParser();
+        }
+        return new StmtIf(ifTk, lParent, cond, rParent, stmt1, elseTk, stmt2);
+    }
+...
+    private StmtPrintf stmtPrintfParser() {
+        Token printfTk = iterator.readNextToken();
+        Token lParent = iterator.readNextToken();
+        Token stringConst = iterator.readNextToken();
+        ArrayList<Token> commas = new ArrayList<>();
+        ArrayList<Exp> exps = new ArrayList<>();
+        while (iterator.nextToken().isType(TokenType.COMMA)) {
+            commas.add(iterator.readNextToken());
+            exps.add(expParser());
+        }
+        Token rParent = null;
+        if (iterator.nextToken().isType(TokenType.RPARENT)) {
+            rParent = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.j, iterator.lastToken().getLineNum()));
+        }
+        Token semicn = null;
+        if (iterator.nextToken().isType(TokenType.SEMICN)) {
+            semicn = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.i, iterator.lastToken().getLineNum()));
+        }
+        return new StmtPrintf(printfTk, lParent, stringConst, commas, exps, rParent, semicn);
+    }
+...
+    private StmtReturn stmtReturnParser() {
+        Token returnTk = iterator.readNextToken();
+        Exp exp = null;
+        if (Exp.getFirst().contains(iterator.nextToken().getType())) {
+            exp = expParser();
+        }
+        Token semicn = null;
+        if (iterator.nextToken().isType(TokenType.SEMICN)) {
+            semicn = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.i, iterator.lastToken().getLineNum()));
+        }
+        return new StmtReturn(returnTk, exp, semicn);
+    }
+...
+    private PrimaryExpExp primaryExpExpParser() {
+        Token lparent = iterator.readNextToken();
+        Exp exp = expParser();
+        Token rparent = null;
+        if (iterator.nextToken().isType(TokenType.RPARENT)) {
+            rparent = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.j, iterator.lastToken().getLineNum()));
+        }
+        return new PrimaryExpExp(lparent, exp, rparent);
+    }
+...
+    private UnaryExpFunc unaryExpFuncParser() {
+        Token ident = iterator.readNextToken();
+        Token lParent = iterator.readNextToken();
+        Exp firstExp = null;
+        ArrayList<Exp> exps = new ArrayList<>();
+        ArrayList<Token> commas = new ArrayList<>();
+        if (!iterator.nextToken().isType(TokenType.RPARENT)) {
+            firstExp = expParser();
+            while (iterator.nextToken().isType(TokenType.COMMA)) {
+                commas.add(iterator.readNextToken());
+                exps.add(expParser());
+            }
+        }
+        Token rParent = null;
+        if (iterator.nextToken().isType(TokenType.RPARENT)) {
+            rParent = iterator.readNextToken();
+        } else {
+            errors.add(new Error(Error.ErrorType.j, iterator.lastToken().getLineNum()));
+        }
+        return new UnaryExpFunc(ident, lParent, firstExp, exps, commas, rParent);
+    }
+...

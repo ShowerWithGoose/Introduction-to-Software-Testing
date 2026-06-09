@@ -1,0 +1,732 @@
+Based on the problem description and the test case, the program fails to detect syntax errors (specifically missing right parentheses `)`) in the input source code. The expected output indicates three errors of type `j` (Missing right parenthesis) at lines 13, 15, and 20. However, the buggy output is empty, meaning no errors were recorded or written.
+
+The core issue lies in how the parser handles errors during recursive descent. When a syntax error (like a missing `)`) is detected, the parser records the error but often continues parsing from the current position. If the parser gets stuck or enters an infinite loop because it doesn't advance past the erroneous token, or if it fails to properly synchronize and continue parsing subsequent structures, it might not complete the analysis or might crash/exit before writing the error file.
+
+However, looking closely at the `analyseStmt` method, specifically the handling of `if` statements:
+
+```java
+        if(isEqualWordType(0, WordType.IFTK)){
+            stmt.type = Stmt.StmtType._if;
+            writeWord(); // consumes 'if'
+            writeWord(); // consumes '('
+            stmt.cond = analyseCond();
+            if(isEqualWordType(0, WordType.RPARENT)){
+                writeWord();
+            }
+            else{
+                Error error = new Error(ErrorType.j,wordList.get(now-1).getRow());
+                errorList.add(error);
+            }
+            stmt.stmtIf = analyseStmt();
+            // ...
+        }
+```
+
+In the test case: `if (3 > 0 { // error 2`, the parser consumes `if`, `(`, parses `3 > 0` as `Cond`. Then it checks for `)`. It finds `{` instead. It records error `j` at the line of the last token of `Cond` (which is `0`). This seems correct for error detection.
+
+Let's look at `analysePrimaryExp`:
+```java
+    private PrimaryExp analysePrimaryExp(){
+        PrimaryExp primaryExp = new PrimaryExp();
+        if(isEqualWordType(0, WordType.LPARENT)){
+            primaryExp.type = PrimaryExp.PrimaryExpType.exp;
+            writeWord();
+            primaryExp.exp = analyseExp();
+            if(isEqualWordType(0, WordType.RPARENT)){
+                writeWord();
+            }
+            else{
+                Error error = new Error(ErrorType.j,wordList.get(now-1).getRow());
+                errorList.add(error);
+            }
+        }
+        // ...
+    }
+```
+
+And `analyseUnaryExp`:
+```java
+    private UnaryExp analyseUnaryExp(){
+        UnaryExp unaryExp = new UnaryExp();
+        if(isEqualWordType(0,WordType.IDENFR)&&isEqualWordType(1,WordType.LPARENT)){
+            unaryExp.type = UnaryExp.UnaryExpType.ident;
+            unaryExp.ident = writeWord();
+            writeWord(); // consumes '('
+            if(isEqualWordType(0, WordType.PLUS)
+                    ||isEqualWordType(0,WordType.MINU)
+                    ||isEqualWordType(0,WordType.NOT)
+                    ||isEqualWordType(0,WordType.IDENFR)
+                    ||isEqualWordType(0,WordType.INTCON)
+                    ||isEqualWordType(0,WordType.CHRCON)){
+                unaryExp.funcRParams = analyseFuncRParams();
+            }
+            if(isEqualWordType(0, WordType.RPARENT)){
+                writeWord();
+            }
+            else{
+                Error error = new Error(ErrorType.j,wordList.get(now-1).getRow());
+                errorList.add(error);
+            }
+        }
+        // ...
+    }
+```
+
+The test case has:
+1. Line 13: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7); // error 1`
+   - This is an assignment statement. `i` is LVal. `=` is consumed. Then `analyseExp()` is called.
+   - `Exp` -> `AddExp` -> ... -> `PrimaryExp`.
+   - `PrimaryExp` sees `(`. Consumes it. Parses inner `Exp`.
+   - The inner expression is `1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7`.
+   - Inside this, there is another `(` at `(3...`. `PrimaryExp` consumes `(`. Parses `3 + ...`.
+   - Inside that, `(4 - 5)`. `PrimaryExp` consumes `(`. Parses `4 - 5`. Expects `)`. Finds `)`. OK.
+   - Back to `3 + 1000 * ... / 6 + 7`. Ends.
+   - Back to outer `PrimaryExp` expecting `)`. It finds `;`.
+   - It should record error `j`. The line number should be where the last non-terminal before `)` was located. The last token parsed was `7`. Line 13. Correct.
+
+2. Line 15: `if (3 > 0 { // error 2`
+   - `if` consumed. `(` consumed. `Cond` parsed (`3 > 0`).
+   - Expects `)`. Finds `{`.
+   - Records error `j`. Last token was `0`. Line 15. Correct.
+
+3. Line 20: `i = (((((f(str))))); // error 3`
+   - Wait, the comment says `// error 3`. Let's count parentheses.
+   - `i = (((((f(str)))));`
+   - `f(str)` is a function call. `f` ident, `(`, `str` param, `)`.
+   - Then `))))`. Four closing parens.
+   - Opening parens: `(((((`. Five opening parens.
+   - So one `(` is unmatched.
+   - Parsing: `i` LVal. `=`. `Exp`.
+   - `Exp` -> `PrimaryExp` sees `(`. Consumes 1st `(`.
+   - `Exp` -> `PrimaryExp` sees `(`. Consumes 2nd `(`.
+   - `Exp` -> `PrimaryExp` sees `(`. Consumes 3rd `(`.
+   - `Exp` -> `PrimaryExp` sees `(`. Consumes 4th `(`.
+   - `Exp` -> `PrimaryExp` sees `(`. Consumes 5th `(`.
+   - `Exp` -> `UnaryExp` -> `ident` `f`. `(`. `str`. `)`.
+   - Returns from `f(str)` call.
+   - Back to 5th `PrimaryExp`. Expects `)`. Finds `)`. OK.
+   - Back to 4th `PrimaryExp`. Expects `)`. Finds `)`. OK.
+   - Back to 3rd `PrimaryExp`. Expects `)`. Finds `)`. OK.
+   - Back to 2nd `PrimaryExp`. Expects `)`. Finds `)`. OK.
+   - Back to 1st `PrimaryExp`. Expects `)`. Finds `;`.
+   - Records error `j`. Last token was `)`. Line 20. Correct.
+
+So the logic for detecting errors seems present. Why is the output empty?
+
+Look at `Compiler.java`:
+```java
+        /*语法分析*/
+        SyntaxMain syntaxMain = new SyntaxMain(lexicalMain.getWordList(),lexicalMain.getErrorList());
+        syntaxMain.buildAst();
+        if(parserPrint){
+            syntaxMain.writeResToFile("parser.txt");
+        }
+        if(parserErrPrint){
+            syntaxMain.writeErrorsToFile("error.txt");
+        }
+```
+
+If `buildAst()` throws an exception or hangs, the files won't be written.
+Or if `writeErrorsToFile` writes to `error.txt`, but `LexicalMain` also wrote to `error.txt` earlier?
+In `Compiler.java`:
+```java
+        if(lexErrPrint){
+            lexicalMain.writeErrorsToFile("error.txt");
+        }
+```
+`lexErrPrint` is `false`. So `lexer` doesn't write to `error.txt`.
+`parserErrPrint` is `true`. So `parser` writes to `error.txt`.
+
+Is it possible that `buildAst()` encounters an error state that causes it to stop processing prematurely without throwing an exception, but also without reaching the end of the file?
+Or perhaps the `errorList` is being cleared or not populated correctly?
+
+Let's look at `analyseCompUnit`:
+```java
+    private CompUnit analyseCompUnit(){
+        CompUnit compUnit = new CompUnit();
+        while(isEqualWordType(0,WordType.CONSTTK)
+                    ||!isEqualWordType(2,WordType.LPARENT)){
+                compUnit.declList.add(analyseDecl());
+        }
+        while(isEqualWordType(0,WordType.VOIDTK)
+                    ||(isEqualWordType(1,WordType.IDENFR)
+                        && isEqualWordType(2,WordType.LPARENT))) {
+                compUnit.funcDefList.add(analyseFuncDef());
+        }
+        if(isEqualWordType(0,WordType.INTTK)
+            && isEqualWordType(1,WordType.MAINTK)
+            && isEqualWordType(2,WordType.LPARENT)){
+            compUnit.mainFuncDef = analyseMainFuncDef();
+        }
+        syntaxRes.add("<"+SyntaxType.CompUnit+">");
+        return compUnit;
+    }
+```
+
+The condition `!isEqualWordType(2,WordType.LPARENT)` for `Decl` is suspicious.
+`Decl` starts with `const` or `BType` (`int`/`char`).
+If it's `int`, `isEqualWordType(0, INTTK)` is true.
+The loop condition is `CONSTTK` OR `!LPARENT at offset 2`.
+If we have `int f(...)`, `offset 0` is `int`, `offset 1` is `f`, `offset 2` is `(`.
+`!isEqualWordType(2, LPARENT)` is FALSE.
+So `int f(...)` does NOT enter the `Decl` loop. Correct.
+If we have `int i = 0;`, `offset 0` is `int`, `offset 1` is `i`, `offset 2` is `=`.
+`!isEqualWordType(2, LPARENT)` is TRUE.
+So `int i = 0;` enters the `Decl` loop. Correct.
+
+However, what if the parser gets stuck in a loop inside `analyseDecl` or `analyseStmt` when an error occurs?
+For example, in `analyseStmt`, if `if` is parsed but `)` is missing, the parser records the error but does NOT consume the unexpected token (`{` in error 2 case).
+Then it calls `analyseStmt()` recursively for `stmtIf`.
+`analyseStmt` sees `{`. It matches `LBRACE`.
+```java
+        else if(isEqualWordType(0,WordType.LBRACE)){
+            stmt.type = Stmt.StmtType.block;
+            stmt.block = analyseBlock();
+        }
+```
+`analyseBlock` consumes `{`, parses items, expects `}`.
+In `if (3 > 0 { ... }`, the block is `{ g(...); }`.
+This parses correctly.
+Then back to `if` statement. Checks for `else`. None.
+Returns `Stmt`.
+Back to `BlockItem` or wherever `if` was called.
+
+The issue might be that when an error is detected (e.g., missing `)`), the parser **does not advance** past the error point. This can cause subsequent parsing to fail or behave unexpectedly, potentially leading to an infinite loop or incorrect parsing state that prevents further error detection or correct termination.
+
+Specifically, in `analysePrimaryExp`:
+```java
+            if(isEqualWordType(0, WordType.RPARENT)){
+                writeWord();
+            }
+            else{
+                Error error = new Error(ErrorType.j,wordList.get(now-1).getRow());
+                errorList.add(error);
+            }
+```
+If `)` is missing, `now` is NOT incremented. The next parsing step will see the same token that caused the error (e.g., `;` or `{`).
+In many recursive descent parsers, it's crucial to **synchronize** or **advance** past the error to prevent infinite loops. If the parser doesn't advance, and the calling function expects a different token, it might loop or fail.
+
+However, the most likely reason for "No output file" or empty output is that the program crashes or hangs.
+If I look at `analyseCompUnit` again:
+```java
+        while(isEqualWordType(0,WordType.CONSTTK)
+                    ||!isEqualWordType(2,WordType.LPARENT)){
+                compUnit.declList.add(analyseDecl());
+        }
+```
+If `analyseDecl` doesn't consume any tokens (due to an error or misprediction), this loop becomes infinite.
+Does `analyseDecl` always consume tokens?
+`analyseDecl` calls `analyseConstDecl` or `analyseVarDecl`.
+`analyseVarDecl` calls `analyseBtype` which calls `writeWord()`. So it consumes at least one token.
+So `Decl` loop is safe.
+
+What about `FuncDef` loop?
+```java
+        while(isEqualWordType(0,WordType.VOIDTK)
+                    ||(isEqualWordType(1,WordType.IDENFR)
+                        && isEqualWordType(2,WordType.LPARENT))) {
+                compUnit.funcDefList.add(analyseFuncDef());
+        }
+```
+`analyseFuncDef` calls `analyseFuncType` which calls `writeWord()`. Safe.
+
+What about `MainFuncDef`?
+It's an `if`, not a loop.
+
+So `CompUnit` should terminate.
+
+Let's look at `analyseBlock`:
+```java
+    private Block analyseBlock(){
+        Block block = new Block();
+        block.lbrace = writeWord();
+        while(!isEqualWordType(0,WordType.RBRACE)) {
+            block.blockItems.add(analyseBlockItem());
+        }
+        block.rbrace = writeWord();
+        syntaxRes.add("<"+SyntaxType.Block+">");
+        return block;
+    }
+```
+If `analyseBlockItem` doesn't consume tokens, this loops infinitely.
+`analyseBlockItem` calls `analyseDecl` or `analyseStmt`.
+We established `analyseDecl` consumes tokens.
+Does `analyseStmt` always consume tokens?
+`analyseStmt` has many branches.
+Most branches start with `writeWord()` or call functions that do.
+Branch: `else if(isEqualWordType(0,WordType.IDENFR))`
+It does lookahead/backtracking.
+If it determines it's an `ExpSemicn` or `LVal=...`, it eventually calls `writeWord()` or `analyseExp()` etc.
+`analyseExp` -> `analyseAddExp` -> ... -> `writeWord()`.
+So `Stmt` should consume tokens.
+
+Wait, look at `analyseStmt` for `if`:
+```java
+        if(isEqualWordType(0, WordType.IFTK)){
+            stmt.type = Stmt.StmtType._if;
+            writeWord(); // consumes if
+            writeWord(); // consumes (
+            stmt.cond = analyseCond();
+            if(isEqualWordType(0, WordType.RPARENT)){
+                writeWord();
+            }
+            else{
+                Error error = new Error(ErrorType.j,wordList.get(now-1).getRow());
+                errorList.add(error);
+            }
+            stmt.stmtIf = analyseStmt();
+            // ...
+        }
+```
+If `)` is missing, `now` stays at `{`.
+`analyseStmt()` is called for `stmtIf`.
+It sees `{`. Matches `LBRACE` branch.
+`analyseBlock()` is called.
+Consumes `{`. Parses content. Consumes `}`.
+Returns.
+Back in `if` handler. Checks `else`. No.
+Returns `Stmt`.
+This seems fine.
+
+Why would the output be empty?
+Maybe the `errorList` is empty?
+If the parser crashes before adding errors?
+Or maybe `writeErrorsToFile` is not called?
+In `Compiler.java`, `parserErrPrint` is `true`.
+
+Let's check the test case input again.
+`int f(char str[]) { ... }`
+`int g(int i, int arr[]) { ... }`
+`int main() { ... }`
+
+Parsing `f`:
+`FuncDef`. `FuncType` (`int`? No, `f` returns `int`? Wait. `int f(...)`).
+`analyseFuncDef`:
+`funcType = analyseFuncType()` -> consumes `int`.
+`ident = writeWord()` -> consumes `f`.
+`lparent = writeWord()` -> consumes `(`.
+Checks for `FuncFParams`. `isEqualWordType(0, INTTK)`? No, it's `CHAR`. `isEqualWordType(0, CHARTK)`? Yes.
+So `haveFuncFParams = true`.
+`funcFParams = analyseFuncFParams()`.
+`analyseFuncFParams`:
+`analyseFuncFParam()`.
+`btype = analyseBtype()` -> consumes `char`.
+`ident = writeWord()` -> consumes `str`.
+`isEqualWordType(0, LBRACK)`? Yes.
+`lbrack = writeWord()` -> consumes `[`.
+`isEqualWordType(0, RBRACK)`? Yes.
+`rbrack = writeWord()` -> consumes `]`.
+Returns `FuncFParam`.
+Back in `FuncFParams`. Checks `,`. No.
+Returns `FuncFParams`.
+Back in `FuncDef`.
+Checks `RPARENT`. `isEqualWordType(0, RPARENT)`? Yes.
+`rparent = writeWord()` -> consumes `)`.
+`block = analyseBlock()`.
+Consumes `{`. `return 0;`. `}`.
+Returns `FuncDef`.
+
+This looks correct.
+
+Is it possible that the `errorList` passed to `SyntaxMain` is the same reference as `lexicalMain.getErrorList()`, and `writeErrorsToFile` in `SyntaxMain` sorts it?
+Yes.
+`Collections.sort(errorList, Comparator.comparingInt(Error::getRow));`
+
+If there are no errors, the file is empty.
+But there SHOULD be errors.
+
+Let's look at `analysePrimaryExp` again.
+Test case 1: `int i = (1 + 2 * (3 + 1000 * (4 - 5) / 6 + 7);`
+`analyseExp` is called.
+Eventually `PrimaryExp` sees `(`.
+Consumes `(`.
+Calls `analyseExp`.
+Inside `analyseExp`, it parses `1 + ...`.
+Eventually it hits the inner `(`.
+`PrimaryExp` sees `(`. Consumes.
+Parses `3 + ...`.
+Hits inner `(`.
+`PrimaryExp` sees `(`. Consumes.
+Parses `4 - 5`.
+Hits `)`. `PrimaryExp` sees `)`. Consumes.
+Returns.
+Back to `3 + ...`. Continues.
+Hits `7`.
+End of `Exp` for the middle `PrimaryExp`.
+Back to middle `PrimaryExp`. Expects `)`.
+Current token is `/`? No.
+`3 + 1000 * (4 - 5) / 6 + 7`.
+After `(4-5)`, we have `/ 6 + 7`.
+The `Exp` parser handles `+`, `-`, `*`, `/`.
+So `analyseExp` for the middle `PrimaryExp` will consume `3 + 1000 * (4 - 5) / 6 + 7`.
+Then it returns.
+Back to middle `PrimaryExp`.
+Expects `)`.
+Current token is `;`.
+Error `j` recorded. Line 13.
+`now` is NOT advanced.
+Returns `PrimaryExp`.
+Returns `UnaryExp`.
+Returns `MulExp`.
+Returns `AddExp`.
+Returns `Exp`.
+Back to `Stmt` (assignment).
+Expects `;`.
+Current token is `;`.
+`isEqualWordType(0, SEMICN)`? Yes.
+`writeWord()`. Consumes `;`.
+Returns `Stmt`.
+
+So Error 1 is recorded.
+
+Test case 2: `if (3 > 0 {`
+`if` consumed. `(` consumed.
+`Cond` parsed. `3 > 0`.
+Expects `)`. Current token `{`.
+Error `j` recorded. Line 15.
+`now` NOT advanced.
+`analyseStmt` for `stmtIf` called.
+Sees `{`.
+`analyseBlock` called.
+Consumes `{`.
+Parses `g(...);`.
+Consumes `}`.
+Returns.
+Back to `if`.
+Checks `else`. No.
+Returns.
+
+So Error 2 is recorded.
+
+Test case 3: `i = (((((f(str)))));`
+`i` LVal. `=`.
+`Exp` called.
+`PrimaryExp` sees `(`. Consumes 1.
+`Exp` called.
+`PrimaryExp` sees `(`. Consumes 2.
+`Exp` called.
+`PrimaryExp` sees `(`. Consumes 3.
+`Exp` called.
+`PrimaryExp` sees `(`. Consumes 4.
+`Exp` called.
+`PrimaryExp` sees `(`. Consumes 5.
+`UnaryExp` called.
+`ident` `f`. `(`. `str`. `)`.
+Returns.
+Back to 5th `PrimaryExp`. Expects `)`. Sees `)`. Consumes.
+Back to 4th `PrimaryExp`. Expects `)`. Sees `)`. Consumes.
+Back to 3rd `PrimaryExp`. Expects `)`. Sees `)`. Consumes.
+Back to 2nd `PrimaryExp`. Expects `)`. Sees `)`. Consumes.
+Back to 1st `PrimaryExp`. Expects `)`. Sees `;`.
+Error `j` recorded. Line 20.
+`now` NOT advanced.
+Returns `PrimaryExp`.
+Returns `Exp`.
+Back to `Stmt`.
+Expects `;`. Sees `;`. Consumes.
+Returns.
+
+So all 3 errors are recorded.
+
+Why is the output empty?
+Check `writeErrorsToFile` in `SyntaxMain`.
+```java
+    public void writeErrorsToFile(String filePath) {
+        Collections.sort(errorList, Comparator.comparingInt(Error::getRow));
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(filePath))) {
+            for (Error error : errorList) {
+                writer.write(error.getRow() + " " + error.getErrorType());
+                writer.newLine(); // 换行
+            }
+            System.out.println("写入成功！");
+        } catch (IOException e) {
+            System.err.println("写入文件时出错: " + e.getMessage());
+        }
+    }
+```
+This looks correct.
+
+Is it possible that `errorList` is null?
+No, initialized in constructor.
+
+Is it possible that `Compiler.java` catches an exception?
+No try-catch around `syntaxMain.buildAst()`.
+
+Wait! Look at `analyseCompUnit` again.
+```java
+        while(isEqualWordType(0,WordType.CONSTTK)
+                    ||!isEqualWordType(2,WordType.LPARENT)){
+                compUnit.declList.add(analyseDecl());
+        }
+```
+What if the input file has trailing whitespace or newlines that result in empty tokens?
+The lexer filters whitespace.
+
+Let's look at the `Lexer` output.
+If the lexer fails, `wordList` might be empty or incomplete.
+But the problem says "Buggy Output: No output file".
+This usually means the program crashed or hung.
+
+If the parser hangs, it's likely an infinite loop.
+Where could an infinite loop occur?
+In `analyseBlock`:
+```java
+        while(!isEqualWordType(0,WordType.RBRACE)) {
+            block.blockItems.add(analyseBlockItem());
+        }
+```
+If `analyseBlockItem` fails to consume a token, it loops.
+`analyseBlockItem` calls `analyseDecl` or `analyseStmt`.
+
+Consider an error scenario where `analyseStmt` is called on a token it doesn't expect, and it doesn't consume it.
+For example, if `analyseStmt` is called and the current token is `}`.
+None of the `if/else if` conditions match `}`.
+`analyseStmt` reaches the end of the function.
+It returns `stmt` (which is empty/default).
+It adds `<Stmt>` to `syntaxRes`.
+It does NOT consume `}`.
+Back in `analyseBlock`.
+`!isEqualWordType(0, RBRACE)` is FALSE.
+Loop terminates.
+`rbrace = writeWord()`. Consumes `}`.
+So this is safe.
+
+What if `analyseStmt` is called on an unexpected token like `]`?
+Same thing. Returns without consuming.
+Caller must handle it.
+
+Is there a case where `analyseStmt` loops?
+No, it's a single pass.
+
+What about `analyseExp`?
+If `analyseExp` is called on a token that isn't an expression start?
+`analyseAddExp` -> `analyseMulExp` -> `analyseUnaryExp` -> `analysePrimaryExp`.
+`analysePrimaryExp`:
+If it's not `(`, `INTCON`, `CHRCON`, `IDENFR`.
+It falls through to `else`?
+No, `else` assumes `lVal`.
+```java
+        else{
+            primaryExp.type = PrimaryExp.PrimaryExpType.lVal;
+            primaryExp.lVal = analyseLVal();
+        }
+```
+`analyseLVal` calls `writeWord()` on `IDENFR`.
+If the token is NOT `IDENFR` (e.g., `]`), `writeWord()` will throw `IndexOutOfBoundsException` or similar if `now` is out of bounds, or just write the wrong token.
+If `now` is valid but token is `]`, `writeWord()` writes `]`.
+Then `isEqualWordType(0, LBRACK)`? No.
+Returns `LVal`.
+Back to `PrimaryExp`. Adds `<PrimaryExp>`.
+Back to `UnaryExp`. Adds `<UnaryExp>`.
+Back to `MulExp`. Adds `<MulExp>`.
+Back to `AddExp`. Adds `<AddExp>`.
+Back to `Exp`. Adds `<Exp>`.
+So it consumes the unexpected token `]` as an identifier.
+This might cause downstream errors, but it consumes a token.
+
+So where is the hang?
+
+Let's look at `analyseFuncDef` again.
+```java
+        if(isEqualWordType(0,WordType.INTTK)
+                ||isEqualWordType(0,WordType.CHARTK)){
+            funcDef.haveFuncFParams = true;
+            funcDef.funcFParams = analyseFuncFParams();
+        }
+        else{
+            funcDef.haveFuncFParams = false;
+        }
+
+        if(isEqualWordType(0, WordType.RPARENT)){
+            funcDef.rparent = writeWord();
+        }
+        else{
+            Error error = new Error(ErrorType.j,wordList.get(now-1).getRow());
+            errorList.add(error);
+        }
+```
+If `)` is missing here, error is recorded. `now` not advanced.
+Then `analyseBlock()` is called.
+If the next token is `{`, it parses the block.
+If the next token is NOT `{`, `analyseBlock` will fail/hang?
+`analyseBlock` expects `{`.
+```java
+    private Block analyseBlock(){
+        Block block = new Block();
+        block.lbrace = writeWord(); // Consumes whatever is next
+        // ...
+    }
+```
+It blindly calls `writeWord()`.
+If the next token is `;` (because `)` was missing and `;` followed), it consumes `;` as `lbrace`.
+Then it loops `while(!RBRACE)`.
+It calls `analyseBlockItem`.
+`analyseBlockItem` sees next token.
+If it's end of file or something unexpected, it might loop or crash.
+
+But in our test cases, the errors are inside expressions or `if` conditions, not at function definition boundaries.
+
+Wait! Look at `analyseCompUnit` loop condition again.
+```java
+        while(isEqualWordType(0,WordType.CONSTTK)
+                    ||!isEqualWordType(2,WordType.LPARENT)){
+                compUnit.declList.add(analyseDecl());
+        }
+```
+If `analyseDecl` encounters an error and doesn't consume tokens, this loops.
+But `analyseDecl` calls `writeWord` via `analyseBtype`.
+
+Is it possible that `wordList` is empty?
+If `testfile.txt` is empty or lexer fails.
+
+Let's assume the code is correct logically but there's a subtle bug.
+The prompt asks to identify the location of the errors.
+The most common bug in these student parsers is **not advancing the token stream after an error**, leading to infinite loops in `while` loops that depend on token consumption.
+
+In `analyseBlock`:
+```java
+        while(!isEqualWordType(0,WordType.RBRACE)) {
+            block.blockItems.add(analyseBlockItem());
+        }
+```
+If `analyseBlockItem` encounters an error and returns without consuming a token, this loops infinitely.
+Does `analyseBlockItem` guarantee consumption?
+It calls `analyseDecl` or `analyseStmt`.
+We analyzed `analyseStmt`. It seems to always consume or return quickly.
+But what if `analyseStmt` is called with an empty `wordList` or `now` out of bounds?
+`isEqualWordType` checks bounds.
+
+Actually, there is a known issue in `analyseStmt` with the `IDENFR` backtracking.
+```java
+        else if(isEqualWordType(0,WordType.IDENFR)){
+            int tempNow = now;
+            ArrayList<String> tempResList = (ArrayList<String>) syntaxRes.clone();
+            ArrayList<Error> tempErrorList = (ArrayList<Error>) errorList.clone();
+            analyseLVal();
+            if(isEqualWordType(0, WordType.ASSIGN)){
+                // ...
+            }
+            else{
+                // ...
+                //回溯
+                now = tempNow;
+                syntaxRes = (ArrayList<String>) tempResList.clone();
+                errorList = (ArrayList<Error>) tempErrorList.clone();
+                //Ident开头不会缺省exp
+                stmt.exp = analyseExp();
+                // ...
+            }
+        }
+```
+If `analyseLVal` consumes tokens, and then we backtrack, we restore `now`.
+Then `analyseExp` is called.
+This is correct.
+
+However, notice that `errorList` is restored from a clone.
+If `analyseLVal` added an error, it is discarded.
+This is intended.
+
+I suspect the issue is in `analyseCompUnit` or `analyseBlock` looping due to lack of token consumption on error paths that are not fully covered.
+
+But given the specific test case, the errors are detected.
+The only reason for "No output file" is if the program crashes.
+A common crash is `IndexOutOfBoundsException` in `writeWord` if `now >= wordList.size()`.
+`writeWord` does:
+```java
+    private Word writeWord(){
+        Word word = wordList.get(now);
+        // ...
+        now++;
+        return word;
+    }
+```
+If `now` is out of bounds, it crashes.
+Does `isEqualWordType` protect against this?
+Yes.
+```java
+    private boolean isEqualWordType(int i, WordType type){
+        if(now+i >= wordList.size()) {
+            return false;
+        }
+        // ...
+    }
+```
+So `writeWord` is only called if checks pass?
+Not necessarily.
+In `analyseBlock`:
+```java
+        block.lbrace = writeWord();
+```
+No check before this.
+If `analyseBlock` is called when `now` is at the end of the list, it crashes.
+When is `analyseBlock` called?
+1. `FuncDef`, `MainFuncDef`.
+2. `Stmt` (block statement).
+3. `ConstInitVal`, `InitVal`.
+
+In the test case, `main` block is parsed.
+Inside `main`, `if` block is parsed.
+If the parser gets confused and calls `analyseBlock` at EOF, it crashes.
+
+However, the most likely error location that fits the "Wrong Answer" / "No output" pattern in these assignments is often related to **error recovery** or **infinite loops**.
+
+Since I must output the code snippet where the error is likely located, and the parser fails to output errors, I will point to the `writeErrorsToFile` method or the error recording logic. But the logic seems fine.
+
+Let's look at `Compiler.java` again.
+```java
+        if(parserErrPrint){
+            syntaxMain.writeErrorsToFile("error.txt");
+        }
+```
+If `syntaxMain` is null or `buildAst` threw an exception, this line is not reached.
+
+I will bet on the `analyseBlock` or `analyseStmt` not consuming tokens in some error path, causing an infinite loop in `analyseBlock`'s `while` loop, preventing the program from finishing and writing the file.
+
+Specifically, if `analyseBlockItem` is called and it encounters a token it can't handle (e.g. `}` is handled, but what about unexpected tokens?), and it returns without consuming, `analyseBlock` loops.
+
+But `analyseBlockItem` calls `analyseDecl` or `analyseStmt`.
+If `analyseStmt` is called with `}`, it returns without consuming.
+Then `analyseBlock` checks `!RBRACE`. It IS `RBRACE`. Loop ends.
+So that's safe.
+
+What if `analyseStmt` is called with an unexpected token, say `]`?
+It falls through to the end?
+No, `analyseStmt` has an `else if` chain.
+If none match, it reaches the end of the function.
+It returns `stmt`.
+It does NOT consume `]`.
+Back in `analyseBlockItem`. Returns.
+Back in `analyseBlock`.
+`!isEqualWordType(0, RBRACE)` is TRUE (it's `]`).
+Loops.
+Calls `analyseBlockItem` again.
+Same thing. Infinite loop.
+
+So if there's a stray `]` or other unexpected token in the block, it hangs.
+In the test case, are there stray tokens?
+Line 13: `... + 7);`
+Line 15: `if (3 > 0 {`
+Line 20: `...)));`
+
+No stray tokens outside of structures.
+
+However, the question asks to identify the location of the errors in the program.
+The "error" in the program is likely that it **hangs** or **crashes**.
+Given the symmetry of the problem, I'll highlight the `analyseBlock` loop as a potential hang spot if error recovery is insufficient, or the `writeErrorsToFile` if it's not being called.
+
+But wait, looking at the provided solution format, I should output the code snippet.
+I will output the `analyseBlock` method as it's a common source of infinite loops in naive parsers.
+
+<frontend/SyntaxAnalysis/SyntaxMain.java>
+...
+    private Block analyseBlock(){
+        Block block = new Block();
+        block.lbrace = writeWord();
+        while(!isEqualWordType(0,WordType.RBRACE)) {
+            block.blockItems.add(analyseBlockItem());
+        }
+        block.rbrace = writeWord();
+        syntaxRes.add("<"+SyntaxType.Block+">");
+        return block;
+    }
+...

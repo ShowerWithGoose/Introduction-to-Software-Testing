@@ -1,0 +1,147 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The program is a syntax analyzer that needs to detect specific syntax errors (missing `)`, missing `;`, missing `]`) and output the line number where the error occurred. The line number should correspond to the last non-terminal symbol before the missing token.
+2.  **Test Case Input**:
+    ```c
+    void f(int a {} // error 1: Missing ')' in FuncDef. Last token before ')' is 'a' (Ident) on line 1.
+    
+    int main( { // error 2: Missing ')' in MainFuncDef. Last token before ')' is '(' on line 3.
+        int a = 10;
+        f(a + 10; // error 3: Missing ')' in UnaryExp (function call). Last token before ')' is '10' (IntConst) or the expression ending on line 5.
+        return 0;
+    }
+    ```
+    *Note: The input provided in the prompt has line numbers implicitly. Let's map them:*
+    Line 1: `void f(int a {}`
+    Line 2: (Empty)
+    Line 3: `int main( {`
+    Line 4: `    int a = 10;`
+    Line 5: `    f(a + 10;`
+    Line 6: `    return 0;`
+    Line 7: `}`
+
+    Expected Output:
+    ```
+    1 j
+    3 j
+    5 j
+    ```
+
+3.  **Buggy Output**:
+    ```
+    3 a
+    1 j
+    3 j
+    5 j
+    5 j
+    ```
+    - It outputs an extra error `3 a` (likely from the Lexer detecting `&` or `|` incorrectly, or a spurious error). Looking at `Lexer.java`, it handles `&` and `|`. The input doesn't have them. However, `Printer.printError` has a hardcoded `sb.append(3); sb.append(" "); sb.append(ErrorType.a.toString());`. This explains the `3 a`.
+    - It outputs `1 j`, `3 j`, `5 j`, `5 j`. The expected is `1 j`, `3 j`, `5 j`.
+    - The duplicate `5 j` suggests that an error is being reported twice for the same location, or an extra error is being generated.
+    - The `3 a` is definitely coming from `Printer.printError`.
+
+4.  **Error Location Identification**:
+    - **Issue 1: Spurious Error `3 a`**. In `frontend/Printer.java`, the `printError` method starts by appending a hardcoded error `3 a`. This is incorrect behavior for a general parser unless specifically required by a test case not shown here, but based on the expected output, this line should not be there.
+    - **Issue 2: Duplicate Error `5 j`**. Let's trace the parsing of `f(a + 10;`.
+        - `parseStmt` calls `parseAssignStmt`? No, `f` is an IDENFR. `parseStmt` checks for assignment. It peeks ahead. `f` followed by `(`. It might try to parse as `UnaryExp` inside an `ExpStmt` or similar.
+        - Actually, `parseStmt` has logic to distinguish between `LVal = ...` and `Exp ;`.
+        - If it parses `f(a + 10` as an `Exp` (via `UnaryExp` -> `Ident '(' ...`), it enters `parseUnaryExp`.
+        - Inside `parseUnaryExp`, it sees `IDENFR` and next is `LPARENT`. It consumes `f`, `(`. Then parses `FuncRParams` (which parses `Exp`). `Exp` parses `a + 10`. Then it expects `)`. It finds `;`. It reports error `j` at the end line of the last node parsed (likely the `Exp` or `PrimaryExp` inside).
+        - Then control returns to `parseStmt` or `parseExpStmt`. If `parseUnaryExp` consumed tokens up to `;`, the current token is `;`.
+        - If `parseStmt` called `parseExp` which called `parseUnaryExp`, and `parseUnaryExp` reported the error but didn't consume the `)`, the parser state might be messy.
+        - However, looking at `parseUnaryExp`:
+          ```java
+          if (curToken.getType() == TokenType.RPARENT) {
+              // ...
+          } else {
+              Printer.getInstance().setHasError();
+              Printer.getInstance().addError(node.getEndLineNum(), ErrorType.j);
+          }
+          ```
+          It adds the error. It does *not* advance past the missing `)`. So `curToken` is still `;`.
+        - Then `parseExp` finishes.
+        - Then `parseExpStmt` (if that's what was called) checks for `;`. It finds `;`. It consumes it. No error there.
+        - So where does the second `5 j` come from?
+        - Let's look at `parseFuncDef` and `parseMainFuncDef`.
+        - Error 1: `void f(int a {}`. `parseFuncDef`. Parses `void`, `f`, `(`. Parses `FuncFParams` (`int a`). Expects `)`. Finds `{`. Reports error `j`. Line number from `node` (last parsed node in `FuncFParams` or `Ident`). `a` is on line 1. Correct.
+        - Error 2: `int main( {`. `parseMainFuncDef`. Parses `int`, `main`, `(`. Expects `)`. Finds `{`. Reports error `j`. Line number from `node` (last parsed node, which is `(` token node?). `(` is on line 3. Correct.
+        - Error 3: `f(a + 10;`. Inside `main` block. `parseStmt`.
+          - `curToken` is `f`.
+          - `parseStmt` sets backpoint. Turns off printing. Calls `parseExp()`.
+          - `parseExp` -> `parseAddExp` -> ... -> `parseUnaryExp`.
+          - `parseUnaryExp` sees `f` and `(`. Consumes `f`, `(`.
+          - Calls `parseFuncRParams`.
+          - `parseFuncRParams` calls `parseExp`.
+          - `parseExp` parses `a + 10`.
+          - Returns to `parseFuncRParams`. Loop checks for `,`. Next is `;`. Loop ends.
+          - Returns to `parseUnaryExp`.
+          - Checks for `)`. Current is `;`.
+          - **Reports Error j**. `node` is the result of `parseFuncRParams` or the last `Exp`. End line is 5.
+          - Does NOT advance. `curToken` is still `;`.
+          - Returns to `parseExp`.
+          - Returns to `parseStmt`.
+          - `parseStmt` had turned printing back on? No, `parseStmt` logic:
+            ```java
+            tokenStream.setBackPoint();
+            Printer.getInstance().turnOff();
+            parseExp();
+            Printer.getInstance().turnOn();
+            
+            if (curToken.getType() == TokenType.ASSIGN) { ... }
+            else {
+                curToken = tokenStream.backToBackPoint();
+                return parseExpStmt();
+            }
+            ```
+          - Ah! `parseStmt` **resets the token stream** to the backpoint (before `f`) if it's not an assignment!
+          - So it calls `parseExpStmt()`.
+          - `parseExpStmt` calls `parseExp()` again!
+          - `parseExp()` calls `parseUnaryExp()` again!
+          - `parseUnaryExp()` reports the **same error j** again!
+          - This explains the duplicate `5 j`.
+
+    - **Fixes Needed**:
+        1.  Remove the hardcoded error in `Printer.printError`.
+        2.  Prevent duplicate error reporting when `parseStmt` backtracks and re-parses. The parser should ideally not report errors during the "probe" phase (when printing is off), OR it should clear errors if it backtracks, OR it should check if an error was already reported at that location.
+        3.  The simplest fix for the student's code structure, given `Printer.turnOff()` is used, is that `addError` should probably respect the `on_off` flag, OR `parseStmt` shouldn't use `parseExp` for probing if it causes side effects like error recording.
+        4.  However, `Printer.turnOff()` only affects `printToken` and `printSyntaxVarType`. It does **not** affect `addError`.
+        5.  Therefore, when `parseStmt` probes with `turnOff`, it still adds errors. Then it backtracks and parses again with `turnOn`, adding the same error again.
+        6.  We should modify `addError` to check `on_off`, or modify `parseStmt` to not report errors during probe. Given the code structure, modifying `addError` to respect `on_off` is a clean solution if we assume "probing" shouldn't generate permanent errors. But wait, if the probe *fails* to match an assignment, it falls back to `ExpStmt`. If the `ExpStmt` is also invalid, we want the error. But here, the error is in the `Exp` itself.
+        7.  Actually, if `parseExp` in the probe phase encounters a syntax error (like missing `)`), it records it. Then we backtrack. Then we parse `ExpStmt` which calls `parseExp` again. It encounters the same error and records it again.
+        8.  To fix this, we can either:
+            - Clear errors if we backtrack? Hard.
+            - Don't add errors when `on_off` is false. This seems logical. If we are just looking ahead to decide grammar path, we shouldn't commit to errors yet.
+            - Or, check if an error already exists at that line/type?
+
+    Let's look at the `Printer` class.
+
+<frontend/Printer.java>
+...
+    public void addError(int lineNum, ErrorType type) {
+        errorMap.computeIfAbsent(lineNum, k -> new ArrayList<>()).add(type);
+    }
+
+    public void printError() throws IOException {
+        try {
+            StringBuilder sb = new StringBuilder();
+            sb.append(3);
+            sb.append(" ");
+            sb.append(ErrorType.a.toString());
+            sb.append("\n");
+            outputStream_Error.write(sb.toString().getBytes());
+            for (Integer lineNum : errorMap.keySet()) {
+                for (ErrorType type: errorMap.get(lineNum)) {
+
+                        sb = new StringBuilder();
+                        sb.append(lineNum);
+                        sb.append(" ");
+                        sb.append(type.toString());
+                        sb.append("\n");
+                        outputStream_Error.write(sb.toString().getBytes());
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("Can not write the error file");
+        }
+    }
+...

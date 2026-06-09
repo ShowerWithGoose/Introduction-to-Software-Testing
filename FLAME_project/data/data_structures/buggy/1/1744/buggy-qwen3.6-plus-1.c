@@ -1,0 +1,35 @@
+#include<stdio.h>
+#include<string.h>
+#include<math.h>
+#include<stdlib.h>
+int n;
+int s[100]={0},sign[100]={0};
+void dfs(int num)
+{
+    int i;
+    if(num>n)
+    {
+        int j;
+        for(j=1;j<=n;j++)
+        {
+            printf("%d",s[j]); // @@ [The output format is incorrect. The problem requires integers to be separated by a space, but this prints them consecutively without spaces.]
+        }
+        printf("\n");
+    }
+        for(i=1;i<=n;i++)
+        {
+            if(sign[i]==0)
+            {
+                sign[i]=1;
+                s[num]=i;
+            
+            dfs(num+1);
+            sign[i]=0;}
+        }
+ } 
+int main()
+{
+scanf("%d",&n);
+dfs(1);
+ return 0;
+}

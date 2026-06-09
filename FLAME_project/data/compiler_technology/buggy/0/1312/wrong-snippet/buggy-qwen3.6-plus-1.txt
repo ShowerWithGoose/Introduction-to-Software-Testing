@@ -1,0 +1,387 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The task is to implement a lexical analyzer that outputs tokens for correct programs or errors for erroneous ones. The specific error type 'a' corresponds to standalone `&` or `|` characters.
+2.  **Test Case**: The input is a valid SysY program (`testfile.txt`). It contains no lexical errors. Therefore, the program should only output tokens to `lexer.txt` and should **not** create or write to `error.txt`.
+3.  **Buggy Output**: The output is empty/missing, and the status is "Time Limit Exceeded" (TLE).
+4.  **Code Analysis**:
+    *   In `Compiler.java`, the code opens a `FileWriter` for `lexer.txt` inside the loop iterating over tokens: `try (FileWriter writer = new FileWriter(outputFile,true))`. This repeatedly opens and closes the file, which is inefficient but likely not the cause of TLE unless the token count is massive. However, the bigger issue is in the logic.
+    *   In `LexicAnalysis.java`, inside `analyseOperatorOrUnknown`, when a standalone `&` or `|` is encountered, it writes to `error.txt`. Since the test case is valid, this path shouldn't be triggered.
+    *   **Crucial Logic Error leading to TLE**: Look at the `analyse()` method in `LexicAnalysis.java`.
+        ```java
+        while (curRow < stringList.size()) {
+            curString = getCurString();
+            if (curCol < curString.length()) {
+                // ... process character ...
+                // Inside processing methods like analyseKeyWordOrIdent, analyseIntConst, etc.,
+                // getNextChar() is called.
+            } else {
+                curCol = 0;
+                curRow += 1;
+            }
+        }
+        ```
+    *   Let's look closely at `analyseKeyWordOrIdent`:
+        ```java
+        private void analyseKeyWordOrIdent(){
+            // ...
+            while (Character.isLetterOrDigit(nextChar()) || nextChar() == '_') {
+                curChar = getNextChar();
+                tokenString = tokenString + curChar;
+            }
+            // ...
+            curChar = getNextChar(); // Advances past the last char of the identifier
+        }
+        ```
+    *   And `getNextChar()`:
+        ```java
+        private char getNextChar(){
+            curCol++;
+            if (curCol < curString.length()) {
+                curChar = curString.charAt(curCol);
+                return curChar;
+            } else {
+                return 0; // Returns 0 if end of line is reached
+            }
+        }
+        ```
+    *   If `getNextChar()` reaches the end of the line (`curCol >= curString.length()`), it returns 0 but **does not increment `curRow`**. It leaves `curCol` pointing to an index equal to `curString.length()`.
+    *   Back in `analyse()`:
+        ```java
+        if (curCol < curString.length()) {
+             // ...
+        } else {
+             curCol = 0;
+             curRow += 1;
+        }
+        ```
+    *   This structure seems okay for moving to the next line *if* the processing functions stop exactly at the boundary. However, consider what happens if a token ends exactly at the last character of the line.
+        1. `analyseKeyWordOrIdent` processes the last char.
+        2. It calls `curChar = getNextChar()`.
+        3. `getNextChar` increments `curCol` so `curCol == curString.length()`. It returns 0.
+        4. `analyseKeyWordOrIdent` finishes.
+        5. Loop in `analyse()` continues.
+        6. `curCol < curString.length()` is false (since they are equal).
+        7. `else` block executes: `curCol = 0; curRow += 1;`.
+        8. Next iteration starts with new line. This seems correct.
+
+    *   **Wait, look at `analyseBlank`**:
+        ```java
+        private void analyseBlank(){
+            curChar = getNextChar();
+        }
+        ```
+        If there are multiple spaces at the end of a line?
+        1. `curChar` is space. `analyseBlank` called.
+        2. `getNextChar()` moves to next char. If it's another space, loop continues.
+        3. If it hits end of line, `curCol` becomes `length`, `curChar` becomes 0.
+        4. Back in `analyse()`, `curCol < length` is false. `else` block resets `curCol` and increments `curRow`. Correct.
+
+    *   **Look at `analyseOperatorOrUnknown` handling comments**:
+        ```java
+        } else if (curChar == '/') {
+            //处理注释
+            if (nextChar() == '/') {
+                curChar = nextChar(); // BUG HERE? nextChar() doesn't advance state
+                nextRow();
+            } else if (nextChar() == '*') {
+                 // ...
+            }
+        }
+        ```
+        `nextChar()` just peeks. It does NOT advance `curCol`.
+        If `//` is found:
+        1. `curChar` is `/`.
+        2. `nextChar()` checks if next is `/`. Yes.
+        3. `curChar = nextChar()` sets `curChar` to `/` (the second one). `curCol` is NOT incremented.
+        4. `nextRow()` is called.
+           ```java
+           private void nextRow() {
+               curCol = 0;
+               curRow += 1;
+               // ...
+           }
+           ```
+        5. This skips the rest of the line correctly.
+
+    *   **Let's re-examine `analyse()` loop condition and `getNextChar` behavior at End Of File (EOF).**
+        If the file does not end with a newline, the last line is processed.
+        When `getNextChar` goes past the last char of the last line:
+        `curCol` becomes `length`. `curChar` becomes 0.
+        Loop continues. `curCol < length` is false.
+        `else` block: `curCol = 0`, `curRow++`.
+        Now `curRow == stringList.size()`.
+        Loop condition `curRow < stringList.size()` fails. Loop terminates.
+        This also seems correct.
+
+    *   **Is there an infinite loop?**
+        Consider `analyseFormatString`:
+        ```java
+        private void analyseFormatString(){
+            // ...
+            while (nextChar() != '\"' && nextChar() != 0) {
+                curChar = getNextChar();
+                tokenString = tokenString + curChar;
+            }
+            if (nextChar() == '\"') {
+                curChar = getNextChar();
+                tokenString = tokenString + curChar;
+            }
+            Token token = new Token(TokenKey.STRCON, tokenString, tokenPos);
+            tokenList.add(token);
+            curChar = getNextChar();
+        }
+        ```
+        If the string is unterminated (error case), `nextChar()` eventually returns 0. Loop terminates. Then `nextChar() == '"'` is false. Token added. `getNextChar()` advances.
+
+    *   **Let's look at `Compiler.java` again.**
+        ```java
+        for (Token token : tokenList) {
+            try (FileWriter writer = new FileWriter(outputFile,true)) {
+                writer.write(token.getTokenKey()+" "+token.getTokenString()+"\n");
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+        ```
+        Creating a new `FileWriter` in append mode for *every single token* is extremely slow due to OS system calls for opening/closing files. For a large file, this could easily cause a **Time Limit Exceeded**. The standard practice is to open the writer once before the loop and close it after.
+
+        Additionally, there is a logical bug in `Compiler.java`:
+        `lexicAnalysis.analyse()` populates `tokenList`.
+        Then the loop writes to `lexer.txt`.
+        However, `LexicAnalysis` also writes to `error.txt` directly if it finds errors.
+        
+        The primary cause of TLE is almost certainly the repeated opening/closing of `lexer.txt` in `Compiler.java`.
+
+        Let's check if there are other infinite loops.
+        In `analyseOperatorOrUnknown`, inside the `/* ... */` comment handling:
+        ```java
+        while (true) {
+            if (curChar == '*') {
+                curChar = getNextChar();
+                if (needNextRow()) {
+                    nextRow();
+                    continue;
+                }
+                if (curChar == '/') {
+                    break;
+                }
+            } else {
+                curChar = getNextChar();
+                if (needNextRow()) {
+                    nextRow();
+                }
+            }
+        }
+        ```
+        `needNextRow()` returns true if `curCol >= curString.length()`.
+        If `curChar` is `*` and `getNextChar()` moves to end of line:
+        1. `curChar` becomes 0 (from `getNextChar` returning 0? No, `getNextChar` returns char at `curCol` if valid, else 0. But it increments `curCol` first).
+        Wait, `getNextChar`:
+        ```java
+        curCol++;
+        if (curCol < curString.length()) {
+             curChar = curString.charAt(curCol);
+             return curChar;
+        } else {
+             return 0;
+        }
+        ```
+        If we are at the last char, `curCol` becomes `length`. Returns 0. `curChar` is NOT updated to the char at `curCol` (because it's out of bounds), but the previous `curChar` remains? No, `curChar` is a member variable. `getNextChar` does NOT update `curChar` if it returns 0?
+        Actually, looking at `getNextChar`:
+        It increments `curCol`.
+        If valid, it updates `curChar` and returns it.
+        If invalid, it returns 0. It does **not** update `curChar`. So `curChar` retains its previous value.
+        
+        Back to comment loop:
+        Suppose we have `/* comment */` at end of line.
+        We are inside `/*`.
+        `curChar` is some char.
+        Loop:
+        `else` branch: `curChar = getNextChar()`.
+        If `getNextChar` hits end of line, it returns 0. `curChar` becomes 0? No, the code says `return 0`. It doesn't assign to `curChar` in the else branch of `getNextChar`.
+        Wait, `getNextChar` implementation:
+        ```java
+        private char getNextChar(){
+            curCol++;
+            if (curCol < curString.length()) {
+                curChar = curString.charAt(curCol);
+                return curChar;
+            } else {
+                return 0;
+            }
+        }
+        ```
+        If it goes to else, `curChar` is **not updated**. It keeps the old value.
+        
+        So in the comment loop:
+        `curChar = getNextChar()`. If EOL, `curChar` stays as the last character read (or whatever it was).
+        Then `if (needNextRow())` checks `curCol >= length`. True.
+        `nextRow()` is called. `curCol=0`, `curRow++`, `curString` updated, `curChar` updated to first char of new line (or 0 if empty).
+        
+        What if the comment is `/*` and then EOF?
+        1. `curChar` is `*` (from `curChar = getNextChar()` after seeing `/*`).
+        2. Loop `while(true)`.
+        3. `curChar` is `*`.
+        4. `curChar = getNextChar()`. Hits EOF. `curCol` increments beyond length. Returns 0. `curChar` remains `*` (because `getNextChar` didn't update it in the else branch).
+        5. `if (needNextRow())` -> True.
+        6. `nextRow()`. `curRow` increments. `curRow` becomes `stringList.size()`.
+        7. `nextRow` logic:
+           ```java
+           if (curRow < stringList.size()) {
+               // update curString, curChar
+           } else {
+               curString = "";
+               curChar = 0;
+           }
+           ```
+           So `curChar` becomes 0.
+        8. `continue`.
+        9. Loop restarts.
+        10. `curChar` is 0.
+        11. `if (curChar == '*')` -> False.
+        12. `else` branch.
+        13. `curChar = getNextChar()`.
+            `curString` is "". `curCol` is 0.
+            `curCol++` -> 1.
+            `1 < 0` is False.
+            Returns 0. `curChar` remains 0.
+        14. `if (needNextRow())` -> `curCol (1) >= curString.length (0)` -> True.
+        15. `nextRow()`. `curRow` increments again.
+        16. `curRow` keeps incrementing indefinitely because `curRow < stringList.size()` will always be false, so `nextRow` keeps going to the `else` block, setting `curString=""`, but `curRow` keeps growing.
+        17. The `while(true)` loop never breaks because `curChar` is never `/` (it's 0).
+        
+        **This is an infinite loop if an unterminated block comment exists.**
+        However, the test case provided is **correct**. It does not have unterminated comments.
+        
+        So why TLE on a correct program?
+        
+        Let's look at `Compiler.java` again.
+        ```java
+        for (Token token : tokenList) {
+            try (FileWriter writer = new FileWriter(outputFile,true)) {
+                writer.write(token.getTokenKey()+" "+token.getTokenString()+"\n");
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+        ```
+        This is O(N) file open/close operations. For a few hundred tokens, this might be slow but usually not TLE unless the time limit is very strict (e.g., 1s) and the disk I/O is slow. But typically, student assignments have limits like 2-5s.
+        
+        Is there another infinite loop possibility in valid code?
+        
+        Check `analyseKeyWordOrIdent`:
+        ```java
+        while (Character.isLetterOrDigit(nextChar()) || nextChar() == '_') {
+            curChar = getNextChar();
+            tokenString = tokenString + curChar;
+        }
+        ```
+        `nextChar()` looks at `curCol + 1`.
+        If we are at the last character of the line, `nextChar()` returns 0.
+        `Character.isLetterOrDigit(0)` is false. `0 == '_'` is false.
+        Loop terminates.
+        `curChar = getNextChar()` advances past the last char.
+        Seems safe.
+
+        Check `analyseIntConst`:
+        Similar logic. Safe.
+
+        Check `analyseFormatString`:
+        ```java
+        while (nextChar() != '\"' && nextChar() != 0) {
+             curChar = getNextChar();
+             // ...
+        }
+        ```
+        If string is valid, it ends with `"`.
+        `nextChar()` sees `"`. Loop terminates.
+        `if (nextChar() == '"')` -> True.
+        `curChar = getNextChar()` consumes `"`.
+        `curChar = getNextChar()` consumes char after `"`.
+        Safe.
+
+        **Re-evaluating the TLE cause.**
+        The most suspicious part for TLE in a correct program is the file I/O in `Compiler.java`.
+        
+        However, there is another subtle bug in `LexicAnalysis.java` in `analyseOperatorOrUnknown` for `/`:
+        ```java
+        } else if (curChar == '/') {
+            //处理注释
+            if (nextChar() == '/') {
+                curChar = nextChar(); // <--- BUG
+                nextRow();
+            }
+        ```
+        `nextChar()` returns the character but does **not** advance `curCol`.
+        So `curChar` is set to `/`.
+        Then `nextRow()` is called.
+        `nextRow()` sets `curCol = 0` and `curRow++`.
+        This effectively skips the rest of the current line.
+        This logic is correct for skipping line comments.
+
+        What about `/*`?
+        ```java
+        } else if (nextChar() == '*') {
+            curChar = getNextChar(); // Consumes *
+            //shit
+            curChar = getNextChar(); // Consumes char after *
+            
+            while (true) {
+                if (curChar == '*') {
+                    curChar = getNextChar();
+                    if (needNextRow()) {
+                        nextRow();
+                        continue;
+                    }
+                    if (curChar == '/') {
+                        break;
+                    }
+                } else {
+                    curChar = getNextChar();
+                    if (needNextRow()) {
+                        nextRow();
+                    }
+                }
+            }
+            //end of shit
+            curChar = getNextChar();
+        }
+        ```
+        If the comment is `/**/`:
+        1. See `/`. Next is `*`.
+        2. `curChar = getNextChar()` -> `*`. `curCol` points to `*`.
+        3. `curChar = getNextChar()` -> `/`. `curCol` points to `/`.
+        4. Loop: `curChar` is `/`. Not `*`.
+        5. Else: `curChar = getNextChar()`. Advances past `/`.
+        6. If end of line, `needNextRow` handles it.
+        7. If not end of line, continues.
+        
+        Wait, if `/**/`:
+        After step 3, `curChar` is `/`.
+        Loop start.
+        `curChar` (`/`) != `*`.
+        Else: `curChar = getNextChar()`.
+        If this was the last char, `getNextChar` returns 0, `curChar` stays `/`? No, `getNextChar` doesn't update `curChar` on failure.
+        So `curChar` remains `/`.
+        `needNextRow()`? If `curCol` went past end, yes.
+        `nextRow()`.
+        Continue.
+        
+        It seems robust enough for valid code.
+
+        **Conclusion:**
+        The TLE is caused by the inefficient file writing in `Compiler.java`. Opening and closing a `FileWriter` for every token is extremely expensive.
+
+<Compiler.java>
+...
+        ArrayList<Token> tokenList = lexicAnalysis.getTokenList();
+        if (outputLexicAnalysis) {
+            for (Token token : tokenList) {
+                try (FileWriter writer = new FileWriter(outputFile,true)) {
+                    writer.write(token.getTokenKey()+" "+token.getTokenString()+"\n");
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+            }
+        }
+...

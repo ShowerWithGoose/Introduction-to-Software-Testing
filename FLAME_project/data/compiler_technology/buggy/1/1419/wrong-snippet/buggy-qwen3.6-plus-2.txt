@@ -1,0 +1,300 @@
+Based on the problem description and the test case, the program is expected to detect syntax errors (missing semicolons) in the source code and output them to `error.txt`. However, the buggy output indicates "No output file", which implies that the program likely crashed or threw an exception before it could write any error information.
+
+The test input contains:
+1. `printf("Hello SysY!\n")` followed by a comment and then `if`. This is missing a semicolon after the `printf` statement.
+2. `int a` followed by a comment and then `;` on a new line (actually, the `;` is part of the empty statement `;` later, but `int a` itself is a declaration missing a semicolon if it's not followed by one immediately. Wait, looking at the input:
+   ```c
+   int main() {
+       printf("Hello SysY!\n") // error 1
+
+       if (1)
+
+
+       /*********/
+       ;
+       int a // error 2
+
+       for (;;) {}
+
+       return 0 // error 3
+   }
+   ```
+   
+   Let's trace the parsing:
+   - `int main() {` : Parses `MainFuncDef`.
+   - Inside `Block`:
+     - `printf("Hello SysY!\n")` : Parses `Stmt` -> `Printf`. It expects a `;` after `)`. The next token is likely the start of a comment or newline, but the lexer skips comments. The next significant token is `if`.
+     - In `Parser.parseStmt`, for `Printf`, it calls `expect(TokenType.SEMICN)`.
+     - The `expect` method checks if `curToken` is `SEMICN`. It is not (it's `IFTK`).
+     - It goes to the `else if (tokenType == TokenType.SEMICN)` block.
+     - It adds an error: `HandleError.getInstance().addError(new Error(tokenList.get(idx - 1).getLine(), ErrorType.i));`.
+     - It returns a fake `SEMICN` token.
+     - **Crucially**, `Config.errorFlag` is set to `true`.
+     
+   - Next token is `if`.
+   - `parseBlockItem` sees `IFTK`, so it calls `parseStmt`.
+   - `parseStmt` handles `if`.
+   - `if (1)` : Parses `Cond`.
+   - Then it expects a `Stmt`.
+   - The next tokens are newlines/comments, then `;`.
+   - `parseStmt` is called again. It doesn't match `if`, `for`, etc. It falls through to the `else` block.
+   - It tries to parse `LVal`. `;` is not an `IDENFR`. `parseLval` calls `expect(TokenType.IDENFR)`.
+   - `expect` fails. It's not `AND`, `OR`, `SEMICN`, `RPARENT`, `RBRACK`.
+   - It throws `RuntimeException("Syntax error at line ...")`.
+
+   The crash happens because `parseStmt`'s fallback logic assumes that if it's not a specific keyword or `{`, it must be an expression statement starting with an `LVal` or an `Exp`. However, a standalone `;` (empty statement) is valid in C-like languages (`[Exp] ';'` where Exp is empty). The grammar says `Stmt → [Exp] ';'`.
+   
+   In `parseStmt`, the `else` block handles `[Exp] ';'`.
+   ```java
+   else {
+       // ... backtrack logic ...
+       AST.Exp exp = null;
+       if (isExp()){
+           exp = parseExp();
+       }
+       Token semicnToken = expect(TokenType.SEMICN);
+       return new AST.Stmt(AST.Stmt.StmtType.Exp, exp, semicnToken);
+   }
+   ```
+   
+   When the parser encounters the standalone `;` (after the `if (1)` block, although the `if` body is missing, let's re-evaluate).
+   
+   Actually, `if (1)` expects a `Stmt`. The next token is `;` (after skipping comments/newlines).
+   `parseStmt` is called.
+   It doesn't match `IF`, `FOR`, etc.
+   It goes to `else`.
+   `isExp()` checks if current token is start of an expression. `;` is not.
+   So `exp` remains `null`.
+   Then `expect(TokenType.SEMICN)` is called.
+   Current token is `;`. So it matches!
+   So `if (1) ;` is parsed as an `If` statement with an empty statement body. This is syntactically valid according to the grammar `Stmt → [Exp] ';'`.
+   
+   Then the loop in `parseBlock` continues.
+   Next token is `int`.
+   `parseBlockItem` sees `INTTK`, so it calls `parseDecl`.
+   `parseDecl` calls `parseVarDecl`.
+   `parseVarDecl` parses `BType` (`int`), then `parseVarDef`.
+   `parseVarDef` expects `IDENFR`. It gets `a`. OK.
+   Then it checks for `[` or `=`. Neither is present.
+   Returns `VarDef`.
+   Back in `parseVarDecl`, it checks for `,`. No.
+   Then it calls `expect(TokenType.SEMICN)`.
+   Current token is `for` (skipping comments/newlines? No, `int a` is followed by newline/comment, then `for`).
+   So `curToken` is `FORTK`.
+   `expect(SEMICN)` fails.
+   It enters the error handling for `SEMICN`.
+   Adds error `i` at line of previous token (`a`).
+   Sets `Config.errorFlag = true`.
+   Returns fake `SEMICN`.
+   
+   Back in `parseBlockItem`, returns `Decl`.
+   Back in `parseBlock`, loop continues.
+   Next token is `for`.
+   `parseBlockItem` sees `FORTK`? No, `parseBlockItem` only checks for `CONSTTK`, `INTTK`, `CHARTK` for `Decl`. Otherwise it calls `parseStmt`.
+   So it calls `parseStmt`.
+   `parseStmt` matches `FORTK`.
+   Parses `for (;;) {}`.
+   
+   Next token is `return`.
+   `parseBlockItem` calls `parseStmt`.
+   `parseStmt` matches `RETURNTK`.
+   Parses `return 0`.
+   Expects `;`.
+   Current token is `}`.
+   `expect(SEMICN)` fails.
+   Adds error `i` at line of `0`.
+   Sets `Config.errorFlag = true`.
+   Returns fake `SEMICN`.
+   
+   Next token is `}`.
+   `parseBlock` loop condition `curToken != RBRACE` fails.
+   Expects `RBRACE`. Matches.
+   
+   `parseMainFuncDef` returns.
+   `parseCompUnit` returns.
+   `parser.analyse()` finishes.
+   
+   Then in `Compiler.java`:
+   ```java
+   if (Config.parserFlag){
+       parser.printParseAnswer();
+   }
+   if (Config.errorFlag){
+       HandleError handleError = HandleError.getInstance();
+       handleError.printErrors();
+   }
+   ```
+   
+   If `Config.parserFlag` is true, it prints the AST.
+   If `Config.errorFlag` is true, it prints errors.
+   
+   The problem states: "For incorrect source programs, output the line number and error category code to `error.txt`".
+   It also says: "Output the information of each word line by line... For correct source programs...".
+   
+   Usually, if there are errors, we should ONLY output errors, or the judge might ignore parser output if errors exist. But here, the "Buggy Output" is "No output file". This suggests an exception occurred.
+   
+   Let's look at `parseCompUnit`:
+   ```java
+   while (tokenList.get(idx + 1).getTokenType() != TokenType.MAINTK && tokenList.get(idx + 2).getTokenType() != TokenType.LPARENT){
+       AST.Decl decl = parseDecl();
+       declList.add(decl);
+   }
+   ```
+   This loop looks ahead `idx + 1` and `idx + 2`. If `idx` is near the end of the list, this will throw `IndexOutOfBoundsException`.
+   
+   In the test case, `int main()` is the first thing.
+   `idx` starts at 0 (`int`).
+   `tokenList.get(1)` is `main`. `tokenList.get(2)` is `(`.
+   Condition: `MAINTK != MAINTK` (False) AND ...
+   False AND ... is False.
+   Loop doesn't execute.
+   
+   Next loop:
+   ```java
+   while (tokenList.get(idx + 1).getTokenType() != TokenType.MAINTK){
+       AST.FuncDef funcDef = parseFuncDef();
+       funcDefList.add(funcDef);
+   }
+   ```
+   `idx` is 0. `tokenList.get(1)` is `main`. `MAINTK != MAINTK` is False.
+   Loop doesn't execute.
+   
+   Then `parseMainFuncDef`.
+   
+   So `parseCompUnit` seems safe for this input.
+   
+   Where could the crash be?
+   
+   Look at `Lexer.java`.
+   When it encounters `&` or `|` alone, it adds an error and sets `Config.errorFlag = true`.
+   
+   Look at `Parser.java` `expect` method.
+   ```java
+   else {
+       throw new RuntimeException("Syntax error at line " + curToken.getLine() + ": " + curToken.getValue() + " is not " + tokenType);
+   }
+   ```
+   
+   Did we hit this?
+   
+   Let's re-trace `if (1)`.
+   `parseStmt` for `if`:
+   `expect(IFTK)` -> OK.
+   `expect(LPARENT)` -> OK.
+   `parseCond()` -> `parseLOrExp()` -> ... -> `parsePrimaryExp()`.
+   `curToken` is `1` (`INTCON`).
+   `parseNumber()` -> `expect(INTCON)` -> OK.
+   `parseUnaryExp` returns.
+   `parseMulExp` returns.
+   `parseAddExp` returns.
+   `parseRelExp` returns.
+   `parseEqExp` returns.
+   `parseLAndExp` returns.
+   `parseLOrExp` returns.
+   `parseCond` returns.
+   `expect(RPARENT)` -> OK.
+   `parseStmt()` is called for the body.
+   
+   The next token is `;` (after skipping comments/newlines).
+   `parseStmt`:
+   Not `LBRACE`, `IFTK`, `FORTK`, `BREAKTK`, `CONTINUETK`, `RETURNTK`, `PRINTFTK`.
+   Goes to `else`.
+   `temp = idx`.
+   `parseLval()` is called.
+   `parseLval` calls `expect(IDENFR)`.
+   Current token is `SEMICN` (wait, did the lexer produce a SEMICN token? Yes, `;` is a token).
+   So `curToken` is `SEMICN`.
+   `expect(IDENFR)` fails.
+   It's not `AND`, `OR`, `SEMICN` (in `expect` check for recovery), `RPARENT`, `RBRACK`.
+   It throws `RuntimeException`.
+   
+   Ah! The `expect` method has recovery for `SEMICN`, `RPARENT`, `RBRACK` when they are *expected* but not found.
+   But here, `IDENFR` is expected, and `SEMICN` is found.
+   The `expect` method does NOT have a case for "Expected IDENFR but found SEMICN".
+   It falls through to the `else` block and throws an exception.
+   
+   This explains the crash ("No output file").
+   
+   The error is in `Parser.java` in the `parseStmt` method. When it falls through to the `else` block, it assumes it can parse an `LVal` or an `Exp`. However, if the statement is just `;` (empty statement), `parseLval` will fail because `;` is not an identifier.
+   
+   The grammar is `Stmt → [Exp] ';'`.
+   The code tries to parse `LVal` first to distinguish between `LVal '=' ...` and `[Exp] ';'`.
+   If `parseLval` fails, it backtracks and tries `[Exp] ';'`.
+   
+   However, `parseLval` calls `expect(IDENFR)`, which throws an exception if it fails, instead of returning null or allowing backtracking.
+   
+   To fix this, `parseStmt` should check if the current token can start an `LVal` or `Exp` before calling `parseLval`. Or, `parseLval` should not use `expect` in a way that crashes on valid follow-set tokens if it's being used for lookahead/prediction.
+   
+   Actually, looking at the code:
+   ```java
+   else {
+       int temp = idx;
+       AST.LVal lVal = parseLval(); // This crashes if curToken is not IDENFR
+       // ...
+   }
+   ```
+   
+   If `curToken` is `;`, `parseLval` crashes.
+   
+   The fix should be to check if `curToken` is `IDENFR` before attempting to parse `LVal`. If it's not, it should go directly to parsing `[Exp] ';'`.
+   
+   Specifically, `LVal` starts with `IDENFR`. `Exp` can start with `IDENFR`, `INTCON`, `CHRCON`, `LPARENT`, `PLUS`, `MINU`, `NOT`.
+   
+   If `curToken` is `;`, it matches `[Exp] ';'` where `Exp` is empty.
+   
+   So, in `parseStmt`, before calling `parseLval`, we should check if `curToken.getTokenType() == TokenType.IDENFR`.
+   
+   Let's verify the location.
+   File: `frontend/Parser.java`
+   Method: `parseStmt`
+   
+   Code snippet:
+   ```java
+   else {
+//            int assign = idx;
+//            for (int i = idx; i < tokenList.size() && tokenList.get(i).getLine() == curToken.getLine(); i++){
+//                if(tokenList.get(i).getTokenType() == TokenType.ASSIGN){
+//                    assign = i;
+//                }
+//            }
+       int temp = idx;
+       AST.LVal lVal = parseLval();
+       if (curToken.getTokenType() == TokenType.ASSIGN) {
+   ```
+   
+   The call `parseLval()` is unsafe here because `parseLval` uses `expect` which throws on failure.
+   
+   Another potential issue: `parseCompUnit` lookahead.
+   ```java
+   while (tokenList.get(idx + 1).getTokenType() != TokenType.MAINTK && tokenList.get(idx + 2).getTokenType() != TokenType.LPARENT){
+   ```
+   If `idx` is `tokenList.size() - 1`, `idx + 1` is out of bounds.
+   If `idx` is `tokenList.size() - 2`, `idx + 2` is out of bounds.
+   
+   In the test case, this didn't trigger because `main` was at the start. But it's a latent bug. However, the immediate crash is due to `parseLval`.
+   
+   Let's confirm the `parseLval` behavior.
+   ```java
+   public AST.LVal parseLval(){
+       // LVal → Ident ['[' Exp ']']
+       Token ident = expect(TokenType.IDENFR);
+       // ...
+   }
+   ```
+   Yes, `expect` throws if not `IDENFR`.
+   
+   So the error location is in `frontend/Parser.java` inside `parseStmt`.
+
+<frontend/Parser.java>
+...
+        else {
+//            int assign = idx;
+//            for (int i = idx; i < tokenList.size() && tokenList.get(i).getLine() == curToken.getLine(); i++){
+//                if(tokenList.get(i).getTokenType() == TokenType.ASSIGN){
+//                    assign = i;
+//                }
+//            }
+            int temp = idx;
+            AST.LVal lVal = parseLval();
+            if (curToken.getTokenType() == TokenType.ASSIGN) {
+...

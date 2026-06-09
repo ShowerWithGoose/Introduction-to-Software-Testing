@@ -1,0 +1,775 @@
+Based on the problem description and comparing the expected output with the buggy behavior, the issue appears to be in the **output logic** of the syntax analysis — specifically, that certain required non-terminal components like `<Stmt>`, `<VarDecl>`, etc., are **not being printed**, while terminal tokens are also missing.
+
+Looking at the `TreeNode.print()` method in `<frontend/TreeNode.java>`, we see the condition that controls what gets printed:
+
+```java
+if(NodeType != Component.Terminal && NodeType != Component.BlockItem
+    && NodeType != Component.Decl && NodeType != Component.BType){
+    stdWriter.write(NodeType.toString() + "\n");
+}
+else{
+    token.print(stdWriter);
+}
+```
+
+According to the problem statement:
+> Before completing the analysis of any syntax components in the grammar (**except for <BlockItem>, <Decl>, <BType>**), output the name of the current syntax component...
+
+This means `<BlockItem>`, `<Decl>`, and `<BType>` should **not** be output — which matches the code.
+
+However, looking at the **expected output**, we see entries like:
+```
+<Stmt>
+...
+<VarDecl>
+...
+<Block>
+...
+```
+
+But in the actual (missing) output, these are absent. That suggests the tree is not being built correctly or the print logic skips them due to incorrect node types.
+
+But more critically, observe that **terminal tokens are also missing** from the output. In the expected output, lines like:
+```
+INTTK int
+MAINTK main
+...
+SEMICN ;
+```
+are present, but in the buggy output they’re absent.
+
+This implies that either:
+1. The tokens aren't added to the tree, or
+2. The `print()` method isn't outputting terminals when it should.
+
+Looking again at `TreeNode.print()`:
+- If `NodeType == Component.Terminal`, it calls `token.print(stdWriter)`
+- Otherwise, if it's a non-terminal **not in the exclusion list**, it prints the component name.
+
+So why are terminals missing?
+
+Because **some terminal nodes are being added with `Component.Terminal`**, but others might be added with specific component types like `<Number>`, `<IntConst>`, etc., which are **non-terminals**, and thus fall into the first branch.
+
+Wait — look at this line in `ConstInitVal`:
+```java
+curNode.addChild(new TreeNode(curToken, Component.Terminal));
+```
+That’s correct.
+
+But in `Number()`:
+```java
+private void Number(TreeNode curNode){
+    IntConst(curNode);
+}
+```
+And `IntConst`:
+```java
+private void IntConst(TreeNode curNode){
+    curNode.addChild(new TreeNode(curToken, Component.Terminal));
+    next();
+}
+```
+So `IntConst` adds a `Component.Terminal` node — good.
+
+However, look at how `<Number>` is added:
+In `PrimaryExp`, when handling a digit:
+```java
+// Number
+curNode.addChild(new TreeNode(curToken, Component.Number));
+Number(curNode.getNextNode());
+```
+Ah! Here's the bug.
+
+The code adds a node of type `Component.Number` (a non-terminal) **with the token attached**, then calls `Number(...)`, which adds **another child** that is a `Component.Terminal`.
+
+So the tree becomes:
+```
+<Number>
+  INTCON 0   <-- this is the terminal, printed via token.print()
+```
+
+Then in `TreeNode.print()`:
+- For the `<Number>` node: it's not in the exclusion list → prints `<Number>`
+- For its child (the terminal): prints `INTCON 0`
+
+That matches expected output.
+
+But now consider the **main issue**: the **entire output is empty** in the buggy case.
+
+Wait — the user says "Buggy Output:" is blank, but expected is long.
+
+That suggests **nothing is being written to parser.txt**.
+
+Looking back at `Praser.start()`:
+```java
+public void start(List<Token> tokenList , List<ErrorType> errorList){
+    this.tokenList = tokenList;
+    this.errorList = errorList;
+    curToken = tokenList.get(curIndex);
+    CompUnit(root);
+//        try {
+//            if (!errorList.isEmpty()) {
+//                ...
+//            } else {
+//                String stdOutputPath = "parser.txt";
+//                FileWriter stdWriter = new FileWriter(stdOutputPath, true);
+//                root.print(stdWriter);
+//                stdWriter.close();
+//            }
+//        }catch (IOException e){}
+}
+```
+
+**The output writing code is commented out!**
+
+Similarly, in `Compiler.main`, after calling `praser.start(...)`, there's no code to write the result.
+
+But wait — in the provided `Compiler.java`, the `clearContent()` clears `parser.txt`, but nothing writes to it unless `Praser.start()` does.
+
+And in `Praser.start()`, the writing block is **commented out**.
+
+Therefore, **no output is ever written to `parser.txt`**, resulting in empty output.
+
+However, the problem states that for correct programs, output goes to `parser.txt`. So the **writing logic must be enabled**.
+
+But the immediate cause of the **missing output** is that the **printing code is disabled**.
+
+Yet, the problem asks us to find the **location of the error in the program** based on **logic**, assuming the I/O is handled.
+
+But note: the expected output includes many syntax component names and tokens. The fact that **none appear** suggests the tree traversal/printing is flawed.
+
+But actually, re-examining: the user says "Buggy Output:" is blank — but maybe in their environment, the print is enabled. Perhaps in the real test, the commented code is **uncommented**.
+
+Assuming that, then why is output still wrong?
+
+Look at the **first few lines** of expected output:
+```
+INTTK int
+MAINTK main
+LPARENT (
+RPARENT )
+LBRACE {
+PRINTFTK printf
+...
+```
+
+But in `MainFuncDef`, the code does:
+```java
+if(match(curToken, "int")){
+    curNode.addChild(new TreeNode(curToken, Component.Terminal));
+    next();
+}
+if(match(curToken, "main")){
+    curNode.addChild(new TreeNode(curToken, Component.Terminal));
+    next();
+}
+if(match(curToken, "(")){
+    curNode.addChild(new TreeNode(curToken, Component.Terminal));
+    next();
+    errorJ(curNode);
+    // Block
+    curNode.addChild(new TreeNode(null, Component.Block));
+    Block(curNode.getNextNode());
+}
+```
+
+Wait — after `"("`, it calls `errorJ(curNode)` **before** expecting `")"`.
+
+But in the input: `int main() { ... }`, so after `"("`, the next token is `")"`.
+
+In `errorJ(curNode)`:
+```java
+public void errorJ(TreeNode curNode){
+    if(match(curToken, ")")){
+        curNode.addChild(new TreeNode(curToken, Component.Terminal));
+        next();
+    }
+    else{
+        ...
+    }
+}
+```
+
+So it **consumes the `")"`** and adds it as a terminal.
+
+So far so good.
+
+But now, the **real issue** emerges when we look at the **order of output**.
+
+The `TreeNode.print()` does a **pre-order traversal?** No — look:
+
+```java
+public void print(FileWriter stdWriter){
+    try {
+        for(int i = 0; i < children.size(); i++){
+            children.get(i).print(stdWriter);
+        }
+        if(NodeType != Component.Terminal && NodeType != Component.BlockItem
+            && NodeType != Component.Decl && NodeType != Component.BType){
+            stdWriter.write(NodeType.toString() + "\n");
+        }
+        else{
+            token.print(stdWriter);
+        }
+    } catch (Exception e) {}
+}
+```
+
+This is **post-order**: it prints all children **first**, then itself.
+
+But the expected output shows:
+- First, the **tokens** (terminals) in lexical order,
+- Then, **after** the tokens that form a construct, the **non-terminal name**.
+
+For example:
+```
+INTCON 0
+<Number>
+<PrimaryExp>
+...
+<Exp>
+<InitVal>
+<VarDef>
+SEMICN ;
+<VarDecl>
+```
+
+This matches **post-order**: leaves (terminals) first, then internal nodes.
+
+So the traversal order is correct.
+
+Now, why is the output missing `<Stmt>` for the `printf`?
+
+In `Stmt`, when handling `printf`, it does:
+```java
+curNode.addChild(new TreeNode(curToken, Component.Terminal)); // PRINTFTK
+next();
+...
+// adds LPARENT, STRCON, etc.
+// then calls errorJ and errorI
+```
+
+But **does it add a `<Stmt>` node?**
+
+Yes! In `BlockItem`, when it's not a Decl, it does:
+```java
+curNode.addChild(new TreeNode(null, Component.Stmt));
+Stmt(curNode.getNextNode());
+```
+
+So the `<Stmt>` node is added.
+
+Then in `Stmt(...)` for printf, it adds terminals and other nodes as children of that `<Stmt>` node.
+
+Then during print, after printing all children (the printf tokens), it should print `<Stmt>`.
+
+But in the **expected output**, we see:
+```
+PRINTFTK printf
+LPARENT (
+STRCON "21373119"
+RPARENT )
+SEMICN ;
+<Stmt>
+```
+
+So `<Stmt>` comes **after** its children — correct.
+
+But in the buggy output, it's missing.
+
+Unless... the `<Stmt>` node is **not being added** in some cases.
+
+Wait — look at the very beginning of `CompUnit`:
+
+```java
+private void CompUnit(TreeNode curNode){
+    while(curIndex<tokenList.size()){
+        if(match(curToken, "int") && match(tokenList.get(curIndex+1), "main")){
+            curNode.addChild(new TreeNode(null , Component.MainFuncDef));
+            MainFuncDef(curNode.getNextNode());
+        }
+        else if(match(tokenList.get(curIndex+2), "(")){
+            curNode.addChild(new TreeNode(null , Component.FuncDef));
+            FuncDef(curNode.getNextNode());
+        }
+        else if(match(curToken, "const") || match(curToken, "int") || match(curToken, "char")){
+            curNode.addChild(new TreeNode(null , Component.Decl));
+            Decl(curNode.getNextNode());
+        }
+    }
+}
+```
+
+But in the input, the first tokens are: `int main() { ... }`
+
+So it matches the first condition: `int` and next is `main` → calls `MainFuncDef`.
+
+But what about the rest of the tokens inside `main`? They are parsed inside `MainFuncDef` → `Block` → `BlockItem` → `Stmt` or `Decl`.
+
+So that should work.
+
+But here's a critical flaw:
+
+In `CompUnit`, the loop continues **while `curIndex < tokenList.size()`**, but **after parsing `MainFuncDef`, the `curIndex` may have advanced past all tokens**, so loop ends.
+
+But what if there are **multiple top-level items**? The grammar allows `{Decl} {FuncDef} MainFuncDef`, so `MainFuncDef` must be **last**.
+
+But the parser assumes that if it sees `int main`, it's the `MainFuncDef`, and parses it.
+
+However, in `MainFuncDef`, after parsing `int main ( )`, it **immediately expects a `Block`**, but **does not consume the `)`** before that!
+
+Look:
+
+```java
+private void MainFuncDef(TreeNode curNode){
+    if(match(curToken, "int")){
+        curNode.addChild(new TreeNode(curToken, Component.Terminal));
+        next();
+    }
+    if(match(curToken, "main")){
+        curNode.addChild(new TreeNode(curToken, Component.Terminal));
+        next();
+    }
+    if(match(curToken, "(")){
+        curNode.addChild(new TreeNode(curToken, Component.Terminal));
+        next();
+        errorJ(curNode);   // <-- this consumes the ')'
+        // Block
+        curNode.addChild(new TreeNode(null, Component.Block));
+        Block(curNode.getNextNode());
+    }
+}
+```
+
+So after `errorJ(curNode)`, the current token is **after `)`**, and then it parses `Block`.
+
+That seems correct.
+
+But now, the **core issue** becomes apparent when we compare the **expected output** and see that **all the non-terminals like `<Stmt>`, `<VarDecl>`, etc., are missing**.
+
+Given that the print logic seems correct, the only remaining possibility is that **these nodes are not being added to the tree**.
+
+Look at `VarDecl`:
+
+```java
+private void VarDecl(TreeNode curNode){
+    // BType
+    curNode.addChild(new TreeNode(null, Component.BType));
+    BType(curNode.getNextNode());
+    // VarDef
+    curNode.addChild(new TreeNode(null, Component.VarDef));
+    VarDef(curNode.getNextNode());
+    while(match(curToken, ",")){
+        curNode.addChild(new TreeNode(curToken, Component.Terminal));
+        next();
+        curNode.addChild(new TreeNode(null, Component.VarDef));
+        VarDef(curNode.getNextNode());
+    }
+    errorI(curNode);
+}
+```
+
+This adds `<BType>` and `<VarDef>` nodes.
+
+But `<BType>` is in the exclusion list, so not printed. `<VarDef>` is not excluded, so should be printed.
+
+In expected output, we see `<VarDef>` and `<VarDecl>`.
+
+But who adds `<VarDecl>`?
+
+In `Decl`:
+```java
+else{
+    curNode.addChild(new TreeNode(null , Component.VarDecl));
+    VarDecl(curNode.getNextNode());
+}
+```
+
+So yes.
+
+Now, the **smoking gun** is in the `TreeNode.print()` method's condition:
+
+```java
+if(NodeType != Component.Terminal && NodeType != Component.BlockItem
+    && NodeType != Component.Decl && NodeType != Component.BType){
+    stdWriter.write(NodeType.toString() + "\n");
+}
+```
+
+Check if `<VarDecl>` is excluded: no.
+
+`<Stmt>`? Not excluded.
+
+But what about `<CompUnit>`? Not excluded — and it appears at the end of expected output.
+
+So why no output?
+
+Unless... the **root node is never printed**.
+
+In `Praser.start()`, if the writing code were enabled, it would call `root.print(stdWriter)`.
+
+The root is `Component.CompUnit`.
+
+In `print()`, it first prints all children, then itself.
+
+So `<CompUnit>` appears last — matches expected.
+
+So logic seems sound.
+
+But wait — in the `Stmt` method, there's a **complex backtracking mechanism** for assignment vs expression:
+
+```java
+if(FrontStatic.isIdent(curToken.getWord())){
+    int pos = curIndex;
+    int errorNum = errorList.size();
+    // LVal
+    curNode.addChild(new TreeNode(curToken, Component.LVal));
+    LVal(curNode.getNextNode());
+    // 这里进行回溯
+    if(match(curToken, "=")){
+        ...
+    }
+    else{
+        curIndex = pos;
+        curNode.removeChild();
+        curToken = tokenList.get(curIndex);
+        for (int i = errorList.size() - 1; i >= errorNum; i--){
+            errorList.remove(i);
+        }
+        curNode.addChild(new TreeNode(null, Component.Exp));
+        Exp(curNode.getNextNode());
+        errorI(curNode);
+    }
+}
+```
+
+Here, if it's not an assignment, it **removes the `<LVal>` child** and instead adds an `<Exp>`.
+
+But in the case of `printf("%d",a);`, the `a` is inside the argument list, parsed as `Exp` → `AddExp` → ... → `LVal`.
+
+So that should be fine.
+
+However, the **critical error** is in the **`CompUnit` parsing loop**.
+
+The loop condition is:
+```java
+while(curIndex<tokenList.size()){
+    if(match(curToken, "int") && match(tokenList.get(curIndex+1), "main")){
+        ...
+    }
+    else if(match(tokenList.get(curIndex+2), "(")){
+        ...
+    }
+    else if(match(curToken, "const") || match(curToken, "int") || match(curToken, "char")){
+        ...
+    }
+}
+```
+
+But what if none of the conditions match? The loop will **infinite loop**, because `curIndex` doesn't advance.
+
+In our input, after parsing `MainFuncDef`, `curIndex` should be at the end, so loop exits.
+
+But suppose during parsing, `curIndex` doesn't reach the end — then it loops forever.
+
+But more importantly, **the `MainFuncDef` is only triggered if the next token is `main`**.
+
+But after parsing global declarations, when it encounters `int main`, it works.
+
+However, in the given input, there are **no global declarations**, so first token is `int`, next is `main` → parsed as `MainFuncDef`.
+
+Inside `MainFuncDef`, it parses the whole function.
+
+At the end, `curIndex` should be at `tokenList.size()`, so loop exits.
+
+So that seems okay.
+
+After careful analysis, the most likely source of the **missing output** is that **the `<Stmt>` node is not added for the `printf` statement**.
+
+But in `BlockItem`, it should be.
+
+Unless... in `BlockItem`, the condition is:
+
+```java
+if(match(curToken, "const") || match(curToken, "int") || match(curToken, "char")) {
+    // Decl
+    curNode.addChild(new TreeNode(null, Component.Decl));
+    Decl(curNode.getNextNode());
+}
+else{
+    // Stmt
+    curNode.addChild(new TreeNode(null, Component.Stmt));
+    Stmt(curNode.getNextNode());
+}
+```
+
+For `printf`, it's not a keyword, so goes to `else` → adds `<Stmt>`.
+
+So it should be there.
+
+Given the complexity, the **most probable location of the error** is in the **`TreeNode.print()` method**, specifically in the condition that decides what to print.
+
+But wait — in the expected output, we see:
+```
+SEMICN ;
+<Stmt>
+```
+
+So the semicolon is printed (as terminal), then `<Stmt>`.
+
+In the tree, the `<Stmt>` node has children including the `SEMICN` terminal.
+
+During post-order print:
+- Print all children (including `SEMICN ;`)
+- Then print `<Stmt>`
+
+Correct.
+
+But what if the `<Stmt>` node has `NodeType == Component.Stmt`, which is not excluded, so it prints.
+
+So why no output?
+
+Unless the **entire tree is empty**.
+
+And why would that be?
+
+Because in `CompUnit`, after parsing `MainFuncDef`, the `curIndex` might not have advanced properly, and the loop might not parse anything.
+
+But let's simulate the first few steps.
+
+Tokens: [INTTK(int), MAINTK(main), LPARENT(() , RPARENT()), LBRACE({), PRINTFTK(printf), ...]
+
+In `CompUnit`:
+- curToken = INTTK(int)
+- tokenList.get(curIndex+1) = MAINTK(main) → match
+- Add `<MainFuncDef>` node
+- Call `MainFuncDef`
+
+In `MainFuncDef`:
+- match "int" → add terminal, next → now at "main"
+- match "main" → add terminal, next → now at "("
+- match "(" → add terminal, next → now at ")"
+- call `errorJ` → match ")" → add terminal, next → now at "{"
+- add `<Block>`, call `Block`
+
+In `Block`:
+- match "{" → add terminal, next → now at "printf"
+- while not "}" → call `BlockItem`
+
+In `BlockItem`:
+- curToken = "printf" → not const/int/char → go to else
+- add `<Stmt>`, call `Stmt`
+
+In `Stmt`:
+- match "printf" → handle printf
+
+So far so good.
+
+The only remaining possibility is that **the `TreeNode` structure is not built correctly due to errors in node addition**.
+
+But the most suspicious part is in `MainFuncDef`:
+
+```java
+if(match(curToken, "(")){
+    curNode.addChild(new TreeNode(curToken, Component.Terminal));
+    next();
+    errorJ(curNode);   // <-- this adds the ')' token as a child of curNode
+    // Block
+    curNode.addChild(new TreeNode(null, Component.Block));
+    Block(curNode.getNextNode());
+}
+```
+
+After `errorJ(curNode)`, the current token is after `)`, and then it adds `<Block>` and parses it.
+
+But `errorJ` adds the `)` as a child of the `MainFuncDef` node.
+
+Then `<Block>` is another child.
+
+So the `MainFuncDef` node has children: int, main, (, ), <Block>
+
+During print: prints all children (including the block's contents), then prints `<MainFuncDef>`
+
+Correct.
+
+Given all this, the **only place left** is the **output writing code being commented out**.
+
+But since the problem says "the program's output" is blank, and expected is full, and assuming the I/O is enabled in the test environment, we must look deeper.
+
+Wait! In the `Praser` class, the `start` method **does not handle the case where the token list is empty or parsing fails silently**.
+
+But more importantly, look at the **`next()` method**:
+
+```java
+public boolean next(){
+    curIndex++;
+    if(curIndex >= tokenList.size())
+        return false;
+    curToken = tokenList.get(curIndex);
+    return true;
+}
+```
+
+And it's used everywhere.
+
+But in `errorI`, `errorJ`, `errorK`, when an error is detected, it **adds a fake token** and **does not advance `curIndex`**, but **does add a child node**.
+
+However, in correct programs, no errors, so those functions just consume the expected token.
+
+Now, the **real error** is in the **`CompUnit` method**: it only parses **one** `MainFuncDef`, but according to the grammar, `CompUnit → {Decl} {FuncDef} MainFuncDef`, so `MainFuncDef` must appear **exactly once and at the end**.
+
+But the parser's loop will parse `Decl`s and `FuncDef`s until it finds `int main`, then parse that as `MainFuncDef`, and then **stop**, because after that, `curIndex` is at the end.
+
+But what if there are tokens after `MainFuncDef`? It would loop again, but shouldn't.
+
+In our case, it's fine.
+
+After extensive analysis, the **most likely cause** of the missing output is that **the `<Stmt>` and other non-terminals are not being added because of a flaw in the `BlockItem` or `Stmt` logic**.
+
+But observe: in the expected output, the first statement is `printf`, which should generate a `<Stmt>`.
+
+In the `Stmt` method, for `printf`, it does **not** have a final `errorI(curNode)` in all paths?
+
+Look:
+
+```java
+else if(match(curToken,"printf")){
+    ...
+    errorJ(curNode);
+    errorI(curNode);   // <-- yes, it does call errorI
+}
+```
+
+And `errorI` will add the `;` if present.
+
+In the input, there is a `;`, so it adds it.
+
+So the `<Stmt>` node has all its children.
+
+Then during print, it should appear.
+
+Given the time, the **most probable location of the error** is in the **`TreeNode.print()` method's condition**, but it looks correct.
+
+Wait! Look at the condition again:
+
+```java
+if(NodeType != Component.Terminal && NodeType != Component.BlockItem
+    && NodeType != Component.Decl && NodeType != Component.BType){
+    stdWriter.write(NodeType.toString() + "\n");
+}
+else{
+    token.print(stdWriter);
+}
+```
+
+What is `Component.Stmt`? It's not in the exclusion list, so it should print.
+
+But what if the node was added with a different type?
+
+No.
+
+The only remaining possibility is that **the tree is not rooted properly**, or **the root has no children**.
+
+Why would that be?
+
+Because in `CompUnit`, the condition `match(tokenList.get(curIndex+1), "main")` may throw an exception if `curIndex+1 >= size`.
+
+For example, if the file ends with `int`, then `curIndex+1` is out of bounds.
+
+But in our case, it's safe.
+
+However, the code does **not check bounds** before accessing `tokenList.get(curIndex+1)`.
+
+In the input, it's safe, but if there's a single `int` at the end, it would crash.
+
+But in our case, it's fine.
+
+Given the expected output includes `<CompUnit>` at the end, the root must have been printed.
+
+So the tree is built.
+
+Therefore, the **only explanation** is that the **output writing code is commented out**, but since the problem asks for logical error, we must assume it's enabled.
+
+After re-examining the expected output, notice that **every terminal token is printed**, and **every non-excluded non-terminal is printed after its children**.
+
+The buggy output is empty, which suggests that **no nodes are being added to the tree**.
+
+Why? Because in `CompUnit`, the first condition is:
+
+```java
+if(match(curToken, "int") && match(tokenList.get(curIndex+1), "main")){
+```
+
+But `match` is defined as:
+
+```java
+public boolean match(Token token, String word){
+    return token.getWord().equals(word);
+}
+```
+
+So for the first token, `curToken.getWord()` is `"int"`, and `tokenList.get(curIndex+1).getWord()` is `"main"` → true.
+
+So it enters.
+
+But what if the `MainFuncDef` method does not advance the token index beyond the function body?
+
+Let's simulate the end of `MainFuncDef`.
+
+After parsing the block, the current token should be after the final `}`.
+
+In the input, the last token is `}` of main.
+
+In `Block`:
+- parses until it sees `}`, then adds it and calls `next()`.
+
+So after `Block` returns, in `MainFuncDef`, there are no more tokens.
+
+So `curIndex == tokenList.size()`.
+
+Then `CompUnit` loop ends.
+
+So the tree should be complete.
+
+Given all this, the error must be in the **print method**.
+
+Look at `token.print(stdWriter)`:
+
+```java
+public void print(FileWriter stdWriter) throws IOException {
+    stdWriter.write(String.format("%s %s\n",type.toString(), word, lineNum));
+}
+```
+
+The format string has **three placeholders**, but only two arguments.
+
+`%s %s\n` expects two strings, but three are provided: `type.toString()`, `word`, `lineNum`.
+
+This will cause a `MissingFormatArgumentException` or similar, which is caught by the empty catch in `TreeNode.print()`:
+
+```java
+} catch (Exception e) {}
+```
+
+So **every attempt to print a terminal token fails silently**, and since non-terminals are printed after children, and children printing fails, the whole output is empty.
+
+That's the bug!
+
+In `Token.print()`, the format string should be `"%s %s\n"`, but three arguments are passed.
+
+It should be:
+
+```java
+stdWriter.write(String.format("%s %s\n", type.toString(), word));
+```
+
+The `lineNum` is not needed in the output (per problem statement: only category code and word).
+
+So the error is in `<frontend/Token.java>`.
+
+<frontend/Token.java>
+...
+    public void print(FileWriter stdWriter) throws IOException {
+        stdWriter.write(String.format("%s %s\n",type.toString(), word, lineNum));
+    }
+...

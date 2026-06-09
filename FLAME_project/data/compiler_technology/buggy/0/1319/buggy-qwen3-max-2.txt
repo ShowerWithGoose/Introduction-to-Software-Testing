@@ -1,0 +1,390 @@
+<Lexer.java>
+...
+                    case '/':
+                        advance();
+                        if (currentChar == '/')
+                        {
+                            do {
+                                advance();
+                            }while (currentChar != '\n' && currentChar != '\0');
+                            advance(); @@ [After consuming the newline, `advance()` is called again, which may skip the first character of the next line or cause incorrect line number tracking. However, the real issue is in the `DIV` handling: when parsing `num/10`, after reading `/`, it correctly falls into the `else` branch and adds `DIV`. But in the test input, the buggy output shows `DIV /` followed by `INTCON 0` instead of `INTCON 10`. This indicates that the digit '1' in "10" was not consumed because the lexer incorrectly treated the '/' as starting a comment. However, looking closer, the actual bug is elsewhere.]
+
+                        }
+                        else if(currentChar == '*')
+                        {
+                            do {
+                                do {
+                                    advance();
+                                } while (currentChar != '*' && currentChar != '\0');
+                                advance();
+                            } while (currentChar != '/' && currentChar != '\0');
+                            advance(); @@ [This nested loop for block comments does not handle newlines, so `lineno` is not incremented when encountering '\n' inside /* ... */ comments. However, the test case doesn't contain block comments, so this isn't the issue.]
+
+                        }
+                        else
+                        {
+                            tokens.add(new Token("DIV", "/"));
+                            advance(); @@ [This is correct for division operator. But the real error is in the `intConst()` method: in the test input, the expected output has `INTCON 10` after `DIV`, but the buggy output shows `INTCON 0`. This suggests that the '1' in "10" was skipped. Looking at the tokenization of `num=num/10 ;`, after `/`, the next char is '1'. The lexer should call `intConst()` and read "10". However, in the buggy output, it outputs `INTCON 0`, meaning only '0' was read. This implies that the '1' was consumed elsewhere. Wait — actually, in the buggy output, the line is: `IDENFR num ASSIGN = IDENFR num DIV / INTCON 0`. So "10" became "0". That means the '1' was lost.
+
+But wait — looking more carefully at the provided buggy vs expected output:
+
+Buggy:   DIV / ... INTCON 0
+Expected: DIV / ... INTCON 10
+
+So the integer constant after `/` is parsed as "0" instead of "10".
+
+Now look at the `tokenize()` method: after handling `/`, if it's not a comment, it adds `DIV` and calls `advance()`. Then the loop continues. Next, it sees '1', which is a digit, so it calls `intConst()`, which should read "10".
+
+But in the buggy output, it reads only "0", meaning the '1' was already consumed or skipped.
+
+Wait — no, in the source code: `num=num/10 ;`
+
+After `num`, `=`, `num`, then `/`, then `1`, `0`.
+
+So after processing `/` as `DIV`, the next character is '1', which should trigger `intConst()` and return "10".
+
+But the buggy output shows `INTCON 0`, which suggests that when `intConst()` was called, `currentChar` was '0', not '1'.
+
+How could that happen?
+
+Look at the `charConst()` and `stringConst()` — not relevant here.
+
+Wait — there's another possibility: in the `tokenize()` loop, after processing `/` in the `else` branch (i.e., as `DIV`), it calls `advance()`. So after adding `DIV`, it advances past the '/'.
+
+Then the loop continues. Now `currentChar` is '1', which is a digit → calls `intConst()`, which reads '1' and then '0', returns "10".
+
+So why does the output show "0"?
+
+Unless... the input was misread.
+
+But look at the **real discrepancy**: in the buggy output, in the `rev` function, we have:
+
+Buggy:
+    IDENFR num
+    ASSIGN =
+    IDENFR num
+    DIV /
+    INTCON 0   ← HERE
+
+Expected:
+    IDENFR num
+    ASSIGN =
+    IDENFR num
+    DIV /
+    INTCON 10  ← CORRECT
+
+So the integer is wrong.
+
+Now, look at the `intConst()` method:
+
+    private String intConst()
+    {
+        StringBuilder result = new StringBuilder();
+        while (currentChar != '\0' && Character.isDigit(currentChar))
+        {
+            result.append(currentChar);
+            advance();
+        }
+        return result.toString();
+    }
+
+This is correct.
+
+So why is it returning "0"?
+
+Unless the '1' was consumed before.
+
+Wait — look at the line in the source: `num=num/10 ;`
+
+But in the buggy output, the token before `DIV` is `IDENFR num`, which is correct.
+
+Then `DIV /` is correct.
+
+Then it should be `INTCON 10`.
+
+But it's `INTCON 0`.
+
+This suggests that the lexer, after reading `/`, did **not** go to the `else` branch (i.e., treat it as `DIV`), but instead went into the comment handling.
+
+Look again at the `/` handling:
+
+                    case '/':
+                        advance();
+                        if (currentChar == '/')
+                        {
+                            // line comment
+                        }
+                        else if(currentChar == '*')
+                        {
+                            // block comment
+                        }
+                        else
+                        {
+                            tokens.add(new Token("DIV", "/"));
+                            advance();
+                        }
+
+In the input, after `/` comes '1', which is not '/' or '*', so it should go to the `else` branch, add `DIV`, and `advance()` — so now `currentChar` becomes '1'.
+
+Then in the next iteration of the `while` loop, since '1' is a digit, it calls `intConst()`, which reads "10".
+
+So why is the output "0"?
+
+Wait — unless the `advance()` in the `else` branch is **not** called? No, it is called.
+
+Alternatively, maybe the input has a space: `num/ 10` — but even then, whitespace is skipped.
+
+But in the test input, it's written as: `num=num/10 ;` — no space between `/` and `1`.
+
+So what's happening?
+
+Ah! Look at the **buggy output** again — in the same function, earlier, there's:
+
+    re=re*10+num%10 ;
+
+And in the buggy output:
+
+    IDENFR re
+    ASSIGN =
+    IDENFR re
+    MULT *
+    INTCON 10   ← this is correct
+    PLUS +
+    IDENFR num
+    MOD %
+    INTCON 10   ← this is also correct
+
+So `10` is correctly parsed **before** the problematic line.
+
+Only the `10` after `/` is parsed as `0`.
+
+This is very suspicious.
+
+Wait — look at the **exact line** in the test input:
+
+        num=num/10 ;
+
+But in the buggy output, the token after `DIV` is `INTCON 0`, and then `SEMICN ;`.
+
+So it's as if the '1' was missing.
+
+Now, consider: what if the lexer, when processing `/`, mistakenly entered the **line comment** branch?
+
+For that to happen, after `/`, the next character would have to be `/`.
+
+But in the input, it's '1'.
+
+Unless... there's a bug in the `advance()` or character reading.
+
+But that seems unlikely.
+
+Alternative theory: **the error is not in `/` handling, but in the fact that the lexer is not resetting state properly**.
+
+Wait — look back at the provided **source code** for `Lexer.java`.
+
+In the `tokenize()` method, in the `case '/'` block:
+
+                        if (currentChar == '/')
+                        {
+                            do {
+                                advance();
+                            }while (currentChar != '\n' && currentChar != '\0');
+                            advance();
+                        }
+
+After the inner loop ends (when `currentChar` is `\n` or `\0`), it calls `advance()` again.
+
+If the line ends with `// comment`, then after the loop, `currentChar` is `\n`, then `advance()` makes it the first char of next line.
+
+But **it does not increment `lineno`** when it sees `\n` inside the comment loop!
+
+Ah! That’s a known issue, but again, our input doesn’t have `//`.
+
+But wait — what if the input had a `/` followed by something that looks like a comment start due to a bug?
+
+No.
+
+Let’s re-express the problem: the only difference between expected and buggy output is:
+
+Expected: `INTCON 10`
+Buggy:    `INTCON 0`
+
+So the string "10" is being read as "0".
+
+This can only happen if, when `intConst()` is called, `currentChar` is '0', not '1'.
+
+So how did the '1' disappear?
+
+Look at the **preceding token**: `DIV /`
+
+To get that, the lexer must have:
+
+- Seen '/', entered the switch case.
+- Called `advance()` → now at '1'
+- Since '1' != '/' and != '*', went to `else`
+- Added `Token("DIV", "/")`
+- Called `advance()` → now at '0'
+
+Wait! That’s it!
+
+If after the first `advance()` (inside the `case '/'`), `currentChar` becomes '1', then in the `else` branch, it adds `DIV`, and then calls `advance()` again — so it skips the '1' and lands on '0'.
+
+Then, in the next iteration of the main loop, `currentChar` is '0', which is a digit, so `intConst()` reads "0".
+
+That’s the bug!
+
+The mistake is: in the `else` branch for `/`, after deciding it's a `DIV` token, the code **should not call `advance()`**, because the main loop will handle advancing via the next iteration.
+
+But no — actually, the pattern in all other single-char tokens is:
+
+    case '+': tokens.add(...); advance(); break;
+
+So they do call `advance()`.
+
+But for `/`, in the `else` branch, it does the same: adds token and calls `advance()`.
+
+However, the issue is: the first `advance()` is called **immediately** when entering the `case '/'`.
+
+Then, based on what's next, it either handles comment or treats as `DIV`.
+
+But in the `else` branch, it calls `advance()` **again**.
+
+So total: two `advance()` calls for a single `/` token.
+
+Let’s simulate:
+
+Input: `/10`
+
+Initial: currentChar = '/'
+
+Enter case '/':
+- advance() → currentChar = '1'
+- check: '1' != '/' and != '*' → go to else
+- add Token("DIV", "/")
+- advance() → currentChar = '0'
+
+Then loop continues: sees '0' → digit → intConst() → returns "0"
+
+But it should have only advanced **once** — after consuming the '/'.
+
+The correct logic is:
+
+- When you see '/', you haven't consumed it yet.
+- You need to consume it (i.e., advance) **only once**, after deciding what it is.
+
+But the current code:
+
+- Immediately advances (consuming the '/') → now at next char
+- Then, if it's a comment, consumes more
+- If it's `DIV`, it adds the token for "/", but then **advances again**, skipping the next character.
+
+That’s the bug.
+
+In contrast, for '+' :
+
+    case '+': tokens.add(new Token("PLUS", "+")); advance(); break;
+
+Here, it adds the token **without** having advanced yet, then advances once.
+
+But for '/', the code **advances first**, then decides.
+
+So to be consistent, it should **not** advance at the beginning.
+
+Correct approach for '/':
+
+- Do not advance immediately.
+- Look at currentChar (which is '/')
+- Then look ahead to next char (without consuming)
+- If next char is '/' or '*', then consume both (or enter comment mode)
+- Else, consume only '/'
+
+But the current code consumes '/' immediately via `advance()`, then looks at what's next.
+
+Then, in the `else` branch, it adds "/" as token (correct), but then advances again — which consumes the next character.
+
+So the fix is: **remove the `advance()` call in the `else` branch**, because the '/' has already been consumed by the initial `advance()`.
+
+But wait — the token value is "/", which is correct.
+
+But the problem is that the next character (e.g., '1') is being skipped.
+
+Yes.
+
+So in the `else` branch, after adding the `DIV` token, it should **not** call `advance()`, because the initial `advance()` already moved past the '/'.
+
+But then, what about the next character? It will be processed in the next iteration.
+
+However, in the current code, the initial `advance()` moves to '1', then the `else` branch adds `DIV` and advances to '0'.
+
+So the '1' is never processed as part of an integer.
+
+Therefore, the error is in the `else` branch of the `/` case: it should **not** call `advance()`.
+
+But wait — let's check the other branches.
+
+In the `//` branch:
+
+- advance() → now at second '/'
+- then do { advance() } while not \n → consumes rest of line
+- then advance() → consumes the \n
+
+That’s correct.
+
+In the `/*` branch:
+
+- advance() → now at '*'
+- then loops until '*/' is found, and advances past '/'
+
+Also correct.
+
+But in the `else` branch:
+
+- advance() → now at next char (e.g., '1')
+- add DIV token
+- advance() → now at char after '1' (e.g., '0')
+
+So the '1' is skipped.
+
+Hence, the extra `advance()` in the `else` branch is the bug.
+
+Therefore, the line:
+
+                            advance();
+
+in the `else` branch of the `/` case is erroneous.
+
+So the annotated line is:
+
+                            advance(); @@ [This extra advance() causes the next character (e.g., '1' in "10") to be skipped, leading to incorrect integer constant parsing. After the initial advance() that consumes '/', the lexer should not advance again in the else branch, as the next character must be processed in the next iteration of the main loop.]
+
+But wait — without that `advance()`, won't the lexer be stuck?
+
+Let’s simulate corrected version:
+
+Input: `/10`
+
+currentChar = '/'
+
+case '/':
+  advance() → currentChar = '1'
+  not comment → else:
+      tokens.add(DIV, "/")
+      // NO advance()
+  break
+
+Then main loop continues: currentChar is '1' → digit → intConst() reads "10"
+
+Perfect.
+
+Whereas currently, it advances again to '0'.
+
+So yes, the extra `advance()` is the bug.
+
+Therefore, the error is on this line.
+...
+                        else
+                        {
+                            tokens.add(new Token("DIV", "/"));
+                            advance(); @@ [This extra advance() causes the next character (e.g., '1' in "10") to be skipped, leading to incorrect integer constant parsing. After the initial advance() that consumes '/', the lexer should not advance again in the else branch, as the next character must be processed in the next iteration of the main loop.]
+                        }
+...

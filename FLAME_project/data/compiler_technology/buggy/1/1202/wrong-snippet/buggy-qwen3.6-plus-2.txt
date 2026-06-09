@@ -1,0 +1,229 @@
+**Summary of Analysis:**
+
+1.  **Problem Description**: The program is a syntax analyzer that needs to detect specific syntax errors (missing semicolon 'i', missing right parenthesis 'j', missing right square bracket 'k') and output the line number where the error occurred. The line number should correspond to the last non-terminal symbol before the missing token.
+2.  **Test Case Input**:
+    ```c
+    void f(int a {} // error 1: Missing ')' for FuncDef parameters. Line 1.
+    
+    int main( { // error 2: Missing ')' for MainFuncDef. Line 3.
+        int a = 10;
+        f(a + 10; // error 3: Missing ')' for function call arguments. Line 5.
+        return 0;
+    }
+    ```
+3.  **Expected Output**:
+    ```
+    1 j
+    3 j
+    5 j
+    ```
+4.  **Buggy Output**:
+    ```
+    1 j
+    3 j
+    5 j
+    5 j
+    5 j
+    5 ...
+    ```
+    The buggy output contains duplicate error entries for line 5. This suggests that the parser is detecting the same error multiple times or entering a loop/recovery state that triggers multiple error logs for the same location.
+
+5.  **Code Analysis**:
+    *   In `Parser.java`, the method `parseUnaryExp` handles function calls (`Ident '(' [FuncRParams] ')'`).
+    *   Inside `parseUnaryExp`, if the closing parenthesis `)` is missing after parsing `FuncRParams` (or if `FuncRParams` was not present but `)` is still missing), it logs error 'j'.
+    *   However, let's look at `parseStmt`. When parsing `f(a + 10;`, it identifies `f` as an `IDENFR`.
+    *   It enters the block checking for `LVal '=' Exp ';'` or function calls.
+    *   The code in `parseStmt` has a complex logic for distinguishing between `LVal = ...` and `Exp ;` or Function Calls.
+    *   Specifically, look at the `parseStmt` method around the handling of `IDENFR`.
+    *   The code attempts to parse `Exp` to see if it's followed by `=`. If not, it backtracks.
+    *   Then it parses `LVal`. `f` is an LVal.
+    *   Then it checks if the next token is `GETINTTK` or `GETCHARTK`. It is not.
+    *   So it goes to the `else` branch: `Stmt → LVal '=' Exp ';'`. Wait, `f(a+10;` is a function call statement, which falls under `[Exp] ';'` where Exp contains a UnaryExp which is a function call.
+    *   The `parseStmt` logic for `IDENFR` seems flawed. It tries to parse `LVal` then expects `=`. If it doesn't find `=`, it might fall through or handle it incorrectly.
+    *   Actually, looking closely at `parseStmt`:
+        ```java
+        if (getToken().getType().equals(Token.TokenType.IDENFR.toString())) {//LVal
+            // ... checks for semicolon immediately
+            parseExp(); // Tries to parse Exp starting with f
+            if (getToken().getType().equals(Token.TokenType.ASSIGN.toString())) {//有等号
+                 // ...
+            }
+            backto(initPos);
+            if (flag == 0) { //这种符合[Exp];的情况，单独讨论一下
+                syntaxes.add(parseExp()); // Parses Exp again. Inside parseExp -> AddExp -> ... -> UnaryExp
+                // Inside UnaryExp, it sees f(, parses FuncRParams (a+10), then expects )
+                // It finds ; instead of ). Logs error 'j' at line 5.
+                // Then it consumes ;? No, it logs error and calls next().
+                
+                if (getToken().getType().equals(Token.TokenType.SEMICN.toString())) {
+                    syntaxes.add(getToken());
+                    next();
+                } else {//没有分号
+                    back();
+                    ErrorLog errorLog = new ErrorLog(getToken().getLineNum(), 'i', pos);
+                    errorLogs.add(errorLog);
+                    next();
+                }
+                return new Stmt(syntaxes);
+            }
+            // ...
+        }
+        ```
+    *   The issue likely lies in how `parseExp` or the subsequent parsing handles the error recovery.
+    *   However, the most suspicious part causing *multiple* errors for the same line is often due to the parser not consuming tokens correctly after an error, or re-entering a parsing rule that triggers the same error check.
+    *   Let's look at `parseUnaryExp` again.
+        ```java
+        public UnaryExp parseUnaryExp() {
+            ArrayList<Syntax> syntaxes = new ArrayList<>();
+            next(); // <--- THIS IS THE BUG
+            Token token = getToken();
+            back();
+            // ...
+        }
+        ```
+    *   In `parseUnaryExp`, the very first thing it does is `next()`. This advances the token pointer unconditionally.
+    *   Then it gets the token and backs up.
+    *   If `parseUnaryExp` is called, it skips one token forward and then back. This seems like a weird way to peek, but if it's intended to skip whitespace or something, it's dangerous because `next()` in this parser just increments `pos`.
+    *   Wait, `next()` increments `pos`. `back()` decrements `pos`. So `next(); getToken(); back();` effectively peeks at the *next* token relative to the current position? No.
+        *   Start at pos `P`.
+        *   `next()` -> pos `P+1`.
+        *   `getToken()` -> returns token at `P+1`.
+        *   `back()` -> pos `P`.
+        *   So it peeks at `P+1`.
+    *   But the logic below uses `getToken()` which returns token at `P` (current).
+        ```java
+        if (getToken().getType().equals(Token.TokenType.IDENFR.toString())
+                && token.getType().equals(Token.TokenType.LPARENT.toString())) { 
+            // Checks if Current is IDENFR and Next is LPARENT
+        }
+        ```
+    *   This logic determines if it's a function call.
+    *   If it is a function call:
+        ```java
+        syntaxes.add(getToken());//Ident
+        next(); // Consume Ident
+        syntaxes.add(getToken());//(
+        next(); // Consume (
+        if (getToken().getType().equals(Token.TokenType.RPARENT.toString())) {
+             // ...
+        } else {
+             syntaxes.add(parseFuncRParams());
+             if (getToken().getType().equals(Token.TokenType.RPARENT.toString())) {
+                 // ...
+             } else {//没有小括号
+                 back();
+                 ErrorLog errorLog = new ErrorLog(getToken().getLineNum(), 'j', pos);
+                 errorLogs.add(errorLog);
+                 next(); // Consumes the token that caused the error (e.g., ;)
+             }
+        }
+        ```
+    *   If the error is logged, `next()` is called. The token `;` is consumed.
+    *   Control returns to `parseExp` / `parseStmt`.
+    *   In `parseStmt`, after `parseExp()` returns:
+        ```java
+        if (getToken().getType().equals(Token.TokenType.SEMICN.toString())) {
+             syntaxes.add(getToken());
+             next();
+        } else {//没有分号
+             back();
+             ErrorLog errorLog = new ErrorLog(getToken().getLineNum(), 'i', pos);
+             errorLogs.add(errorLog);
+             next();
+        }
+        ```
+    *   Since `parseUnaryExp` already consumed the `;` (via `next()` after logging error 'j'), `getToken()` now points to the *next* token (likely `return` or whatever follows).
+    *   So `getToken()` is NOT `SEMICN`.
+    *   It enters the `else` block, logs error 'i' (missing semicolon) at the current position (line 6? or end of line 5?).
+    *   This would explain a second error, but the output shows multiple 'j' errors or 'j' and 'i'. The buggy output shows `5 j` repeated.
+    *   Let's re-read the buggy output: `1 j`, `3 j`, `5 j`, `5 j`, `5 j`...
+    *   This implies error 'j' is being logged multiple times for line 5.
+    *   Where else is 'j' logged?
+        *   `parseMainFuncDef`
+        *   `parseFuncDef`
+        *   `parsePrimaryExp`
+        *   `parseUnaryExp`
+        *   `parseStmt` (inside `if`, `for`, `printf`)
+    *   In the input `f(a + 10;`, the parser is inside `main`.
+    *   It parses `int a = 10;` correctly.
+    *   It encounters `f`.
+    *   `parseBlockItem` -> `parseStmt`.
+    *   `parseStmt` sees `IDENFR`.
+    *   It executes the `IDENFR` block.
+    *   It calls `parseExp()`.
+    *   `parseExp` -> `parseAddExp` -> ... -> `parseUnaryExp`.
+    *   `parseUnaryExp` detects `f(`, parses args, misses `)`, logs 'j', consumes `;`.
+    *   Returns to `parseStmt`.
+    *   `parseStmt` checks for `;`. It's gone. Logs 'i'? Or maybe `back()` puts it back?
+    *   If `parseUnaryExp` called `next()` after logging, the `;` is consumed.
+    *   If `parseStmt` then calls `back()` because it didn't see `;`, it goes back to `;`.
+    *   Then it logs 'i' (missing semicolon)?? No, if it backs up to `;`, it sees `;`.
+    *   Wait, if `parseUnaryExp` consumed `;`, `pos` is at `return`.
+    *   `parseStmt` checks `getToken()` (which is `return`). Not `SEMICN`.
+    *   Enters `else`. `back()`. `pos` moves to `;`.
+    *   Logs error 'i' at `;`.
+    *   `next()`. `pos` moves to `return`.
+    *   This would produce `5 j` and `5 i`.
+    *   Why multiple `5 j`?
+    *   Perhaps `parseExp` is called multiple times?
+    *   In `parseStmt`:
+        ```java
+        parseExp(); // First call, side effects?
+        // ...
+        backto(initPos);
+        if (flag == 0) {
+             syntaxes.add(parseExp()); // Second call
+             // ...
+        }
+        ```
+    *   Yes! `parseExp()` is called **twice** in the `IDENFR` block of `parseStmt`.
+    *   First call: `parseExp();` to check for `=`.
+        *   This call traverses the tokens. Inside, `parseUnaryExp` is called.
+        *   `parseUnaryExp` sees `f(`, misses `)`, logs error 'j', consumes `;`.
+    *   Then `backto(initPos)` is called. This resets `pos` to the start of the statement (`f`).
+    *   **Crucially**, `backto` resets the position index `pos`, but it **does not undo the side effects** of the previous parsing, such as adding errors to `errorLogs`.
+    *   So, error 'j' is already in the list.
+    *   Second call: `syntaxes.add(parseExp());`.
+        *   This call traverses the tokens again.
+        *   Inside, `parseUnaryExp` is called again.
+        *   It sees `f(`, misses `)`, logs error 'j' **again**.
+    *   This explains the duplicate errors.
+
+**Conclusion:**
+The error is in `Parser.java`, specifically in the `parseStmt` method. The method calls `parseExp()` (which triggers error detection and logging) to lookahead/check for assignment, then backtracks using `backto(initPos)`, and then calls `parseExp()` again to actually parse the expression. Since the error logging has side effects (adding to `errorLogs`) that are not undone by `backto`, the same error is logged multiple times.
+
+The fix should involve preventing error logging during the lookahead phase, or clearing/restoring the error log state, or restructuring the logic to avoid double parsing. Given the constraint to identify the location, I will point to the `parseStmt` method in `Parser.java`.
+
+<Parser/Parser.java>
+...
+    public Stmt parseStmt() {
+        ArrayList<Syntax> syntaxes = new ArrayList<>();
+        if (getToken().getType().equals(Token.TokenType.IDENFR.toString())) {//LVal
+            int flag = 0;
+            int initPos = pos;
+            if (getToken().getType().equals(Token.TokenType.SEMICN.toString())) {//只有分号
+                flag = 1;
+                syntaxes.add(getToken());
+                next();
+                return new Stmt(syntaxes);
+            }
+            parseExp();
+            if (getToken().getType().equals(Token.TokenType.ASSIGN.toString())) {//有等号
+                flag = 1;
+                next();
+            }
+            backto(initPos);
+            if (flag == 0) { //这种符合[Exp];的情况，单独讨论一下
+                syntaxes.add(parseExp());
+                if (getToken().getType().equals(Token.TokenType.SEMICN.toString())) {
+                    syntaxes.add(getToken());
+                    next();
+                } else {//没有分号
+                    back();
+                    ErrorLog errorLog = new ErrorLog(getToken().getLineNum(), 'i', pos);
+                    errorLogs.add(errorLog);
+                    next();
+                }
+                return new Stmt(syntaxes);
+            }
+...

@@ -1,0 +1,799 @@
+Based on the problem description and the provided code, here is the analysis:
+
+1.  **Problem Context**: The task is to implement a lexical analyzer. A specific error type 'a' is defined for when `&` or `|` appear individually (i.e., not as part of `&&` or `||`).
+2.  **Code Analysis**:
+    *   In `lexer.h`, the function `lexer_getWord` handles logic operators (`&`, `|`) in the `else if (isLogic(temp))` block.
+    *   It reads the next character `ch`.
+    *   If the next character forms a valid pair (`&&` or `||`), it returns the correct token.
+    *   If not, it seeks back one character (`file.seekg(-1,ios::cur)`) and creates an error Word: `ans.reset("",singleWord,1);`.
+    *   In `main.cpp`, when an error Word is detected (`temp.isError()`), it creates an `Error` object using `nowLineNum`.
+3.  **The Bug**:
+    *   The variable `nowLineNum` is a global variable updated in `lexer_getWord` when newlines are encountered.
+    *   However, `nowLineNum` tracks the line number of the *current* position in the file stream or the *next* line to be processed.
+    *   Crucially, inside `lexer_getWord`, when we detect a single `&` or `|`, we have already consumed that character. The `nowLineNum` at this point reflects the line where that character was found.
+    *   Let's look closer at `del_note`. It updates `nowLineNum`.
+    *   Let's look at the main loop in `lexer_getWord`. It increments `nowLineNum` when it sees `\n`.
+    *   When `lexer_getWord` returns an error word for a single `&` or `|`, the `nowLineNum` in `main.cpp` should correspond to the line where the error occurred.
+    *   Wait, look at `main.cpp`:
+        ```cpp
+        while (!file.eof()) {
+            Word temp;
+            temp = lexer_getWord(file);
+            if (file.eof() && temp.get_str().empty()) break;
+            if (temp.get_str().empty()) continue;
+            if (temp.isError()) {
+                auto temp_error = Error(nowLineNum,'a'); // Uses global nowLineNum
+                errorList.push_back(temp_error);
+            }
+            ...
+        }
+        ```
+    *   The issue might be subtle. Let's look at how `nowLineNum` is managed. It is initialized to 1.
+    *   In `lexer_getWord`, leading whitespaces are skipped. If a `\n` is skipped, `nowLineNum` is incremented.
+    *   Then, if the character is `/`, `del_note` is called, which may also increment `nowLineNum`.
+    *   Then the character `temp` is processed.
+    *   If `temp` is `&` or `|`, it is on the current line (represented by `nowLineNum` *before* any potential newline consumption for the *next* token, but `nowLineNum` was incremented *when* the newline preceding this token was consumed).
+    *   Actually, `nowLineNum` represents the line number of the character currently being processed or just passed.
+    *   Let's check the test case input provided in the prompt: `/bin/sh: 1: g++: not found`. This indicates the compilation failed, so we don't have runtime output to compare. We must rely on static analysis.
+    *   Is there a logical error in identifying the error?
+    *   The prompt says: "The symbols "&" and "|" appearing individually".
+    *   Code:
+        ```cpp
+        else if (isLogic(temp)) {
+            singleWord.push_back(temp);
+            char ch = ' ';
+            int check = 0;
+            if (!file.eof()) {
+                file.get(ch);
+                check = 1;
+            }
+            if (ch == '&' && temp == '&' || ch == '|' && temp == '|') {
+                 // Valid && or ||
+            }
+            else {
+                if (check == 1) file.seekg(-1,ios::cur);
+                ans.reset("",singleWord,1); // Error
+                return ans;
+            }
+        }
+        ```
+    *   This logic seems correct for detecting single `&` or `|`.
+    *   However, consider the `nowLineNum` tracking.
+    *   In `main.cpp`, `extern int nowLineNum;` is used.
+    *   In `lexer.h`, `int nowLineNum = 1;` is defined.
+    *   This is a definition in a header file included in `main.cpp`. If `lexer.h` is included in multiple files, this would cause a multiple definition error during linking. But here it's only included in `main.cpp` (and potentially `lexer.cpp` if it existed, but it's all in headers).
+    *   Wait, `lexer.h` contains `int nowLineNum = 1;`. This is a **definition**, not just a declaration. If this header is included in any other `.cpp` file (though none are shown besides `main.cpp`), it would violate the One Definition Rule (ODR) if linked together. However, with just `main.cpp`, it compiles.
+    *   Let's look at the `del_note` function again.
+    *   If the file starts with comments, `nowLineNum` is updated correctly.
+    *   Is there an issue with how `nowLineNum` is reported?
+    *   The problem states: "output the line number of the error... line numbers start from 1".
+    *   If the error is on line 1, `nowLineNum` is 1. Correct.
+    *   If the error is on line 2, `nowLineNum` should be 2.
+    *   In `lexer_getWord`, before processing the token, it skips whitespace. If it encounters `\n`, it increments `nowLineNum`. So when it starts processing the token on line 2, `nowLineNum` is already 2. This seems correct.
+
+    Let's re-read the "Special Reminder": "Ensure that the read string is preserved exactly as it appears... especially for numerical values."
+    
+    Let's look at `INTCON` handling:
+    ```cpp
+    else if (isNum(temp)) {
+        char ch = temp;
+        singleWord.push_back(temp);
+        while (!file.eof()) {
+            file.get(ch);
+            if (isNum(ch)) {
+                singleWord.push_back(ch);
+            }
+            else break;
+        }
+        if (!isNum(ch)) file.seekg(-1,ios::cur);
+        ans.reset("INTCON",singleWord,0);
+        return ans;
+    }
+    ```
+    This looks standard.
+
+    Let's look at `IDENFR` handling:
+    ```cpp
+    else if (isAZ(temp) || temp == '_') {
+        // ... similar logic
+    }
+    ```
+
+    Let's look at the error reporting in `main.cpp` again.
+    ```cpp
+    if (temp.isError()) {
+        auto temp_error = Error(nowLineNum,'a');
+        errorList.push_back(temp_error);
+    }
+    ```
+    
+    Is it possible that `nowLineNum` is incorrect when the error is detected?
+    Consider the case where the error is the very last character in the file, and there is no newline at the end.
+    
+    Actually, there is a known issue with `ifstream` and `eof()`.
+    In `lexer_getWord`:
+    ```cpp
+    while (!file.eof()) {
+        file.get(temp);
+        if (temp == '\n') {
+            nowLineNum++;
+            continue;
+        }
+        if (temp != ' ' && temp != '\t') {
+            break;
+        }
+    }
+    if (file.eof() && (temp == ' ' || temp == '\t' || temp == '\n')) {
+        return ans;
+    }
+    ```
+    If the file ends with whitespace, `file.get(temp)` sets eofbit. The loop terminates. The check `if (file.eof() ...)` returns an empty word. This seems okay.
+
+    However, look at the `isLogic` block again.
+    ```cpp
+    else if (isLogic(temp)) {
+        singleWord.push_back(temp);
+        char ch = ' ';
+        int check = 0;
+        if (!file.eof()) {
+            file.get(ch);
+            check = 1;
+        }
+        if (ch == '&' && temp == '&' || ch == '|' && temp == '|') {
+             // ...
+        }
+        else {
+            if (check == 1) file.seekg(-1,ios::cur);
+            ans.reset("",singleWord,1);
+            return ans;
+        }
+    }
+    ```
+    
+    There is a potential logical error in operator precedence in the condition:
+    `if (ch == '&' && temp == '&' || ch == '|' && temp == '|')`
+    
+    `&&` has higher precedence than `||`. So this is evaluated as:
+    `(ch == '&' && temp == '&') || (ch == '|' && temp == '|')`
+    This is actually correct for C++.
+
+    Let's look at `getCompareType1` and `getCompareType2`.
+    In `isNot` block:
+    ```cpp
+    else if (isNot(temp)) {
+        // ...
+        if (ch == '=') {
+             // ...
+             ans.reset(getCompareType1(singleWord),singleWord,0); // Returns "NEQ" for "!="
+        }
+        else {
+             // ...
+             ans.reset(getLogicType(singleWord),singleWord,0); // Returns "NOT" for "!"
+        }
+    }
+    ```
+    This is correct.
+
+    Let's look at the `isCompare` block.
+    ```cpp
+    else if (isCompare(temp)) {
+        singleWord.push_back(temp);
+        char ch = ' ';
+        int check = 0;
+        if (!file.eof()) {
+            file.get(ch);
+            check = 1;
+        }
+        if (ch == '=') {
+            singleWord.push_back(ch);
+            ans.reset(getCompareType1(singleWord),singleWord,0);
+            return ans;
+        }
+        else {
+            if (check == 1) file.seekg(-1,ios::cur);
+            ans.reset(getCompareType2(singleWord),singleWord,0);
+            return ans;
+        }
+    }
+    ```
+    If `temp` is `<`, and next is `=`, `singleWord` becomes `<=`. `getCompareType1("<=")` returns `"LEQ"`. Correct.
+    If `temp` is `<`, and next is `>`, `singleWord` is `<`. `seekg(-1)`. `getCompareType2("<")` returns `"LSS"`. Correct.
+    
+    Wait, what if `temp` is `=`?
+    If `temp` is `=`, and next is `=`, `singleWord` becomes `==`. `getCompareType1("==")` returns `"EQL"`. Correct.
+    If `temp` is `=`, and next is NOT `=`, `singleWord` is `=`. `getCompareType2("=")` returns `"ASSIGN"`. Correct.
+
+    So where is the error?
+    
+    Let's look at the `main.cpp` output section.
+    ```cpp
+    if (errorList.empty()) {
+        ofstream outFile("lexer.txt",ios::out | ios::binary);
+        for (int i = 0;i < wordList.size();i++) {
+            outFile << wordList[i].get_typeCode()
+            << ' ' << wordList[i].get_str() << endl;
+        }
+    }
+    else {
+        ofstream outFile("error.txt",ios::out | ios::binary);
+        for (int i = 0;i < errorList.size();i++) {
+            outFile << errorList[i].get_lineNum() << ' ' << errorList[i].get_type() << endl;
+        }
+    }
+    ```
+    
+    The problem states: "For an erroneous source program... output the line number... and the corresponding error type code... Each erroneous example will have exactly one error."
+    
+    If there is an error, we output to `error.txt`.
+    
+    Let's look closely at `lexer.h` -> `lexer_getWord`.
+    
+    Is it possible that `nowLineNum` is not being updated correctly in some edge case?
+    
+    Or is there an issue with how `Word` stores the string?
+    
+    Let's look at the `isLogic` error handling again.
+    ```cpp
+    ans.reset("",singleWord,1);
+    ```
+    The `typeCode` is set to `""`.
+    In `main.cpp`:
+    ```cpp
+    if (temp.isError()) {
+        auto temp_error = Error(nowLineNum,'a');
+        errorList.push_back(temp_error);
+    }
+    else {
+        wordList.push_back(temp);
+    }
+    ```
+    This seems fine.
+
+    Let's look at the `del_note` function.
+    ```cpp
+    char del_note(ifstream &file) {
+        char ch;
+        if (file.eof()) {
+            return '/';
+        }
+        file.get(ch);
+        if (ch != '/' && ch != '*') {
+            file.seekg(-1,ios::cur);
+            return '/';
+        }
+        if (ch == '/') {
+            while (!file.eof() && ch != '\n') {
+                file.get(ch);
+            }
+            if (ch == '\n') nowLineNum++;
+            if (!file.eof()) file.get(ch);
+            else ch = ' ';
+            return ch;
+        }
+        else {
+            // ...
+        }
+    }
+    ```
+    If it's a `//` comment:
+    It reads until `\n` or EOF.
+    If it finds `\n`, it increments `nowLineNum`.
+    Then it reads the next character `ch` (the first char of the next line) and returns it.
+    Back in `lexer_getWord`:
+    ```cpp
+    if (temp == '/') temp = del_note(file);
+    ```
+    So `temp` becomes the first character of the next line (or space if EOF).
+    Then the code continues to process `temp`.
+    If `temp` is a newline? No, `del_note` consumes the newline and increments `nowLineNum`, then reads the *next* char.
+    If the next char is `\n` (empty line), `temp` will be `\n`.
+    Then the code falls through to the type checks.
+    `\n` is not `'`, `"`, digit, letter, calc, compare, bracket, end, not, logic.
+    So it goes to `else { return ans; }`.
+    `ans` is empty.
+    Back in `main.cpp`:
+    ```cpp
+    if (temp.get_str().empty()) continue;
+    ```
+    So it skips it. But `nowLineNum` was already incremented in `del_note`.
+    Wait, if `temp` is `\n`, `lexer_getWord` returns an empty word.
+    The next iteration of `while(!file.eof())` in `lexer_getWord` (wait, `lexer_getWord` is called once per token in `main`).
+    
+    In `main`:
+    ```cpp
+    while (!file.eof()) {
+        Word temp = lexer_getWord(file);
+        // ...
+    }
+    ```
+    
+    If `lexer_getWord` returns an empty word (e.g. because it hit a newline after a comment), `main` continues to the next iteration.
+    
+    However, look at the start of `lexer_getWord`:
+    ```cpp
+    while (!file.eof()) {
+        file.get(temp);
+        if (temp == '\n') {
+            nowLineNum++;
+            continue;
+        }
+        // ...
+    }
+    ```
+    This loop skips leading whitespace/newlines.
+    
+    If `del_note` returns a `\n` (which shouldn't happen as it reads past `\n`), or if `del_note` returns a character that is then treated as whitespace?
+    
+    Actually, there is a bug in `del_note` for `/* */` comments.
+    ```cpp
+    else {
+        //默认注释一定匹配,所以未检查eof边界
+        file.get(ch);
+        if (ch == '\n') nowLineNum++;
+        char before = ch;
+        file.get(ch);
+        while (before != '*' && ch != '/') {
+            if (ch == '\n') nowLineNum++;
+            before = ch;
+            file.get(ch);
+        }
+        return ' ';
+    }
+    ```
+    It returns `' '`.
+    Back in `lexer_getWord`:
+    ```cpp
+    if (temp == '/') temp = del_note(file);
+    ```
+    So `temp` becomes `' '`.
+    Then the code proceeds.
+    The `while` loop at the beginning of `lexer_getWord` has *already finished*.
+    So `temp` is `' '`.
+    It checks `if (temp == '\'' ...)` -> False.
+    ...
+    It goes to `else { return ans; }`.
+    Returns empty word.
+    `main` sees empty word, continues.
+    
+    This means if a `/* */` comment is followed by nothing but EOF, or if it's at the end of a line, the space returned might cause an empty word return, which is skipped. This seems acceptable for skipping comments.
+
+    **However**, there is a critical issue with `nowLineNum` synchronization.
+    
+    In `main.cpp`, `nowLineNum` is `extern`.
+    In `lexer.h`, `int nowLineNum = 1;`.
+    
+    If `lexer.h` is included in `main.cpp`, `nowLineNum` is defined there.
+    
+    Let's look at the error case `a` again.
+    Input: `if(1 & 2)`
+    
+    1. `if` -> IDENFR? No, `getWordType("if")` returns `"IFTK"`.
+    2. `(` -> LPARENT
+    3. `1` -> INTCON
+    4. ` ` -> skipped
+    5. `&` -> `isLogic('&')` is true.
+       - `singleWord` = "&"
+       - `file.get(ch)` -> gets ` ` (space)
+       - `ch` is not `&`.
+       - `seekg(-1)`
+       - `ans.reset("", "&", 1)` -> Error.
+       - Returns.
+    6. `main` receives error word.
+    7. `nowLineNum` is used.
+    
+    If the input is `if(1 & 2)`, `nowLineNum` should be 1.
+    
+    Is it possible the error is in `getWordType`?
+    `if` is a keyword.
+    
+    Let's look at `isAZ`.
+    `bool isAZ(char temp) { return temp >= 'a' && temp <='z' || temp >= 'A' && temp <='Z'; }`
+    Precedence: `&&` > `||`.
+    `(temp >= 'a' && temp <='z') || (temp >= 'A' && temp <='Z')`. Correct.
+
+    Let's look at `isNum`.
+    `bool isNum(char temp) { return temp >= '0' && temp <= '9'; }` Correct.
+
+    **Wait**, look at `lexer_getWord` handling of `isLogic`.
+    
+    ```cpp
+    else if (isLogic(temp)) {
+        singleWord.push_back(temp);
+        char ch = ' ';
+        int check = 0;
+        if (!file.eof()) {
+            file.get(ch);
+            check = 1;
+        }
+        if (ch == '&' && temp == '&' || ch == '|' && temp == '|') {
+            singleWord.push_back(ch);
+            ans.reset(getLogicType(singleWord),singleWord,0);
+            return ans;
+        }
+        else {
+            if (check == 1) file.seekg(-1,ios::cur);
+            ans.reset("",singleWord,1);
+            return ans;
+        }
+    }
+    ```
+    
+    If the input is `&` followed by EOF.
+    `file.get(ch)` sets eofbit. `ch` is unchanged (still `' '`).
+    `check` is 1.
+    Condition `ch == '&' ...` is false.
+    Goes to else.
+    `if (check == 1) file.seekg(-1,ios::cur);`
+    Seeking back on a stream that has hit EOF is undefined behavior or fails.
+    However, the bigger issue is that `ch` was not a valid character read.
+    
+    But usually, test cases have newlines at the end.
+
+    Let's look at the `main.cpp` loop condition.
+    ```cpp
+    while (!file.eof()) {
+        Word temp = lexer_getWord(file);
+        if (file.eof() && temp.get_str().empty()) break;
+        if (temp.get_str().empty()) continue;
+        // ...
+    }
+    ```
+    
+    If `lexer_getWord` hits EOF while reading a token (e.g. `&` at end of file), it returns an error word.
+    `file.eof()` is true.
+    `temp.get_str()` is "&" (not empty).
+    So it does NOT break.
+    It processes the error.
+    Then loop continues.
+    Next call to `lexer_getWord`.
+    Inside `lexer_getWord`:
+    `while (!file.eof())` -> False immediately.
+    Returns empty `ans`.
+    Back in `main`:
+    `file.eof()` is true.
+    `temp.get_str().empty()` is true.
+    Breaks.
+    
+    This seems robust enough.
+
+    **Is there a typo in the Token Codes?**
+    Problem: `!=` -> NEQ.
+    Code: `getCompareType1` checks `!=` returns `NEQ`. Correct.
+    
+    Problem: `||` -> OR.
+    Code: `getLogicType` checks `||` returns `OR`. Correct.
+
+    **Let's check the header guards and includes.**
+    `lexer.h` includes `<utility>` and uses `std::string`, `std::ifstream`, `std::ios`.
+    It does NOT include `<string>`, `<fstream>`, `<iostream>`.
+    `main.cpp` includes `<iostream>`, `<fstream>`, `<vector>`, `"lexer.h"`, `"error.h"`.
+    
+    In `lexer.h`:
+    `using namespace std;`
+    `string getWordType(string singleWord)`
+    
+    If `<string>` is not included, `string` might not be recognized depending on the compiler/transitive includes. `<iostream>` usually includes `<string>`, so in `main.cpp` it might work. But `lexer.h` itself might fail to compile if included in isolation or if the compiler doesn't guarantee transitive includes. However, the error message says `g++: not found`, which is a system environment error, not a compilation error of the code logic. But I must assume the code *would* compile in a proper environment and find logical bugs.
+
+    **Logical Bug Candidate:**
+    
+    In `lexer.h`, `nowLineNum` is a global variable.
+    In `main.cpp`, it is declared `extern`.
+    
+    In `lexer_getWord`, when `del_note` is called for `//` comments:
+    ```cpp
+    if (ch == '/') {
+        while (!file.eof() && ch != '\n') {
+            file.get(ch);
+        }
+        if (ch == '\n') nowLineNum++;
+        if (!file.eof()) file.get(ch);
+        else ch = ' ';
+        return ch;
+    }
+    ```
+    If the comment is at the very end of the file without a newline:
+    `file.get(ch)` hits EOF. `ch` remains the last char? No, `get` fails.
+    `while` loop terminates because `file.eof()` is true.
+    `ch` is the last character read (likely not `\n`).
+    `if (ch == '\n')` -> False.
+    `if (!file.eof())` -> False.
+    `ch = ' '`.
+    Returns `' '`.
+    
+    If the comment ends with `\n`:
+    `ch` becomes `\n`.
+    `nowLineNum++`.
+    `file.get(ch)` reads next char.
+    
+    This seems correct.
+
+    **However**, there is a subtle bug in `main.cpp` regarding the order of operations or variable scope? No.
+
+    Let's look at `Error` class.
+    ```cpp
+    class Error {
+        int occurLineNum;
+        char type;
+    public:
+        Error(int occurLineNum,char type) {
+            this->occurLineNum = occurLineNum;
+            this->type = type;
+        }
+        int get_lineNum() { return occurLineNum; }
+        char get_type() { return type; }
+    };
+    ```
+    
+    Output format: `error line number error category code`.
+    `outFile << errorList[i].get_lineNum() << ' ' << errorList[i].get_type() << endl;`
+    
+    This matches.
+
+    **Wait!** Look at `lexer_getWord` again.
+    
+    ```cpp
+    else if (isLogic(temp)) {
+        // ...
+        if (ch == '&' && temp == '&' || ch == '|' && temp == '|') {
+             // ...
+        }
+        else {
+             // ...
+             ans.reset("",singleWord,1);
+             return ans;
+        }
+    }
+    ```
+    
+    If `temp` is `&` and `ch` is `|` (e.g. `&|`)?
+    It treats `&` as an error. Correct.
+    
+    If `temp` is `&` and `ch` is `&`?
+    It treats `&&` as AND. Correct.
+
+    **Is there an issue with `nowLineNum` initialization?**
+    `int nowLineNum = 1;` in `lexer.h`.
+    
+    If the file is empty?
+    `lexer_getWord` returns empty.
+    `main` breaks.
+    `errorList` empty.
+    `wordList` empty.
+    Outputs empty `lexer.txt`. Correct.
+
+    **Let's check the `isCompare` logic again.**
+    
+    ```cpp
+    else if (isCompare(temp)) {
+        singleWord.push_back(temp);
+        char ch = ' ';
+        int check = 0;
+        if (!file.eof()) {
+            file.get(ch);
+            check = 1;
+        }
+        if (ch == '=') {
+            singleWord.push_back(ch);
+            ans.reset(getCompareType1(singleWord),singleWord,0);
+            return ans;
+        }
+        else {
+            if (check == 1) file.seekg(-1,ios::cur);
+            ans.reset(getCompareType2(singleWord),singleWord,0);
+            return ans;
+        }
+    }
+    ```
+    
+    If `temp` is `!`?
+    Handled in `isNot`.
+    
+    If `temp` is `<`?
+    Handled in `isCompare`.
+    
+    What if `temp` is `>`?
+    Handled in `isCompare`.
+
+    **One common mistake in these assignments:**
+    
+    The problem says: "The symbols "&" and "|" appearing individually".
+    
+    Does the code handle `&` inside a string or char constant?
+    
+    ```cpp
+    if (temp == '\'' || temp == '\"') {
+        // ... reads until closing quote
+        // returns CHRCON or STRCON
+    }
+    ```
+    Yes, strings/chars are handled first. So `&` inside `"a&b"` is part of the string. Correct.
+
+    **What about `nowLineNum` in `main.cpp`?**
+    
+    ```cpp
+    extern int nowLineNum;
+    ```
+    
+    And in `lexer.h`:
+    ```cpp
+    int nowLineNum = 1;
+    ```
+    
+    If `lexer.h` is included in `main.cpp`, `nowLineNum` is defined.
+    
+    **Is it possible that `nowLineNum` is not updated when it should be?**
+    
+    Consider the case:
+    Line 1: `int a`
+    Line 2: `&`
+    
+    Processing Line 1:
+    `int` -> INTTK.
+    `a` -> IDENFR.
+    End of line 1.
+    Next `lexer_getWord` call.
+    Skips `\n`. `nowLineNum` becomes 2.
+    Reads `&`.
+    Detects error.
+    Reports `nowLineNum` (which is 2).
+    Correct.
+
+    **Conclusion:**
+    
+    The code logic for lexical analysis seems largely correct for the standard cases.
+    
+    However, there is a **potential issue with the `isLogic` check precedence** or **missing includes**.
+    
+    But looking closer at `lexer.h`:
+    
+    ```cpp
+    #include <utility>
+    using namespace std;
+    ```
+    
+    It uses `string`, `ifstream`, `ios`.
+    `<utility>` does not define `string` or `ifstream`.
+    `main.cpp` includes `<iostream>` and `<fstream>`.
+    `<iostream>` typically includes `<string>`.
+    `<fstream>` defines `ifstream`.
+    
+    So compilation should succeed.
+
+    **Wait, look at `getWordType`**.
+    
+    ```cpp
+    string getWordType(string singleWord) {
+        if (singleWord == "main") return"MAINTK";
+        // ...
+        else {
+            return "IDENFR";
+        }
+    }
+    ```
+    
+    If the identifier is `void`?
+    `if (singleWord == "void") return "VOIDTK";`
+    
+    If the identifier is `getint`?
+    `if (singleWord == "getint") return "GETINTTK";`
+
+    All keywords seem covered.
+
+    **Let's look at the `Error` output format.**
+    
+    `error line number error category code`
+    
+    Code:
+    `outFile << errorList[i].get_lineNum() << ' ' << errorList[i].get_type() << endl;`
+    
+    This outputs `1 a` for line 1 error type a.
+    
+    **Is there a bug in `lexer_getWord` regarding `seekg`?**
+    
+    ```cpp
+    if (!isNum(ch)) file.seekg(-1,ios::cur);
+    ```
+    
+    If `ch` is EOF? `isNum(EOF)`?
+    `isNum` takes `char`. `EOF` is usually -1.
+    If `char` is signed, -1 is not a digit.
+    `seekg(-1)` on EOF state?
+    
+    If `file.get(ch)` hits EOF, `ch` is unchanged.
+    If `ch` was initialized to `temp` (a digit), `isNum(ch)` is true.
+    Loop continues?
+    `while (!file.eof())`
+    `file.get(ch)` -> EOF.
+    `isNum(ch)` -> True (if `ch` retained old value).
+    `singleWord.push_back(ch)` -> Pushes old digit again?
+    
+    **This is a bug!**
+    
+    ```cpp
+    else if (isNum(temp)) {
+        char ch = temp;
+        singleWord.push_back(temp);
+        while (!file.eof()) {
+            file.get(ch);
+            if (isNum(ch)) {
+                singleWord.push_back(ch);
+            }
+            else break;
+        }
+        if (!isNum(ch)) file.seekg(-1,ios::cur);
+        // ...
+    }
+    ```
+    
+    If `file.get(ch)` fails (EOF), `ch` retains its previous value (the last valid digit).
+    `isNum(ch)` is true.
+    It pushes the digit again into `singleWord`.
+    Then `while (!file.eof())` checks EOF. It is now EOF. Loop terminates.
+    `if (!isNum(ch))` -> False.
+    So it does NOT seek back.
+    
+    Result: The last digit is duplicated in the token string.
+    Example: `12` at end of file.
+    1. `temp` = '1'.
+    2. `ch` = '1'. `singleWord` = "1".
+    3. Loop. `file.get(ch)` reads '2'. `ch`='2'.
+    4. `isNum('2')` true. `singleWord` = "12".
+    5. Loop. `file.get(ch)` hits EOF. `ch` remains '2'.
+    6. `isNum('2')` true. `singleWord` = "122".
+    7. Loop condition `!file.eof()` is false. Terminate.
+    8. `!isNum('2')` is false. No seek.
+    9. Returns "122".
+    
+    This is definitely a bug. It affects `INTCON`, `IDENFR` (similar logic), and potentially others.
+
+    Similarly for `IDENFR`:
+    ```cpp
+    else if (isAZ(temp) || temp == '_') {
+        char ch = temp;
+        singleWord.push_back(temp);
+        while (!file.eof()) {
+            file.get(ch);
+            if (isNum(ch) || isAZ(ch) || ch == '_') {
+                singleWord.push_back(ch);
+            }
+            else break;
+        }
+        if (!(isNum(ch) || isAZ(ch) || ch == '_')) file.seekg(-1,ios::cur);
+        // ...
+    }
+    ```
+    Same bug. If EOF occurs, `ch` retains last valid char. Condition is true. Duplicates last char.
+
+    This bug causes incorrect token strings.
+
+    <lexer.h>
+...
+    else if (isNum(temp)) {
+        char ch = temp;
+        singleWord.push_back(temp);
+        while (!file.eof()) {
+            file.get(ch);
+            if (isNum(ch)) {
+                singleWord.push_back(ch);
+            }
+            else break;
+        }
+        if (!isNum(ch)) file.seekg(-1,ios::cur);
+        ans.reset("INTCON",singleWord,0);
+        return ans;
+    }
+    else if (isAZ(temp) || temp == '_') {
+        char ch = temp;
+        singleWord.push_back(temp);
+        while (!file.eof()) {
+            file.get(ch);
+            if (isNum(ch) || isAZ(ch) || ch == '_') {
+                singleWord.push_back(ch);
+            }
+            else break;
+        }
+        if (!(isNum(ch) || isAZ(ch) || ch == '_')) file.seekg(-1,ios::cur);
+        ans.reset(getWordType(singleWord),singleWord,0);
+        return ans;
+    }
+...

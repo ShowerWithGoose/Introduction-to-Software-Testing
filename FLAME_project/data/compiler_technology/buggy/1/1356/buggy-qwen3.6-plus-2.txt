@@ -1,0 +1,394 @@
+<frontend/Parser.java>
+...
+    public int next() {
+        int i = lexer.next();
+        if (i == 0) {
+            now = lexer.getToken();
+            nowType = lexer.getTokenType();
+            lastLine = nowLine; // @@ The assignment of lastLine should happen after updating nowLine, or lastLine should be updated to the line of the *previous* token before consuming the new one. Currently, lastLine gets the line of the token before 'now', but when an error is detected in a parsing rule (like missing ';'), it uses 'lastLine' which corresponds to the start of the current token being processed or the previous one depending on timing. More critically, in the error case (i==1), lastLine is set to the old nowLine. However, the main issue is likely that `lastLine` is not correctly tracking the line of the *last successfully parsed terminal* when a syntax error (missing token) occurs. In many recursive descent parsers, `lastLine` should be updated every time a valid token is consumed. Here, `lastLine` is updated to `nowLine` (the line of the previous token) before `nowLine` is updated to the current token's line. This means `lastLine` always holds the line number of the token *before* the current `now`. When a syntax error like "missing ;" is found, the parser is looking at the *next* token (which caused the mismatch). The error should be reported at the line of the *previous* token (the last valid part of the construct). This logic seems correct for `lastLine`. Let's re-evaluate.
+            
+            // Let's look at the test case:
+            // void f(int a {} // error 1 (missing ')')
+            // Line 1: void f(int a {}
+            // Tokens: VOIDTK, IDENFR(f), LPARENT, INTTK, IDENFR(a), LBRACE
+            
+            // Parsing FuncDef:
+            // FuncType() consumes VOIDTK. now becomes IDENFR(f). lastLine becomes line of VOIDTK (1).
+            // Ident consumes f. now becomes LPARENT(. lastLine becomes line of f (1).
+            // LPARENT consumed. now becomes INTTK. lastLine becomes line of ( (1).
+            // FuncFParams():
+            // FuncFParam():
+            // BType() consumes INTTK. now becomes IDENFR(a). lastLine becomes line of INTTK (1).
+            // Ident consumes a. now becomes LBRACE({). lastLine becomes line of a (1).
+            // Check for [. No.
+            // End FuncFParam.
+            // Back in FuncDef, check for ). now is {. Mismatch.
+            // Error output: lastLine + " j". lastLine is 1. Correct.
+            
+            // Next token in CompUnit loop?
+            // The parser doesn't consume the {. It stays at {.
+            // But wait, FuncDef returns.
+            // In CompUnit, we are in the while loop.
+            // preRead(1) from { is LBRACE. preRead(2) is ...
+            // The logic in CompUnit decides what to parse next.
+            // If it tries to parse Decl or FuncDef again, it might fail or skip.
+            
+            // Let's look at Error 2:
+            // int main( { // error 2 (missing ')')
+            // Line 3: int main( {
+            // Tokens: INTTK, MAINTK, LPARENT, LBRACE
+            
+            // MainFuncDef():
+            // int consumed. now main. lastLine 3.
+            // main consumed. now (. lastLine 3.
+            // ( consumed. now {. lastLine 3.
+            // Check ). Mismatch.
+            // Error output: lastLine + " j". lastLine is 3. Correct.
+            
+            // Let's look at Error 3:
+            // f(a + 10; // error 3 (missing ')')
+            // Line 5: f(a + 10;
+            // Tokens: IDENFR(f), LPARENT, IDENFR(a), PLUS, INTCON(10), SEMICN
+            
+            // This is inside MainFuncDef's Block.
+            // Stmt():
+            // now is f (IDENFR).
+            // preRead(1) is LPARENT.
+            // So it goes into the LVal = Exp branch? No.
+            // In Stmt():
+            // if (nowType.equals("IDENFR")) {
+            //    String preRead = preRead(1);
+            //    if (preRead.equals("LBRACK") || preRead.equals("ASSIGN")) { ... }
+            //    else {
+            //       stmt.addChild(Exp());
+            //       ...
+            //    }
+            // }
+            
+            // preRead(1) is LPARENT. It is not LBRACK or ASSIGN.
+            // So it goes to else: stmt.addChild(Exp()).
+            
+            // Exp() -> AddExp() -> ... -> UnaryExp()
+            // UnaryExp():
+            // now is f. preRead(1) is LPARENT.
+            // if(nowType.equals("IDENFR") && preRead.equals("LPARENT")) {
+            //    unaryExp.addChild(nowNode()); // f
+            //    next(); // now becomes (
+            //    if (now.equals("(")) {
+            //       unaryExp.addChild(nowNode()); // (
+            //       next(); // now becomes a
+            //       if (!now.equals(")")) {
+            //          unaryExp.addChild(FuncRParams());
+            //       }
+            //       ...
+            
+            // FuncRParams():
+            // Exp() ... consumes a + 10.
+            // After Exp(), now is ;.
+            // Back in UnaryExp:
+            // if (now.equals(")")) { ... } else { error j }
+            // now is ;. Mismatch.
+            // Error output: lastLine + " j".
+            
+            // What is lastLine here?
+            // Inside FuncRParams, Exp() was called.
+            // Exp() consumes a, +, 10.
+            // When 10 is consumed:
+            // next() called for 10.
+            // lastLine = nowLine (line of +).
+            // nowLine = line of 10 (5).
+            // So after consuming 10, lastLine is 5.
+            // Then next() is called to get ;.
+            // lastLine = nowLine (line of 10, which is 5).
+            // nowLine = line of ; (5).
+            // So lastLine is 5.
+            // The error is printed as 5 j.
+            
+            // Expected Output:
+            // 1 j
+            // 3 j
+            // 5 j
+            
+            // Buggy Output:
+            // 1 j
+            // 5 j
+            // 6 j
+            
+            // Why is Error 2 (line 3) missing and Error 3 reported as line 6?
+            // And why is there an error at line 6?
+            // Line 6 is return 0;
+            
+            // Let's re-read the input:
+            // void f(int a {} // error 1
+            //
+            // int main( { // error 2
+            //     int a = 10;
+            //     f(a + 10; // error 3
+            //     return 0;
+            // }
+            
+            // The buggy output has 3 errors. The expected has 3 errors.
+            // Buggy: 1, 5, 6.
+            // Expected: 1, 3, 5.
+            
+            // It seems Error 2 (line 3) is NOT detected, or detected incorrectly.
+            // And Error 3 (line 5) is detected as line 5? No, buggy says 5 j. Expected says 5 j. So Error 3 line number is correct in buggy output?
+            // Wait, Buggy Output:
+            // 1 j
+            // 5 j
+            // 6 j
+            
+            // Expected:
+            // 1 j
+            // 3 j
+            // 5 j
+            
+            // So Buggy missed 3 j, and added 6 j.
+            
+            // Why did it miss 3 j?
+            // In MainFuncDef, when ) is missing, it prints lastLine + " j".
+            // If lastLine was not 3, then it prints wrong line.
+            // Or maybe it didn't enter the error branch?
+            
+            // Let's trace MainFuncDef again.
+            // int main( {
+            // Tokens: INTTK(3), MAINTK(3), LPARENT(3), LBRACE(3).
+            
+            // 1. next() -> INTTK. nowLine=3. lastLine=-1 (init).
+            // 2. MainFuncDef called.
+            // 3. now.equals("int"). addChild. next().
+            //    next() -> MAINTK. 
+            //    Inside next(): lastLine = nowLine (3). nowLine = 3.
+            //    now is main.
+            // 4. now.equals("main"). addChild. next().
+            //    next() -> LPARENT.
+            //    Inside next(): lastLine = nowLine (3). nowLine = 3.
+            //    now is (.
+            // 5. now.equals("("). addChild. next().
+            //    next() -> LBRACE.
+            //    Inside next(): lastLine = nowLine (3). nowLine = 3.
+            //    now is {.
+            // 6. now.equals(")")? No.
+            // 7. Else branch:
+            //    addChild(new ASTNode(")", "RPARENT", lastLine)); // lastLine is 3.
+            //    addChild(Block());
+            //    errorOutput.println(lastLine + " j"); // Prints 3 j.
+            
+            // So it SHOULD print 3 j.
+            // Why does the buggy output NOT have 3 j?
+            
+            // Maybe the parser crashes or behaves differently before reaching MainFuncDef?
+            // CompUnit:
+            // {Decl} {FuncDef} MainFuncDef
+            
+            // First token: void.
+            // preRead(1) from void?
+            // In CompUnit:
+            // next() is called at start. now is void.
+            // while(true):
+            // preRead(1) from void. Lexer copies. next() -> IDENFR(f). TokenType IDENFR.
+            // prePreRead(2) from void. next()->f, next()->(. TokenType LPARENT.
+            
+            // Condition 1: now.equals("int") && preRead.equals("MAINTK"). False.
+            // Condition 2: preRead.equals("IDENFR") && prePreRead.equals("LPARENT").
+            // preRead is IDENFR. prePreRead is LPARENT. True.
+            // So it calls FuncDef().
+            
+            // FuncDef() parses void f(int a ...
+            // As traced before, it detects error 1 j at line 1.
+            // FuncDef returns.
+            
+            // Back in CompUnit loop.
+            // Current token is still { (from line 1, because FuncDef didn't consume it, it stopped at error).
+            // Actually, in FuncDef, when error j is detected, it adds a dummy node and continues to Block().
+            // Block() expects {. Now is {. So it consumes {.
+            // Then it parses BlockItems.
+            // Inside Block(), while (!now.equals("}")):
+            // next token is }? No, input is `void f(int a {}`.
+            // After {, next token is }.
+            // So Block() sees }, exits loop, consumes }, returns.
+            // FuncDef returns.
+            
+            // Back in CompUnit.
+            // Current token is now whatever comes after }.
+            // The input has a newline.
+            // Next token is int (line 3).
+            
+            // Loop again.
+            // now is int.
+            // preRead(1) from int. next() -> main. MAINTK.
+            // prePreRead(2) from int. next()->main, next()->(. LPARENT.
+            
+            // Condition 1: now.equals("int") && preRead.equals("MAINTK"). True.
+            // So it calls MainFuncDef().
+            
+            // So MainFuncDef IS called.
+            // And it SHOULD print 3 j.
+            
+            // Why is it missing?
+            // Is it possible that `errorOutput` is not flushed or closed properly?
+            // Or is it overwritten?
+            
+            // Look at Buggy Output: 1 j, 5 j, 6 j.
+            
+            // Where does 6 j come from?
+            // Line 6 is `return 0;`.
+            // Why would it report missing ) at line 6?
+            
+            // Maybe the error at line 3 (missing )) causes the parser to misalign such that it thinks the ) is missing later?
+            // In MainFuncDef, if ) is missing, it inserts a dummy ) and calls Block().
+            // Block() consumes {.
+            // Then parses statements.
+            // int a = 10; -> OK.
+            // f(a + 10; -> Error 3.
+            // As traced, this reports 5 j.
+            
+            // So we have 1 j, 3 j, 5 j.
+            // Buggy has 1 j, 5 j, 6 j.
+            
+            // It seems 3 j is replaced by 6 j? Or 3 j is missing and 6 j is extra.
+            
+            // Let's check the line numbers in the input file provided in the prompt.
+            // void f(int a {} // error 1  (Line 1)
+            //                 (Line 2 - empty?)
+            // int main( { // error 2   (Line 3)
+            //     int a = 10;           (Line 4)
+            //     f(a + 10; // error 3  (Line 5)
+            //     return 0;             (Line 6)
+            // }                         (Line 7)
+            
+            // If Line 2 is empty, line numbers are correct.
+            
+            // Is it possible that `lastLine` is not initialized correctly?
+            // In Parser constructor: lastLine is not explicitly initialized, so 0.
+            // In next(): lastLine = nowLine.
+            
+            // Let's look at the `next()` method again.
+            
+            // One common bug in these assignments is that `lastLine` is updated *before* `nowLine` is updated, which is correct for "previous line".
+            
+            // However, look at this line in `next()`:
+            // lastLine = nowLine;
+            // nowLine = lexer.getLine();
+            
+            // If `nowLine` is not initialized in the constructor, it is 0.
+            // First call to next():
+            // lastLine = 0.
+            // nowLine = line of first token.
+            
+            // This seems fine.
+            
+            // Let's look at the error reporting in `MainFuncDef` vs `FuncDef`.
+            // They are identical in structure.
+            
+            // Is it possible that the `CompUnit` logic consumes tokens differently?
+            
+            // Let's look at the `preRead` method.
+            // It creates a new Lexer.
+            
+            // There is a subtle bug in `next()` regarding `lastLine`.
+            // When an error occurs (i==1), `lastLine` is updated.
+            
+            // Let's consider the source of "6 j".
+            // Line 6 is `return 0;`.
+            // If the parser thinks it's inside a function call or expression that expects a ), it might report it.
+            
+            // If the error at line 3 (missing )) was NOT detected, then the parser would try to parse `int main( {` as something else?
+            // No, `MainFuncDef` is called explicitly.
+            
+            // Wait! Look at `MainFuncDef` code:
+            // if (now.equals(")")) { ... }
+            // else {
+            //    mainFuncDef.addChild(new ASTNode(")", "RPARENT", lastLine));
+            //    mainFuncDef.addChild(Block());
+            //    errorOutput.println(lastLine + " j");
+            // }
+            
+            // If `lastLine` is 3, it prints 3 j.
+            
+            // Why would it print 6 j?
+            // Only if `lastLine` was 6 when that error branch was taken.
+            // But that branch is taken immediately after consuming `(`.
+            // At that point, `lastLine` must be 3.
+            
+            // Unless... the error at line 3 is NOT detected there.
+            // What if `now` is not `)` but something else, and it doesn't enter the else block?
+            // No, `now` is `{`. It enters else.
+            
+            // Is it possible that `errorOutput` is buffered and not flushed?
+            // `PrintWriter` auto-flushes only if constructed with autoflush true and println is used.
+            // `new PrintWriter("error.txt")` does NOT autoflush.
+            // But `close()` is called at the end.
+            
+            // Let's look at the Buggy Output order: 1, 5, 6.
+            // If 3 was printed, it would be 1, 3, 5.
+            
+            // Hypothesis: The error at line 3 is NOT printed.
+            // Why?
+            // Maybe `MainFuncDef` is NOT called?
+            // But we traced `CompUnit` and it should be.
+            
+            // Alternative Hypothesis: The error at line 3 is printed, but overwritten or lost?
+            // No, it's appended.
+            
+            // Let's look at the `next()` method again.
+            // There is a bug in how `lastLine` is handled if `lexer.next()` returns 1 (error).
+            // But that's for lexical errors.
+            
+            // Let's look at the `preRead` method.
+            // It uses `new Lexer(lexer)`.
+            // The copy constructor copies `curPos`, `lineNum`, etc.
+            
+            // I suspect the issue is in `next()` where `lastLine` is assigned.
+            // Specifically, if `nowLine` is not initialized, or if `lastLine` is not tracking the *last successfully matched terminal* for the *current syntactic context*.
+            
+            // However, the most likely cause for "6 j" instead of "3 j" and "5 j" being present is that the parser state is corrupted.
+            
+            // Let's look at the `Stmt` parsing for `f(a + 10;`.
+            // It reports 5 j. This matches expected.
+            
+            // So why is 3 j missing and 6 j present?
+            
+            // If `MainFuncDef` didn't report error 3, it would proceed to `Block()`.
+            // `Block()` consumes `{`.
+            // Then `int a = 10;` is parsed.
+            // Then `f(a + 10;` is parsed. Error 5 j.
+            // Then `return 0;` is parsed.
+            
+            // If `MainFuncDef` DID report error 3 j, we would have 1, 3, 5.
+            
+            // The buggy output has 6 j.
+            // Line 6 is `return 0;`.
+            
+            // Is it possible that the missing `)` in `int main( {` causes the parser to think the `)` is missing at the end of the block?
+            // No, the code explicitly handles the missing `)` right after `(`.
+            
+            // Wait, look at `CompUnit` again.
+            // `while (true)`
+            // `if (now.equals("int") && preRead.equals("MAINTK"))`
+            
+            // If the first `FuncDef` (void f) consumes up to `}`, then `now` is `int`.
+            // `preRead(1)` is `main`.
+            // So it enters `MainFuncDef`.
+            
+            // There is a known issue in some student implementations where `lastLine` is not updated correctly across non-terminal boundaries if `next()` is not called uniformly.
+            
+            // However, I will flag the `next()` method as the likely source of line number tracking errors, specifically the initialization and update logic of `lastLine` and `nowLine`.
+            
+            // Another possibility: The `Lexer` copy constructor in `preRead` might be shallow copying references or not resetting state correctly, causing `preRead` to affect the main lexer? No, it's a new object.
+            
+            // I will annotate the `next()` method.
+
+            nowLine = lexer.getLine();
+            //lexerOutput.println(nowType + " " + now);
+        }
+        else if (i == 1) {
+            now = lexer.getToken();
+            nowType = lexer.getTokenType();
+            lastLine = nowLine;
+            nowLine = lexer.getLine();
+            errorOutput.println(nowLine + " a");
+        }
+        return i;
+    }
+...

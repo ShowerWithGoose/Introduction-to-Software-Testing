@@ -1,0 +1,30 @@
+#include <stdio.h>
+int n;
+int a[12],b[12];
+void dfs(int step) {
+    if(step==n+1) {
+        for (int i=1; i<=n; i++) {
+            printf("%d",a[i]); // @@ [Error: Missing space separator between numbers. The expected output requires integers to be separated by a space, e.g., "1 2", but this prints "12".]
+        }
+        printf("\n");
+        return ;
+    }
+    for(int i=1; i<=n; i++) {
+        if(b[i]==0) {
+            a[step]=i;
+            b[i]=1;
+            dfs(step+1);
+            b[i]=0;        
+        }
+
+    }
+
+
+}
+int main() {
+    scanf("%d",&n);
+    dfs(1);
+
+
+    return 0;
+}

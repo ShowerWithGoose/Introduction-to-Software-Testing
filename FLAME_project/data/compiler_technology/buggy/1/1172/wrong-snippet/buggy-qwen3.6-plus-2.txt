@@ -1,0 +1,873 @@
+Based on the comparison between the buggy output and the expected output, the program is incorrectly outputting a `SEMICN ;` token immediately after the opening brace `{` of the main function block. This suggests that the parser is consuming or generating an extra semicolon token at the beginning of the block parsing process, or there is an issue with how the `Block` or `BlockItem` handles the initial state.
+
+Looking at the `BlockParser.java`, it reads the left brace, then enters a loop where it reads a token to check if it's a right brace. If not, it unread the token and parses a `BlockItem`. This logic seems correct for standard blocks.
+
+However, let's look at `StmtParser.java` and how it handles blocks. In `parseStmt`, when `LBRACE` is encountered, it unreads the token and calls `blockParser.parseBlock()`. This also seems correct.
+
+Let's look closely at the `Buggy Output`:
+```
+LBRACE {
+SEMICN ;   <-- Extra semicolon here
+PRINTFTK printf
+...
+```
+
+The expected output does not have this semicolon. The input code is:
+```c
+int main() {
+    printf("21373119");
+    ...
+}
+```
+
+There is no semicolon after `{`. The error likely lies in how the `BlockParser` or `BlockItemParser` initializes or processes the first token, or potentially in the `CompUnitParser` or `MainFuncDefParser` passing incorrect state.
+
+Wait, looking at `BlockParser.java`:
+```java
+public Block parseBlock() {
+    // 读取左大括号 Token
+    Token leftBraceToken = tokenStream.readNextToken();
+    if (leftBraceToken.getType() != TokenType.LBRACE) {
+        throw new Error("Expected '{' at the beginning of a block.");
+    }
+
+    // 初始化 BlockItem 解析器和列表
+    BlockItemParser blockItemParser = new BlockItemParser(tokenStream);
+    LinkedList<BlockItem> blockItemList = new LinkedList<>();
+
+    // 解析代码块项，直到遇到右大括号
+    while (true) {
+        Token currentToken = tokenStream.readNextToken();
+        if (currentToken.getType() == TokenType.RBRACE) {
+            // 找到右大括号，结束解析
+            Token rightBraceToken = currentToken;
+            return new Block(leftBraceToken, blockItemList, rightBraceToken);
+        } else {
+            // 回退一个 Token，解析下一个 BlockItem
+            tokenStream.unReadTokens(1);
+            BlockItem blockItem = blockItemParser.parseBlockItem();
+            blockItemList.add(blockItem);
+        }
+    }
+}
+```
+This looks correct. It reads `{`, then checks the next token. If it's `}`, it returns. Otherwise, it unreads and parses a `BlockItem`.
+
+Let's look at `BlockItemParser.java`:
+```java
+public BlockItem parseBlockItem() {
+    // 初始化变量
+    Decl declaration = null;
+    Stmt statement = null;
+
+    // 初始化子解析器
+    DeclParser declParser = new DeclParser(tokenStream);
+    StmtParser stmtParser = new StmtParser(tokenStream);
+
+    // 读取下一个 Token
+    Token currentToken = tokenStream.readNextToken();
+    TokenType tokenType = currentToken.getType();
+
+    // 根据 Token 类型判断是声明还是语句
+    if (tokenType == TokenType.INTTK || tokenType == TokenType.CHARTK || tokenType == TokenType.CONSTTK) {
+        // 回退一个 Token，解析声明
+        tokenStream.unReadTokens(1);
+        declaration = declParser.parseDecl();
+    } else if (tokenType == TokenType.RBRACE) {
+        // 右大括号，回退一个 Token，结束解析
+        tokenStream.unReadTokens(1);
+    } else {
+        // 回退一个 Token，解析语句
+        tokenStream.unReadTokens(1);
+        statement = stmtParser.parseStmt();
+    }
+
+    // 创建并返回 BlockItem 对象
+    return new BlockItem(declaration, statement);
+}
+```
+This also looks correct. It reads a token, determines if it's a decl, stmt, or end of block, unreads, and parses accordingly.
+
+Let's look at `StmtParser.java` again. Specifically the `default` case or how it handles `PRINTFTK`.
+In `parseStmt`:
+```java
+case PRINTFTK:
+    // 解析 printf 语句
+    printfToken = currentToken;
+    ...
+```
+This handles `printf` correctly.
+
+Is it possible the error is in `Lexer.java` or `TokenList`?
+The buggy output shows `SEMICN ;` right after `LBRACE {`.
+In the input:
+```c
+int main() {
+    printf("21373119");
+```
+There is no semicolon after `{`.
+
+Let's look at `MainFuncDefParser.java`:
+```java
+public MainFuncDef parseMainFuncDef() {
+    // 读取 "int" 关键字
+    Token intKeyword = tokenIterator.readNextToken();
+    // 读取 "main" 关键字
+    Token mainKeyword = tokenIterator.readNextToken();
+    // 读取左括号 "("
+    Token leftParen = tokenIterator.readNextToken();
+
+    // 检查前面三个 Token 是否符合主函数的定义
+    if (intKeyword.getType() == TokenType.INTTK &&
+            mainKeyword.getType() == TokenType.MAINTK &&
+            leftParen.getType() == TokenType.LPARENT) {
+
+        // 读取右括号 ")"
+        Token nextToken = tokenIterator.readNextToken();
+        Token rightParen;
+        if (nextToken.getType() == TokenType.RPARENT) {
+            rightParen = nextToken;
+        } else {
+            // 处理缺失右括号的情况
+            rightParen = handleMissingRightParen(leftParen);
+        }
+
+        // 解析主函数的函数体
+        BlockParser blockParser = new BlockParser(tokenIterator);
+        Block mainFunctionBody = blockParser.parseBlock();
+
+        // 返回解析得到的 MainFuncDef 对象
+        return new MainFuncDef(intKeyword, mainKeyword, leftParen, rightParen, mainFunctionBody);
+    } else {
+        // 如果不符合主函数定义，回退读取的 Tokens
+        tokenIterator.unReadTokens(3);
+        return null;
+    }
+}
+```
+This reads `int`, `main`, `(`, `)`, then calls `blockParser.parseBlock()`.
+`parseBlock()` reads `{`. Then it reads the next token to check for `}`. The next token is `printf`. It unreads `printf` and calls `parseBlockItem()`.
+`parseBlockItem()` reads `printf`, sees it's not a decl or `}`, unreads, and calls `stmtParser.parseStmt()`.
+`parseStmt()` reads `printf`, goes to `case PRINTFTK`, parses the printf statement.
+
+Where does the extra `SEMICN ;` come from?
+
+Let's look at the `Buggy Output` again.
+```
+LBRACE {
+SEMICN ;
+PRINTFTK printf
+```
+It seems like a semicolon is being output *before* the printf statement is parsed/outputted.
+
+Could it be in `DeclParser` or `VarDeclParser`?
+If `BlockItemParser` mistakenly identifies the start of the block as a declaration?
+`BlockItemParser` checks for `INTTK`, `CHARTK`, `CONSTTK`. `printf` is `PRINTFTK`. So it goes to `else` -> `stmtParser.parseStmt()`.
+
+Let's look at `StmtParser.parseStmt()` default case again.
+```java
+            default:
+                // 尝试解析 Lval 或表达式语句
+                tokenIterator.unReadTokens(1);
+                int startIndex = tokenIterator.getCurrentIndex();
+                lvalParser.tryParseLval();
+                Token nextToken = tokenIterator.readNextToken();
+                int endIndex = tokenIterator.getCurrentIndex();
+                int tokensRead = endIndex - startIndex;
+                if (nextToken.getType() == TokenType.ASSIGN) {
+                   ...
+                } else {
+                    // 解析表达式语句
+                    tokenIterator.unReadTokens(tokensRead);
+                    expression = addExpParser.parseAddExp();
+                    Token semicolonExp = tokenIterator.readNextToken();
+                    if (semicolonExp.getType() != TokenType.SEMICN) {
+                        tokenIterator.unReadTokens(1);
+                        semicolonToken = new Token(TokenType.SEMICN, ";", semicolonExp.getLine() - 1);
+                        SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, semicolonExp.getLine() - 1);
+                    } else {
+                        semicolonToken = semicolonExp;
+                    }
+                    return new Stmt(expression, semicolonToken);
+                }
+```
+If `printf` was handled by default, it would try to parse it as an expression. But `printf` is handled by `case PRINTFTK`.
+
+Is it possible that `BlockParser` or `BlockItemParser` is reading an extra token somewhere?
+
+Let's look at `CompUnitParser.java`.
+```java
+    private void parseGlobalDeclarations() {
+        // 初始化全局声明解析器
+        DeclParser declParser = new DeclParser(this.tokenIterator);
+
+        // 遍历 Token，尝试解析每个全局声明
+        while (this.tokenIterator.hasNext()) {
+            int tokensRead = 0;  // 记录读取的 Token 数量，便于回退
+            Token firstToken = tokenIterator.readNextToken();
+            tokensRead++;
+
+            // 如果没有下一个 Token，回退并退出
+            if (!tokenIterator.hasNext()) {
+                tokenIterator.unReadTokens(tokensRead);
+                break;
+            }
+
+            Token secondToken = tokenIterator.readNextToken();
+            tokensRead++;
+
+            // 如果没有下一个 Token，回退并退出
+            if (!tokenIterator.hasNext()) {
+                tokenIterator.unReadTokens(tokensRead);
+                break;
+            }
+
+            Token thirdToken = tokenIterator.readNextToken();
+            tokensRead++;
+
+            // 如果第三个 Token 是左括号 "(", 表示遇到函数定义，退出解析
+            if (thirdToken.getType() == TokenType.LPARENT) {
+                tokenIterator.unReadTokens(tokensRead);  // 回退读取的 Token
+                break;
+            } else {
+                // 如果不是函数定义，解析为全局声明
+                tokenIterator.unReadTokens(tokensRead);  // 回退读取的 Token
+                Decl globalDecl = declParser.parseDecl();
+                if (globalDecl != null) {
+                    this.globalDeclarations.add(globalDecl);  // 添加解析后的全局声明
+                }
+            }
+        }
+    }
+```
+This lookahead logic for global declarations reads 3 tokens. If it finds `(`, it unreads 3.
+For `int main()`, it reads `int`, `main`, `(`. It sees `(`, so it unreads 3.
+Then `parseFunctionDefinitions` is called.
+
+```java
+    private void parseFunctionDefinitions() {
+        // 初始化函数定义解析器
+        FuncDefParser funcDefParser = new FuncDefParser(this.tokenIterator);
+
+        // 遍历 Token，尝试解析每个函数定义
+        while (this.tokenIterator.hasNext()) {
+            int tokensRead = 0;  // 记录读取的 Token 数量，便于回退
+            Token firstToken = tokenIterator.readNextToken();
+            tokensRead++;
+
+            // 如果没有下一个 Token，回退并退出
+            if (!tokenIterator.hasNext()) {
+                tokenIterator.unReadTokens(tokensRead);
+                break;
+            }
+
+            Token secondToken = tokenIterator.readNextToken();
+            tokensRead++;
+
+            // 如果第二个 Token 是主函数的标识 "main"，表示遇到主函数定义，退出
+            if (secondToken.getType() == TokenType.MAINTK) {
+                tokenIterator.unReadTokens(tokensRead);  // 回退读取的 Token
+                break;
+            } else {
+                // 如果不是主函数，解析为普通函数定义
+                tokenIterator.unReadTokens(tokensRead);  // 回退读取的 Token
+                FuncDef funcDef = funcDefParser.parseFuncDef();
+                if (funcDef != null) {
+                    this.functionDefinitions.add(funcDef);  // 添加解析后的函数定义
+                }
+            }
+        }
+    }
+```
+It reads `int`, `main`. Sees `main`, unreads 2.
+Then `parseMainFunctionDefinition` is called.
+
+```java
+    private void parseMainFunctionDefinition() {
+        // 初始化主函数定义解析器
+        MainFuncDefParser mainFuncDefParser = new MainFuncDefParser(this.tokenIterator);
+        // 解析并存储主函数定义
+        this.mainFunctionDefinition = mainFuncDefParser.parseMainFuncDef();
+    }
+```
+`MainFuncDefParser.parseMainFuncDef()` reads `int`, `main`, `(`, `)`, then calls `blockParser.parseBlock()`.
+
+Everything seems to flow correctly. Why is there an extra `SEMICN`?
+
+Let's look at the `Lexer.java` `processTokens` method.
+```java
+    private void processTokens(TokenList tokens) {
+        // 如果文件结束，则终止递归
+        if (lexerState.isEndOfInput()) {
+            return;
+        }
+        Token token = getNextToken(); // 获取下一个Token
+        if (token != null) {
+            // 如果Token类型是错误类型，则进行处理
+            if (token.getType().isError()) {
+                // 写入语法错误
+                SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.a, token.getLine());
+                // 特定错误类型的修正
+                switch (token.getType()) {
+                    case ERROR_AND: // 处理逻辑与错误
+                        token = new Token(TokenType.AND, "&&", token.getLine());
+                        break;
+                    case ERROR_OR: // 处理逻辑或错误
+                        token = new Token(TokenType.OR, "||", token.getLine());
+                        break;
+                    default:
+                        // 其他错误类型的处理（这里没有具体定义）
+                        break;
+                }
+            }
+            tokens.addToken(token); // 将Token添加到Token列表
+            writeTokenToFile(token); // 将Token写入文件
+        }
+        processTokens(tokens); // 递归调用，处理下一个Token
+    }
+```
+The lexer writes tokens to `lexer_output.txt` (via `writeTokenToFile`), but the problem description says output to `parser.txt`. The `Compiler.java` calls `unit.toSyntaxString()` which writes to `parser.txt`. The lexer output is separate. The buggy output provided is clearly the content of `parser.txt` because it contains syntax nodes like `<Stmt>`.
+
+So the extra `SEMICN ;` must be generated by the parser's `toSyntaxString()` methods.
+
+Let's look at `Block.java`:
+```java
+    @Override
+    public String toSyntaxString() {
+        StringBuilder syntaxBuilder = new StringBuilder();
+        syntaxBuilder.append(leftBraceToken.toSyntaxString());
+        for (BlockItem blockItem : blockItemList) {
+            syntaxBuilder.append(blockItem.toSyntaxString());
+        }
+        syntaxBuilder.append(rightBraceToken.toSyntaxString());
+        syntaxBuilder.append(NODE_NAME).append("\n");
+        return syntaxBuilder.toString();
+    }
+```
+It outputs `{`, then items, then `}`, then `<Block>`.
+
+`BlockItem.java`:
+```java
+    @Override
+    public String toSyntaxString() {
+        StringBuilder syntaxBuilder = new StringBuilder();
+        if (declaration != null) {
+            syntaxBuilder.append(declaration.toSyntaxString());
+        }
+        if (statement != null) {
+            syntaxBuilder.append(statement.toSyntaxString());
+        }
+        return syntaxBuilder.toString();
+    }
+```
+
+`Stmt.java` for `printf`:
+```java
+        // 处理 printf 语句
+        if (printfToken != null) {
+            syntaxBuilder.append(printfToken.toSyntaxString());
+            syntaxBuilder.append(leftParenPrintf.toSyntaxString());
+            syntaxBuilder.append(stringConstToken.toSyntaxString());
+            if (printfExpressions != null && !printfExpressions.isEmpty()) {
+                int exprCount = printfExpressions.size();
+                for (int index = 0; index < exprCount; index++) {
+                    syntaxBuilder.append(commaTokenList.get(index).toSyntaxString());
+                    syntaxBuilder.append(printfExpressions.get(index).toSyntaxString());
+                    syntaxBuilder.append("<Exp>\n");
+                }
+            }
+            syntaxBuilder.append(rightParenPrintf.toSyntaxString());
+            if (semicolonToken != null) {
+                syntaxBuilder.append(semicolonToken.toSyntaxString());
+            }
+        }
+```
+This outputs `printf`, `(`, `"..."`, `)`, `;`, then `<Stmt>`.
+
+Where does the extra `SEMICN ;` before `printf` come from?
+
+Look at the buggy output again:
+```
+LBRACE {
+SEMICN ;
+PRINTFTK printf
+...
+<Stmt>
+```
+The `SEMICN ;` is output *before* `PRINTFTK printf`. This means it's not part of the `printf` statement's output (which ends with `;` and `<Stmt>`). It's something else.
+
+Is it possible that `BlockItemParser` is creating an empty `BlockItem` or a `BlockItem` with an empty statement that outputs a semicolon?
+
+In `BlockItemParser.parseBlockItem()`:
+```java
+    } else if (tokenType == TokenType.RBRACE) {
+        // 右大括号，回退一个 Token，结束解析
+        tokenStream.unReadTokens(1);
+    } else {
+        // 回退一个 Token，解析语句
+        tokenStream.unReadTokens(1);
+        statement = stmtParser.parseStmt();
+    }
+
+    // 创建并返回 BlockItem 对象
+    return new BlockItem(declaration, statement);
+```
+If `tokenType` is `RBRACE`, it unreads and returns `new BlockItem(null, null)`.
+`BlockItem.toSyntaxString()` for `null` declaration and `null` statement returns an empty string. So this shouldn't output anything.
+
+However, look at `BlockParser.parseBlock()`:
+```java
+    while (true) {
+        Token currentToken = tokenStream.readNextToken();
+        if (currentToken.getType() == TokenType.RBRACE) {
+            // 找到右大括号，结束解析
+            Token rightBraceToken = currentToken;
+            return new Block(leftBraceToken, blockItemList, rightBraceToken);
+        } else {
+            // 回退一个 Token，解析下一个 BlockItem
+            tokenStream.unReadTokens(1);
+            BlockItem blockItem = blockItemParser.parseBlockItem();
+            blockItemList.add(blockItem);
+        }
+    }
+```
+If the block is empty `{}`, it reads `}`, sees `RBRACE`, and returns. `blockItemList` is empty. Correct.
+
+If the block is `{ printf... }`:
+1. Read `{`.
+2. Loop:
+   - Read `printf`. Not `RBRACE`.
+   - Unread `printf`.
+   - `parseBlockItem()`:
+     - Read `printf`. Not `INTTK`/`CHARTK`/`CONSTTK`/`RBRACE`.
+     - Unread `printf`.
+     - `parseStmt()`:
+       - Read `printf`. Case `PRINTFTK`. Parses printf. Returns `Stmt`.
+     - Returns `BlockItem(null, stmt)`.
+   - Add `blockItem` to list.
+3. Loop:
+   - Read `}`. Is `RBRACE`. Return.
+
+This logic seems correct.
+
+Is it possible that `StmtParser.parseStmt()` is being called incorrectly or returning a statement that includes an extra semicolon?
+
+Let's look at the `default` case of `StmtParser.parseStmt()` again.
+```java
+            default:
+                // 尝试解析 Lval 或表达式语句
+                tokenIterator.unReadTokens(1);
+                int startIndex = tokenIterator.getCurrentIndex();
+                lvalParser.tryParseLval();
+                Token nextToken = tokenIterator.readNextToken();
+                int endIndex = tokenIterator.getCurrentIndex();
+                int tokensRead = endIndex - startIndex;
+                if (nextToken.getType() == TokenType.ASSIGN) {
+                   ...
+                } else {
+                    // 解析表达式语句
+                    tokenIterator.unReadTokens(tokensRead);
+                    expression = addExpParser.parseAddExp();
+                    Token semicolonExp = tokenIterator.readNextToken();
+                    if (semicolonExp.getType() != TokenType.SEMICN) {
+                        tokenIterator.unReadTokens(1);
+                        semicolonToken = new Token(TokenType.SEMICN, ";", semicolonExp.getLine() - 1);
+                        SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, semicolonExp.getLine() - 1);
+                    } else {
+                        semicolonToken = semicolonExp;
+                    }
+                    return new Stmt(expression, semicolonToken);
+                }
+```
+If `printf` fell through to default (it shouldn't), it would parse `printf(...)` as an expression? No, `printf` is a keyword, not an identifier. `AddExpParser` would likely fail or consume nothing?
+
+Wait, `TokenType.PRINTFTK` is handled in `switch`.
+
+Is there any other place where `SEMICN` could be output?
+
+Look at `VarDecl.java`:
+```java
+    @Override
+    public String toSyntaxString() {
+        StringBuilder syntaxBuilder = new StringBuilder();
+        syntaxBuilder.append(baseTypeToken.toSyntaxString());
+        int defCount = varDefList.size();
+        for (int index = 0; index < defCount; index++) {
+            syntaxBuilder.append(varDefList.get(index).toSyntaxString());
+            if (index < commaTokenList.size()) {
+                syntaxBuilder.append(commaTokenList.get(index).toSyntaxString());
+            }
+        }
+        syntaxBuilder.append(semicolonToken.toSyntaxString());
+        syntaxBuilder.append(NODE_NAME).append("\n");
+        return syntaxBuilder.toString();
+    }
+```
+If a `VarDecl` was parsed incorrectly at the start of the block, it would output `int a = 0; <VarDecl>`. But the first item is `printf`.
+
+Let's look at `BlockItemParser` again.
+```java
+        if (tokenType == TokenType.INTTK || tokenType == TokenType.CHARTK || tokenType == TokenType.CONSTTK) {
+            // 回退一个 Token，解析声明
+            tokenStream.unReadTokens(1);
+            declaration = declParser.parseDecl();
+        } else if (tokenType == TokenType.RBRACE) {
+            // 右大括号，回退一个 Token，结束解析
+            tokenStream.unReadTokens(1);
+        } else {
+            // 回退一个 Token，解析语句
+            tokenStream.unReadTokens(1);
+            statement = stmtParser.parseStmt();
+        }
+```
+What if `tokenType` is `SEMICN`?
+`SEMICN` is not `INTTK`, `CHARTK`, `CONSTTK`, or `RBRACE`.
+So it goes to `else`:
+```java
+            statement = stmtParser.parseStmt();
+```
+In `StmtParser.parseStmt()`:
+```java
+            case SEMICN:
+                // 空语句，仅有分号
+                return new Stmt(currentToken);
+```
+So if `BlockItemParser` encounters a `;`, it creates a `BlockItem` with an empty statement `Stmt(;)`.
+`Stmt.toSyntaxString()` for `Stmt(Token semicolonToken)`:
+```java
+        // 处理表达式语句或空语句
+        if (expression != null && leftValue == null) {
+           ...
+        } else if (expression == null && semicolonToken != null && leftValue == null) {
+            syntaxBuilder.append(semicolonToken.toSyntaxString());
+        }
+```
+It outputs the semicolon. And then:
+```java
+        syntaxBuilder.append(NODE_NAME).append("\n");
+```
+It outputs `<Stmt>`.
+
+So, if there is a `;` at the beginning of the block, it would output:
+```
+SEMICN ;
+<Stmt>
+```
+
+But the input is:
+```c
+int main() {
+    printf("21373119");
+```
+There is no `;` after `{`.
+
+Why would the parser see a `;`?
+
+Let's look at `MainFuncDefParser` again.
+```java
+        // 读取右括号 ")"
+        Token nextToken = tokenIterator.readNextToken();
+        Token rightParen;
+        if (nextToken.getType() == TokenType.RPARENT) {
+            rightParen = nextToken;
+        } else {
+            // 处理缺失右括号的情况
+            rightParen = handleMissingRightParen(leftParen);
+        }
+
+        // 解析主函数的函数体
+        BlockParser blockParser = new BlockParser(tokenIterator);
+        Block mainFunctionBody = blockParser.parseBlock();
+```
+It reads `)`. Then calls `parseBlock()`.
+`parseBlock()` reads `{`.
+
+Is it possible that `handleMissingRightParen` is being called incorrectly?
+If `nextToken` is `{` (which it is), `nextToken.getType()` is `LBRACE`.
+`LBRACE != RPARENT`.
+So it calls `handleMissingRightParen(leftParen)`.
+```java
+    private Token handleMissingRightParen(Token leftParen) {
+        // 回退一个 Token，因为刚刚读取的 Token 不是右括号
+        tokenIterator.unReadTokens(1);
+        // 记录语法错误
+        SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.j, leftParen.getLine());
+        // 返回一个补全的右括号 Token
+        return new Token(TokenType.RPARENT, ")", leftParen.getLine());
+    }
+```
+It unreads `{`. Returns a fake `)` token.
+Then `parseBlock()` is called.
+`parseBlock()` reads `{`. Correct.
+
+So `MainFuncDefParser` is working correctly regarding the stream position.
+
+Wait, look at `FuncDefParser.parseFuncDef()`:
+```java
+        // 读取右括号 ")"
+        Token possibleRightParen = tokenIterator.readNextToken();
+        if (possibleRightParen.getType() != TokenType.RPARENT) {
+            // 如果不是右括号，处理缺失的右括号错误
+            rightParen = handleMissingRightParen(leftParen);
+        } else {
+            rightParen = possibleRightParen;
+        }
+
+        // 解析函数体
+        Block functionBody = blockParser.parseBlock();
+```
+Same logic.
+
+Is it possible that `BlockParser` is reading an extra token?
+
+Let's look at `CompUnitParser.parseGlobalDeclarations()` again.
+It reads 3 tokens. `int`, `main`, `(`.
+Sees `(`. Unreads 3.
+Then `parseFunctionDefinitions()`.
+Reads `int`, `main`.
+Sees `main`. Unreads 2.
+Then `parseMainFunctionDefinition()`.
+Reads `int`, `main`, `(`, `)`.
+Calls `parseBlock()`.
+
+This seems fine.
+
+Let's look at the `Buggy Output` again.
+```
+INTTK int
+MAINTK main
+LPARENT (
+RPARENT )
+LBRACE {
+SEMICN ;
+PRINTFTK printf
+```
+The `SEMICN ;` is output *after* `LBRACE {` and *before* `PRINTFTK printf`.
+
+If `BlockParser` reads `{`, then enters the loop.
+Reads next token. If it's `printf`, it's not `RBRACE`.
+Unreads `printf`.
+Calls `parseBlockItem()`.
+`parseBlockItem()` reads `printf`.
+Goes to `else`. Unreads `printf`.
+Calls `parseStmt()`.
+`parseStmt()` reads `printf`. Handles `PRINTFTK`.
+
+Where does `SEMICN ;` come from?
+
+Could it be that `BlockItemParser` is reading a `;` instead of `printf`?
+No, `printf` is the next token.
+
+Is it possible that `StmtParser` is outputting a semicolon for some reason?
+
+Let's look at `Stmt.java` constructor for `printf`:
+```java
+    public Stmt(Token printfToken, Token leftParenPrintf, Token stringConstToken,
+                LinkedList<Token> commaTokenList, LinkedList<AddExp> printfExpressions,
+                Token rightParenPrintf, Token semicolonToken) {
+```
+And `toSyntaxString()`:
+```java
+        // 处理 printf 语句
+        if (printfToken != null) {
+            syntaxBuilder.append(printfToken.toSyntaxString());
+            ...
+            if (semicolonToken != null) {
+                syntaxBuilder.append(semicolonToken.toSyntaxString());
+            }
+        }
+        ...
+        syntaxBuilder.append(NODE_NAME).append("\n");
+```
+This outputs `printf`, `(`, `"..."`, `)`, `;`, `<Stmt>`.
+
+The buggy output has `SEMICN ;` *before* `PRINTFTK printf`.
+
+This implies that there is a `Stmt` or `Decl` or something else being output before the `printf` statement.
+
+What if `BlockItemParser` is creating a `BlockItem` with a `null` statement but a non-null declaration? No, `printf` is not a declaration.
+
+What if `BlockParser` is adding an extra `BlockItem`?
+
+Let's look at `BlockParser` again.
+```java
+    while (true) {
+        Token currentToken = tokenStream.readNextToken();
+        if (currentToken.getType() == TokenType.RBRACE) {
+            ...
+        } else {
+            tokenStream.unReadTokens(1);
+            BlockItem blockItem = blockItemParser.parseBlockItem();
+            blockItemList.add(blockItem);
+        }
+    }
+```
+If `currentToken` is `printf`, it unreads, parses `BlockItem`, adds it.
+
+Is it possible that `parseBlockItem()` is returning a `BlockItem` that outputs a semicolon?
+
+If `parseBlockItem()` reads `;`?
+But the token is `printf`.
+
+Wait! Look at `Lexer.java` `skipIgnoredTokens()`.
+```java
+    private void skipIgnoredTokens() {
+        boolean shouldContinue;
+        do {
+            shouldContinue = false;
+            while (!lexerState.isEndOfInput() &&
+                    (Character.isWhitespace(lexerState.currentChar()) || lexerState.EndOfLine())) {
+                lexerState.advanceChar();
+            }
+            // 检查是否遇到单行注释的开头符号 "//"
+            if (lexerState.getSingleLineComment().equals(lexerState.peekAhead(2))) {
+                skipSingleLineComment();
+                shouldContinue = true;
+            }
+            // 检查是否遇到多行注释的开头符号 "/*"
+            else if (lexerState.getMultiLineCommentStart().equals(lexerState.peekAhead(2))) {
+                skipMultiLineComment();
+                shouldContinue = true;
+            }
+        } while (shouldContinue);
+    }
+```
+This skips whitespace and comments.
+
+Is it possible that the `TokenList` contains an extra `SEMICN` token?
+The lexer generates tokens. If the lexer generated an extra `;`, it would be in the list.
+But the input doesn't have one.
+
+Let's look at `StmtParser.parseStmt()` `case RETURNTK`:
+```java
+            case RETURNTK:
+                // 解析 return 语句
+                returnToken = currentToken;
+                Token nextTokenReturn = tokenIterator.readNextToken();
+                if (nextTokenReturn.getType() != TokenType.SEMICN) {
+                    tokenIterator.unReadTokens(1);
+                    returnExpression = addExpParser.parseAddExp();
+                } else {
+                    tokenIterator.unReadTokens(1);
+                }
+                Token semicolonReturn = tokenIterator.readNextToken();
+                if (semicolonReturn.getType() == TokenType.SEMICN) {
+                    semicolonToken = semicolonReturn;
+                } else {
+                    tokenIterator.unReadTokens(1);
+                    semicolonToken = new Token(TokenType.SEMICN, ";", returnToken.getLine());
+                    SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, returnToken.getLine());
+                }
+                return new Stmt(returnToken, returnExpression, semicolonToken);
+```
+
+Look at `case BREAKTK`:
+```java
+            case BREAKTK:
+                // 解析 break 语句
+                breakToken = currentToken;
+                Token semicolonBreak = tokenIterator.readNextToken();
+                if (semicolonBreak.getType() == TokenType.SEMICN) {
+                    semicolonToken = semicolonBreak;
+                } else {
+                    tokenIterator.unReadTokens(1);
+                    semicolonToken = new Token(TokenType.SEMICN, ";", breakToken.getLine());
+                    SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, breakToken.getLine());
+                }
+                // 显式指定 null 类型为 Token，以匹配正确的构造函数
+                return new Stmt(breakToken, (Token) null, semicolonToken);
+```
+
+Look at `case CONTINUETK`:
+Similar.
+
+Look at `default`:
+```java
+                } else {
+                    // 解析表达式语句
+                    tokenIterator.unReadTokens(tokensRead);
+                    expression = addExpParser.parseAddExp();
+                    Token semicolonExp = tokenIterator.readNextToken();
+                    if (semicolonExp.getType() != TokenType.SEMICN) {
+                        tokenIterator.unReadTokens(1);
+                        semicolonToken = new Token(TokenType.SEMICN, ";", semicolonExp.getLine() - 1);
+                        SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, semicolonExp.getLine() - 1);
+                    } else {
+                        semicolonToken = semicolonExp;
+                    }
+                    return new Stmt(expression, semicolonToken);
+                }
+```
+
+None of these explain an extra `SEMICN` before `printf`.
+
+Let's look at `BlockItemParser` again.
+```java
+    public BlockItem parseBlockItem() {
+        ...
+        Token currentToken = tokenStream.readNextToken();
+        TokenType tokenType = currentToken.getType();
+
+        if (tokenType == TokenType.INTTK || tokenType == TokenType.CHARTK || tokenType == TokenType.CONSTTK) {
+            ...
+        } else if (tokenType == TokenType.RBRACE) {
+            ...
+        } else {
+            ...
+            statement = stmtParser.parseStmt();
+        }
+
+        return new BlockItem(declaration, statement);
+    }
+```
+
+Is it possible that `StmtParser.parseStmt()` is being called, and it's falling into `default`?
+No, `printf` is `PRINTFTK`.
+
+Wait, look at `StmtParser.parseStmt()` `case PRINTFTK`:
+```java
+            case PRINTFTK:
+                // 解析 printf 语句
+                printfToken = currentToken;
+                leftParenPrintf = tokenIterator.readNextToken();
+                stringConstToken = tokenIterator.readNextToken();
+                Token nextTokenPrintf = tokenIterator.readNextToken();
+                while (nextTokenPrintf.getType() == TokenType.COMMA) {
+                    commaTokenList.add(nextTokenPrintf);
+                    AddExp printfExp = addExpParser.parseAddExp();
+                    printfExpressions.add(printfExp);
+                    nextTokenPrintf = tokenIterator.readNextToken();
+                }
+                tokenIterator.unReadTokens(1);
+                Token rightParenTokenPrintf = tokenIterator.readNextToken();
+                if (rightParenTokenPrintf.getType() != TokenType.RPARENT) {
+                    tokenIterator.unReadTokens(1);
+                    rightParenPrintf = new Token(TokenType.RPARENT, ")", printfToken.getLine());
+                    SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.j, leftParenPrintf.getLine());
+                } else {
+                    rightParenPrintf = rightParenTokenPrintf;
+                }
+                Token semicolonPrintf = tokenIterator.readNextToken();
+                if (semicolonPrintf.getType() != TokenType.SEMICN) {
+                    tokenIterator.unReadTokens(1);
+                    semicolonToken = new Token(TokenType.SEMICN, ";", printfToken.getLine());
+                    SyntaxErrorHandler.getInstance().WriteSyntaxError(ErrorType.i, printfToken.getLine());
+                } else {
+                    semicolonToken = semicolonPrintf;
+                }
+                return new Stmt(printfToken, leftParenPrintf, stringConstToken, commaTokenList,
+                        printfExpressions, rightParenPrintf, semicolonToken);
+```
+
+This looks correct.
+
+Is it possible that `BlockParser` is calling `parseBlockItem()` twice?
+No, the loop is `while(true)`.
+
+Let's look at `CompUnit.java` `toSyntaxString()`:
+```java
+    @Override
+    public String toSyntaxString() {
+        ...
+        if (mainFunctionDefinition != null) {
+           

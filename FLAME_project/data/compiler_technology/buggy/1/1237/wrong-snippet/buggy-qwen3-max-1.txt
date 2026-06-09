@@ -1,0 +1,694 @@
+Looking at the test case input and comparing the buggy output with the expected output, I can see that the issue is in the `return 0;` statement parsing.
+
+In the buggy output, the `RETURNTK return` token is missing from the output. The parser is correctly parsing the expression `0` and the semicolon, but it's not outputting the `RETURNTK return` token itself.
+
+Looking at the code, the issue appears to be in the `StmtReturn` class's `syntaxOutput()` method in the file `<frontend/statement/stmt/StmtReturn.java>`.
+
+Let me examine the `StmtReturn` class:
+
+```java
+@Override
+public String syntaxOutput() {
+    StringBuilder sb = new StringBuilder();
+    sb.append(this.returnTk.syntaxOutput());
+    if (exp != null) {
+        sb.append(this.exp.syntaxOutput());
+    }
+    sb.append(this.semicn.syntaxOutput());
+    return sb.toString();
+}
+```
+
+This looks correct - it should output the `returnTk` token. However, looking more carefully at the test case, I notice that in the buggy output, we have:
+
+```
+INTCON 0
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+SEMICN ;
+<Stmt>
+```
+
+But in the expected output, we have:
+
+```
+RETURNTK return
+INTCON 0
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+SEMICN ;
+<Stmt>
+```
+
+The `RETURNTK return` line is missing entirely. This suggests that the `returnTk.syntaxOutput()` is not being called or is not producing the expected output.
+
+Looking at the `StmtReturnParser.parseStmtReturn()` method, I see that it correctly reads the `returnTk` token and passes it to the `StmtReturn` constructor.
+
+However, looking more closely at the `StmtReturn` constructors:
+
+```java
+public StmtReturn(Token returnTk,
+                  Token semicn) {
+    this.returnTk = returnTk;
+    this.semicn = semicn;
+}
+
+public StmtReturn(Token returnTk,
+                  Exp exp,
+                  Token semicn) {
+    this(returnTk, semicn);
+    this.exp = exp;
+}
+```
+
+Both constructors properly assign `returnTk`. The issue must be elsewhere.
+
+Wait, let me check the actual output again. In the buggy output, I see that after the block closing brace, we have:
+
+```
+RBRACE }
+<Block>
+<Stmt>
+INTCON 0
+...
+```
+
+But it should be:
+
+```
+RBRACE }
+<Block>
+<Stmt>
+RETURNTK return
+INTCON 0
+...
+```
+
+This suggests that the `RETURNTK return` token is not being output at all. 
+
+Looking at the `Token.syntaxOutput()` method in `<frontend/Token.java>`:
+
+```java
+public String syntaxOutput() {
+    return this.getType() + " " + this.getContent() + "\n";
+}
+```
+
+This should work correctly.
+
+Now I notice something important: in the `StmtReturnParser.parseStmtReturn()` method, there's logic that might be causing an issue. Let me look at it more carefully:
+
+```java
+// 解析 'return' 关键字
+Token returnTk = this.iterator.readNextToken();
+if (returnTk.getType() != TokenType.RETURNTK) {
+    System.err.println("ERROR: Expected 'return' keyword (RETURNTK), but found: " + returnTk);
+}
+
+// 尝试解析可选的返回表达式
+Token semicn = this.iterator.readNextToken();
+Exp exp = null;
+if (semicn.getType() != TokenType.SEMICN) {
+    if (!isValidExpressionStart(semicn)) {
+        // 处理 i 类错误：缺少分号 ';'
+        this.iterator.unReadToken(2); // 回退两个 Token，获取前一个非终结符的行号
+        Error error = new Error(this.iterator.readNextToken().getLineIndex(), ErrorType.MISSING_SEMICN);
+        ErrorTable.addError(error);
+        semicn = new Token(TokenType.SEMICN, semicn.getLineIndex(), ";");
+    } else {
+        // 合法的表达式，调用 ExpParser 解析
+        this.iterator.unReadToken(1);
+        ExpParser expParser = new ExpParser(this.iterator);
+        exp = expParser.parseExp();
+        semicn = this.iterator.readNextToken();
+
+        // 解析分号 ';'
+        if (semicn.getType() != TokenType.SEMICN) {
+            // 处理 i 类错误：缺少分号 ';'
+            this.iterator.unReadToken(2); // 回退两个 Token，获取前一个非终结符的行号
+            Error error = new Error(this.iterator.readNextToken().getLineIndex(), ErrorType.MISSING_SEMICN);
+            ErrorTable.addError(error);
+        }
+    }
+}
+```
+
+The problem is in the error handling logic! When there's no error (which is the case in our test), the code should go to the `else` branch where it calls `this.iterator.unReadToken(1)` and then parses the expression.
+
+But wait, let's trace through what happens with `return 0;`:
+
+1. `returnTk = iterator.readNextToken()` → reads `RETURNTK return`
+2. `semicn = iterator.readNextToken()` → reads `INTCON 0` (not a semicolon!)
+3. Since `semicn.getType() != TokenType.SEMICN`, it checks `isValidExpressionStart(semicn)`
+4. `INTCON` is a valid expression start, so it goes to the `else` branch
+5. `this.iterator.unReadToken(1)` → puts `INTCON 0` back
+6. `ExpParser expParser = new ExpParser(this.iterator); exp = expParser.parseExp();` → parses `0` correctly
+7. `semicn = this.iterator.readNextToken();` → reads `SEMICN ;`
+
+This should work correctly and create a `StmtReturn(returnTk, exp, semicn)`.
+
+But looking at the buggy output again, I notice that the `<Stmt>` is being output, which means the `Stmt` wrapper is working, but the `StmtReturn.syntaxOutput()` is not including the `returnTk`.
+
+Wait, let me check if there's an issue with how the `StmtReturn` object is being created. 
+
+Actually, looking more carefully at the buggy output structure, I see that the sequence is:
+
+```
+RBRACE }
+<Block>
+<Stmt>
+INTCON 0
+...
+```
+
+This suggests that the `<Stmt>` tag is being output (from the `Stmt` class), but the content inside (from `StmtReturn`) is missing the `RETURNTK return` line.
+
+The issue must be in the `StmtReturn.syntaxOutput()` method. But that method looks correct.
+
+Let me check if there's a different issue. Looking at the `StmtParser.parseStmt()` method, when it encounters `RETURNTK`, it does:
+
+```java
+case RETURNTK: // 'return'
+    this.iterator.unReadToken(1);
+    StmtReturnParser stmtReturnParser = new StmtReturnParser(this.iterator);
+    this.stmtEle = stmtReturnParser.parseStmtReturn();
+    break;
+```
+
+This should work correctly.
+
+I think I need to look at the actual `StmtReturn` object creation more carefully. 
+
+Wait! I see the issue now. In the `StmtReturnParser.parseStmtReturn()` method, when there IS an expression (like `return 0;`), it creates `new StmtReturn(returnTk, exp, semicn)`. But when there's NO expression (like `return;`), it creates `new StmtReturn(returnTk, semicn)`.
+
+Both constructors should work. But let me check if there's an issue with the field assignments.
+
+Looking at the constructors again:
+
+```java
+public StmtReturn(Token returnTk,
+                  Token semicn) {
+    this.returnTk = returnTk;
+    this.semicn = semicn;
+}
+
+public StmtReturn(Token returnTk,
+                  Exp exp,
+                  Token semicn) {
+    this(returnTk, semicn);
+    this.exp = exp;
+}
+```
+
+This looks correct.
+
+But wait! What if the `returnTk` field is being overwritten or not properly set? Let me check if there are any other assignments to `returnTk`.
+
+Actually, I think I found the real issue. Looking at the buggy output, I notice that the `<Stmt>` appears right after `<Block>`, and then immediately shows `INTCON 0`. This suggests that the `RETURNTK return` token might have been consumed but not output.
+
+Let me check the `StmtReturn.syntaxOutput()` method one more time. It calls `this.returnTk.syntaxOutput()`, which should output `RETURNTK return\n`.
+
+But what if `this.returnTk` is null? That would cause no output.
+
+Looking at the constructors, both properly assign `returnTk`, so it shouldn't be null.
+
+Wait, let me look at the test case input again:
+
+```c
+int main() {
+    printf("21373119");
+    int a = 0;
+    {
+        int a = 1;
+        printf("%d",a); // 输出 1
+    }
+    return 0;
+}
+```
+
+The `return 0;` is on its own line. 
+
+I think the issue might be in the `StmtReturnParser.parseStmtReturn()` method's logic for handling the semicolon. Let me trace through it step by step:
+
+1. Read `RETURNTK return` → `returnTk`
+2. Read next token → `INTCON 0` → stored in `semicn` variable (misnamed!)
+3. Since `semicn.getType() != SEMICN`, and `INTCON` is valid expression start:
+   - `unReadToken(1)` → puts `INTCON 0` back
+   - Parse expression → `exp = Exp for 0`
+   - Read next token → `SEMICN ;` → stored in `semicn`
+   - Check if `semicn.getType() == SEMICN` → yes, so no error
+4. Return `new StmtReturn(returnTk, exp, semicn)`
+
+This should work.
+
+But wait! I notice that in the `StmtReturn` class, the field is named `returnTk`, but in the constructor parameter it's also `returnTk`. That should be fine.
+
+Actually, I think I need to look at this differently. Let me check if there's an issue with the token reading order.
+
+Looking at the expected output, the sequence should be:
+- `RETURNTK return`
+- `INTCON 0`
+- `<Number>`
+- etc.
+
+But in the buggy output, `RETURNTK return` is completely missing.
+
+This suggests that the `returnTk.syntaxOutput()` call is not happening at all, which means either:
+1. `returnTk` is null, or
+2. The `syntaxOutput()` method is not being called properly
+
+Given that the rest of the output is there (the expression and semicolon), option 1 seems more likely.
+
+Let me check if there's a bug in the constructor. Wait, I see something!
+
+In the first constructor:
+```java
+public StmtReturn(Token returnTk,
+                  Token semicn) {
+    this.returnTk = returnTk;
+    this.semicn = semicn;
+}
+```
+
+In the second constructor:
+```java
+public StmtReturn(Token returnTk,
+                  Exp exp,
+                  Token semicn) {
+    this(returnTk, semicn);
+    this.exp = exp;
+}
+```
+
+This looks correct.
+
+But what if there's an issue with how the `StmtReturnParser` is creating the object?
+
+Looking at the end of `parseStmtReturn()`:
+```java
+// 返回解析后的 StmtReturn 对象
+return (exp != null) ? new StmtReturn(returnTk, exp, semicn) : new StmtReturn(returnTk, semicn);
+```
+
+This should work.
+
+I'm starting to think the issue might be elsewhere. Let me check the `Stmt` class's `syntaxOutput()` method:
+
+```java
+@Override
+public String syntaxOutput() {
+    StringBuilder sb = new StringBuilder();
+    sb.append(this.stmtEle.syntaxOutput());
+    sb.append(this.name + "\n");
+    return sb.toString();
+}
+```
+
+So it calls `stmtEle.syntaxOutput()`, which for a `StmtReturn` should include the `RETURNTK return`.
+
+Wait a minute! Looking at the buggy output again:
+
+```
+RBRACE }
+<Block>
+<Stmt>
+INTCON 0
+<Number>
+...
+```
+
+I see that `<Stmt>` appears AFTER the content, which is correct according to the `Stmt.syntaxOutput()` method (it appends the name at the end).
+
+But the content before `<Stmt>` should include `RETURNTK return`, but it doesn't.
+
+This really suggests that `StmtReturn.syntaxOutput()` is not outputting the `returnTk`.
+
+Let me double-check the `Token.syntaxOutput()` method:
+
+```java
+public String syntaxOutput() {
+    return this.getType() + " " + this.getContent() + "\n";
+}
+```
+
+For a `RETURNTK` token with content "return", this should return `"RETURNTK return\n"`.
+
+So if `returnTk.syntaxOutput()` is being called, it should appear in the output.
+
+The only explanation is that `returnTk` is null or the call is not happening.
+
+Wait! I think I found it. Looking at the `StmtReturnParser.parseStmtReturn()` method again, there's a potential issue in the error handling logic.
+
+When there's no error (the normal case), the code path is:
+1. Read `returnTk` 
+2. Read next token into `semicn` variable
+3. Since it's not SEMICN but is valid expression start:
+   - `unReadToken(1)`
+   - Parse expression
+   - Read semicolon into `semicn`
+4. Return `StmtReturn(returnTk, exp, semicn)`
+
+But what if during the expression parsing, something goes wrong with the token stream?
+
+Actually, let me look at this from a different angle. Maybe the issue is not in `StmtReturn` at all, but in how the tokens are being read.
+
+Looking at the test input, the `return 0;` statement should generate these tokens:
+- `RETURNTK return`
+- `INTCON 0`  
+- `SEMICN ;`
+
+In the buggy output, we see `INTCON 0` and `SEMICN ;`, but not `RETURNTK return`.
+
+This suggests that the `RETURNTK return` token was read but not output.
+
+But the `StmtReturn` object should output it via `returnTk.syntaxOutput()`.
+
+Unless... the `returnTk` field in the `StmtReturn` object is not the actual `RETURNTK` token.
+
+Let me check if there's a bug in the token reading. In `StmtReturnParser.parseStmtReturn()`:
+
+```java
+Token returnTk = this.iterator.readNextToken();
+```
+
+This should read the `RETURNTK return` token correctly.
+
+I think I need to consider that there might be an issue with the `StmtReturn` class itself. Let me look at it once more.
+
+Actually, wait! I just realized something. In the buggy output, after the inner block, we have:
+
+```
+RBRACE }
+<Block>
+<Stmt>
+```
+
+And then immediately `INTCON 0`. But according to the grammar, the `return` statement should be parsed as a `Stmt`, which contains a `StmtReturn`, which should output `RETURNTK return` first.
+
+The fact that it's missing suggests that either:
+1. The `RETURNTK return` token was never read, or
+2. It was read but not stored properly in the `StmtReturn` object
+
+Given that the rest of the parsing works (the expression `0` is parsed correctly), option 2 seems more likely.
+
+But I've checked the constructors and they seem correct.
+
+Wait! What if there's a typo in the field name? Let me check:
+
+```java
+public class StmtReturn implements StmtEle {
+    private Token returnTk; // 'return'
+    private Exp exp; // MAY exist
+    private Token semicn; // ';'
+```
+
+Field name is `returnTk`.
+
+In the constructor:
+```java
+public StmtReturn(Token returnTk,
+                  Token semicn) {
+    this.returnTk = returnTk;
+    this.semicn = semicn;
+}
+```
+
+This assigns to `this.returnTk`, which is correct.
+
+In `syntaxOutput()`:
+```java
+sb.append(this.returnTk.syntaxOutput());
+```
+
+This uses `this.returnTk`, which should be correct.
+
+I'm running out of ideas. Let me consider if there's an issue with the token itself.
+
+What if the `RETURNTK` token is being consumed by a different parser? 
+
+Looking at the `StmtParser.parseStmt()` method, when it sees `RETURNTK`, it unreads it and calls `StmtReturnParser`. That should be fine.
+
+Actually, let me look at the very beginning of `StmtParser.parseStmt()`:
+
+```java
+Token first = this.iterator.readNextToken();
+switch (first.getType()) {
+    case RETURNTK: // 'return'
+        this.iterator.unReadToken(1);
+        StmtReturnParser stmtReturnParser = new StmtReturnParser(this.iterator);
+        this.stmtEle = stmtReturnParser.parseStmtReturn();
+        break;
+```
+
+So it reads the first token, sees it's `RETURNTK`, unreads it, then the `StmtReturnParser` reads it again as `returnTk`.
+
+This should work correctly.
+
+I think I need to consider that the issue might be in the `StmtReturn.syntaxOutput()` method not being called at all, but that doesn't make sense because we see the expression output.
+
+Wait! Looking at the buggy output again:
+
+```
+RBRACE }
+<Block>
+<Stmt>
+INTCON 0
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+SEMICN ;
+<Stmt>
+```
+
+I see two `<Stmt>` tags! One after `<Block>` and one at the very end.
+
+This suggests that the structure is:
+- `<Block>` (the outer block)
+- `<Stmt>` (the return statement)
+  - Content of the return statement (missing `RETURNTK return`)
+- Final `<Stmt>` (closing the return statement)
+
+So the `StmtReturn.syntaxOutput()` is definitely being called, but it's not outputting `RETURNTK return`.
+
+The only remaining possibility is that `this.returnTk` is null.
+
+How could that happen? Only if the constructor didn't set it properly.
+
+Wait! I think I see a subtle issue. In the `StmtReturnParser.parseStmtReturn()` method, there's error handling code that creates a new `SEMICN` token:
+
+```java
+semicn = new Token(TokenType.SEMICN, semicn.getLineIndex(), ";");
+```
+
+But there's no similar handling for the `returnTk`. However, in our case, there's no error, so this code path isn't taken.
+
+I'm stuck. Let me try a different approach.
+
+Looking at the expected vs buggy output, the only difference is the missing `RETURNTK return` line.
+
+This must mean that in the `StmtReturn.syntaxOutput()` method, the `this.returnTk.syntaxOutput()` call is not producing any output.
+
+The most likely explanation is that `this.returnTk` is null.
+
+How could `this.returnTk` be null? Only if the constructor received a null value.
+
+But the `StmtReturnParser` reads `returnTk = this.iterator.readNextToken()`, which should not be null.
+
+Unless... there's an exception being thrown and caught somewhere that results in a null token.
+
+But I don't see any exception handling that would cause this.
+
+Wait! Let me check if there's a bug in the `StmtReturn` class definition itself. Is it possible that there are two fields with similar names?
+
+No, I only see one `returnTk` field.
+
+Actually, I think I need to consider that the issue might be in the test environment or something else, but that's unlikely.
+
+Let me look at other statement types to see if they have similar issues.
+
+For example, the `printf` statement in the test case works correctly:
+
+```
+PRINTFTK printf
+LPARENT (
+STRCON "21373119"
+RPARENT )
+SEMICN ;
+<Stmt>
+```
+
+So the `PRINTFTK printf` is correctly output.
+
+This suggests that the general mechanism works, but there's something specific to `StmtReturn`.
+
+Looking at `StmtPrint.syntaxOutput()`:
+
+```java
+@Override
+public String syntaxOutput() {
+    StringBuilder sb = new StringBuilder();
+    sb.append(this.printf.syntaxOutput());
+    sb.append(this.leftParent.syntaxOutput());
+    // ... etc
+    return sb.toString();
+}
+```
+
+This is similar to `StmtReturn.syntaxOutput()`.
+
+So why would `StmtReturn` not output its first token?
+
+I think I have to conclude that there's a bug in the `StmtReturn` class, but I can't see it in the code provided.
+
+Wait! One last idea: what if the `returnTk` field is being shadowed or there's a naming conflict?
+
+Looking at the `StmtReturn` class again:
+
+```java
+public class StmtReturn implements StmtEle {
+    private Token returnTk; // 'return'
+    private Exp exp; // MAY exist
+    private Token semicn; // ';'
+
+    public StmtReturn(Token returnTk,
+                      Token semicn) {
+        this.returnTk = returnTk;
+        this.semicn = semicn;
+    }
+
+    public StmtReturn(Token returnTk,
+                      Exp exp,
+                      Token semicn) {
+        this(returnTk, semicn);
+        this.exp = exp;
+    }
+
+    @Override
+    public String syntaxOutput() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(this.returnTk.syntaxOutput());
+        if (exp != null) {
+            sb.append(this.exp.syntaxOutput());
+        }
+        sb.append(this.semicn.syntaxOutput());
+        return sb.toString();
+    }
+}
+```
+
+This looks perfect.
+
+I'm forced to consider that the issue might be in the `StmtReturnParser` not actually passing the correct token.
+
+Let me look at the `StmtReturnParser.parseStmtReturn()` method one more time, very carefully:
+
+```java
+public StmtReturn parseStmtReturn() {
+    // 解析 'return' 关键字
+    Token returnTk = this.iterator.readNextToken();
+    if (returnTk.getType() != TokenType.RETURNTK) {
+        System.err.println("ERROR: Expected 'return' keyword (RETURNTK), but found: " + returnTk);
+    }
+
+    // 尝试解析可选的返回表达式
+    Token semicn = this.iterator.readNextToken();
+    Exp exp = null;
+    if (semicn.getType() != TokenType.SEMICN) {
+        if (!isValidExpressionStart(semicn)) {
+            // 处理 i 类错误：缺少分号 ';'
+            this.iterator.unReadToken(2); // 回退两个 Token，获取前一个非终结符的行号
+            Error error = new Error(this.iterator.readNextToken().getLineIndex(), ErrorType.MISSING_SEMICN);
+            ErrorTable.addError(error);
+            semicn = new Token(TokenType.SEMICN, semicn.getLineIndex(), ";");
+        } else {
+            // 合法的表达式，调用 ExpParser 解析
+            this.iterator.unReadToken(1);
+            ExpParser expParser = new ExpParser(this.iterator);
+            exp = expParser.parseExp();
+            semicn = this.iterator.readNextToken();
+
+            // 解析分号 ';'
+            if (semicn.getType() != TokenType.SEMICN) {
+                // 处理 i 类错误：缺少分号 ';'
+                this.iterator.unReadToken(2); // 回退两个 Token，获取前一个非终结符的行号
+                Error error = new Error(this.iterator.readNextToken().getLineIndex(), ErrorType.MISSING_SEMICN);
+                ErrorTable.addError(error);
+            }
+        }
+    }
+    // 返回解析后的 StmtReturn 对象
+    return (exp != null) ? new StmtReturn(returnTk, exp, semicn) : new StmtReturn(returnTk, semicn);
+}
+```
+
+Ah! I see a potential issue now. In the error handling within the `else` branch, when there's a missing semicolon after the expression, it does:
+
+```java
+this.iterator.unReadToken(2); // 回退两个 Token，获取前一个非终结符的行号
+Error error = new Error(this.iterator.readNextToken().getLineIndex(), ErrorType.MISSING_SEMICN);
+ErrorTable.addError(error);
+```
+
+But it doesn't update the `semicn` variable in this case! So `semicn` would still be whatever was read before (which was not a semicolon).
+
+However, in our test case, there is no error - the semicolon is present - so this code path is not taken.
+
+But wait, what if there's a different issue? Let me trace through the successful case again:
+
+1. `returnTk = readNextToken()` → `RETURNTK return` ✓
+2. `semicn = readNextToken()` → `INTCON 0` (stored in variable named `semicn` but it's actually the expression start) ✓
+3. Since `semicn.getType() != SEMICN` and `isValidExpressionStart(semicn)` is true:
+   - `unReadToken(1)` → puts `INTCON 0` back ✓
+   - `exp = expParser.parseExp()` → parses `0` correctly ✓
+   - `semicn = readNextToken()` → `SEMICN ;` ✓
+   - Check if `semicn.getType() == SEMICN` → yes, so no error handling ✓
+4. Return `new StmtReturn(returnTk, exp, semicn)` ✓
+
+This should work perfectly.
+
+I'm really stuck. Given the information available, the most likely location of the bug is in the `StmtReturn` class's `syntaxOutput()` method, even though I can't see the exact issue in the provided code.
+
+But wait! Let me check if there's a possibility that the `returnTk` field is not being initialized due to some Java constructor chaining issue.
+
+No, the constructor chaining looks correct.
+
+Actually, I think I need to consider that there might be a typo in the field name that I'm not seeing. Let me look very carefully:
+
+In the class declaration: `private Token returnTk;`
+In the constructor: `this.returnTk = returnTk;`
+In syntaxOutput: `this.returnTk.syntaxOutput();`
+
+All consistent.
+
+One final possibility: what if the `RETURNTK` token is being consumed by a different part of the parser before `StmtReturnParser` gets to it?
+
+But the `StmtParser` specifically handles `RETURNTK` and delegates to `StmtReturnParser`.
+
+I think I have to conclude that the bug is in the `StmtReturn.syntaxOutput()` method, and the most likely cause is that `this.returnTk` is null, which would mean the constructor didn't set it properly.
+
+Given the evidence, I'll identify the `StmtReturn` class as the location of the error.
+
+<frontend/statement/stmt/StmtReturn.java>
+...
+    @Override
+    public String syntaxOutput() {
+        StringBuilder sb = new StringBuilder();
+        sb.append(this.returnTk.syntaxOutput());
+        if (exp != null) {
+            sb.append(this.exp.syntaxOutput());
+        }
+        sb.append(this.semicn.syntaxOutput());
+        return sb.toString();
+    }
+...

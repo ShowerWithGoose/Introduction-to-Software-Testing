@@ -1,0 +1,27 @@
+import fronted.Lexer.*;
+
+import java.io.BufferedReader;
+import java.io.FileReader;
+import java.io.IOException;
+
+/**
+ * @author
+ * @Description:
+ * @date 2024/9/24 16:05
+ */
+public class Compiler {
+    public static void main(String[] args) {
+        try (BufferedReader reader = new BufferedReader(new FileReader("testfile.txt"))) {
+            StringBuilder sourceCode = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                sourceCode.append(line).append("\n");
+            }
+            Lexer lexer = new Lexer(sourceCode.toString());
+            lexer.tokenize();
+            lexer.output();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+}

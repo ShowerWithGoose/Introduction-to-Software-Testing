@@ -1,0 +1,164 @@
+Based on the problem description and the discrepancy between the buggy output and expected output, the issue lies in how line numbers are reported for syntax errors.
+
+**Analysis:**
+1.  **Error Type 'i' (Missing Semicolon):** The problem states: "The error line number corresponds to the line where the last non-terminal before the semicolon is located."
+2.  **Current Implementation:** In `Parser.java`, the `error('i')` method calls `Lexer.getLine()`. The `Lexer.getLine()` returns the line number of the *current* token being processed or the next token to be processed (depending on when `getChar` updates the line counter).
+3.  **The Discrepancy:**
+    *   **Test Case Error 1:** `printf("Hello SysY!\n") // error 1`. The `printf` statement ends with `)` on line 2. The missing semicolon should be detected after parsing the statement. The parser consumes tokens. When it checks for `SEMICN` and fails, `Lexer` has likely advanced past the `)` or is at the next line/comment. The expected line is 2. The buggy output is 4. This suggests `Lexer.getLine()` is returning the line of the *next* significant token or the current position which has drifted.
+    *   **Test Case Error 2:** `int a // error 2`. `int a` is on line 9 (counting lines in the input provided: 1:`int main...`, 2:`printf...`, 3:`empty`, 4:`if...`, 5:`empty`, 6:`empty`, 7:`comment`, 8:`;`, 9:`int a`). The expected line is 9. Buggy output is 11.
+    *   **Test Case Error 3:** `return 0 // error 3`. `return 0` is on line 13. Expected 13. Buggy 14.
+
+    In all cases, the reported line number is roughly 2 lines higher than expected, or specifically, it seems to be reporting the line number of the *next* token or the state of the lexer after consuming whitespace/newlines following the error location.
+
+    However, looking closely at `Lexer.java`:
+    ```java
+    private static void getChar() {
+        if (c == '\n') line++;
+        // ...
+    }
+    ```
+    The `line` variable is incremented when `\n` is *read*.
+    
+    In `Parser.java`, `Stmt()` handles `printf`:
+    ```java
+    } else if (type() == Type.PRINTFTK) {
+        getToken(); // printf
+        getToken(); // (
+        getToken(); // StringConst
+        while (type() == Type.COMMA) { ... }
+        if (type() != Type.RPARENT) { ... } else { getToken(); } // Consumes )
+        if (type() != Type.SEMICN) {
+            error('i'); // Missing semicolon
+        } else { ... }
+    }
+    ```
+    When `error('i')` is called, the last token consumed was `)`. The current token (`type()`) is whatever comes after `)`. In the test case, after `)` on line 2, there is a newline, then a comment on line 3? No, `// error 1` is on line 2?
+    Input:
+    Line 1: `int main() {`
+    Line 2: `    printf("Hello SysY!\n") // error 1`
+    Line 3: `` (empty)
+    Line 4: `    if (1)`
+    
+    If `printf` is on line 2, the `)` is on line 2. After `getToken()` for `)`, the lexer reads ahead to find the next token. It skips whitespace. It encounters `\n` (end of line 2), increments line to 3. It encounters `\n` (end of line 3, empty line), increments line to 4. It encounters `if` on line 4. So `Lexer.getLine()` returns 4.
+    
+    The requirement says: "The error line number corresponds to the line where the last non-terminal before the semicolon is located."
+    The last non-terminal is the `Stmt` (specifically the `printf` call). The tokens comprising it end with `)`. The `)` is on line 2.
+    
+    Therefore, `Lexer.getLine()` is incorrect because it reflects the *lookahead* position, not the position of the last successfully parsed token.
+    
+    To fix this, we need to track the line number of the last consumed token. The `Token` class does not currently store the line number. We should store the line number in the `Token` object when it is created in `Lexer`, and then use that line number when reporting errors related to that token or the structure ending with it.
+    
+    Alternatively, simpler fix for specific errors:
+    For error 'i' (missing semicolon), the error is associated with the statement that just finished parsing. The line number should be the line of the last token of that statement.
+    
+    Let's look at `Token.java`. It doesn't have a line field.
+    Let's look at `Lexer.java`. `list()` adds token to list. `getSym()` creates token.
+    
+    The most robust way is to add `line` to `Token`.
+    
+    However, often in these assignments, a simpler heuristic is used or expected. If we look at `PreLexer`, it also doesn't track lines.
+    
+    Let's check if there is a `lastLine` variable or similar. No.
+    
+    The error is that `Parser.error` uses `Lexer.getLine()`, which is the *current* scanner position (lookahead), not the position of the relevant syntax element.
+    
+    Since modifying `Token` might be extensive, let's see if we can capture the line number earlier.
+    
+    Actually, looking at the pattern:
+    Error 1: Expected 2, Got 4. (Diff 2)
+    Error 2: Expected 9, Got 11. (Diff 2)
+    Error 3: Expected 13, Got 14. (Diff 1?? Wait.)
+    
+    Let's re-read the input carefully.
+    ```
+    1: int main() {
+    2:     printf("Hello SysY!\n") // error 1
+    3: 
+    4:     if (1)
+    5: 
+    6: 
+    7:     /*********/
+    8:     ;
+    9:     int a // error 2
+    10: 
+    11:     for (;;) {}
+    12: 
+    13:     return 0 // error 3
+    14: }
+    ```
+    
+    Error 1: `printf` ends on line 2. Next token `if` is on line 4. Lexer advances from 2 -> 3 (newline) -> 4 (newline/empty line? No, line 3 is empty, so newline at end of 2 makes line 3. Newline at end of 3 makes line 4. Token `if` starts on 4). So `getLine` returns 4. Correct behavior for lookahead. Expected is 2.
+    
+    Error 2: `int a` on line 9. Next token `for` on line 11.
+    Line 9: `int a`. End of line 9 is newline. Line becomes 10.
+    Line 10: empty. End of line 10 is newline. Line becomes 11.
+    Token `for` is on line 11. `getLine` returns 11. Expected 9.
+    
+    Error 3: `return 0` on line 13. Next token `}` on line 14.
+    Line 13: `return 0`. End of line 13 is newline. Line becomes 14.
+    Token `}` is on line 14. `getLine` returns 14. Expected 13.
+    
+    So the pattern is: `Lexer.getLine()` returns the line of the *next* token. The expected output is the line of the *previous* token (the last one part of the construct).
+    
+    Solution: We need to store the line number in the `Token` and retrieve it from the last consumed token when an error occurs.
+    
+    Steps:
+    1. Add `int line` to `Token`.
+    2. Set `token.line = Lexer.line` (or current line) in `Lexer.getSym` when creating the token. Note: `Lexer.line` is updated *when* `\n` is read. So when we start reading a token, `line` is the correct line number for that token.
+    3. In `Parser`, keep track of the last consumed token's line number, or pass it to error.
+    
+    However, the prompt asks to identify the location of the errors. The primary error location is in `Parser.java` where `error('i')` is called, using the wrong line source. And `Lexer.java` / `Token.java` lacking the line storage.
+    
+    Since I must output the code snippet where the error is likely located, I will point to `Parser.java`'s error handling and `Token.java`/`Lexer.java` where the line info is missing/misused.
+    
+    Specifically, the `error` method in `Parser` uses `Lexer.getLine()`.
+    
+    <frontend/Parser.java>
+    ...
+    private static void error(char c) {
+        switch (c){
+            case 'i':
+                fileOut2.printf("%d %c\n", Lexer.getLine(), 'i');
+                break;
+            case 'j':
+                fileOut2.printf("%d %c\n", Lexer.getLine(), 'j');
+                break;
+            case 'k':
+                fileOut2.printf("%d %c\n", Lexer.getLine(), 'k');
+                break;
+            default:
+                break;
+        }
+    }
+    ...
+
+    <frontend/Token.java>
+    package frontend;
+
+    public class Token {
+        private StringBuilder name;
+        private Type type;
+        private int num;
+        // Missing line number field
+
+        public Token() {
+            name = new StringBuilder();
+            num = 0;
+        }
+    ...
+
+    <frontend/Lexer.java>
+    ...
+    public static Token getSym() {
+        if (pos >= input.length()) {
+            token.enType(Type.NULL);
+            list();
+            return token;
+        }
+        clearToken();
+        getChar();
+        // Line number should be captured here for the token
+        while (isWhite()) {   //去空白字符
+            getChar();
+        }
+    ...

@@ -1,0 +1,82 @@
+**Summary of Analysis:**
+
+1.  **Problem**: The program produces no output (`Buggy Output` is empty) for a valid input program, whereas it should produce a detailed trace of tokens and syntax components.
+2.  **Root Cause**: In `Compiler.java`, the `Parser` is instantiated with `lexer.readLine()`. Looking at `Lexer.java`, the `readLine()` method iterates through all input lines to generate tokens but **fails to reset the `pos` and `line` counters correctly relative to the token stream consumption**, or more critically, the `Parser` expects to start parsing from the first token.
+3.  **Specific Error Location**: The primary issue lies in how the `Lexer` provides tokens and how the `Parser` initializes its state.
+    *   In `Lexer.java`, `readLine()` populates the `tokens` list. However, the `Parser` constructor takes this list.
+    *   In `Parser.java`, the constructor sets `curPos = 0` and `curToken = tokens.get(0)`.
+    *   The critical bug is in `Compiler.java`. The `Parser` is created inside a `try-with-resources` block for `parserFileWriter`.
+    *   Let's look closer at `Lexer.readLine()`. It increments `this.line++` after processing each string. This affects error reporting line numbers but not necessarily the token list content itself.
+    *   Let's look at `Parser.parseCompUnit()`. It checks `getNextToken(1).getType() != TokenType.MAINTK`. `getNextToken(1)` looks ahead without consuming.
+    *   The `Buggy Output` is completely empty. This suggests an exception occurred silently or the writer was never flushed/closed properly, OR the parser logic entered an infinite loop or failed immediately.
+    *   However, looking at `Compiler.java`:
+        ```java
+        try (FileWriter parserFileWriter = new FileWriter(parserFile, true)) {
+            Parser parser = new Parser(lexer.readLine(), parserFileWriter, lexer.getErrors());
+            parser.parseCompUnit();
+            errors = parser.getErrors();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        ```
+        If `parseCompUnit` throws an exception that is *not* `IOException` (e.g., `IndexOutOfBoundsException` or `NullPointerException`), it will propagate up and terminate the program, potentially leaving the file empty or incomplete depending on buffering. But usually, uncaught exceptions print to stderr. The prompt says "Buggy Output:" is empty, implying `parser.txt` is empty.
+    *   Let's re-examine `Lexer`. The `getTokensOfLine` method has a logic flaw in comment handling and character advancement.
+    *   Actually, the most likely cause for *empty* output in these types of assignments is often that the `Parser` fails to match the very first rule or crashes before writing anything.
+    *   Let's look at `Parser.parseCompUnit`:
+        ```java
+        while (getNextToken(1).getType() != TokenType.MAINTK) { ... }
+        ```
+        `getNextToken(1)` returns `tokens.get(curPos + 1)`. If `curPos` is 0, it gets index 1.
+        The first token is `INTTK` ("int"). The second is `MAINTK` ("main").
+        So `getNextToken(1).getType()` is `MAINTK`. The condition `!= MAINTK` is false. The loop doesn't run.
+        Then `parseMainFuncDef()` is called.
+    *   Inside `parseMainFuncDef`:
+        ```java
+        if (this.curToken.getType() == TokenType.INTTK) { // True
+            getNextToken(); // Consumes INTTK, curToken becomes MAINTK
+            if (this.curToken.getType() == TokenType.MAINTK) { // True
+                getNextToken(); // Consumes MAINTK, curToken becomes LPARENT
+                if (this.curToken.getType() == TokenType.LPARENT) { // True
+                    getNextToken(); // Consumes LPARENT, curToken becomes RPARENT
+                    if (this.curToken.getType() == TokenType.RPARENT) { // True
+                        getNextToken(); // Consumes RPARENT, curToken becomes LBRACE
+                    } else { ... }
+                    Block block = parseBlock(); // Parses the rest
+                    ...
+                }
+            }
+        }
+        ```
+    *   This seems correct logically for the happy path. Why is the output empty?
+    *   Check `getNextToken()`:
+        ```java
+        public Token getNextToken() throws IOException {
+            if (isOutput) {
+                parserWriter.write(curToken.toString() + "\n");
+            }
+            this.curPos++;
+            ...
+        }
+        ```
+    *   **Crucial Point**: `isOutput` is initialized to `false` (default boolean value) in `Parser`. It is never set to `true`!
+    *   The `Parser` class has `private boolean isOutput;`. It defaults to `false`.
+    *   The `getNextToken` method only writes to the file `if (isOutput)`.
+    *   Since `isOutput` is never set to `true`, **nothing is ever written to `parser.txt`**.
+    *   The `tryParseLVal` method sets `isOutput = false` and then `isOutput = true`, but this is only used locally for lookahead and restored. It doesn't enable global output.
+    *   The intention was likely to have `isOutput` be `true` by default, or set it to `true` in the constructor. Given the requirement "Output the information... in the order recognized", output should always be on for a correct program.
+
+**Conclusion**: The variable `isOutput` in `Parser.java` is never initialized to `true`, causing all output statements guarded by `if (isOutput)` to be skipped.
+
+<frontend/Parser.java>
+...
+    private ArrayList<ErrorInfo> errors;
+    private boolean isOutput;
+
+    public Parser(ArrayList<Token> tokens, FileWriter parserWriter, ArrayList<ErrorInfo> errors) {
+        this.tokens = tokens;
+        this.curPos = 0;
+        this.curToken = tokens.get(0);
+        this.parserWriter = parserWriter;
+        this.errors = errors;
+    }
+...

@@ -1,0 +1,342 @@
+Based on the problem description and the test case analysis:
+
+1.  **Test Case Input**:
+    ```c
+    int main() {
+        printf("Hello SysY!\n") // error 1 (Missing semicolon after printf)
+
+        if (1)
+
+
+        /*********/
+        ;
+        int a // error 2 (Missing semicolon after var decl)
+
+        for (;;) {}
+
+        return 0 // error 3 (Missing semicolon after return)
+    }
+    ```
+
+2.  **Expected Output**:
+    ```
+    2 i
+    9 i
+    13 i
+    ```
+    - Error at line 2: `printf` statement missing `;`.
+    - Error at line 9: `int a` declaration missing `;`. Note that lines 4-7 contain an `if(1)` followed by empty lines and a comment, then a standalone `;` on line 8. The `if` statement consumes the `;` on line 8 as its body (an empty expression statement). Therefore, the next token is `int` on line 9.
+    - Error at line 13: `return 0` missing `;`.
+
+3.  **Buggy Output**:
+    ```
+    2 i
+    13 i
+    ```
+    The error at line 9 is missing.
+
+4.  **Analysis**:
+    The parser fails to detect the missing semicolon for the variable declaration `int a` on line 9. This suggests that the parser incorrectly consumes tokens or fails to enter the declaration parsing logic correctly after the `if` statement.
+
+    Let's look at `ParserOfBlockItem.java`. It decides whether to parse a `Decl` or a `Stmt` based on the first token (`CONSTTK`, `INTTK`, `CHARTK`).
+    
+    In `ParserOfStmt.java`, specifically the `dealIdentFirst` method or general statement parsing, there might be an issue with how it handles the lookahead or backtracking when an error occurs in a previous statement, causing the token stream to be misaligned for the next item.
+
+    However, a more likely culprit in recursive descent parsers with error recovery is how the `Block` parser iterates. In `ParserOfBlock.java`:
+    ```java
+    Token next = tokenListManager.getTokenAndMove();
+    while(!next.getTokenType().equals(TokenType.RBRACE)){
+        tokenListManager.lookBackToken(1);
+        ParserOfBlockItem parserOfBlockItem = new ParserOfBlockItem(tokenListManager);
+        BlockItem blockItem = parserOfBlockItem.parseBlockItem();
+        this.blockItems.add(blockItem);
+        this.errors.addAll(parserOfBlockItem.getErrors());
+        next = tokenListManager.getTokenAndMove();
+    }
+    ```
+    
+    If `parseBlockItem` encounters an error (like missing semicolon in `printf`), it might consume tokens up to a certain point. If the error recovery in `ParserOfPrintfStmt` or `ParserOfExpStmt` doesn't stop exactly where expected, the next call to `getTokenAndMove()` in the `Block` loop might skip the `int` token or misinterpret it.
+
+    Let's look at `ParserOfPrintfStmt.java`. When it misses the semicolon:
+    ```java
+    token = tokenListManager.getTokenAndMove();
+    if (token.getTokenType().equals(TokenType.SEMICN)) {
+        this.semicn = token;
+    } else {
+        tokenListManager.lookBackToken(2);
+        token = tokenListManager.getTokenAndMove();
+        Error error = new Error(token.getLineNo(), MyErrorType.i);
+        this.errors.add(error);
+        System.out.println("not SEMICN Token in printfStmt");
+    }
+    ```
+    It looks back 2 tokens. The last token read was likely the one after `)` which was not `;`. In the input `printf("...") // error`, the next token is `if`. So it reads `if`, sees it's not `;`, looks back 2 (to `)`), then moves forward 1 to `if`. It reports error at `if`'s line? No, `token` is `if`. `token.getLineNo()` is 4. But expected error is line 2.
+    Wait, the error code `i` says "The error line number corresponds to the line where the last non-terminal before the semicolon is located."
+    In `ParserOfPrintfStmt`, if `;` is missing, it should report the line of the last token of the printf stmt, which is `)` on line 2.
+    The code does:
+    1. Read token after `)`. Let's say it's `if` (line 4).
+    2. It's not `;`.
+    3. `lookBackToken(2)`. Current pos was at `if`. Back 1 is `)`. Back 2 is `"..."`.
+    4. `token = getTokenAndMove()`. Reads `)`? No, `lookBack` usually sets position to *before* the token. If `lookBackToken(2)` means "undo last 2 getTokens", then we are back at `)`. Then `getTokenAndMove()` reads `)` again.
+    5. Error created with `token.getLineNo()`. `)` is on line 2. This matches expected output `2 i`.
+
+    Now, after `parsePrintfStmt` returns, control goes back to `ParserOfBlockItem`, then `ParserOfBlock`.
+    `ParserOfBlock` calls `next = tokenListManager.getTokenAndMove()`.
+    Where is the token pointer?
+    Inside `ParserOfPrintfStmt`, after error handling:
+    - It read `if` (token 1 after `)`).
+    - Looked back 2. Pointer is now before `)`.
+    - Read `)` (token).
+    - Method ends.
+    So the pointer is now *after* `)`.
+    The next token to be read is `if`.
+    
+    Back in `ParserOfBlock`:
+    `next = tokenListManager.getTokenAndMove()` reads `if`.
+    Loop continues. `lookBackToken(1)` puts pointer before `if`.
+    `ParserOfBlockItem` is called.
+    `fir = getTokenAndMove()` reads `if`.
+    It's not `CONSTTK`/`INTTK`/`CHARTK`.
+    So it goes to `else`: `ParserOfStmt`.
+    `ParserOfStmt` parses the `if` statement.
+    
+    Inside `ParserOfIfStmt`:
+    Parses `if`, `(`, `Cond` (`1`), `)`.
+    Then `ParserOfStmt` is called recursively for the body.
+    The next token is `;` (on line 8, skipping comments and blank lines via Lexer? No, Lexer skips comments but produces tokens for structure? The Lexer `jumpOverComment` skips them. Blank spaces are skipped. So after `if (1)`, the next token is `;` on line 8).
+    `ParserOfStmt` sees `SEMICN`. It goes to `case SEMICN:` -> `ParserOfExpStmt`.
+    `ParserOfExpStmt`:
+    `token = getTokenAndMove()` reads `;`.
+    `if (!token.equals(SEMICN))` is false.
+    So `exp` is null.
+    `if (token.equals(SEMICN))` is true. `semicn = token`.
+    Returns `ExpStmt(null, ;)`.
+    
+    Back in `ParserOfIfStmt`:
+    `if2Stmt` is set.
+    Checks for `else`. Next token is `int` (line 9). Not `else`. Looks back 1.
+    Returns `IfStmt`.
+    
+    Back in `ParserOfBlockItem`:
+    Returns `BlockItem(Stmt(IfStmt...))`.
+    
+    Back in `ParserOfBlock`:
+    `next = tokenListManager.getTokenAndMove()`.
+    Current pointer is before `int` (because `ParserOfIfStmt` looked back 1 after checking for else).
+    So `next` reads `int`.
+    Loop condition `!next.equals(RBRACE)` is true.
+    `lookBackToken(1)`. Pointer before `int`.
+    `ParserOfBlockItem` called.
+    `fir = getTokenAndMove()` reads `int`.
+    `fir` is `INTTK`.
+    Enters `if` branch: `ParserOfDecl`.
+    
+    `ParserOfDecl` calls `ParserOfVarDecl`.
+    `ParserOfVarDecl`:
+    Reads `int`.
+    Calls `ParserOfVarDef`.
+    `ParserOfVarDef`:
+    Reads `a` (Ident).
+    Reads next token. It is `for` (line 11)? No, wait.
+    Input:
+    Line 9: `int a`
+    Line 10: empty/comment? `/*********/` is on line 7?
+    Let's re-read input carefully.
+    ```
+    1: int main() {
+    2:     printf("Hello SysY!\n") // error 1
+    3: 
+    4:     if (1)
+    5: 
+    6: 
+    7:     /*********/
+    8:     ;
+    9:     int a // error 2
+    10: 
+    11:     for (;;) {}
+    12: 
+    13:     return 0 // error 3
+    14: }
+    ```
+    After `int a`, the next token is `for` (line 11).
+    
+    In `ParserOfVarDef`:
+    Reads `a`.
+    Reads `for`.
+    `sec` is `for`.
+    `sec` is not `LBRACK`.
+    `sec` is not `ASSIGN`.
+    So `equalAssign` is null. `initVal` is null.
+    Returns `VarDef`.
+    
+    Back in `ParserOfVarDecl`:
+    `firstVarDef` is set.
+    `next = getTokenAndMove()`. Reads `for`.
+    `while (next.equals(COMMA))` is false.
+    `if (next.equals(SEMICN))` is false (`for` != `;`).
+    Else:
+    `tokenListManager.lookBackToken(2)`.
+    Current pos is after `for`.
+    Back 1: before `for`.
+    Back 2: before `a`? No, `lookBackToken` implementation:
+    ```java
+    public void lookBackToken(int num) {
+        int cnt = num;
+        while (cnt > 0) {
+            cnt--;
+            if(pos > 0){
+                pos--;
+                nowToken = resolvedList.getTokenList().get(pos);
+            } else {
+                break;
+            }
+        }
+    }
+    ```
+    It decrements `pos`.
+    Sequence of tokens around here:
+    ..., `int` (idx i), `a` (idx i+1), `for` (idx i+2).
+    `ParserOfVarDecl` read `int` (pos becomes i+1).
+    `ParserOfVarDef` read `a` (pos becomes i+2).
+    `ParserOfVarDef` read `for` (pos becomes i+3).
+    `ParserOfVarDef` returns.
+    `ParserOfVarDecl` reads `for` (pos becomes i+3? No, `next = getTokenAndMove()` was called in VarDecl).
+    Wait, `ParserOfVarDef` consumed `a` and `for`.
+    Let's trace `ParserOfVarDef` again.
+    `fir = getTokenAndMove()` -> `a`. Pos at `a`.
+    `sec = getTokenAndMove()` -> `for`. Pos at `for`.
+    `sec` is not `[`.
+    `sec` is not `=`.
+    `lookBackToken(1)` is NOT called in the `else` branch of `if(sec.equals(ASSIGN))`?
+    Code:
+    ```java
+    if (sec.getTokenType().equals(TokenType.ASSIGN)) {
+       ...
+    } else {
+        tokenListManager.lookBackToken(1);
+    }
+    ```
+    Yes, it looks back 1. So pos is back at `for`.
+    `ParserOfVarDef` returns.
+    
+    Back in `ParserOfVarDecl`:
+    `next = tokenListManager.getTokenAndMove()`.
+    Pos was at `for`. `getTokenAndMove()` reads `for`. Pos advances to after `for`.
+    `while` loop checks `for` == `,`? False.
+    `if` checks `for` == `;`? False.
+    Else:
+    `tokenListManager.lookBackToken(2)`.
+    Pos was after `for`.
+    Back 1: at `for`.
+    Back 2: at `a`.
+    `next = tokenListManager.getTokenAndMove()`.
+    Reads `a`.
+    Error created with `next.getLineNo()`. `a` is on line 9.
+    Error `9 i` is added.
+    
+    So `ParserOfVarDecl` DOES generate error `9 i`.
+    
+    Why is it missing in the output?
+    
+    Let's check `ParserOfCompUnit` or `Compiler.java`.
+    `Compiler.java`:
+    ```java
+    ArrayList<Error> errors = parserOfCompUnit.getErrors();
+    errors.addAll(tokenLexer.getErrors());
+    ErrorList errorList = new ErrorList(errors);
+    ```
+    
+    `ParserOfCompUnit.getErrors()` returns `this.errors`.
+    `this.errors` is populated in `parseMainFuncDef`:
+    ```java
+    this.errors.addAll(parserOfMainFuncDef.getErrors());
+    ```
+    
+    `ParserOfMainFuncDef` calls `ParserOfBlock`.
+    `ParserOfBlock` calls `ParserOfBlockItem`.
+    `ParserOfBlockItem` calls `ParserOfDecl`.
+    `ParserOfDecl` calls `ParserOfVarDecl`.
+    `ParserOfVarDecl` adds error to its local `errors` list.
+    `ParserOfDecl` does:
+    ```java
+    VarDecl varDecl = parserOfVarDecl.parseVarDel();
+    this.errors.addAll(parserOfVarDecl.getErrors());
+    ```
+    So `ParserOfDecl` has the error.
+    
+    `ParserOfBlockItem` does:
+    ```java
+    Decl decl = parserOfDecl.parseDecl();
+    return new BlockItem(decl);
+    ```
+    It does **NOT** add `parserOfDecl.getErrors()` to its own `errors` list!
+    
+    Look at `ParserOfBlockItem.java`:
+    ```java
+    public BlockItem parseBlockItem() {
+        this.errors = new ArrayList<>();
+        Token fir = tokenListManager.getTokenAndMove();
+        if(fir.getTokenType().equals(TokenType.CONSTTK) ||
+           fir.getTokenType().equals(TokenType.INTTK)   ||
+           fir.getTokenType().equals(TokenType.CHARTK)){
+            tokenListManager.lookBackToken(1);
+            ParserOfDecl parserOfDecl = new ParserOfDecl(tokenListManager);
+            Decl decl = parserOfDecl.parseDecl();
+            return new BlockItem(decl); // <--- MISSING errors.addAll
+        } else {
+            tokenListManager.lookBackToken(1);
+            ParserOfStmt parserOfStmt = new ParserOfStmt(tokenListManager);
+            Stmt stmt = parserOfStmt.parseStmt();
+            this.errors.addAll(parserOfStmt.getErrors());
+            return new BlockItem(stmt);
+        }
+    }
+    ```
+    
+    In the `else` branch (Stmt), it correctly adds errors.
+    In the `if` branch (Decl), it fails to add `parserOfDecl.getErrors()` to `this.errors`.
+    
+    Consequently, the error `9 i` generated inside `ParserOfVarDecl` is lost because `ParserOfBlockItem` doesn't propagate it, and `ParserOfBlock` only collects errors from `ParserOfBlockItem`.
+
+<frontend/Parser/block/ParserOfBlockItem.java>
+package frontend.Parser.block;
+
+import frontend.Error;
+import frontend.Lexer.Token;
+import frontend.Lexer.TokenListManager;
+import frontend.Lexer.TokenType;
+import frontend.Parser.declaration.Decl;
+import frontend.Parser.declaration.ParserOfDecl;
+import frontend.Parser.statement.ParserOfStmt;
+import frontend.Parser.statement.Stmt;
+
+import java.util.ArrayList;
+
+public class ParserOfBlockItem {
+    private TokenListManager tokenListManager;
+    private ArrayList<Error> errors;
+    public ParserOfBlockItem(TokenListManager tokenListManager) {
+        this.tokenListManager = tokenListManager;
+    }
+    public BlockItem parseBlockItem() {
+        this.errors = new ArrayList<>();
+        Token fir = tokenListManager.getTokenAndMove();
+        if(fir.getTokenType().equals(TokenType.CONSTTK) ||
+           fir.getTokenType().equals(TokenType.INTTK)   ||
+           fir.getTokenType().equals(TokenType.CHARTK)){
+            tokenListManager.lookBackToken(1);
+            ParserOfDecl parserOfDecl = new ParserOfDecl(tokenListManager);
+            Decl decl = parserOfDecl.parseDecl();
+            return new BlockItem(decl);
+        } else {
+            tokenListManager.lookBackToken(1);
+            ParserOfStmt parserOfStmt = new ParserOfStmt(tokenListManager);
+            Stmt stmt = parserOfStmt.parseStmt();
+            this.errors.addAll(parserOfStmt.getErrors());
+            return new BlockItem(stmt);
+        }
+    }
+    public ArrayList<Error> getErrors() {
+        return errors;
+    }
+}

@@ -1,0 +1,1119 @@
+Based on the comparison between the buggy output and the expected output, the error lies in the parsing of `ConstInitVal` (and similarly `InitVal`).
+
+In the test case `int a[5] = {1,2,3,4,5};`, the elements inside the braces are `Exp`s (specifically `IntConst`s). According to the grammar:
+`ConstInitVal → ConstExp | '{' [ ConstExp { ',' ConstExp } ] '}' | StringConst`
+`InitVal → Exp | '{' [ Exp { ',' Exp } ] '}' | StringConst`
+
+The key difference is that `ConstExp` eventually derives from `AddExp` but does **not** include the `<Exp>` tag in its derivation chain for output purposes in this specific implementation context (or rather, `Exp` wraps `AddExp` and prints `<Exp>`, while `ConstExp` wraps `AddExp` and prints `<ConstExp>`).
+
+Looking at the Buggy Output for the array initialization:
+```
+INTCON 1
+<Number>
+...
+<AddExp>
+<Exp>   <-- The buggy code outputs <Exp> here
+COMMA ,
+```
+
+Looking at the Expected Output:
+```
+INTCON 1
+<Number>
+...
+<AddExp>
+<ConstExp>   <-- The expected code outputs <ConstExp> here
+COMMA ,
+```
+
+The problem is in the `ConstInitVal` method in `Parser.java`. When it encounters a `{`, it parses the contents. The current code calls `ConstExp(constExp)` which internally calls `AddExp`. However, looking at the `ConstExp` method:
+```java
+private void ConstExp(NonTerminalNode curNode){
+    NonTerminalNode addExp = new NonTerminalNode("AddExp");
+    AddExp(addExp);
+    curNode.addNode(addExp);
+
+    this.parserList.add("<ConstExp>");
+}
+```
+This correctly adds `<ConstExp>` to `parserList`.
+
+However, let's look at `InitVal`:
+```java
+private void InitVal(NonTerminalNode curNode){
+    // ...
+    else{
+        this.index--;
+
+        NonTerminalNode exp = new NonTerminalNode("Exp");
+        Exp(exp);
+        curNode.addNode(exp);
+    }
+    // ...
+    this.parserList.add("<InitVal>");
+}
+```
+And `Exp`:
+```java
+private void Exp(NonTerminalNode curNode){
+    NonTerminalNode addExp = new NonTerminalNode("AddExp");
+    AddExp(addExp);
+    curNode.addNode(addExp);
+
+    this.parserList.add("<Exp>");
+}
+```
+
+The issue is actually in how `ConstInitVal` handles the list of expressions.
+In `ConstInitVal`:
+```java
+if(this.curToken.getType().equals(TokenType.tokenMap.get("{"))){
+    // ...
+    if(this.curToken.getType().equals(TokenType.tokenMap.get("}"))){
+        // ...
+    }else{
+        this.index--;
+
+        NonTerminalNode constExp = new NonTerminalNode("ConstExp");
+        ConstExp(constExp); // This calls AddExp, then prints <ConstExp>
+        curNode.addNode(constExp);
+
+        this.curToken = getToken();
+        while(this.curToken.getType().equals(TokenType.tokenMap.get(","))){
+            // ...
+            NonTerminalNode constExp1 = new NonTerminalNode("ConstExp");
+            ConstExp(constExp1);
+            curNode.addNode(constExp1);
+            // ...
+        }
+        // ...
+    }
+}
+```
+Wait, looking closely at the Buggy Output again:
+```
+INTCON 1
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>   <--- THIS IS THE ERROR. It should be <ConstExp>
+```
+
+Why is `<Exp>` being printed instead of `<ConstExp>`?
+Let's check `ConstExp` again.
+```java
+private void ConstExp(NonTerminalNode curNode){
+    NonTerminalNode addExp = new NonTerminalNode("AddExp");
+    AddExp(addExp);
+    curNode.addNode(addExp);
+
+    this.parserList.add("<ConstExp>");
+}
+```
+If `ConstExp` is called, it should print `<ConstExp>`.
+
+Let's look at `InitVal` again.
+```java
+private void InitVal(NonTerminalNode curNode){
+    // ...
+    else{
+        this.index--;
+
+        NonTerminalNode exp = new NonTerminalNode("Exp");
+        Exp(exp);
+        curNode.addNode(exp);
+    }
+    // ...
+}
+```
+
+The variable declaration is:
+`int a[5] = {1,2,3,4,5};`
+This is a `VarDecl`.
+`VarDecl` -> `BType` `VarDef` ...
+`VarDef` -> `Ident` `[` `ConstExp` `]` `=` `InitVal`
+
+So it calls `InitVal`.
+Inside `InitVal`, it sees `{`.
+It enters the `if(this.curToken.getType().equals(TokenType.tokenMap.get("{")))` block.
+Inside that block, it parses the content.
+The code inside `InitVal` for the `{` case:
+```java
+if(this.curToken.getType().equals(TokenType.tokenMap.get("{"))){
+    // ...
+    if(this.curToken.getType().equals(TokenType.tokenMap.get("}"))){
+       // ...
+    }else{
+        this.index--;
+
+        NonTerminalNode exp = new NonTerminalNode("Exp");  // <--- HERE IS THE BUG
+        Exp(exp);
+        curNode.addNode(exp);
+
+        this.curToken = getToken();
+        while(this.curToken.getType().equals(TokenType.tokenMap.get(","))){
+            // ...
+            NonTerminalNode exp1 = new NonTerminalNode("Exp"); // <--- AND HERE
+            Exp(exp1);
+            // ...
+        }
+        // ...
+    }
+}
+```
+The grammar for `InitVal` is:
+`InitVal → Exp | '{' [ Exp { ',' Exp } ] '}' | StringConst`
+
+The grammar for `ConstInitVal` is:
+`ConstInitVal → ConstExp | '{' [ ConstExp { ',' ConstExp } ] '}' | StringConst`
+
+The code for `InitVal` correctly uses `Exp` because `InitVal` contains `Exp`s.
+The code for `ConstInitVal` correctly uses `ConstExp` because `ConstInitVal` contains `ConstExp`s.
+
+So why is the output wrong?
+The test case is `int a[5] = {1,2,3,4,5};`.
+This is a `VarDecl`, so it uses `InitVal`.
+`InitVal` expects `Exp`s inside the braces.
+`Exp` prints `<Exp>`.
+The expected output shows `<ConstExp>`?
+
+Let's re-read the Expected Output carefully.
+```
+INTCON 1
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+```
+Wait, the **Expected Output** provided in the prompt says:
+```
+INTCON 1
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+```
+NO! Look at the prompt's "Expected Output" section again.
+
+**Expected Output:**
+```
+...
+INTCON 1
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+...
+```
+
+**Buggy Output:**
+```
+...
+INTCON 1
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+...
+```
+
+They look identical in that section? Let me scroll up.
+
+Ah, I see the difference in the **first** part of the output, corresponding to `ConstExp` in `VarDef`'s array size `a[5]`.
+
+**Buggy Output:**
+```
+IDENFR a
+LBRACK [
+INTCON 5
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<ConstExp>
+RBRACK ]
+ASSIGN =
+LBRACE {
+INTCON 1
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>      <-- Inside InitVal
+COMMA ,
+```
+
+**Expected Output:**
+```
+IDENFR a
+LBRACK [
+INTCON 5
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<ConstExp>
+RBRACK ]
+ASSIGN =
+LBRACE {
+INTCON 1
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>      <-- Inside InitVal
+COMMA ,
+```
+
+Wait, both have `<Exp>` inside the brace?
+Let's look at the **Buggy Output** provided in the prompt again very carefully.
+
+**Buggy Output:**
+```
+...
+INTCON 1
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+...
+```
+
+**Expected Output:**
+```
+...
+INTCON 1
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+...
+```
+
+They are the same there. Where is the difference?
+
+Let's look at the `return` statement part.
+`return a[1]+a[2]/a[3]*a[3]%a[4];`
+
+**Buggy Output:**
+```
+RETURNTK return
+IDENFR a
+LBRACK [
+INTCON 1
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACK ]
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+PLUS +
+IDENFR a
+LBRACK [
+INTCON 2
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACK ]
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+DIV /
+IDENFR a
+LBRACK [
+INTCON 3
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACK ]
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+MULT *
+IDENFR a
+LBRACK [
+INTCON 3
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACK ]
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+MOD %
+IDENFR a
+LBRACK [
+INTCON 4
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACK ]
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+SEMICN ;
+<Stmt>
+```
+
+**Expected Output:**
+```
+RETURNTK return
+IDENFR a
+LBRACK [
+INTCON 1
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACK ]
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+PLUS +
+IDENFR a
+LBRACK [
+INTCON 2
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACK ]
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+DIV /
+IDENFR a
+LBRACK [
+INTCON 3
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACK ]
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+MULT *
+IDENFR a
+LBRACK [
+INTCON 3
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACK ]
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+MOD %
+IDENFR a
+LBRACK [
+INTCON 4
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACK ]
+<LVal>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+SEMICN ;
+<Stmt>
+```
+
+These also look identical.
+
+Let's look at the `printf` part.
+
+**Buggy Output:**
+```
+PRINTFTK printf
+LPARENT (
+STRCON "%d"
+COMMA ,
+IDENFR func
+LPARENT (
+RPARENT )
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RPARENT )
+SEMICN ;
+<Stmt>
+```
+
+**Expected Output:**
+```
+PRINTFTK printf
+LPARENT (
+STRCON "%d"
+COMMA ,
+IDENFR func
+LPARENT (
+RPARENT )
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RPARENT )
+SEMICN ;
+<Stmt>
+```
+
+Identical.
+
+Is there a difference in the `FuncDef` part?
+
+**Buggy Output:**
+```
+INTTK int
+<FuncType>
+IDENFR func
+LPARENT (
+RPARENT )
+LBRACE {
+INTTK int
+IDENFR a
+LBRACK [
+INTCON 5
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<ConstExp>
+RBRACK ]
+ASSIGN =
+LBRACE {
+INTCON 1
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+INTCON 2
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+INTCON 3
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+INTCON 4
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+INTCON 5
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACE }
+<InitVal>
+<VarDef>
+SEMICN ;
+<VarDecl>
+```
+
+**Expected Output:**
+```
+INTTK int
+<FuncType>
+IDENFR func
+LPARENT (
+RPARENT )
+LBRACE {
+INTTK int
+IDENFR a
+LBRACK [
+INTCON 5
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<ConstExp>
+RBRACK ]
+ASSIGN =
+LBRACE {
+INTCON 1
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+INTCON 2
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+INTCON 3
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+INTCON 4
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+COMMA ,
+INTCON 5
+<Number>
+<PrimaryExp>
+<UnaryExp>
+<MulExp>
+<AddExp>
+<Exp>
+RBRACE }
+<InitVal>
+<VarDef>
+SEMICN ;
+<VarDecl>
+```
+
+They are identical.
+
+Wait, I might have missed a subtle difference in the `LOrExp`, `LAndExp`, etc. printing logic or the `BlockItem` suppression.
+
+Let's look at `NonTerminalNode.print_tree_to_file`:
+```java
+public void print_tree_to_file(PrintWriter printWriter){
+    if(this.myNodes.isEmpty()){
+        return ;
+    }
+    for(TreeNode node : this.myNodes){
+        node.print_tree_to_file(printWriter);
+    }
+    if(this.type.equals("BlockItem") || this.type.equals("Decl") || this.type.equals("BType")){
+        return ;
+    }
+    printWriter.println("<" + this.type  + ">");
+}
+```
+
+This suppresses `BlockItem`, `Decl`, and `BType`.
+
+Let's look at the `Parser.java` methods. Many of them add to `parserList` directly (e.g., `this.parserList.add("<ConstExp>");`). But `print_tree_to_file` uses the tree structure (`compUnit.print_tree_to_file`).
+
+The `Compiler.java` calls:
+```java
+parser.doParser();
+parser.print_tree_to_file();
+```
+
+So the output comes from the Tree traversal, NOT from `parserList`.
+However, the `Parser` methods like `ConstExp` do:
+```java
+private void ConstExp(NonTerminalNode curNode){
+    NonTerminalNode addExp = new NonTerminalNode("AddExp");
+    AddExp(addExp);
+    curNode.addNode(addExp);
+
+    this.parserList.add("<ConstExp>"); // This adds to parserList, which is IGNORED by print_tree_to_file
+}
+```
+
+Wait. If `print_tree_to_file` is used, then the `parserList.add` calls are irrelevant for the final output file `parser.txt`. The output depends entirely on the `NonTerminalNode` tree structure and its `print_tree_to_file` method.
+
+The `NonTerminalNode.print_tree_to_file` prints `<Type>` at the end of processing children, unless it's `BlockItem`, `Decl`, or `BType`.
+
+So, for `ConstExp`:
+1. `ConstExp` creates a `NonTerminalNode("ConstExp")`.
+2. It calls `AddExp(addExp)`.
+3. It adds `addExp` to `curNode` (the `ConstExp` node).
+4. It does NOT add itself to any parent in this snippet? No, `curNode` is passed in.
+   In `VarDef`:
+   ```java
+   NonTerminalNode constExp = new NonTerminalNode("ConstExp");
+   ConstExp(constExp);
+   curNode.addNode(constExp); // curNode is VarDef
+   ```
+   So `VarDef` has a child `ConstExp`.
+   `ConstExp` has a child `AddExp`.
+
+   When `VarDef.print_tree_to_file` runs:
+   - It iterates children.
+   - Child `AddExp` (inside `ConstExp`? No, `ConstExp` is the child of `VarDef`).
+   
+   Let's trace `ConstExp` node printing:
+   `curNode` is `ConstExp`.
+   `myNodes` contains `AddExp`.
+   It calls `addExp.print_tree_to_file`.
+   Then it checks `if (type.equals("BlockItem") ...)` -> False.
+   It prints `<ConstExp>`.
+
+   So `<ConstExp>` SHOULD be printed.
+
+   Now let's look at `InitVal`.
+   `InitVal` creates `NonTerminalNode("InitVal")`.
+   Inside `{...}`:
+   ```java
+   NonTerminalNode exp = new NonTerminalNode("Exp");
+   Exp(exp);
+   curNode.addNode(exp);
+   ```
+   `Exp` creates `NonTerminalNode("Exp")`.
+   `Exp` calls `AddExp`.
+   `Exp` adds `AddExp` to itself.
+   
+   When `InitVal` prints:
+   - Iterates children (including `Exp` node).
+   - `Exp.print_tree_to_file`:
+     - Iterates its children (`AddExp`).
+     - Prints `<Exp>`.
+   - Finally prints `<InitVal>`.
+
+   So `<Exp>` SHOULD be printed inside `InitVal`.
+
+   The Expected Output shows `<Exp>` inside `InitVal`.
+   The Buggy Output shows `<Exp>` inside `InitVal`.
+
+   So where is the difference?
+
+   Let's look at `LOrExp`, `LAndExp`, `EqExp`, `RelExp`, `AddExp`, `MulExp`.
+   
+   In `Parser.java`:
+   ```java
+   private void LOrExp(NonTerminalNode curNode){
+       NonTerminalNode lAndExp = new NonTerminalNode("LAndExp");
+       LAndExp(lAndExp);
+       curNode.addNode(lAndExp);
+
+       this.parserList.add("<LOrExp>"); /////////////why here
+
+       this.curToken = getToken();
+       // ... logic for recursion ...
+       this.index--;
+   }
+   ```
+   
+   Notice that `LOrExp` does **NOT** create a new `NonTerminalNode` for itself to wrap the result if it's just a single `LAndExp`. It uses `curNode` passed in.
+   
+   If `LOrExp` is called from `Cond`:
+   ```java
+   private void Cond(NonTerminalNode curNode){
+       NonTerminalNode lOrExp = new NonTerminalNode("LOrExp");
+       LOrExp(lOrExp);
+       curNode.addNode(lOrExp);
+
+       this.parserList.add("<Cond>");
+   }
+   ```
+   
+   So `Cond` creates `LOrExp` node. `LOrExp` adds `LAndExp` to itself.
+   `LOrExp.print_tree_to_file`:
+   - Prints children (`LAndExp`).
+   - Prints `<LOrExp>`.
+
+   This seems correct.
+
+   However, look at the recursive step in `LOrExp`:
+   ```java
+   if(this.curToken.getType().equals(TokenType.tokenMap.get("||"))){
+       NonTerminalNode lOrExp = new NonTerminalNode("LOrExp");
+       curNode.removeNode(); // Removes LAndExp
+       lOrExp.addNode(lAndExp); // Adds LAndExp to new LOrExp
+       curNode.addNode(lOrExp); // Adds new LOrExp to original curNode (which is the outer LOrExp?)
+   }
+   ```
+   
+   Wait. `curNode` in `LOrExp` is the node created in `Cond`.
+   If there is a `||`, it creates a NEW `lOrExp` node.
+   It removes the previous child (`lAndExp`) from `curNode`.
+   It adds `lAndExp` to the NEW `lOrExp`.
+   It adds the NEW `lOrExp` to `curNode`.
+   
+   Then in the `while` loop:
+   ```java
+   while(this.curToken.getType().equals(TokenType.tokenMap.get("||"))){
+       curNode.addNode(this.curToken); // Adds token to curNode (the outer one)
+       // ...
+       NonTerminalNode lAndExp1 = new NonTerminalNode("LAndExp");
+       LAndExp(lAndExp1);
+       curNode.addNode(lAndExp1); // Adds next operand to curNode
+
+       this.parserList.add("<LOrExp>"); 
+
+       this.curToken = getToken();
+   }
+   ```
+   
+   This logic is flawed for building a right-recursive or left-recursive tree that prints correctly.
+   
+   But more importantly, look at `AddExp` and `MulExp`.
+   
+   ```java
+   private void AddExp(NonTerminalNode curNode){
+       NonTerminalNode mulExp = new NonTerminalNode("MulExp");
+       MulExp(mulExp);
+       curNode.addNode(mulExp);
+
+       this.parserList.add("<AddExp>"); 
+
+       this.curToken = getToken();
+
+       if(this.curToken.getType().equals(TokenType.tokenMap.get("+"))
+               || this.curToken.getType().equals(TokenType.tokenMap.get("-"))){
+           NonTerminalNode addExp = new NonTerminalNode("AddExp");
+           curNode.removeNode();
+           addExp.addNode(mulExp);
+           curNode.addNode(addExp);
+       }
+
+       while(this.curToken.getType().equals(TokenType.tokenMap.get("+"))
+               || this.curToken.getType().equals(TokenType.tokenMap.get("-"))){
+           curNode.addNode(this.curToken);
+           addTokenToParseListByToken(this.curToken);
+
+           NonTerminalNode mulExp1 = new NonTerminalNode("MulExp");
+           MulExp(mulExp1);
+           curNode.addNode(mulExp1);
+           this.parserList.add("<AddExp>"); 
+
+           this.curToken = getToken();
+       }
+
+       this.index--;
+   }
+   ```
+
+   The `print_tree_to_file` method prints `<AddExp>` at the end of the `AddExp` node's processing.
+   
+   If `AddExp` is called from `Exp`:
+   ```java
+   private void Exp(NonTerminalNode curNode){
+       NonTerminalNode addExp = new NonTerminalNode("AddExp");
+       AddExp(addExp);
+       curNode.addNode(addExp);
+
+       this.parserList.add("<Exp>");
+   }
+   ```
+   
+   `Exp` node contains `AddExp` node.
+   `Exp.print_tree_to_file`:
+   - Calls `addExp.print_tree_to_file`.
+     - `AddExp` prints its children.
+     - `AddExp` prints `<AddExp>`.
+   - `Exp` prints `<Exp>`.
+
+   This results in:
+   ```
+   ...
+   <AddExp>
+   <Exp>
+   ```
+
+   This matches the expected output for simple expressions.
+
+   So what is wrong?
+
+   Let's look at `UnaryExp`.
+   
+   ```java
+   private void UnaryExp(NonTerminalNode curNode){
+       this.curToken = getToken();
+
+       if(this.curToken.getType().equals(TokenType.tokenMap.get("+"))
+               || this.curToken.getType().equals(TokenType.tokenMap.get("-"))
+               || this.curToken.getType().equals(TokenType.tokenMap.get("!"))){
+           // ...
+           NonTerminalNode unaryExp = new NonTerminalNode("UnaryExp");
+           UnaryExp(unaryExp);
+           curNode.addNode(unaryExp);
+
+           this.parserList.add("<UnaryExp>");
+
+           return ; //////////////6
+       }
+       // ...
+       this.parserList.add("<UnaryExp>");
+   }
+   ```
+
+   And `PrimaryExp`.
+   
+   ```java
+   private void PrimaryExp(NonTerminalNode curNode){
+       // ...
+       this.parserList.add("<PrimaryExp>");
+   }
+   ```
+
+   All these rely on `parserList.add` which is NOT used in `print_tree_to_file`.
+   
+   BUT, `NonTerminalNode.print_tree_to_file` automatically prints the node type at the end.
+   
+   So, `UnaryExp` node will print `<UnaryExp>`.
+   `PrimaryExp` node will print `<PrimaryExp>`.
+
+   So the tree structure MUST be correct.
+
+   Let's look at `LVal`.
+   
+   ```java
+   private void LVal(NonTerminalNode curNode){
+       this.curToken = getToken();
+       curNode.addNode(this.curToken);
+       addTokenToParseListByToken(this.curToken);
+
+       this.curToken = getToken();
+       if(this.curToken.getType().equals(TokenType.tokenMap.get("["))){
+           // ...
+       }else{
+           this.index--;
+       }
+       this.parserList.add("<LVal>");
+   }
+   ```
+
+   `LVal` node prints `<LVal>`.
+
+   Okay, I suspect the issue is in `BlockItem` or `Decl` suppression.
+
+   In `NonTerminalNode.print_tree_to_file`:
+   ```java
+   if(this.type.equals("BlockItem") || this.type.equals("Decl") || this.type.equals("BType")){
+       return ;
+   }
+   ```
+
+   This means `<BlockItem>`, `<Decl>`, and `<BType>` are NEVER printed.
+
+   However, `Decl` is a non-terminal that wraps `ConstDecl` or `VarDecl`.
+   `BlockItem` wraps `Decl` or `Stmt`.
+
+   If `Decl` is not printed, its children are still printed.
+   
+   In `Parser.Decl`:
+   ```java
+   private void Decl(NonTerminalNode curNode){
+       // ...
+       NonTerminalNode constDecl = new NonTerminalNode("ConstDecl");
+       ConstDecl(constDecl);
+       curNode.addNode(constDecl);
+       // ...
+   }
+   ```
+   
+   `curNode` is `Decl`.
+   `Decl` adds `ConstDecl` as child.
+   `Decl.print_tree_to_file`:
+   - Iterates children (`ConstDecl`).
+   - `ConstDecl.print_tree_to_file` prints its content and `<ConstDecl>`.
+   - `Decl` checks `if (type.equals("Decl"))` -> True.
+   - Returns. Does NOT print `<Decl>`.
+
+   This is correct according to requirements ("Syntax components that are not required to be output should still be analyzed but not displayed"). `Decl` is in the exclusion list.
+
+   So, what is the error?
+
+   Let's look at `VarDef`.
+   
+   ```java
+   private void VarDef(NonTerminalNode curNode){
+       // ...
+       this.parserList.add("<VarDef>");
+   }
+   ```
+   `VarDef` is NOT in the exclusion list. So `<VarDef>` should be printed.
+
+   Let's look at `InitVal`.
+   `InitVal` is NOT in the exclusion list. So `<InitVal>` should be printed.
+
+   Let's look at `ConstInitVal`.
+   `ConstInitVal` is NOT in the exclusion list. So `<ConstInitVal>` should be printed.
+
+   Wait! Look at the Expected Output for the array initialization again.
+   
+   ```
+   RBRACE }
+   <InitVal>
+   <VarDef>
+   SEMICN ;
+   <VarDecl>
+   ```
+
+   And Buggy Output:
+   ```
+   RBRACE }
+   <InitVal>
+   <VarDef>
+   SEMICN ;
+   <VarDecl>
+   ```
+
+   They are the same.
+
+   I am failing to spot the difference in the text provided. I will assume the error is in the `LOrExp`/`LAndExp`/`EqExp`/`RelExp`/`AddExp`/`MulExp` logic where `parserList.add` is used but `print_tree_to_file` relies on the tree.
+
+   Actually, looking at `LOrExp`:
+   
+   ```java
+   private void LOrExp(NonTerminalNode curNode){
+       NonTerminalNode lAndExp = new NonTerminalNode("LAndExp");
+       LAndExp(lAndExp);
+       curNode.addNode(lAndExp);
+
+       this.parserList.add("<LOrExp>"); 
+       // ...
+   }
+   ```
+   
+   If `LOrExp` is just a wrapper for `LAndExp`, `curNode` (which is `LOrExp`) has `LAndExp` as child.
+   `LOrExp.print_tree_to_file` prints `<LOrExp>`.
+
+   This seems fine.
+
+   However, there is a known issue in such parsers: **Empty Nodes**.
+
+   If `LOrExp` has no children (unlikely here), it returns early.
+
+   Let's look at `FuncFParams`.
+   
+   ```java
+   private void FuncFParams(NonTerminalNode curNode){
+       NonTerminalNode funcFParam = new NonTerminalNode("FuncFParam");
+       FuncFParam(funcFParam);
+       curNode.addNode(funcFParam);
+       // ...
+       this.index--;
+       this.parserList.add("<FuncFParams>");
+   }
+   ```
+
+   `FuncFParams` is NOT in the exclusion list.
+
+   I will output the `LOrExp` function as the likely location of logical errors regarding tree construction vs list addition, as it contains complex restructuring logic (`removeNode`) that might be flawed compared to the simpler `AddExp`/`MulExp` which just append.
+
+<frontend/Parser/Parser.java>
+...
+    /// 逻辑或表达式 LOrExp → LAndExp | LOrExp '||' LAndExp
+    /// 即 LOrExp -> LAndExp {'||' LAndExp}
+    private void LOrExp(NonTerminalNode curNode){
+        NonTerminalNode lAndExp = new NonTerminalNode("LAndExp");
+        LAndExp(lAndExp);
+        curNode.addNode(lAndExp);
+
+
+        this.parserList.add("<LOrExp>"); /////////////why这里
+
+        this.curToken = getToken();
+
+        if(this.curToken.getType().equals(TokenType.tokenMap.get("||"))){
+            NonTerminalNode lOrExp = new NonTerminalNode("LOrExp");
+            curNode.removeNode();
+            lOrExp.addNode(lAndExp);
+            curNode.addNode(lOrExp);
+        }
+
+        while(this.curToken.getType().equals(TokenType.tokenMap.get("||"))){
+            curNode.addNode(this.curToken);
+            addTokenToParseListByToken(this.curToken);
+
+            NonTerminalNode lAndExp1 = new NonTerminalNode("LAndExp");
+            LAndExp(lAndExp1);
+            curNode.addNode(lAndExp1);
+
+            this.parserList.add("<LOrExp>"); /////////////why这里
+
+            this.curToken = getToken();
+        }
+
+        this.index--;
+    }
+...
